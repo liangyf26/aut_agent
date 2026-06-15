@@ -1,0 +1,15 @@
+{
+  "name": "aut-agent-assessment-platform",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI Agent software assessment platform MVP for third-party software acceptance assessment.",
+  "type": "commonjs",
+  "scripts": {
+    "dev": "node src/server.js",
+    "start": "node src/server.js",
+    "check": "node --check src/server.js && node --check src/storage.js && node --check src/domain/agents.js && node --check src/domain/assessment.js && node --check src/domain/executors.js && node --check src/domain/llmProviders.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

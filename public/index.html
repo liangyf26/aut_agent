@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>aut_agent 软件自动化评测平台</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark">A</span>
+          <div>
+            <strong>aut_agent</strong>
+            <span>软件自动化评测平台</span>
+          </div>
+        </div>
+
+        <button class="primary-action" id="newProjectButton" type="button">新建评测项目</button>
+        <div class="project-list" id="projectList"></div>
+      </aside>
+
+      <main class="workspace">
+        <section class="toolbar">
+          <div>
+            <p class="eyebrow">第三方验收评测</p>
+            <h1 id="pageTitle">评测项目工作台</h1>
+          </div>
+          <div class="pipeline">
+            <button data-action="analyze" type="button">解析需求</button>
+            <button data-action="generate-cases" type="button">生成用例</button>
+            <button data-action="run" type="button">执行评测</button>
+            <button data-action="report" type="button">生成报告</button>
+          </div>
+        </section>
+
+        <section class="content-grid">
+          <form class="panel project-form" id="projectForm">
+            <div class="panel-heading">
+              <h2>项目资料</h2>
+              <span id="saveState">未保存</span>
+            </div>
+            <label>
+              项目名称
+              <input name="name" required placeholder="例如：OA 系统一期验收评测">
+            </label>
+            <div class="two-cols">
+              <label>
+                甲方单位
+                <input name="client" placeholder="甲方">
+              </label>
+              <label>
+                乙方单位
+                <input name="vendor" placeholder="乙方">
+              </label>
+            </div>
+            <div class="two-cols">
+              <label>
+                被测系统
+                <input name="sutName" placeholder="系统名称">
+              </label>
+              <label>
+                访问地址
+                <input name="sutBaseUrl" placeholder="https://test.example.com">
+              </label>
+            </div>
+            <label>
+              测试账号与环境说明
+              <textarea name="accountNotes" rows="3" placeholder="账号、角色、权限、环境限制"></textarea>
+            </label>
+            <label>
+              评测范围
+              <textarea name="scope" rows="4" placeholder="本次需要覆盖的功能模块、业务流程和不纳入范围"></textarea>
+            </label>
+            <label>
+              需求资料
+              <textarea name="documentText" rows="10" placeholder="粘贴需求说明书、功能说明书或验收项文本"></textarea>
+            </label>
+            <button class="submit-button" type="submit">保存项目</button>
+          </form>
+
+          <section class="panel overview-panel">
+            <div class="panel-heading">
+              <h2>评测概览</h2>
+              <span id="projectStatus">待创建</span>
+            </div>
+            <div class="metric-grid">
+              <div class="metric">
+                <span>功能模块</span>
+                <strong id="moduleCount">0</strong>
+              </div>
+              <div class="metric">
+                <span>验收项</span>
+                <strong id="criteriaCount">0</strong>
+              </div>
+              <div class="metric">
+                <span>测试用例</span>
+                <strong id="caseCount">0</strong>
+              </div>
+              <div class="metric">
+                <span>通过率</span>
+                <strong id="passRate">0%</strong>
+              </div>
+            </div>
+
+            <div class="tabs" role="tablist">
+              <button class="active" data-tab="analysis" type="button">需求</button>
+              <button data-tab="cases" type="button">用例</button>
+              <button data-tab="execution" type="button">执行</button>
+              <button data-tab="report" type="button">报告</button>
+              <button data-tab="code" type="button">代码</button>
+            </div>
+
+            <div class="tab-body active" id="analysisTab"></div>
+            <div class="tab-body" id="casesTab"></div>
+            <div class="tab-body" id="executionTab"></div>
+            <div class="tab-body" id="reportTab"></div>
+            <pre class="tab-body code-output" id="codeTab"></pre>
+          </section>
+        </section>
+      </main>
+    </div>
+    <script src="/app.js"></script>
+  </body>
+</html>
