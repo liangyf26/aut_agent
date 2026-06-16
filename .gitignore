@@ -1,9 +1,15 @@
 node_modules/
+.venv/
 data/
 *.log
 .env
 .env.*
+*.env
 dist/
 coverage/
 playwright-report/
 test-results/
+artifacts/
+pic/
+log_*.md
+log_*.conversation.json/

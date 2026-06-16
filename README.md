@@ -98,3 +98,46 @@ npm run check
 3. 补齐用例审核编辑能力，让测试人员能调整 AI 生成结果。
 4. 增加报告导出能力，优先支持 HTML 或 Word/PDF。
 5. 为项目创建、需求解析、用例生成和执行流程补充自动化测试。
+
+## 第二阶段进度
+
+检查日期：2026-06-16
+
+阶段目标：在独立 Python 原型中验证“模型能力预检 + 能力标签 + 任务路由”的执行前置条件，并确认 Browser Use、Playwright 与本地/公网模型的实际兼容边界。
+
+### 已完成
+
+- 已新增第二阶段需求分析、技术方案与 ADR。
+- 已实现模型能力预检脚本：`tools/probe_llm_capabilities.py`。
+- 已完成多组对照验证：
+  - `demo/.env` 指向的本地 `AI-tester` 当前对 `/chat/completions` 连通性不稳定，基础 chat、`json_object`、`json_schema`、tool calling 全部超时。
+  - `demo/local_qwen.env` 指向的本地 `Qwen3.6-35B-A3B-UD-Q5_K_M-MTP` 当前对 `/chat/completions` 连通性不稳定，基础 chat、`json_object`、`json_schema`、forced tool calling、auto tool calling、Browser Use 封装路径全部超时或连接失败。
+  - `demo/deepseek.env` 指向的公网 `deepseek-v4-flash-260425`，基础 chat 可用；raw HTTP 直接验证 `response_format.type=json_schema` 被服务端明确拒绝；原始 tool calling 两次探测结果不一致，需要继续观察。
+  - `demo/deepseek-v4-flash.env` 指向的 DeepSeek 原厂 `deepseek-v4-flash`，基础 chat、`response_format.type=json_object`、自动 tool calling 可用；`response_format.type=json_schema` 被服务端明确拒绝；强制 `tool_choice` 被 thinking mode 拒绝。
+- 已确认 Browser Use 的 `ChatOpenAI` 结构化路径会强制使用 `response_format.type=json_schema`，在上述公网模型上会失败。
+- 已确认 Browser Use 的 `ChatDeepSeek` 兼容路径在一次探测中可工作，但它走的是另一套协议，不应与 `ChatOpenAI` 的结构化输出能力混为一谈，也不应直接等同于稳定的原始 tool calling 能力。
+
+### 当前结论
+
+- 第二阶段原型启动前，模型能力预检必须是强制步骤。
+- 任务路由不能只看“模型能否聊天”，必须显式区分：
+  - 普通 chat 能力
+  - tool calling 能力
+  - `json_object` 能力
+  - `json_schema` 能力
+  - Browser Use 封装层兼容性
+- 对于当前探测到的 `deepseek-v4-flash-260425`，它不应进入依赖 `response_format.type=json_schema` 的 Browser Use 结构化输出路径。
+- 对于当前探测到的原厂 `deepseek-v4-flash`，它也不应进入依赖 `response_format.type=json_schema` 或强制 `tool_choice` 的路径；可优先用于普通 chat、`json_object` 结构化输出和自动 tool calling 路径。
+- 本地 `AI-tester` 和本地 Qwen 端点当前需要先排查网络、服务负载、模型加载状态或 OpenAI 兼容服务实现，不适合直接作为原型主路径的唯一依赖。
+
+### 验证产物
+
+- 探测脚本输出目录：`artifacts/model_capability_probe/`
+- 公网模型探测结果：
+  - `artifacts/model_capability_probe/20260616_185018_deepseek-v4-flash-260425.json`
+  - `artifacts/model_capability_probe/20260616_185142_deepseek-v4-flash-260425.json`
+  - `artifacts/model_capability_probe/20260616_203747_deepseek-v4-flash.json`
+  - `artifacts/model_capability_probe/20260616_203831_deepseek-v4-flash.json`
+- 本地模型探测结果：
+  - `artifacts/model_capability_probe/20260616_184923_AI-tester.json`
+  - `artifacts/model_capability_probe/20260616_213322_Qwen3.6-35B-A3B-UD-Q5_K_M-MTP.json`
