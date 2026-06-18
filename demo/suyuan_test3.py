@@ -360,7 +360,7 @@ async def main():
         use_vision=True,
         llm_timeout=300,
         step_timeout=300,
-        max_steps=80,
+        max_steps=30,
         max_actions_per_step=1,
         max_failures=6,
         flash_mode=True,
@@ -369,7 +369,7 @@ async def main():
 
     print(f"截图: {PICTURE_PATH}")
     print(f"日志: {LOG_PATH}")
-    print("Agent 启动中... (flash_mode=true, max_steps=80)")
+    print("Agent 启动中... (flash_mode=true, max_steps=30)")
     print("流程：进入线上备案申请 -> 申请备案 -> 填写表单 -> 提交 -> 继续流程")
     print()
 
