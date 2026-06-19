@@ -1,0 +1,63 @@
+{
+  "template_name": "lab_create_add",
+  "version": "0.1.0",
+  "page_entry": {
+    "name": "Template Lab Create",
+    "url": "file:///C:/project/aut_agent/prototype/stage2/app/verification/_w3_template_lab.html"
+  },
+  "feature_point": {
+    "name": "模板实验页新增",
+    "type": "新增"
+  },
+  "execution_path": "create_template_lab_record",
+  "steps": [
+    {
+      "id": "open_lab_page",
+      "kind": "navigation",
+      "action": "navigate_to_url",
+      "args": {
+        "url_ref": "page_entry.url"
+      }
+    },
+    {
+      "id": "fill_create_name",
+      "kind": "field_input",
+      "action": "fill_field_by_locator",
+      "args": {
+        "locator": "#createName",
+        "data_ref": "create_form.name"
+      }
+    },
+    {
+      "id": "select_create_type",
+      "kind": "field_select",
+      "action": "select_option_by_locator",
+      "args": {
+        "locator": "#createType",
+        "data_ref": "create_form.type"
+      }
+    },
+    {
+      "id": "submit_create_form",
+      "kind": "action",
+      "action": "click_by_locator",
+      "args": {
+        "locator": "#createButton"
+      }
+    },
+    {
+      "id": "assert_create_result",
+      "kind": "assertion",
+      "action": "assert_text_visible",
+      "args": {
+        "text": "create-submitted",
+        "exact": true
+      }
+    }
+  ],
+  "success_rules": {
+    "ui_texts": [
+      "create-submitted"
+    ]
+  }
+}

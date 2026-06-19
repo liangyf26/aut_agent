@@ -1,8 +1,11 @@
 from .models import (
     ArtifactRef,
+    DailySummary,
     FailureCluster,
     Fact,
     ModelEvaluation,
+    PlatformDailyReport,
+    PromotionCandidateSummary,
     ProgressCounter,
     ProgressEvent,
     ProgressSnapshot,
@@ -10,21 +13,27 @@ from .models import (
     RunReport,
     RunSummary,
     SectionBlock,
+    SkillInventorySummary,
+    coerce_platform_daily_report,
     coerce_progress_event,
     coerce_progress_snapshot,
     coerce_run_report,
     coerce_run_summary,
 )
 from .adapters import adapt_progress_snapshot
+from .daily_digest import build_platform_daily_report
 from .progress_view import render_progress_markdown, render_progress_text
-from .report_markdown import render_run_report_markdown
+from .report_markdown import render_platform_daily_report_markdown, render_run_report_markdown
 
 __all__ = [
     "adapt_progress_snapshot",
     "ArtifactRef",
+    "DailySummary",
     "FailureCluster",
     "Fact",
     "ModelEvaluation",
+    "PlatformDailyReport",
+    "PromotionCandidateSummary",
     "ProgressCounter",
     "ProgressEvent",
     "ProgressSnapshot",
@@ -32,10 +41,14 @@ __all__ = [
     "RunReport",
     "RunSummary",
     "SectionBlock",
+    "SkillInventorySummary",
+    "build_platform_daily_report",
+    "coerce_platform_daily_report",
     "coerce_progress_event",
     "coerce_progress_snapshot",
     "coerce_run_report",
     "coerce_run_summary",
+    "render_platform_daily_report_markdown",
     "render_progress_markdown",
     "render_progress_text",
     "render_run_report_markdown",

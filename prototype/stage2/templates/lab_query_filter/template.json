@@ -1,0 +1,63 @@
+{
+  "template_name": "lab_query_filter",
+  "version": "0.1.0",
+  "page_entry": {
+    "name": "Template Lab Query",
+    "url": "file:///C:/project/aut_agent/prototype/stage2/app/verification/_w3_template_lab.html"
+  },
+  "feature_point": {
+    "name": "模板实验页查询筛选",
+    "type": "查询"
+  },
+  "execution_path": "query_template_lab",
+  "steps": [
+    {
+      "id": "open_lab_page",
+      "kind": "navigation",
+      "action": "navigate_to_url",
+      "args": {
+        "url_ref": "page_entry.url"
+      }
+    },
+    {
+      "id": "fill_query_keyword",
+      "kind": "field_input",
+      "action": "fill_field_by_locator",
+      "args": {
+        "locator": "#queryInput",
+        "data_ref": "query_form.keyword"
+      }
+    },
+    {
+      "id": "select_query_status",
+      "kind": "field_select",
+      "action": "select_option_by_locator",
+      "args": {
+        "locator": "#statusSelect",
+        "data_ref": "query_form.status"
+      }
+    },
+    {
+      "id": "trigger_query",
+      "kind": "action",
+      "action": "click_by_locator",
+      "args": {
+        "locator": "#searchButton"
+      }
+    },
+    {
+      "id": "assert_query_result",
+      "kind": "assertion",
+      "action": "assert_text_visible",
+      "args": {
+        "text": "query-completed",
+        "exact": true
+      }
+    }
+  ],
+  "success_rules": {
+    "ui_texts": [
+      "query-completed"
+    ]
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "template_name": "lab_navigation",
+  "version": "0.1.0",
+  "page_entry": {
+    "name": "Template Lab Landing",
+    "url": "file:///C:/project/aut_agent/prototype/stage2/app/verification/_w3_template_lab.html"
+  },
+  "feature_point": {
+    "name": "导航到模板实验页",
+    "type": "导航"
+  },
+  "execution_path": "navigate_template_lab",
+  "steps": [
+    {
+      "id": "open_lab_page",
+      "kind": "navigation",
+      "action": "navigate_to_url",
+      "args": {
+        "url_ref": "page_entry.url"
+      }
+    },
+    {
+      "id": "assert_landing_marker",
+      "kind": "assertion",
+      "action": "assert_text_visible",
+      "args": {
+        "text": "landing-ready",
+        "exact": true
+      }
+    },
+    {
+      "id": "capture_navigation_result",
+      "kind": "artifact",
+      "action": "capture_named_screenshot",
+      "args": {
+        "file_name": "lab_navigation.png",
+        "full_page": true
+      }
+    }
+  ],
+  "success_rules": {
+    "ui_texts": [
+      "landing-ready"
+    ]
+  },
+  "notes": [
+    "This is a local W3 verification template used to prove the navigation template family works through the shared executor."
+  ]
+}

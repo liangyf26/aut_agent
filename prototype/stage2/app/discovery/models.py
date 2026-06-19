@@ -17,6 +17,14 @@ class PageEntryRecord:
     template_name: str
     source: str
     confidence: str
+    page_type: str = "page_entry"
+    stable_key: str | None = None
+    dedupe_key: str | None = None
+    dedupe_basis: dict[str, Any] = field(default_factory=dict)
+    discovery_depth: int = 0
+    parent_page_entry_id: str | None = None
+    source_page_entry_id: str | None = None
+    source_action_type: str | None = None
     execution_path: str | None = None
     evidence: dict[str, Any] = field(default_factory=dict)
 
@@ -33,6 +41,13 @@ class FeaturePointRecord:
     template_name: str
     source: str
     confidence: str
+    feature_scope: str = "page_action"
+    action_type: str = "trigger"
+    stable_key: str | None = None
+    dedupe_key: str | None = None
+    dedupe_basis: dict[str, Any] = field(default_factory=dict)
+    discovery_depth: int = 0
+    source_page_entry_id: str | None = None
     execution_path: str | None = None
     evidence: dict[str, Any] = field(default_factory=dict)
 
@@ -64,6 +79,8 @@ class DiscoveryResult:
     page_entries: list[PageEntryRecord]
     feature_points: list[FeaturePointRecord]
     screenshot_records: list[ScreenshotRecord]
+    review_queue: list[dict[str, Any]] = field(default_factory=list)
+    review_hints: dict[str, Any] = field(default_factory=dict)
     stats: dict[str, Any] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
@@ -75,6 +92,8 @@ class DiscoveryResult:
             "page_entries": [item.to_dict() for item in self.page_entries],
             "feature_points": [item.to_dict() for item in self.feature_points],
             "screenshot_records": [item.to_dict() for item in self.screenshot_records],
+            "review_queue": list(self.review_queue),
+            "review_hints": dict(self.review_hints),
             "stats": dict(self.stats),
             "notes": list(self.notes),
         }

@@ -1,13 +1,40 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, Mapping
 
 
 @dataclass(frozen=True)
 class TemplateRuntimeData:
     baseline: dict[str, Any]
     run_data: dict[str, Any]
+    generated_files: dict[str, Path] | None = None
+
+    def resolve_ref(self, ref: str | None) -> Any:
+        if not ref:
+            return None
+
+        current: Any = {
+            **self.run_data,
+            "baseline": self.baseline,
+            "run_data": self.run_data,
+            "generated_files": self.generated_files or {},
+        }
+        for part in ref.split("."):
+            if isinstance(current, Mapping):
+                current = current.get(part)
+                continue
+            return None
+        return current
+
+    def generated_file(self, ref: str) -> Path | None:
+        value = self.resolve_ref(ref)
+        if isinstance(value, Path):
+            return value
+        if isinstance(value, str) and value:
+            return Path(value)
+        return None
 
     @property
     def initial_form(self) -> dict[str, Any]:

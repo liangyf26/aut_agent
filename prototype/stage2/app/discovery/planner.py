@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .identity import build_feature_point_identity, build_page_entry_identity
 from .models import (
     DiscoveryResult,
     FeaturePointRecord,
@@ -29,8 +30,21 @@ class DiscoveryPlanner:
         execution_path = template.get("execution_path")
         step_ids = self._step_ids(template.get("steps"))
 
-        page_entry_id = self._page_entry_id(template_name, page_entry)
-        feature_point_id = self._feature_point_id(template_name, feature_point)
+        page_identity = build_page_entry_identity(
+            template_name,
+            name=page_entry.get("name", template_name),
+            url=page_entry.get("url", ""),
+        )
+        page_entry_id = page_identity["record_id"]
+        feature_identity = build_feature_point_identity(
+            template_name,
+            page_entry_key=page_identity["stable_key"],
+            name=feature_point.get("name", page_entry.get("name", template_name)),
+            feature_scope="page_action",
+            action_type="verified_flow_entry",
+            container_label=page_entry.get("name", template_name),
+        )
+        feature_point_id = feature_identity["record_id"]
 
         page_entries = [
             PageEntryRecord(
@@ -40,6 +54,10 @@ class DiscoveryPlanner:
                 template_name=template_name,
                 source="template.page_entry",
                 confidence="verified_path_seed",
+                stable_key=page_identity["stable_key"],
+                dedupe_key=page_identity["dedupe_key"],
+                dedupe_basis=page_identity["dedupe_basis"],
+                discovery_depth=0,
                 execution_path=execution_path,
                 evidence={
                     "step_ids": step_ids,
@@ -56,6 +74,13 @@ class DiscoveryPlanner:
                 template_name=template_name,
                 source="template.feature_point",
                 confidence="verified_path_seed",
+                feature_scope="page_action",
+                action_type="verified_flow_entry",
+                stable_key=feature_identity["stable_key"],
+                dedupe_key=feature_identity["dedupe_key"],
+                dedupe_basis=feature_identity["dedupe_basis"],
+                discovery_depth=0,
+                source_page_entry_id=page_entry_id,
                 execution_path=execution_path,
                 evidence={
                     "step_ids": step_ids,
@@ -78,11 +103,56 @@ class DiscoveryPlanner:
             page_entries=page_entries,
             feature_points=feature_points,
             screenshot_records=screenshot_records,
+            review_queue=[
+                {
+                    "record_type": "page_entry",
+                    "record_id": page_entry_id,
+                    "priority": "medium",
+                    "reason": "template_seed_validation",
+                    "fields": {
+                        "name": page_entry.get("name", template_name),
+                        "url": page_entry.get("url", ""),
+                        "page_type": "page_entry",
+                        "discovery_depth": 0,
+                        "stable_key": page_identity["stable_key"],
+                    },
+                },
+                {
+                    "record_type": "feature_point",
+                    "record_id": feature_point_id,
+                    "priority": "medium",
+                    "reason": "template_seed_validation",
+                    "fields": {
+                        "name": feature_point.get("name", page_entry.get("name", template_name)),
+                        "page_entry_id": page_entry_id,
+                        "feature_scope": "page_action",
+                        "action_type": "verified_flow_entry",
+                        "discovery_depth": 0,
+                        "stable_key": feature_identity["stable_key"],
+                    },
+                },
+            ],
+            review_hints={
+                "status": "pending_manual_review",
+                "entry": {
+                    "kind": "manual_review_placeholder",
+                    "suggested_outputs": ["page_entries.json", "feature_points.json", "discovery_result.json"],
+                    "review_queue_file": "discovery_review_queue.json",
+                },
+                "recommended_checks": [
+                    "确认模板播种的页面入口是否仍然有效。",
+                    "确认模板播种的功能点名称与当前页面文案是否一致。",
+                ],
+            },
             stats={
                 "page_entry_count": len(page_entries),
                 "feature_point_count": len(feature_points),
                 "screenshot_record_count": len(screenshot_records),
+                "review_queue_count": 2,
                 "seed_step_count": len(step_ids),
+                "page_type_breakdown": {"page_entry": len(page_entries)},
+                "feature_scope_breakdown": {"page_action": len(feature_points)},
+                "action_type_breakdown": {"verified_flow_entry": len(feature_points)},
             },
             notes=[
                 "当前发现结果来自已验证模板的保守播种，不包含自动页面遍历。",
@@ -131,12 +201,6 @@ class DiscoveryPlanner:
                 ],
             ),
         ]
-
-    def _page_entry_id(self, template_name: str, page_entry: dict[str, Any]) -> str:
-        return f"{template_name}__page_entry__{self._slug(page_entry.get('name') or 'entry')}"
-
-    def _feature_point_id(self, template_name: str, feature_point: dict[str, Any]) -> str:
-        return f"{template_name}__feature_point__{self._slug(feature_point.get('name') or 'feature')}"
 
     def _step_ids(self, steps: Any) -> list[str]:
         if not isinstance(steps, list):

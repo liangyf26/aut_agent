@@ -1,5 +1,6 @@
 from .drafts import CandidateTemplateDraftGenerator, MinimalCandidateTemplateDraftGenerator
 from .models import (
+    build_recording_summary,
     CandidateTemplateDraft,
     HumanRecordingEvent,
     RecordingArtifactPaths,
@@ -12,6 +13,7 @@ from .recorder import HumanLoopRecorder
 __all__ = [
     "CandidateTemplateDraft",
     "CandidateTemplateDraftGenerator",
+    "build_recording_summary",
     "HumanLoopRecorder",
     "HumanRecordingEvent",
     "MinimalCandidateTemplateDraftGenerator",

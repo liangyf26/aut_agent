@@ -27,13 +27,21 @@ from prototype.stage2.app.progress import ProgressManager
 from prototype.stage2.app.progress.console import format_status_line
 from prototype.stage2.app.reporting import (
     adapt_progress_snapshot,
+    build_platform_daily_report,
     render_progress_markdown,
     render_progress_text,
+    render_platform_daily_report_markdown,
     render_run_report_markdown,
 )
 from prototype.stage2.app.runtime.artifacts import ArtifactWriter
 from prototype.stage2.app.runtime.templates import load_template_bundle
 from prototype.stage2.app.verification.generated_files import build_default_generated_files
+from prototype.stage2.app.verification.template_executor import (
+    TemplateActionRegistry,
+    TemplateFlowExecutor,
+    TemplateStepExecution,
+)
+from prototype.stage2.app.verification.template_runtime import TemplateRuntimeData
 
 
 if sys.stdout.encoding != "utf-8":
@@ -74,37 +82,127 @@ async def build_live_discovery(page: Page, artifacts: ArtifactWriter) -> tuple[o
     return result, paths
 
 
-def build_report_page_entries(discovery_result: object, fallback_name: str, page_url: str, success: bool) -> list[dict[str, Any]]:
+def build_report_page_entries(discovery_result: object, fallback_name: str, page_url: str) -> list[dict[str, Any]]:
     result = getattr(discovery_result, "page_entries", [])
     if result:
         return [
             {
                 "item_id": item.page_entry_id,
                 "name": item.name,
-                "status": "执行通过" if success else "执行失败",
-                "summary": page_url or item.url,
+                "status": "已发现",
+                "summary": item.url or page_url,
                 "source": item.source,
             }
             for item in result
         ]
-    return [{"name": fallback_name, "status": "执行通过" if success else "执行失败", "summary": page_url}]
+    return [{"name": fallback_name, "status": "已发现", "summary": page_url}]
 
 
-def build_report_feature_points(discovery_result: object, fallback_name: str, summary: str, success: bool) -> list[dict[str, Any]]:
+def build_report_feature_points(discovery_result: object, fallback_name: str) -> list[dict[str, Any]]:
     result = getattr(discovery_result, "feature_points", [])
     if result:
         return [
             {
                 "item_id": item.feature_point_id,
                 "name": item.name,
-                "status": "执行通过" if success else "执行失败",
-                "summary": summary,
+                "status": "已发现",
+                "summary": item.feature_type,
                 "source": item.source,
                 "owner": item.page_entry_id,
             }
             for item in result
         ]
-    return [{"name": fallback_name, "status": "执行通过" if success else "执行失败", "summary": summary}]
+    return [{"name": fallback_name, "status": "已发现", "summary": "待验证"}]
+
+
+def build_report_key_artifacts(artifacts: ArtifactWriter) -> list[dict[str, Any]]:
+    labels = [
+        "page_before_apply.png",
+        "dialog_opened.png",
+        "verified_flow_initial_form.png",
+        "verified_flow_full_form.png",
+        "verified_flow_submit_dialog.png",
+        "verified_flow_final_result.png",
+        "attempt_01_before_submit.png",
+        "attempt_01_after_submit.png",
+    ]
+    items: list[dict[str, Any]] = []
+    for label in labels:
+        path = artifacts.screenshots_dir / label
+        if not path.exists():
+            continue
+        items.append(
+            {
+                "label": label,
+                "kind": "file",
+                "path": str(path),
+            }
+        )
+    return items
+
+
+def build_cross_model_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+    items: list[dict[str, Any]] = []
+    success_count = 0
+    durations_ms: list[int] = []
+    for result in results:
+        run_dir = Path(str(result.get("run_dir", "")))
+        report_path = run_dir / "reports" / "run_report.md"
+        current_status_path = run_dir / "current_status.json"
+        status_payload: dict[str, Any] = {}
+        if current_status_path.exists():
+            try:
+                status_payload = json.loads(current_status_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                status_payload = {}
+        overall_status = str(result.get("status") or status_payload.get("overall_status") or "unknown")
+        stats = status_payload.get("stats") or {}
+        elapsed_ms = int(status_payload.get("elapsed_ms") or 0)
+        round_count = int(result.get("round_count") or 0)
+        final_next_round_decision = result.get("final_next_round_decision") or {}
+        if overall_status == "completed":
+            success_count += 1
+        if elapsed_ms:
+            durations_ms.append(elapsed_ms)
+        items.append(
+            {
+                "name": str(result.get("model", "unknown-model")),
+                "status": overall_status,
+                "summary": f"run_dir={run_dir.name}",
+                "facts": [
+                    {"label": "elapsed_ms", "value": elapsed_ms},
+                    {"label": "round_count", "value": round_count or None},
+                    {
+                        "label": "next_round_status",
+                        "value": final_next_round_decision.get("status"),
+                    },
+                    {"label": "page_entries_discovered", "value": stats.get("page_entries_discovered")},
+                    {"label": "feature_points_discovered", "value": stats.get("feature_points_discovered")},
+                    {"label": "verification_successes", "value": stats.get("verification_successes")},
+                ],
+                "artifacts": (
+                    [{"label": "run_report.md", "path": str(report_path), "kind": "file"}]
+                    if report_path.exists()
+                    else []
+                ),
+            }
+        )
+
+    average_elapsed_ms = round(sum(durations_ms) / len(durations_ms), 2) if durations_ms else None
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "summary": f"{success_count}/{len(results)} models completed the current sample run successfully.",
+        "facts": [
+            {"label": "model_count", "value": len(results)},
+            {"label": "successful_models", "value": success_count},
+            {"label": "average_elapsed_ms", "value": average_elapsed_ms},
+        ],
+        "items": items,
+        "notes": [
+            "This summary compares the latest per-model run directories produced by the current execution.",
+            "Use these results as a routing hint, not as a formal benchmark.",
+        ],
+    }
 
 
 def build_report_failure_clusters(iteration_artifacts: object) -> list[dict[str, Any]]:
@@ -130,6 +228,34 @@ def build_report_failure_clusters(iteration_artifacts: object) -> list[dict[str,
     return result
 
 
+def summarize_attempt_execution(actions: list[dict[str, Any]]) -> dict[str, Any]:
+    failed_steps = [
+        item.get("step")
+        for item in actions
+        if str(item.get("status") or "").lower() == "failed"
+        or (isinstance(item.get("result"), dict) and item["result"].get("ok") is False)
+    ]
+    duration_ms = sum(
+        int(item.get("duration_ms") or 0)
+        for item in actions
+        if isinstance(item, dict)
+    )
+    return {
+        "step_count": len(actions),
+        "failed_steps": [step for step in failed_steps if step],
+        "duration_ms": duration_ms,
+        "status": "failed" if failed_steps else "completed",
+    }
+
+
+def total_attempt_duration_ms(attempts: list[dict[str, Any]]) -> int:
+    return sum(
+        int(item.get("execution_summary", {}).get("duration_ms") or 0)
+        for item in attempts
+        if isinstance(item, dict)
+    )
+
+
 def build_report_promotion_candidates(iteration_artifacts: object) -> list[dict[str, Any]]:
     candidates = getattr(iteration_artifacts, "promotion_candidates", [])
     return [
@@ -143,6 +269,172 @@ def build_report_promotion_candidates(iteration_artifacts: object) -> list[dict[
         }
         for candidate in candidates
     ]
+
+
+def build_iteration_asset_refs(run_dir: Path) -> list[dict[str, str]]:
+    labels = [
+        "failure_clusters.json",
+        "retry_plan.json",
+        "promotion_candidates.json",
+        "stop_conditions.json",
+        "iteration_comparison.json",
+        "next_round_decision.json",
+    ]
+    return [{"label": label, "path": str(run_dir / label)} for label in labels]
+
+
+def _read_json_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def load_run_report_payload(run_dir: Path) -> dict[str, Any]:
+    return _read_json_file(run_dir / "reports" / "run_report.json")
+
+
+def load_next_round_decision(run_dir: Path) -> dict[str, Any]:
+    return _read_json_file(run_dir / "next_round_decision.json")
+
+
+def should_auto_continue_next_round(decision: dict[str, Any]) -> bool:
+    status = str(decision.get("status") or "").strip().lower()
+    should_start = decision.get("should_start_next_round")
+    return status == "scheduled" and should_start is True
+
+
+def write_platform_daily_report_bundle(results: list[dict[str, Any]]) -> dict[str, Any] | None:
+    report_payloads: list[dict[str, Any]] = []
+    for result in results:
+        run_dir = Path(str(result.get("run_dir", "")))
+        payload = load_run_report_payload(run_dir)
+        if payload:
+            report_payloads.append(payload)
+
+    if not report_payloads:
+        return None
+
+    platform_report = build_platform_daily_report(report_payloads)
+    json_path = ARTIFACT_ROOT / "latest_platform_daily_report.json"
+    markdown_path = ARTIFACT_ROOT / "latest_platform_daily_report.md"
+    json_path.write_text(
+        json.dumps(platform_report.to_dict(), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    markdown_path.write_text(
+        render_platform_daily_report_markdown(platform_report),
+        encoding="utf-8",
+    )
+    return {
+        "json_path": str(json_path),
+        "markdown_path": str(markdown_path),
+        "report_date": platform_report.report_date,
+        "run_count": len(report_payloads),
+    }
+
+
+def build_baseline_freeze_manifest(
+    results: list[dict[str, Any]],
+    *,
+    comparison_path: Path,
+    platform_daily_report: dict[str, Any] | None,
+) -> dict[str, Any]:
+    run_items: list[dict[str, Any]] = []
+    for result in results:
+        run_dir = Path(str(result.get("run_dir", "")))
+        status_payload = _read_json_file(run_dir / "current_status.json")
+        stop_conditions = _read_json_file(run_dir / "stop_conditions.json")
+        next_round_decision = _read_json_file(run_dir / "next_round_decision.json")
+        run_report = load_run_report_payload(run_dir)
+        elapsed_ms = int(status_payload.get("elapsed_ms") or 0)
+        overall_status = str(
+            status_payload.get("overall_status")
+            or run_report.get("summary", {}).get("status")
+            or "unknown"
+        )
+        round_count = int(result.get("round_count") or 0)
+        run_items.append(
+            {
+                "model": str(result.get("model", "unknown-model")),
+                "run_dir": str(run_dir),
+                "status": overall_status,
+                "elapsed_ms": elapsed_ms,
+                "round_count": round_count or None,
+                "triggered_stop_conditions": stop_conditions.get("triggered_conditions", []),
+                "next_round_status": next_round_decision.get("status"),
+                "should_start_next_round": next_round_decision.get("should_start_next_round"),
+                "artifacts": {
+                    "baseline_snapshot": str(run_dir / "baseline_snapshot.json"),
+                    "runtime_data": str(run_dir / "runtime_data.json"),
+                    "run_report_json": str(run_dir / "reports" / "run_report.json"),
+                    "run_report_markdown": str(run_dir / "reports" / "run_report.md"),
+                    "progress_view": str(run_dir / "reports" / "progress_view.md"),
+                },
+            }
+        )
+
+    successful_runs = [item for item in run_items if item["status"] == "completed"]
+    primary_run = None
+    if successful_runs:
+        primary_run = sorted(
+            successful_runs,
+            key=lambda item: (
+                item["elapsed_ms"] if item["elapsed_ms"] else 10**12,
+                item["model"],
+            ),
+        )[0]
+
+    freeze_recommended = primary_run is not None
+    if primary_run is not None:
+        selection_reason = (
+            "Selected the completed run with the shortest observed elapsed time "
+            "as the recommended regression baseline."
+        )
+    else:
+        selection_reason = "No completed run is available yet, so baseline freeze is not recommended."
+
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "template_name": TEMPLATE_BUNDLE.name,
+        "freeze_recommended": freeze_recommended,
+        "selection_reason": selection_reason,
+        "comparison_summary_path": str(comparison_path),
+        "platform_daily_report": platform_daily_report or {},
+        "recommended_primary_run": primary_run,
+        "run_count": len(run_items),
+        "successful_run_count": len(successful_runs),
+        "runs": run_items,
+        "notes": [
+            "This manifest is a platform-level W7 artifact used to declare which run is recommended as the current frozen baseline.",
+            "Project-level and platform-level promotions still require human review.",
+        ],
+    }
+
+
+def write_baseline_freeze_manifest(
+    results: list[dict[str, Any]],
+    *,
+    comparison_path: Path,
+    platform_daily_report: dict[str, Any] | None,
+) -> dict[str, Any]:
+    payload = build_baseline_freeze_manifest(
+        results,
+        comparison_path=comparison_path,
+        platform_daily_report=platform_daily_report,
+    )
+    manifest_path = ARTIFACT_ROOT / "latest_baseline_freeze_manifest.json"
+    manifest_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return {
+        "path": str(manifest_path),
+        "freeze_recommended": payload.get("freeze_recommended"),
+        "recommended_primary_run": payload.get("recommended_primary_run"),
+    }
 
 
 def build_retry_plan_section(iteration_artifacts: object) -> list[dict[str, Any]]:
@@ -181,15 +473,139 @@ def build_retry_plan_section(iteration_artifacts: object) -> list[dict[str, Any]
     ]
 
 
+def build_iteration_comparison_section(iteration_artifacts: object) -> dict[str, Any] | None:
+    comparison = getattr(iteration_artifacts, "iteration_comparison", None)
+    if comparison is None:
+        return None
+
+    facts: list[dict[str, Any]] = [
+        {"label": "status", "value": comparison.status},
+        {"label": "improvement_judgement", "value": comparison.improvement_judgement},
+    ]
+    if comparison.previous_run_id:
+        facts.append({"label": "previous_run_id", "value": comparison.previous_run_id})
+    if comparison.no_improvement_streak_after is not None:
+        facts.append(
+            {
+                "label": "no_improvement_streak_after",
+                "value": comparison.no_improvement_streak_after,
+            }
+        )
+
+    items: list[dict[str, Any]] = []
+    for metric in getattr(comparison, "metrics", []):
+        items.append(
+            {
+                "item_id": metric.metric_id,
+                "name": metric.label,
+                "status": metric.trend,
+                "summary": metric.note or f"{metric.previous_value} -> {metric.current_value}",
+                "facts": [
+                    {"label": "previous_value", "value": metric.previous_value},
+                    {"label": "current_value", "value": metric.current_value},
+                    {"label": "delta", "value": metric.delta},
+                ],
+            }
+        )
+    for change in getattr(comparison, "cluster_changes", []):
+        items.append(
+            {
+                "item_id": change.cluster_key,
+                "name": f"{change.category} / {change.stage or 'unknown'}",
+                "status": change.status,
+                "summary": change.summary,
+                "facts": [
+                    {"label": "previous_signal_count", "value": change.previous_signal_count},
+                    {"label": "current_signal_count", "value": change.current_signal_count},
+                    {"label": "signal_delta", "value": change.signal_delta},
+                ],
+            }
+        )
+
+    return {
+        "title": "Iteration Comparison",
+        "summary": comparison.summary,
+        "facts": facts,
+        "items": items,
+        "notes": comparison.notes,
+    }
+
+
+def build_stop_conditions_section(iteration_artifacts: object) -> dict[str, Any] | None:
+    stop_conditions = getattr(iteration_artifacts, "stop_conditions", None)
+    if stop_conditions is None:
+        return None
+
+    facts: list[dict[str, Any]] = [
+        {"label": "status", "value": stop_conditions.status},
+        {"label": "should_stop", "value": stop_conditions.should_stop},
+        {"label": "primary_reason", "value": stop_conditions.primary_reason},
+        {"label": "no_improvement_streak", "value": stop_conditions.no_improvement_streak},
+    ]
+    items = [
+        {
+            "item_id": condition.condition_id,
+            "name": condition.condition_type,
+            "status": condition.status,
+            "summary": condition.summary,
+            "facts": [
+                {"label": "stop", "value": condition.stop},
+                {"label": "evidence_count", "value": len(condition.evidence)},
+            ],
+            "notes": condition.notes,
+        }
+        for condition in getattr(stop_conditions, "conditions", [])
+    ]
+    return {
+        "title": "Stop Conditions",
+        "facts": facts,
+        "items": items,
+        "notes": stop_conditions.notes,
+    }
+
+
+def build_next_round_decision_section(iteration_artifacts: object) -> dict[str, Any] | None:
+    next_round = getattr(iteration_artifacts, "next_round_decision", None)
+    if next_round is None:
+        return None
+
+    facts: list[dict[str, Any]] = [
+        {"label": "status", "value": next_round.status},
+        {"label": "should_start_next_round", "value": next_round.should_start_next_round},
+        {"label": "current_round", "value": next_round.current_round},
+        {"label": "next_round", "value": next_round.next_round},
+        {"label": "target_stage", "value": next_round.target_stage},
+        {"label": "primary_reason", "value": next_round.primary_reason},
+        {"label": "remaining_attempt_budget", "value": next_round.remaining_attempt_budget},
+    ]
+    items = [
+        {
+            "item_id": cluster_id,
+            "name": cluster_id,
+            "status": "scheduled",
+            "summary": "Failure cluster scheduled for the next round.",
+        }
+        for cluster_id in getattr(next_round, "scheduled_cluster_ids", [])
+    ]
+    return {
+        "title": "Next Round Decision",
+        "facts": facts,
+        "items": items,
+        "notes": getattr(next_round, "notes", []),
+    }
+
+
 async def click_apply_button(page: Page) -> None:
     button = page.get_by_role("button", name="我要申请备案")
     if await button.count():
         await button.first.click(force=True)
+        await page.wait_for_timeout(1200)
         return
 
     text_match = page.get_by_text("我要申请备案", exact=True)
     if await text_match.count():
         await text_match.first.click(force=True)
+        await page.wait_for_timeout(1200)
         return
 
     raise RuntimeError("未找到“我要申请备案”按钮")
@@ -711,7 +1127,9 @@ async def set_attachment_validation_success(page: Page, prop: str) -> dict[str, 
 
 async def run_apply_wizard(page: Page) -> list[dict[str, Any]]:
     steps: list[dict[str, Any]] = []
-    steps.append({"step": "click_apply_button", "result": await click_exact_button(page, "我要申请备案")})
+    await click_apply_button(page)
+    dialog = await wait_for_dialog(page)
+    steps.append({"step": "click_apply_button", "result": {"ok": await dialog.is_visible(), "method": "entry_opened"}})
     steps.append(
         {
             "step": "click_intro_confirm",
@@ -978,74 +1396,142 @@ async def submit_filing_dialog(page: Page) -> dict[str, Any]:
     return {"ok": False, "reason": "submit-record-not-found"}
 
 
-def template_data_ref(runtime_data: dict[str, Any], ref: str) -> Any:
-    current: Any = runtime_data
-    for part in ref.split("."):
-        if not isinstance(current, dict):
-            return None
-        current = current.get(part)
-    return current
+def build_verified_new_application_registry() -> TemplateActionRegistry:
+    registry = TemplateActionRegistry()
+
+    async def handle_run_apply_wizard(
+        page: Page,
+        artifacts: ArtifactWriter,
+        runtime: TemplateRuntimeData,
+        step: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        return await run_apply_wizard(page)
+
+    async def handle_select_drawer_option(
+        page: Page,
+        artifacts: ArtifactWriter,
+        runtime: TemplateRuntimeData,
+        step: dict[str, Any],
+    ) -> dict[str, Any]:
+        label = step.get("args", {}).get("label", "")
+        ref = step.get("args", {}).get("data_ref", "")
+        option_value = runtime.resolve_ref(ref)
+        return await select_drawer_option(page, label, str(option_value or ""))
+
+    async def handle_ensure_drawer_checkbox(
+        page: Page,
+        artifacts: ArtifactWriter,
+        runtime: TemplateRuntimeData,
+        step: dict[str, Any],
+    ) -> dict[str, Any]:
+        label_text = step.get("args", {}).get("label_text", "")
+        return await ensure_drawer_checkbox(page, label_text)
+
+    async def handle_expand_cultivation_form(
+        page: Page,
+        artifacts: ArtifactWriter,
+        runtime: TemplateRuntimeData,
+        step: dict[str, Any],
+    ) -> dict[str, Any]:
+        return await expand_cultivation_form(page)
+
+    async def handle_fill_success_template(
+        page: Page,
+        artifacts: ArtifactWriter,
+        runtime: TemplateRuntimeData,
+        step: dict[str, Any],
+    ) -> dict[str, Any]:
+        ref = step.get("args", {}).get("data_ref", "")
+        data = runtime.resolve_ref(ref) if ref else {}
+        return await fill_success_template(page, data or {})
+
+    async def handle_upload_drawer_required_files(
+        page: Page,
+        artifacts: ArtifactWriter,
+        runtime: TemplateRuntimeData,
+        step: dict[str, Any],
+    ) -> dict[str, Any]:
+        files_ref = step.get("args", {}).get("files_ref", "")
+        generated_files = runtime.resolve_ref(files_ref) if files_ref else {}
+        personnel_file = runtime.generated_file(f"{files_ref}.personnel_file") if files_ref else None
+        acceptance_file = runtime.generated_file(f"{files_ref}.acceptance_file") if files_ref else None
+        if personnel_file is None:
+            personnel_file = runtime.generated_file("generated_files.personnel_file")
+        if acceptance_file is None:
+            acceptance_file = runtime.generated_file("generated_files.acceptance_file")
+        return await upload_drawer_required_files(
+            page,
+            personnel_file or Path(str((generated_files or {}).get("personnel_file", ""))),
+            acceptance_file or Path(str((generated_files or {}).get("acceptance_file", ""))),
+        )
+
+    async def handle_select_submit_dialog_dept(
+        page: Page,
+        artifacts: ArtifactWriter,
+        runtime: TemplateRuntimeData,
+        step: dict[str, Any],
+    ) -> dict[str, Any]:
+        ref = step.get("args", {}).get("data_ref", "")
+        dept_label = runtime.resolve_ref(ref) if ref else ""
+        return await select_submit_dialog_dept(page, str(dept_label or ""))
+
+    async def handle_upload_submit_dialog_apply_file(
+        page: Page,
+        artifacts: ArtifactWriter,
+        runtime: TemplateRuntimeData,
+        step: dict[str, Any],
+    ) -> dict[str, Any]:
+        file_ref = step.get("args", {}).get("file_ref", "")
+        apply_file = runtime.generated_file(file_ref) if file_ref else None
+        if apply_file is None:
+            apply_file = runtime.generated_file("generated_files.apply_file")
+        return await upload_submit_dialog_apply_file(page, apply_file or Path("apply_file_missing.pdf"))
+
+    async def handle_submit_filing_dialog(
+        page: Page,
+        artifacts: ArtifactWriter,
+        runtime: TemplateRuntimeData,
+        step: dict[str, Any],
+    ) -> dict[str, Any]:
+        return await submit_filing_dialog(page)
+
+    registry.register("run_apply_wizard", handle_run_apply_wizard)
+    registry.register("select_drawer_option", handle_select_drawer_option)
+    registry.register("ensure_drawer_checkbox", handle_ensure_drawer_checkbox)
+    registry.register("expand_cultivation_form", handle_expand_cultivation_form)
+    registry.register("fill_success_template", handle_fill_success_template)
+    registry.register("upload_drawer_required_files", handle_upload_drawer_required_files)
+    registry.register("select_submit_dialog_dept", handle_select_submit_dialog_dept)
+    registry.register("upload_submit_dialog_apply_file", handle_upload_submit_dialog_apply_file)
+    registry.register("submit_filing_dialog", handle_submit_filing_dialog)
+    return registry
 
 
 async def execute_verified_new_application_flow(
     page: Page,
     artifacts: ArtifactWriter,
-    runtime_data: dict[str, Any],
-    personnel_file: Path,
-    acceptance_file: Path,
-    apply_file: Path,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    runtime: TemplateRuntimeData,
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[TemplateStepExecution]]:
+    executor = TemplateFlowExecutor(build_verified_new_application_registry())
+    executions = await executor.execute(
+        page=page,
+        artifacts=artifacts,
+        runtime=runtime,
+        template=TEMPLATE_BUNDLE.template,
+    )
     actions: list[dict[str, Any]] = []
-    for step in TEMPLATE_BUNDLE.template.get("steps", []):
-        action_name = step.get("action")
-        step_id = step.get("id", action_name)
-        if action_name == "run_apply_wizard":
-            actions.extend(await run_apply_wizard(page))
-        elif action_name == "select_drawer_option":
-            label = step.get("args", {}).get("label", "")
-            ref = step.get("args", {}).get("data_ref", "")
-            option_value = template_data_ref(runtime_data, ref) if ref else None
-            actions.append(
-                {
-                    "step": step_id,
-                    "result": await select_drawer_option(page, label, str(option_value or "")),
-                }
-            )
-        elif action_name == "ensure_drawer_checkbox":
-            label_text = step.get("args", {}).get("label_text", "")
-            actions.append({"step": step_id, "result": await ensure_drawer_checkbox(page, label_text)})
-        elif action_name == "expand_cultivation_form":
-            actions.append({"step": step_id, "result": await expand_cultivation_form(page)})
-        elif action_name == "fill_success_template":
-            ref = step.get("args", {}).get("data_ref", "")
-            data = template_data_ref(runtime_data, ref) if ref else {}
-            actions.append({"step": step_id, "result": await fill_success_template(page, data or {})})
-        elif action_name == "upload_drawer_required_files":
-            actions.append(
-                {
-                    "step": step_id,
-                    "result": await upload_drawer_required_files(page, personnel_file, acceptance_file),
-                }
-            )
-        elif action_name == "select_submit_dialog_dept":
-            ref = step.get("args", {}).get("data_ref", "")
-            dept_label = template_data_ref(runtime_data, ref) if ref else ""
-            actions.append({"step": step_id, "result": await select_submit_dialog_dept(page, str(dept_label or ""))})
-        elif action_name == "upload_submit_dialog_apply_file":
-            actions.append({"step": step_id, "result": await upload_submit_dialog_apply_file(page, apply_file)})
-        elif action_name == "submit_filing_dialog":
-            actions.append({"step": step_id, "result": await submit_filing_dialog(page)})
-
-        if step_id == "check_initial_promise":
+    for execution in executions:
+        actions.append(execution.to_attempt_action())
+        if execution.step_id == "check_initial_promise":
             await page.screenshot(path=str(artifacts.screenshots_dir / "verified_flow_initial_form.png"), full_page=True)
-        elif step_id == "upload_required_files":
+        elif execution.step_id == "upload_required_files":
             await page.screenshot(path=str(artifacts.screenshots_dir / "verified_flow_full_form.png"), full_page=True)
-        elif step_id == "upload_apply_form":
+        elif execution.step_id == "upload_apply_form":
             await page.screenshot(path=str(artifacts.screenshots_dir / "verified_flow_submit_dialog.png"), full_page=True)
 
     await page.screenshot(path=str(artifacts.screenshots_dir / "verified_flow_final_result.png"), full_page=True)
     final_state = await snapshot_submit_dialog(page)
-    return actions, final_state
+    return actions, final_state, executions
 
 
 async def dismiss_overlays(page: Page) -> dict[str, Any]:
@@ -1253,8 +1739,10 @@ def write_structured_stage2_report(
     discovery_result: object | None = None,
     discovery_paths: dict[str, Path] | None = None,
     notes: list[str] | None = None,
+    max_attempts: int | None = None,
 ) -> None:
     progress_snapshot = adapt_progress_snapshot(progress.snapshot)
+    total_duration_ms = total_attempt_duration_ms(attempts)
     report_payload = {
         "summary": {
             "run_id": artifacts.run_dir.name,
@@ -1263,6 +1751,7 @@ def write_structured_stage2_report(
             "template_name": TEMPLATE_BUNDLE.name,
             "started_at": progress.snapshot.started_at,
             "finished_at": progress.snapshot.updated_at,
+            "duration_seconds": round(total_duration_ms / 1000, 3) if total_duration_ms else None,
             "stop_reason": classification.get("reason"),
             "next_action": progress.snapshot.next_action,
             "counts": [
@@ -1279,20 +1768,27 @@ def write_structured_stage2_report(
             discovery_result,
             TEMPLATE_BUNDLE.template.get("page_entry", {}).get("name", "页面入口"),
             page_url,
-            success,
         ),
         "feature_points": build_report_feature_points(
             discovery_result,
             TEMPLATE_BUNDLE.template.get("feature_point", {}).get("name", "功能点"),
-            classification.get("reason"),
-            success,
         ),
         "success_items": [
             {
                 "name": "线上申请备案模板样本",
                 "status": "passed",
                 "summary": classification.get("reason"),
-            }
+            },
+            {
+                "item_id": TEMPLATE_BUNDLE.template.get("feature_point", {}).get("name", "online_apply"),
+                "name": TEMPLATE_BUNDLE.template.get("feature_point", {}).get("name", "线上申请备案"),
+                "status": "passed",
+                "summary": classification.get("reason"),
+                "facts": [
+                    {"label": "template_execution_path", "value": TEMPLATE_BUNDLE.template.get("execution_path")},
+                    {"label": "attempt_count", "value": len(attempts)},
+                ],
+            },
         ]
         if success
         else [],
@@ -1305,6 +1801,7 @@ def write_structured_stage2_report(
                 "summary": classification.get("reason"),
             }
         ],
+        "key_artifacts": build_report_key_artifacts(artifacts),
         "project_assets": [
             {
                 "name": "Template Snapshot",
@@ -1327,18 +1824,46 @@ def write_structured_stage2_report(
                     {"label": key, "path": str(path)} for key, path in generated_files.items()
                 ],
             },
+            {
+                "name": "Key Screenshots",
+                "status": "generated",
+                "artifacts": build_report_key_artifacts(artifacts),
+            },
         ],
         "network_highlights": [
             {
                 "name": f"Attempt {item.get('attempt')}",
                 "status": item.get("classification", {}).get("category", "unknown"),
                 "summary": item.get("classification", {}).get("reason", ""),
+                "facts": [
+                    {"label": "attempt_status", "value": item.get("status")},
+                    {"label": "step_count", "value": item.get("execution_summary", {}).get("step_count")},
+                    {"label": "duration_ms", "value": item.get("execution_summary", {}).get("duration_ms")},
+                ],
             }
             for item in attempts
         ],
         "efficiency_observations": [
             {"label": "attempt_count", "value": len(attempts)},
             {"label": "platform_status", "value": progress.snapshot.overall_status},
+            {
+                "label": "template_execution_duration_ms",
+                "value": total_duration_ms,
+            },
+        ],
+        "model_evaluations": [
+            {
+                "model_name": profile.name,
+                "summary": classification.get("reason"),
+                "participated_stages": ["verification"],
+                "joined_discovery": True,
+                "joined_attribution": True,
+                "comparison_summary": "Single-run observation; cross-model comparison requires multiple completed runs.",
+                "facts": [
+                    {"label": "attempt_count", "value": len(attempts)},
+                    {"label": "final_category", "value": classification.get("category")},
+                ],
+            }
         ],
         "notes": (notes or []) + [
             f"当前平台级状态：{progress.snapshot.overall_status} / {progress.snapshot.current_phase}",
@@ -1361,21 +1886,92 @@ def write_structured_stage2_report(
         run_report=report_payload,
         status_snapshot=progress_snapshot,
         attempts=attempts,
+        max_attempts=max_attempts,
+    )
+    report_payload["summary"]["current_round"] = progress_snapshot.current_round
+    report_payload["summary"]["next_round_status"] = iteration_artifacts.next_round_decision.status
+    report_payload["summary"]["next_round_should_start"] = (
+        iteration_artifacts.next_round_decision.should_start_next_round
+    )
+    report_payload["summary"]["failure_cluster_count"] = len(iteration_artifacts.failure_clusters)
+    report_payload["summary"]["promotion_candidate_count"] = len(
+        iteration_artifacts.promotion_candidates
     )
     report_payload["project_assets"].append(
         {
             "name": "Iteration Outputs",
             "status": "generated",
-            "artifacts": [
-                {"label": "failure_clusters.json", "path": str(artifacts.run_dir / "failure_clusters.json")},
-                {"label": "retry_plan.json", "path": str(artifacts.run_dir / "retry_plan.json")},
-                {"label": "promotion_candidates.json", "path": str(artifacts.run_dir / "promotion_candidates.json")},
-            ],
+            "artifacts": build_iteration_asset_refs(artifacts.run_dir),
         }
     )
     report_payload["failure_clusters"] = build_report_failure_clusters(iteration_artifacts)
     report_payload["promotion_candidates"] = build_report_promotion_candidates(iteration_artifacts)
-    report_payload["extra_sections"] = build_retry_plan_section(iteration_artifacts)
+    report_payload["daily_summary"] = {
+        "summary": "本轮 run 已完成真实 discovery / verification / iteration 产物输出。",
+        "new_failure_fix_strategies": [
+            {
+                "name": classification.get("category", "unknown"),
+                "status": "observed",
+                "summary": classification.get("reason"),
+            }
+        ],
+        "watch_items": [
+            {
+                "name": "iteration_follow_up",
+                "status": "pending",
+                "summary": "结合本轮 stop_conditions 和 iteration_comparison 决定下一轮动作。",
+            }
+        ],
+    }
+    report_payload["model_comparison_summary"] = {
+        "title": "Model Comparison Summary",
+        "summary": "当前为单模型单 run 摘要，跨模型对比需汇总多轮完成结果。",
+        "items": report_payload["model_evaluations"],
+    }
+    report_payload["skill_inventory_summary"] = {
+        "summary": "本轮运行已沉淀 discovery / verification / iteration / reporting 相关项目级能力。",
+        "runtime_skills": [
+            {
+                "name": "controlled_live_discovery",
+                "status": "available",
+                "summary": "真实页面受控 discovery 已输出稳定 key、scope 和 review hints。",
+            },
+            {
+                "name": "human_loop_capture_v2",
+                "status": "available",
+                "summary": "human loop 事件采集已带 richer metadata 和 summary。",
+            },
+        ],
+        "project_skills": [
+            {
+                "name": TEMPLATE_BUNDLE.name,
+                "status": "available",
+                "summary": "项目级模板样本已支持 runtime data、discovery、verification 和 iteration 产物输出。",
+            }
+        ],
+    }
+    report_payload["promotion_candidate_summary"] = {
+        "summary": "本轮仅输出项目级/平台级候选摘要，最终晋升仍需人工审查。",
+        "candidates": report_payload["promotion_candidates"],
+        "approval_notes": [
+            "平台级基线沉淀必须人工审核后晋升。",
+        ],
+        "evidence_requirements": [
+            "至少提供成功执行证据、失败归因对比和关键步骤截图。",
+        ],
+    }
+    extra_sections = build_retry_plan_section(iteration_artifacts)
+    comparison_section = build_iteration_comparison_section(iteration_artifacts)
+    stop_section = build_stop_conditions_section(iteration_artifacts)
+    next_round_section = build_next_round_decision_section(iteration_artifacts)
+    if comparison_section:
+        extra_sections.append(comparison_section)
+    if stop_section:
+        extra_sections.append(stop_section)
+    if next_round_section:
+        extra_sections.append(next_round_section)
+    report_payload["extra_sections"] = extra_sections
+    artifacts.write_json("reports/run_report.json", report_payload)
     artifacts.write_text("reports/run_report.md", render_run_report_markdown(report_payload))
     artifacts.write_text("reports/progress_view.md", render_progress_markdown(progress_snapshot))
     artifacts.write_text("reports/progress_view.txt", render_progress_text(progress_snapshot))
@@ -1535,6 +2131,11 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
     artifacts.write_json("runtime_data.json", runtime_data)
 
     generated_files = build_default_generated_files(artifacts.generated_dir, profile.name)
+    runtime = TemplateRuntimeData(
+        baseline=SUCCESS_BASELINE,
+        run_data=runtime_data,
+        generated_files=generated_files,
+    )
     person_pdf = generated_files["personnel_file"]
     accept_pdf = generated_files["acceptance_file"]
     apply_pdf = generated_files["apply_file"]
@@ -1644,11 +2245,6 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
             page.on("request", on_request)
             page.on("response", on_response)
 
-            dialog = await find_open_panel(page)
-            if dialog is None:
-                await click_apply_button(page)
-                dialog = await wait_for_dialog(page)
-            await page.screenshot(path=str(artifacts.screenshots_dir / "dialog_opened.png"), full_page=True)
             before_state = await snapshot_dialog_state(page)
             artifacts.write_json("dialog_before.json", before_state)
 
@@ -1666,10 +2262,6 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                     actions.append({"step": "reset_online_apply_page", "result": await reset_online_apply_page(page)})
                     actions.append({"step": "close_visible_panel", "result": await close_visible_panel(page)})
                     await page.wait_for_load_state("domcontentloaded")
-                    dialog = await find_open_panel(page)
-                    if dialog is None:
-                        await click_apply_button(page)
-                        dialog = await wait_for_dialog(page)
                     path_info = await detect_submission_path(page)
                     actions.append({"step": "detect_submission_path", "result": path_info})
 
@@ -1687,22 +2279,24 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                             target_label="线上申请备案",
                             message="按模板执行线上备案申请成功路径",
                         )
-                        actions.append({"step": "dialog_visible", "ok": await dialog.is_visible()})
-                        flow_actions, final_state = await execute_verified_new_application_flow(
+                        flow_actions, final_state, step_executions = await execute_verified_new_application_flow(
                             page,
                             artifacts,
-                            runtime_data,
-                            person_pdf,
-                            accept_pdf,
-                            apply_pdf,
+                            runtime,
                         )
                         actions.extend(flow_actions)
+                        await page.screenshot(
+                            path=str(artifacts.screenshots_dir / "dialog_opened.png"),
+                            full_page=True,
+                        )
                         submit_result = {
                             "messages": final_state.get("messages", []),
                             "errors": [],
                             "bodySnippet": final_state.get("body", ""),
                         }
+                        execution_summary = summarize_attempt_execution(flow_actions)
                     else:
+                        step_executions = []
                         actions.append({"step": "click_first_continue_action", "result": await click_first_continue_action(page)})
                         await page.wait_for_timeout(1500)
                         after_click_state = await get_apply_state(page)
@@ -1773,13 +2367,16 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                     )
                     if path_info["path"] != "new_application":
                         submit_result = await submit_dialog(page)
+                        execution_summary = summarize_attempt_execution(actions)
                     final_submit = submit_result
                 except (PlaywrightError, RuntimeError) as exc:
+                    step_executions = []
                     submit_result = {
                         "messages": [],
                         "errors": [f"{type(exc).__name__}: {exc}"],
                         "bodySnippet": "",
                     }
+                    execution_summary = summarize_attempt_execution(actions)
 
                 after_state = await snapshot_dialog_state(page)
                 apply_state = await get_apply_state(page)
@@ -1797,6 +2394,9 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                     "submit_result": submit_result,
                     "apply_state": apply_state,
                     "classification": classification,
+                    "status": "passed" if classification["success"] else "failed",
+                    "execution_summary": execution_summary,
+                    "step_executions": [item.to_attempt_action() for item in step_executions],
                     "network_events": relevant_network,
                     "dialog_state": after_state,
                 }
@@ -1852,6 +2452,7 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                         discovery_result=discovery_result,
                         discovery_paths=discovery_paths,
                         notes=["真实执行样本已成功完成最终备案提交。"],
+                        max_attempts=max_attempts,
                     )
                     return artifacts.run_dir
 
@@ -1905,6 +2506,7 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                         discovery_result=discovery_result,
                         discovery_paths=discovery_paths,
                         notes=["真实执行样本命中了已识别的阻塞类型。"],
+                        max_attempts=max_attempts,
                     )
                     return artifacts.run_dir
 
@@ -1946,6 +2548,7 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                         discovery_result=discovery_result,
                         discovery_paths=discovery_paths,
                         notes=["真实执行样本未继续收敛，已提前结束当前 run。"],
+                        max_attempts=max_attempts,
                     )
                     return artifacts.run_dir
 
@@ -1982,6 +2585,7 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                 discovery_result=discovery_result,
                 discovery_paths=discovery_paths,
                 notes=["真实执行样本耗尽最大尝试次数。"],
+                max_attempts=max_attempts,
             )
             return artifacts.run_dir
         except Exception as exc:
@@ -2029,6 +2633,7 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                 discovery_result=discovery_result,
                 discovery_paths=discovery_paths,
                 notes=["验证阶段在连接浏览器或接管已登录会话之前失败。"],
+                max_attempts=max_attempts,
             )
             return artifacts.run_dir
         finally:
@@ -2036,19 +2641,95 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                 await browser.close()
 
 
-async def main() -> None:
+async def run_profile_with_iterations(
+    profile: ModelProfile,
+    *,
+    cdp_url: str,
+    max_attempts: int,
+    max_rounds: int,
+) -> dict[str, Any]:
+    rounds: list[dict[str, Any]] = []
+    latest_run_dir: Path | None = None
+
+    for round_index in range(1, max_rounds + 1):
+        run_dir = await run_single_profile(profile, cdp_url, max_attempts)
+        latest_run_dir = run_dir
+        status_payload = _read_json_file(run_dir / "current_status.json")
+        next_round_decision = load_next_round_decision(run_dir)
+        round_payload = {
+            "round": round_index,
+            "run_dir": str(run_dir),
+            "status": status_payload.get("overall_status"),
+            "elapsed_ms": status_payload.get("elapsed_ms"),
+            "next_round_decision": next_round_decision,
+        }
+        rounds.append(round_payload)
+        if not should_auto_continue_next_round(next_round_decision):
+            break
+
+    final_status = rounds[-1]["status"] if rounds else "unknown"
+    final_elapsed_ms = rounds[-1]["elapsed_ms"] if rounds else None
+    final_decision = rounds[-1]["next_round_decision"] if rounds else {}
+    return {
+        "model": profile.name,
+        "run_dir": str(latest_run_dir) if latest_run_dir is not None else "",
+        "status": final_status,
+        "elapsed_ms": final_elapsed_ms,
+        "round_count": len(rounds),
+        "final_next_round_decision": final_decision,
+        "rounds": rounds,
+    }
+
+
+async def run_stage2_sample(
+    *,
+    cdp_url: str | None = None,
+    max_attempts: int | None = None,
+    max_rounds: int = 1,
+) -> dict[str, Any]:
     profiles = load_stage2_model_profiles(DEFAULT_ENV_FILES)
     if not profiles:
         raise RuntimeError("未从 demo 目录加载到模型配置")
 
-    cdp_url = os.getenv("SUYUAN_CDP_URL", DEFAULT_CDP_URL)
-    max_attempts = int(os.getenv("SUYUAN_MAX_ATTEMPTS", "3"))
-    results = []
+    resolved_cdp_url = cdp_url or os.getenv("SUYUAN_CDP_URL", DEFAULT_CDP_URL)
+    resolved_max_attempts = max_attempts or int(os.getenv("SUYUAN_MAX_ATTEMPTS", "3"))
+    results: list[dict[str, Any]] = []
     for profile in profiles:
-        run_dir = await run_single_profile(profile, cdp_url, max_attempts)
-        results.append({"model": profile.name, "run_dir": str(run_dir)})
+        results.append(
+            await run_profile_with_iterations(
+                profile,
+                cdp_url=resolved_cdp_url,
+                max_attempts=resolved_max_attempts,
+                max_rounds=max_rounds,
+            )
+        )
 
-    print(json.dumps(results, ensure_ascii=False, indent=2))
+    comparison_summary = build_cross_model_summary(results)
+    comparison_path = ROOT_DIR / "artifacts" / "stage2" / "latest_model_comparison.json"
+    comparison_path.write_text(
+        json.dumps(comparison_summary, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    platform_daily_report = write_platform_daily_report_bundle(results)
+    baseline_freeze_manifest = write_baseline_freeze_manifest(
+        results,
+        comparison_path=comparison_path,
+        platform_daily_report=platform_daily_report,
+    )
+    return {
+        "template_name": TEMPLATE_BUNDLE.name,
+        "model_count": len(results),
+        "results": results,
+        "comparison_path": str(comparison_path),
+        "comparison_summary": comparison_summary,
+        "platform_daily_report": platform_daily_report,
+        "baseline_freeze_manifest": baseline_freeze_manifest,
+    }
+
+
+async def main() -> None:
+    payload = await run_stage2_sample()
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

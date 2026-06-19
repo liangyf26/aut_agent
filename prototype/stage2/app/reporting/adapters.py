@@ -12,6 +12,10 @@ def adapt_progress_snapshot(snapshot: CurrentStatusSnapshot) -> ProgressSnapshot
         for key, value in sorted(snapshot.stats.items())
     ]
     recent_events = [adapt_recent_event(event) for event in snapshot.recent_events]
+    current_round = snapshot.current_round.index
+    discovery_round = snapshot.current_round.index if snapshot.current_round.kind == "discovery" else None
+    verification_round = snapshot.current_round.index if snapshot.current_round.kind == "verification" else None
+    attribution_round = snapshot.current_round.index if snapshot.current_round.kind == "attribution" else None
     return ProgressSnapshot(
         run_id=snapshot.run_id,
         status=snapshot.overall_status,
@@ -19,6 +23,10 @@ def adapt_progress_snapshot(snapshot: CurrentStatusSnapshot) -> ProgressSnapshot
         step=snapshot.current_step.label or snapshot.current_step.key,
         project_name=snapshot.project_name,
         template_name=snapshot.template_name,
+        current_round=current_round,
+        discovery_round=discovery_round,
+        verification_round=verification_round,
+        attribution_round=attribution_round,
         target_type=snapshot.current_target.kind,
         target_name=snapshot.current_target.label or snapshot.current_target.id,
         started_at=snapshot.started_at,

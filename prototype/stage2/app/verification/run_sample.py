@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -11,12 +12,15 @@ from prototype.stage2.app.orchestration.run_context import Stage2RunContext
 from prototype.stage2.app.progress import ProgressManager
 from prototype.stage2.app.reporting import (
     adapt_progress_snapshot,
+    build_platform_daily_report,
     render_progress_markdown,
+    render_platform_daily_report_markdown,
     render_run_report_markdown,
 )
 from prototype.stage2.app.runtime.artifacts import ArtifactWriter
 from prototype.stage2.app.runtime.templates import load_template_bundle
 from prototype.stage2.app.verification.constants import ARTIFACT_ROOT, DEFAULT_CDP_URL, DEFAULT_ENV_FILES
+from prototype.stage2.app.verification.template_runtime import TemplateRuntimeData
 
 
 def _map_discovery_page_entries(discovery_result: object) -> list[dict[str, str]]:
@@ -48,6 +52,18 @@ def _map_discovery_feature_points(discovery_result: object) -> list[dict[str, st
     ]
 
 
+def _build_iteration_asset_refs(run_dir: Path) -> list[dict[str, str]]:
+    labels = [
+        "failure_clusters.json",
+        "retry_plan.json",
+        "promotion_candidates.json",
+        "stop_conditions.json",
+        "iteration_comparison.json",
+        "next_round_decision.json",
+    ]
+    return [{"label": label, "path": str(run_dir / label)} for label in labels]
+
+
 def build_run_contexts(template_name: str = "suyuan_online_apply") -> list[Stage2RunContext]:
     template_dir = Path(__file__).resolve().parents[2] / "templates" / template_name
     bundle = load_template_bundle(template_dir)
@@ -63,6 +79,11 @@ def build_run_contexts(template_name: str = "suyuan_online_apply") -> list[Stage
         run_data = TemplateDataFactory(artifacts.run_dir.name).build(
             baseline=bundle.baseline,
             schema=bundle.data_schema,
+        )
+        runtime = TemplateRuntimeData(
+            baseline=bundle.baseline,
+            run_data=run_data,
+            generated_files={},
         )
         progress = ProgressManager(
             run_id=artifacts.run_dir.name,
@@ -166,18 +187,67 @@ def build_run_contexts(template_name: str = "suyuan_online_apply") -> list[Stage
             run_report=report_payload,
             status_snapshot=progress_snapshot,
             attempts=[],
+            max_attempts=max_attempts,
         )
         report_payload["project_assets"].append(
             {
                 "name": "Iteration Outputs",
                 "status": "generated",
-                "artifacts": [
-                    {"label": "failure_clusters.json", "path": str(artifacts.run_dir / "failure_clusters.json")},
-                    {"label": "retry_plan.json", "path": str(artifacts.run_dir / "retry_plan.json")},
-                    {"label": "promotion_candidates.json", "path": str(artifacts.run_dir / "promotion_candidates.json")},
-                ],
+                "artifacts": _build_iteration_asset_refs(artifacts.run_dir),
             }
         )
+        report_payload["daily_summary"] = {
+            "summary": "初始化 run 已创建 discovery 和 iteration 占位产物，等待真实浏览器验证接入。",
+            "new_templates": [
+                {
+                    "name": template_name,
+                    "status": "initialized",
+                    "summary": "模板快照、运行时数据和发现产物已落盘。",
+                }
+            ],
+            "watch_items": [
+                {
+                    "name": "verification_executor_pending",
+                    "status": "pending",
+                    "summary": "初始化报告阶段尚未真正执行浏览器验证。",
+                }
+            ],
+        }
+        report_payload["model_comparison_summary"] = {
+            "title": "Model Comparison Summary",
+            "summary": "当前仅完成初始化阶段，模型对比需等待真实验证执行结果后再补齐。",
+            "items": [
+                {
+                    "name": profile.name,
+                    "status": "initialized",
+                    "summary": "已装载模板与 runtime data，待进入真实验证阶段。",
+                }
+            ],
+        }
+        report_payload["skill_inventory_summary"] = {
+            "summary": "当前 run 仅完成模板播种和初始化沉淀。",
+            "runtime_skills": [
+                {
+                    "name": "template_seed_discovery",
+                    "status": "available",
+                    "summary": "模板播种式 discovery 已可输出页面入口与功能点清单。",
+                }
+            ],
+            "project_skills": [
+                {
+                    "name": "suyuan_online_apply",
+                    "status": "available",
+                    "summary": "首个项目模板样本已完成初始化。",
+                }
+            ],
+        }
+        report_payload["promotion_candidate_summary"] = {
+            "summary": "初始化阶段不自动晋升平台级候选，等待真实验证与人工审查。",
+            "approval_notes": [
+                "平台级晋升必须在真实验证 run 之后结合证据审查。",
+            ],
+        }
+        artifacts.write_json("reports/run_report.json", report_payload)
         artifacts.write_text("reports/progress_view.md", render_progress_markdown(progress_snapshot))
         artifacts.write_text(
             "reports/run_report.md",
@@ -192,8 +262,39 @@ def build_run_contexts(template_name: str = "suyuan_online_apply") -> list[Stage
                 model_profile=profile,
                 artifacts=artifacts,
                 bundle=bundle,
-                runtime_data=run_data,
+                runtime=runtime,
                 progress=progress,
             )
         )
     return contexts
+
+
+def build_platform_daily_report_from_contexts(
+    contexts: list[Stage2RunContext],
+) -> dict[str, str | int | None]:
+    report_payloads = []
+    for context in contexts:
+        report_path = context.artifacts.run_dir / "reports" / "run_report.json"
+        if not report_path.exists():
+            continue
+        try:
+            report_payloads.append(json.loads(report_path.read_text(encoding="utf-8")))
+        except json.JSONDecodeError:
+            continue
+    platform_report = build_platform_daily_report(report_payloads)
+    json_path = ARTIFACT_ROOT / "latest_platform_daily_report.json"
+    markdown_path = ARTIFACT_ROOT / "latest_platform_daily_report.md"
+    json_path.write_text(
+        json.dumps(platform_report.to_dict(), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    markdown_path.write_text(
+        render_platform_daily_report_markdown(platform_report),
+        encoding="utf-8",
+    )
+    return {
+        "report_date": platform_report.report_date,
+        "run_count": len(report_payloads),
+        "json_path": str(json_path),
+        "markdown_path": str(markdown_path),
+    }

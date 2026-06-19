@@ -1,0 +1,6 @@
+{
+  "query_start_date_input": "input[placeholder='开始日期']",
+  "query_end_date_input": "input[placeholder='结束日期']",
+  "search_button": "button:has-text('搜索')",
+  "reset_button": "button:has-text('重置')"
+}

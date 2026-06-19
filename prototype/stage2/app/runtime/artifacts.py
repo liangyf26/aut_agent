@@ -28,7 +28,12 @@ class ArtifactWriter:
     def __init__(self, artifact_root: Path, run_name: str) -> None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_name = sanitize_name(run_name)
-        run_dir = artifact_root / f"{timestamp}_{safe_name}"
+        base_run_dir = artifact_root / f"{timestamp}_{safe_name}"
+        run_dir = base_run_dir
+        suffix = 1
+        while run_dir.exists():
+            run_dir = artifact_root / f"{timestamp}_{safe_name}_{suffix:02d}"
+            suffix += 1
         screenshots_dir = run_dir / "screenshots"
         generated_dir = run_dir / "generated"
         reports_dir = run_dir / "reports"

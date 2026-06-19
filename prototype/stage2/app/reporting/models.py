@@ -50,6 +50,22 @@ def _number(value: Any) -> int | float | None:
     return None
 
 
+def _boolean(value: Any) -> bool | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "off"}:
+            return False
+    return None
+
+
 def _string_list(value: Any) -> list[str]:
     if value is None:
         return []
@@ -80,6 +96,13 @@ def _coerce_list(value: Any, factory: Any) -> list[Any]:
     if isinstance(value, Sequence):
         return [factory(item) for item in value]
     return [factory(value)]
+
+
+def _first_present(mapping: Mapping[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return None
 
 
 @dataclass(slots=True)
@@ -336,6 +359,9 @@ class ModelEvaluation:
     summary: str | None = None
     precheck_tags: list[str] = field(default_factory=list)
     participated_stages: list[str] = field(default_factory=list)
+    joined_discovery: bool | None = None
+    joined_attribution: bool | None = None
+    comparison_summary: str | None = None
     completion_rate: int | float | str | None = None
     response_stability: str | None = None
     average_latency_ms: int | float | None = None
@@ -362,6 +388,9 @@ class ModelEvaluation:
             "capability_tags",
             "participated_stages",
             "roles",
+            "joined_discovery",
+            "joined_attribution",
+            "comparison_summary",
             "completion_rate",
             "response_stability",
             "average_latency_ms",
@@ -377,6 +406,9 @@ class ModelEvaluation:
             summary=_text(data.get("summary") or data.get("description")),
             precheck_tags=_string_list(data.get("precheck_tags") or data.get("capability_tags")),
             participated_stages=_string_list(data.get("participated_stages") or data.get("roles")),
+            joined_discovery=_boolean(data.get("joined_discovery")),
+            joined_attribution=_boolean(data.get("joined_attribution")),
+            comparison_summary=_text(data.get("comparison_summary")),
             completion_rate=data.get("completion_rate"),
             response_stability=_text(data.get("response_stability")),
             average_latency_ms=_number(data.get("average_latency_ms") or data.get("avg_latency_ms")),
@@ -418,6 +450,268 @@ class SectionBlock:
             items=_coerce_list(data.get("items"), ReportItem.from_value),
             notes=_string_list(data.get("notes")),
             markdown=_text(data.get("markdown")),
+            extra=_extra_values(data, known_keys),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class DailySummary:
+    date: str | None = None
+    summary: str | None = None
+    new_templates: list[ReportItem] = field(default_factory=list)
+    new_locator_strategies: list[ReportItem] = field(default_factory=list)
+    new_failure_fix_strategies: list[ReportItem] = field(default_factory=list)
+    candidate_platform_skills: list[ReportItem] = field(default_factory=list)
+    watch_items: list[ReportItem] = field(default_factory=list)
+    facts: list[Fact] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_value(cls, value: Any) -> "DailySummary":
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            return cls(summary=_text(value))
+        data = _to_mapping(value)
+        if not data:
+            return cls()
+        known_keys = {
+            "date",
+            "summary",
+            "new_templates",
+            "templates",
+            "new_locator_strategies",
+            "locator_strategies",
+            "new_failure_fix_strategies",
+            "failure_fix_strategies",
+            "candidate_platform_skills",
+            "platform_skills",
+            "watch_items",
+            "open_issues",
+            "facts",
+            "notes",
+        }
+        return cls(
+            date=_text(data.get("date")),
+            summary=_text(data.get("summary")),
+            new_templates=_coerce_list(
+                _first_present(data, "new_templates", "templates"),
+                ReportItem.from_value,
+            ),
+            new_locator_strategies=_coerce_list(
+                _first_present(data, "new_locator_strategies", "locator_strategies"),
+                ReportItem.from_value,
+            ),
+            new_failure_fix_strategies=_coerce_list(
+                _first_present(data, "new_failure_fix_strategies", "failure_fix_strategies"),
+                ReportItem.from_value,
+            ),
+            candidate_platform_skills=_coerce_list(
+                _first_present(data, "candidate_platform_skills", "platform_skills"),
+                ReportItem.from_value,
+            ),
+            watch_items=_coerce_list(
+                _first_present(data, "watch_items", "open_issues"),
+                ReportItem.from_value,
+            ),
+            facts=_coerce_facts(data.get("facts")),
+            notes=_string_list(data.get("notes")),
+            extra=_extra_values(data, known_keys),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class SkillInventorySummary:
+    summary: str | None = None
+    runtime_skills: list[ReportItem] = field(default_factory=list)
+    project_skills: list[ReportItem] = field(default_factory=list)
+    platform_candidates: list[ReportItem] = field(default_factory=list)
+    facts: list[Fact] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_value(cls, value: Any) -> "SkillInventorySummary":
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            return cls(summary=_text(value))
+        data = _to_mapping(value)
+        if not data:
+            return cls()
+        known_keys = {
+            "summary",
+            "runtime_skills",
+            "runtime",
+            "project_skills",
+            "project",
+            "platform_candidates",
+            "promotion_candidates",
+            "facts",
+            "notes",
+        }
+        return cls(
+            summary=_text(data.get("summary")),
+            runtime_skills=_coerce_list(
+                _first_present(data, "runtime_skills", "runtime"),
+                ReportItem.from_value,
+            ),
+            project_skills=_coerce_list(
+                _first_present(data, "project_skills", "project"),
+                ReportItem.from_value,
+            ),
+            platform_candidates=_coerce_list(
+                _first_present(data, "platform_candidates", "promotion_candidates"),
+                ReportItem.from_value,
+            ),
+            facts=_coerce_facts(data.get("facts")),
+            notes=_string_list(data.get("notes")),
+            extra=_extra_values(data, known_keys),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class PromotionCandidateSummary:
+    summary: str | None = None
+    candidates: list[ReportItem] = field(default_factory=list)
+    approval_notes: list[str] = field(default_factory=list)
+    evidence_requirements: list[str] = field(default_factory=list)
+    facts: list[Fact] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_value(cls, value: Any) -> "PromotionCandidateSummary":
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            return cls(summary=_text(value))
+        data = _to_mapping(value)
+        if not data:
+            return cls()
+        known_keys = {
+            "summary",
+            "candidates",
+            "items",
+            "approval_notes",
+            "review_notes",
+            "evidence_requirements",
+            "required_evidence",
+            "facts",
+            "notes",
+        }
+        return cls(
+            summary=_text(data.get("summary")),
+            candidates=_coerce_list(
+                _first_present(data, "candidates", "items"),
+                ReportItem.from_value,
+            ),
+            approval_notes=_string_list(
+                _first_present(data, "approval_notes", "review_notes"),
+            ),
+            evidence_requirements=_string_list(
+                _first_present(data, "evidence_requirements", "required_evidence"),
+            ),
+            facts=_coerce_facts(data.get("facts")),
+            notes=_string_list(data.get("notes")),
+            extra=_extra_values(data, known_keys),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class PlatformDailyReport:
+    report_date: str | None = None
+    summary: str | None = None
+    facts: list[Fact] = field(default_factory=list)
+    run_summaries: list[ReportItem] = field(default_factory=list)
+    efficiency_observations: list[Fact] = field(default_factory=list)
+    daily_summary: DailySummary | None = None
+    model_comparison_summary: SectionBlock | None = None
+    skill_inventory_summary: SkillInventorySummary | None = None
+    promotion_candidate_summary: PromotionCandidateSummary | None = None
+    notes: list[str] = field(default_factory=list)
+    extra_sections: list[SectionBlock] = field(default_factory=list)
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_value(cls, value: Any) -> "PlatformDailyReport":
+        if isinstance(value, cls):
+            return value
+        data = _to_mapping(value)
+        if not data:
+            return cls()
+        known_keys = {
+            "report_date",
+            "date",
+            "summary",
+            "facts",
+            "run_summaries",
+            "runs",
+            "efficiency_observations",
+            "efficiency_metrics",
+            "daily_summary",
+            "daily_digest",
+            "model_comparison_summary",
+            "model_summary",
+            "skill_inventory_summary",
+            "skill_summary",
+            "promotion_candidate_summary",
+            "promotion_summary",
+            "notes",
+            "extra_sections",
+            "sections",
+        }
+        return cls(
+            report_date=_text(data.get("report_date") or data.get("date")),
+            summary=_text(data.get("summary")),
+            facts=_coerce_facts(data.get("facts")),
+            run_summaries=_coerce_list(
+                _first_present(data, "run_summaries", "runs"),
+                ReportItem.from_value,
+            ),
+            efficiency_observations=_coerce_facts(
+                _first_present(data, "efficiency_observations", "efficiency_metrics")
+            ),
+            daily_summary=(
+                DailySummary.from_value(_first_present(data, "daily_summary", "daily_digest"))
+                if _first_present(data, "daily_summary", "daily_digest") is not None
+                else None
+            ),
+            model_comparison_summary=(
+                SectionBlock.from_value(_first_present(data, "model_comparison_summary", "model_summary"))
+                if _first_present(data, "model_comparison_summary", "model_summary") is not None
+                else None
+            ),
+            skill_inventory_summary=(
+                SkillInventorySummary.from_value(_first_present(data, "skill_inventory_summary", "skill_summary"))
+                if _first_present(data, "skill_inventory_summary", "skill_summary") is not None
+                else None
+            ),
+            promotion_candidate_summary=(
+                PromotionCandidateSummary.from_value(
+                    _first_present(data, "promotion_candidate_summary", "promotion_summary")
+                )
+                if _first_present(data, "promotion_candidate_summary", "promotion_summary") is not None
+                else None
+            ),
+            notes=_string_list(data.get("notes")),
+            extra_sections=_coerce_list(
+                _first_present(data, "extra_sections", "sections"),
+                SectionBlock.from_value,
+            ),
             extra=_extra_values(data, known_keys),
         )
 
@@ -517,6 +811,10 @@ class RunReport:
     project_assets: list[ReportItem] = field(default_factory=list)
     promotion_candidates: list[ReportItem] = field(default_factory=list)
     model_evaluations: list[ModelEvaluation] = field(default_factory=list)
+    daily_summary: DailySummary | None = None
+    model_comparison_summary: SectionBlock | None = None
+    skill_inventory_summary: SkillInventorySummary | None = None
+    promotion_candidate_summary: PromotionCandidateSummary | None = None
     extra_sections: list[SectionBlock] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     extra: dict[str, Any] = field(default_factory=dict)
@@ -556,6 +854,14 @@ class RunReport:
             "candidates",
             "model_evaluations",
             "models",
+            "daily_summary",
+            "daily_digest",
+            "model_comparison_summary",
+            "model_summary",
+            "skill_inventory_summary",
+            "skill_summary",
+            "promotion_candidate_summary",
+            "promotion_summary",
             "extra_sections",
             "sections",
             "notes",
@@ -619,6 +925,28 @@ class RunReport:
             ),
             model_evaluations=_coerce_list(
                 data.get("model_evaluations") or data.get("models"), ModelEvaluation.from_value
+            ),
+            daily_summary=(
+                DailySummary.from_value(_first_present(data, "daily_summary", "daily_digest"))
+                if _first_present(data, "daily_summary", "daily_digest") is not None
+                else None
+            ),
+            model_comparison_summary=(
+                SectionBlock.from_value(_first_present(data, "model_comparison_summary", "model_summary"))
+                if _first_present(data, "model_comparison_summary", "model_summary") is not None
+                else None
+            ),
+            skill_inventory_summary=(
+                SkillInventorySummary.from_value(_first_present(data, "skill_inventory_summary", "skill_summary"))
+                if _first_present(data, "skill_inventory_summary", "skill_summary") is not None
+                else None
+            ),
+            promotion_candidate_summary=(
+                PromotionCandidateSummary.from_value(
+                    _first_present(data, "promotion_candidate_summary", "promotion_summary")
+                )
+                if _first_present(data, "promotion_candidate_summary", "promotion_summary") is not None
+                else None
             ),
             extra_sections=_coerce_list(
                 data.get("extra_sections") or data.get("sections"), SectionBlock.from_value
@@ -813,6 +1141,10 @@ def coerce_run_summary(value: Any) -> RunSummary:
 
 def coerce_run_report(value: Any) -> RunReport:
     return RunReport.from_value(value)
+
+
+def coerce_platform_daily_report(value: Any) -> PlatformDailyReport:
+    return PlatformDailyReport.from_value(value)
 
 
 def coerce_progress_event(value: Any) -> ProgressEvent:
