@@ -6,6 +6,7 @@ from .models import (
     RecordingEventType,
     RecordingSessionConfig,
 )
+from .playwright_capture import PlaywrightCaptureResult, PlaywrightHumanLoopCapture, record_human_loop_from_cdp
 from .recorder import HumanLoopRecorder
 
 __all__ = [
@@ -14,7 +15,10 @@ __all__ = [
     "HumanLoopRecorder",
     "HumanRecordingEvent",
     "MinimalCandidateTemplateDraftGenerator",
+    "PlaywrightCaptureResult",
+    "PlaywrightHumanLoopCapture",
     "RecordingArtifactPaths",
     "RecordingEventType",
     "RecordingSessionConfig",
+    "record_human_loop_from_cdp",
 ]

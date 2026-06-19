@@ -17,7 +17,11 @@ from prototype.stage2.app.config.models import (
     load_model_profiles as load_stage2_model_profiles,
 )
 from prototype.stage2.app.data_factory.generator import TemplateDataFactory
-from prototype.stage2.app.discovery import DiscoveryArtifactWriter, DiscoveryPlanner
+from prototype.stage2.app.discovery import (
+    DiscoveryArtifactWriter,
+    DiscoveryPlanner,
+    plan_live_discovery,
+)
 from prototype.stage2.app.iteration import write_iteration_artifacts
 from prototype.stage2.app.progress import ProgressManager
 from prototype.stage2.app.progress.console import format_status_line
@@ -53,6 +57,18 @@ def build_discovery_seed(artifacts: ArtifactWriter) -> tuple[object, dict[str, P
         template_name=TEMPLATE_BUNDLE.name,
         template=TEMPLATE_BUNDLE.template,
         baseline=SUCCESS_BASELINE,
+    )
+    paths = DiscoveryArtifactWriter(artifacts.run_dir).write(result)
+    return result, paths
+
+
+async def build_live_discovery(page: Page, artifacts: ArtifactWriter) -> tuple[object, dict[str, Path]]:
+    result = await plan_live_discovery(
+        page,
+        template_name=TEMPLATE_BUNDLE.name,
+        template=TEMPLATE_BUNDLE.template,
+        baseline=SUCCESS_BASELINE,
+        screenshots_dir=artifacts.run_dir,
     )
     paths = DiscoveryArtifactWriter(artifacts.run_dir).write(result)
     return result, paths
@@ -1526,37 +1542,18 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
         "preflight",
         phase_label="预检",
         message="运行时数据和生成附件已准备完成",
-        next_action="进入发现阶段并播种页面入口",
+        next_action="进入发现阶段并连接浏览器执行受控遍历",
     )
     progress.start_phase(
         "discovery",
         phase_label="发现",
-        message="基于已验证模板播种页面入口和功能点",
-        next_action="输出 discovery 最小闭环产物",
+        message="先生成模板播种结果，并尝试升级到真实页面受控遍历",
+        next_action="连接浏览器并 enrich discovery 结果",
     )
     discovery_result, discovery_paths = build_discovery_seed(artifacts)
-    progress.complete_phase(
-        "discovery",
-        phase_label="发现",
-        message="已生成页面入口清单和功能点清单",
-        next_action="连接浏览器并进入验证阶段",
-        stats={
-            "page_entries_discovered": len(getattr(discovery_result, "page_entries", [])),
-            "feature_points_discovered": len(getattr(discovery_result, "feature_points", [])),
-        },
-    )
 
     async with async_playwright() as p:
         browser = None
-        progress.start_phase(
-            "verification",
-            phase_label="验证",
-            round_kind="verification",
-            round_index=1,
-            round_label="验证第 1 轮",
-            message="连接可见浏览器并准备执行模板样本",
-            next_action="执行线上备案申请主路径",
-        )
         try:
             browser = await p.chromium.connect_over_cdp(cdp_url)
             contexts = browser.contexts
@@ -1580,6 +1577,27 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
             if "record/online" not in page.url:
                 await page.goto(ONLINE_RECORD_URL, wait_until="domcontentloaded")
                 await page.wait_for_timeout(3000)
+
+            discovery_result, discovery_paths = await build_live_discovery(page, artifacts)
+            progress.complete_phase(
+                "discovery",
+                phase_label="发现",
+                message="已完成真实页面受控遍历并生成页面入口清单和功能点清单",
+                next_action="进入验证阶段执行模板样本",
+                stats={
+                    "page_entries_discovered": len(getattr(discovery_result, "page_entries", [])),
+                    "feature_points_discovered": len(getattr(discovery_result, "feature_points", [])),
+                },
+            )
+            progress.start_phase(
+                "verification",
+                phase_label="验证",
+                round_kind="verification",
+                round_index=1,
+                round_label="验证第 1 轮",
+                message="连接可见浏览器并准备执行模板样本",
+                next_action="执行线上备案申请主路径",
+            )
 
             artifacts.write_json(
                 "page_entry.json",
@@ -1968,6 +1986,17 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
             return artifacts.run_dir
         except Exception as exc:
             error_text = f"{type(exc).__name__}: {exc}"
+            if progress.snapshot.phase_statuses.get("discovery") != "completed":
+                progress.complete_phase(
+                    "discovery",
+                    phase_label="发现",
+                    message="浏览器不可用，保留模板播种 discovery 结果",
+                    next_action="输出受限发现结果并结束验证",
+                    stats={
+                        "page_entries_discovered": len(getattr(discovery_result, "page_entries", [])),
+                        "feature_points_discovered": len(getattr(discovery_result, "feature_points", [])),
+                    },
+                )
             progress.fail_phase(
                 "verification",
                 phase_label="验证",
