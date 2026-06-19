@@ -60,6 +60,129 @@ TEMPLATE_BUNDLE = load_template_bundle(STAGE2_TEMPLATE_DIR)
 SUCCESS_BASELINE = TEMPLATE_BUNDLE.baseline
 
 
+def build_orchestration_stream_id(template_name: str, model_name: str) -> str:
+    return f"{template_name}::{profile_safe_name(model_name)}"
+
+
+def profile_safe_name(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value)
+
+
+def read_round_input(run_dir: Path) -> dict[str, Any]:
+    return _read_json_file(run_dir / "round_input.json")
+
+
+def build_round_input(
+    profile: ModelProfile,
+    *,
+    round_index: int,
+    max_rounds: int,
+    previous_run_dir: Path | None,
+    previous_decision: dict[str, Any] | None,
+) -> dict[str, Any]:
+    orchestration_stream_id = build_orchestration_stream_id(TEMPLATE_BUNDLE.name, profile.name)
+    decision = previous_decision or {}
+    retry_plan = _read_json_file(previous_run_dir / "retry_plan.json") if previous_run_dir else {}
+    round_input: dict[str, Any] = {
+        "orchestration_stream_id": orchestration_stream_id,
+        "template_name": TEMPLATE_BUNDLE.name,
+        "model_name": profile.name,
+        "project_name": "AI Agent 软件自动化评测平台第二阶段原型",
+        "round_index": round_index,
+        "max_rounds": max_rounds,
+        "previous_run_id": previous_run_dir.name if previous_run_dir else None,
+        "previous_run_dir": str(previous_run_dir) if previous_run_dir else None,
+        "retry_run_dir": str(previous_run_dir) if previous_run_dir else None,
+        "target_stage": decision.get("target_stage") or "verification",
+        "goal": retry_plan.get("goal") or "Resolve scheduled failure clusters in the next orchestration round.",
+        "source_decision_status": decision.get("status"),
+        "source_decision_reason": decision.get("primary_reason") or decision.get("stop_reason"),
+        "scheduled_cluster_ids": decision.get("scheduled_cluster_ids") or [],
+        "scheduled_action_ids": decision.get("scheduled_action_ids") or [],
+        "execution_hints": build_execution_hints(previous_run_dir, decision, retry_plan),
+        "notes": list(decision.get("notes") or []),
+    }
+    if round_index == 1:
+        round_input["notes"].append("Initial orchestration round with no previous retry decision.")
+    else:
+        round_input["notes"].append("Round input was derived from the previous run's next-round decision.")
+    return round_input
+
+
+def build_execution_hints(
+    previous_run_dir: Path | None,
+    decision: dict[str, Any],
+    retry_plan: dict[str, Any],
+) -> dict[str, Any]:
+    failure_cluster_index: dict[str, dict[str, Any]] = {}
+    if previous_run_dir is not None:
+        failure_payload = _read_json_file(previous_run_dir / "failure_clusters.json")
+        failure_cluster_index = {
+            str(item.get("cluster_id")): item
+            for item in failure_payload.get("clusters", [])
+            if isinstance(item, dict) and item.get("cluster_id")
+        }
+    hints: dict[str, Any] = {
+        "focus_stage": decision.get("target_stage") or "verification",
+        "scheduled_cluster_ids": list(decision.get("scheduled_cluster_ids") or []),
+        "scheduled_action_ids": list(decision.get("scheduled_action_ids") or []),
+        "scheduled_strategies": [],
+        "scheduled_clusters": [],
+        "scheduled_cluster_categories": [],
+        "scheduled_cluster_stages": [],
+        "scheduled_owners": [],
+        "skip_completed_discovery": previous_run_dir is not None,
+        "preserve_generated_files": previous_run_dir is not None,
+        "resume_from_previous_run": previous_run_dir is not None,
+        "continue_policy": "scheduled_only",
+    }
+    scheduled_categories: set[str] = set()
+    scheduled_stages: set[str] = set()
+    scheduled_owners: set[str] = set()
+    for action in retry_plan.get("actions") or []:
+        if action.get("action_id") not in hints["scheduled_action_ids"]:
+            continue
+        strategy = action.get("strategy")
+        if strategy and strategy not in hints["scheduled_strategies"]:
+            hints["scheduled_strategies"].append(strategy)
+        execution_hints = action.get("execution_hints")
+        if isinstance(execution_hints, dict):
+            hints.update({key: value for key, value in execution_hints.items() if value is not None})
+        owner = str(action.get("owner") or "").strip()
+        if owner:
+            scheduled_owners.add(owner)
+        cluster_id = str(action.get("cluster_id") or "").strip()
+        cluster_meta = failure_cluster_index.get(cluster_id, {})
+        cluster_stage = cluster_meta.get("stage") or action.get("stage")
+        cluster_category = cluster_meta.get("category")
+        if cluster_category:
+            scheduled_categories.add(str(cluster_category))
+        if cluster_stage:
+            scheduled_stages.add(str(cluster_stage))
+        hints["scheduled_clusters"].append(
+            {
+                "cluster_id": cluster_id or None,
+                "category": cluster_category,
+                "stage": cluster_stage,
+                "action_level": cluster_meta.get("action_level"),
+                "strategy": strategy,
+                "owner": owner or None,
+            }
+        )
+    if "repair_input_then_rerun" in hints["scheduled_strategies"]:
+        hints["regenerate_runtime_data"] = True
+    if "refresh_locator_and_rerun" in hints["scheduled_strategies"]:
+        hints["ui_retry_mode"] = "refresh_locator_and_rerun"
+    if "capture_and_retry" in hints["scheduled_strategies"]:
+        hints["capture_network_on_retry"] = True
+    if "fix_precondition_then_rerun" in hints["scheduled_strategies"]:
+        hints["preflight_mode"] = "fix_precondition_then_rerun"
+    hints["scheduled_cluster_categories"] = sorted(scheduled_categories)
+    hints["scheduled_cluster_stages"] = sorted(scheduled_stages)
+    hints["scheduled_owners"] = sorted(scheduled_owners)
+    return hints
+
+
 def build_discovery_seed(artifacts: ArtifactWriter) -> tuple[object, dict[str, Path]]:
     result = DiscoveryPlanner().plan(
         template_name=TEMPLATE_BUNDLE.name,
@@ -273,6 +396,7 @@ def build_report_promotion_candidates(iteration_artifacts: object) -> list[dict[
 
 def build_iteration_asset_refs(run_dir: Path) -> list[dict[str, str]]:
     labels = [
+        "round_input.json",
         "failure_clusters.json",
         "retry_plan.json",
         "promotion_candidates.json",
@@ -437,6 +561,65 @@ def write_baseline_freeze_manifest(
     }
 
 
+def _summarize_round_input(round_input: object) -> str:
+    round_index = getattr(round_input, "round_index", None)
+    target_stage = getattr(round_input, "target_stage", None) or "verification"
+    scheduled_clusters = len(getattr(round_input, "scheduled_cluster_ids", []) or [])
+    scheduled_actions = len(getattr(round_input, "scheduled_action_ids", []) or [])
+    if round_index is None:
+        return "Round input was prepared for the current orchestration cycle."
+    return (
+        f"Round {round_index} will focus on {target_stage} with "
+        f"{scheduled_clusters} scheduled cluster(s) and {scheduled_actions} scheduled action(s)."
+    )
+
+
+def summarize_execution_hints(execution_hints: dict[str, Any]) -> str:
+    scheduled_strategies = execution_hints.get("scheduled_strategies") or []
+    focus_stage = execution_hints.get("focus_stage") or "verification"
+    if scheduled_strategies:
+        return (
+            f"Execution will focus on {focus_stage} and prefer retry strategies: "
+            + ", ".join(str(item) for item in scheduled_strategies)
+            + "."
+        )
+    if execution_hints.get("requires_human_review"):
+        return "Execution hints indicate that human review is required before continuing."
+    return f"Execution will focus on {focus_stage} using the carried orchestration hints."
+
+
+def summarize_stop_conditions(stop_conditions: object) -> str:
+    triggered = list(getattr(stop_conditions, "triggered_conditions", []) or [])
+    if getattr(stop_conditions, "should_stop", None) is True:
+        if triggered:
+            return "Run will stop because these stop conditions were triggered: " + ", ".join(triggered) + "."
+        return "Run will stop because one or more stop conditions were triggered."
+    if getattr(stop_conditions, "should_stop", None) is None:
+        return "Run cannot safely decide whether to stop or continue; manual review is required."
+    return "No stop condition blocked the current run, so the orchestration loop may continue conservatively."
+
+
+def summarize_next_round_decision(next_round: object) -> str:
+    status = str(getattr(next_round, "status", "") or "").strip().lower()
+    next_round_index = getattr(next_round, "next_round", None)
+    target_stage = getattr(next_round, "target_stage", None) or "verification"
+    primary_reason = getattr(next_round, "primary_reason", None)
+    if status == "scheduled":
+        prefix = f"Next round {next_round_index} is scheduled for {target_stage}."
+        if primary_reason:
+            return f"{prefix} {primary_reason}"
+        return prefix
+    if status == "stopped":
+        return primary_reason or "Next-round scheduling stopped because a stop condition was triggered."
+    if status == "needs_review":
+        return primary_reason or "Next-round scheduling requires manual review before continuing."
+    if status == "budget_exhausted":
+        return primary_reason or "Next-round scheduling stopped because the attempt budget was exhausted."
+    if status == "no_retry_needed":
+        return primary_reason or "No next round is needed because no open failure cluster remains."
+    return primary_reason or "Next-round decision was recorded, but no stronger explanation was available."
+
+
 def build_retry_plan_section(iteration_artifacts: object) -> list[dict[str, Any]]:
     retry_plan = getattr(iteration_artifacts, "retry_plan", None)
     if retry_plan is None:
@@ -459,6 +642,10 @@ def build_retry_plan_section(iteration_artifacts: object) -> list[dict[str, Any]
             "facts": [
                 {"label": "strategy", "value": action.strategy},
                 {"label": "expected_outcome", "value": action.expected_outcome},
+            ]
+            + [
+                {"label": key, "value": value}
+                for key, value in sorted((action.execution_hints or {}).items())
             ],
         }
         for action in retry_plan.actions
@@ -466,6 +653,11 @@ def build_retry_plan_section(iteration_artifacts: object) -> list[dict[str, Any]
     return [
         {
             "title": "Retry Plan",
+            "summary": (
+                f"Prepared {len(retry_plan.actions)} retry action(s) for the next orchestration handoff."
+                if retry_plan.actions
+                else "No retry action was required for this run."
+            ),
             "facts": facts,
             "items": items,
             "notes": retry_plan.notes,
@@ -531,6 +723,97 @@ def build_iteration_comparison_section(iteration_artifacts: object) -> dict[str,
     }
 
 
+def build_round_input_section(iteration_artifacts: object) -> dict[str, Any] | None:
+    round_input = getattr(iteration_artifacts, "round_input", None)
+    if round_input is None:
+        return None
+
+    facts: list[dict[str, Any]] = [
+        {"label": "orchestration_stream_id", "value": round_input.orchestration_stream_id},
+        {"label": "template_name", "value": round_input.template_name},
+        {"label": "model_name", "value": round_input.model_name},
+        {"label": "project_name", "value": round_input.project_name},
+        {"label": "round_index", "value": round_input.round_index},
+        {"label": "max_rounds", "value": round_input.max_rounds},
+        {"label": "target_stage", "value": round_input.target_stage},
+        {"label": "goal", "value": round_input.goal},
+        {"label": "source_decision_status", "value": round_input.source_decision_status},
+        {"label": "source_decision_reason", "value": round_input.source_decision_reason},
+        {"label": "previous_run_id", "value": round_input.previous_run_id},
+        {"label": "scheduled_cluster_count", "value": len(round_input.scheduled_cluster_ids)},
+        {"label": "scheduled_action_count", "value": len(round_input.scheduled_action_ids)},
+    ]
+    items: list[dict[str, Any]] = []
+    for cluster in round_input.scheduled_cluster_ids:
+        items.append(
+            {
+                "item_id": cluster,
+                "name": cluster,
+                "status": "scheduled",
+                "summary": "Failure cluster carried into this round input.",
+            }
+        )
+    for action_id in round_input.scheduled_action_ids:
+        items.append(
+            {
+                "item_id": action_id,
+                "name": action_id,
+                "status": "scheduled",
+                "summary": "Retry action carried into this round input.",
+            }
+        )
+    return {
+        "title": "Round Input",
+        "summary": _summarize_round_input(round_input),
+        "facts": [item for item in facts if item["value"] not in (None, [], {})],
+        "items": items,
+        "notes": list(getattr(round_input, "notes", []) or []),
+    }
+
+
+def build_execution_hints_section(iteration_artifacts: object) -> dict[str, Any] | None:
+    round_input = getattr(iteration_artifacts, "round_input", None)
+    if round_input is None:
+        return None
+    execution_hints = getattr(round_input, "execution_hints", None) or {}
+    if not execution_hints:
+        return None
+
+    items: list[dict[str, Any]] = []
+    for cluster in execution_hints.get("scheduled_clusters") or []:
+        if not isinstance(cluster, dict):
+            continue
+        items.append(
+            {
+                "item_id": cluster.get("cluster_id"),
+                "name": cluster.get("category") or cluster.get("cluster_id") or "scheduled_cluster",
+                "status": "scheduled",
+                "summary": "Execution hints retained this cluster for the next round.",
+                "owner": cluster.get("owner"),
+                "source": cluster.get("stage"),
+                "facts": [
+                    {"label": "strategy", "value": cluster.get("strategy")},
+                    {"label": "action_level", "value": cluster.get("action_level")},
+                ],
+            }
+        )
+
+    facts = [
+        {"label": key, "value": value}
+        for key, value in sorted(execution_hints.items())
+        if key != "scheduled_clusters"
+    ]
+    return {
+        "title": "Execution Hints",
+        "summary": summarize_execution_hints(execution_hints),
+        "facts": [item for item in facts if item["value"] not in (None, [], {})],
+        "items": items,
+        "notes": [
+            "Execution hints are advisory orchestration inputs passed into the next round.",
+        ],
+    }
+
+
 def build_stop_conditions_section(iteration_artifacts: object) -> dict[str, Any] | None:
     stop_conditions = getattr(iteration_artifacts, "stop_conditions", None)
     if stop_conditions is None:
@@ -558,9 +841,11 @@ def build_stop_conditions_section(iteration_artifacts: object) -> dict[str, Any]
     ]
     return {
         "title": "Stop Conditions",
+        "summary": summarize_stop_conditions(stop_conditions),
         "facts": facts,
         "items": items,
         "notes": stop_conditions.notes,
+        "triggered_conditions": list(getattr(stop_conditions, "triggered_conditions", [])),
     }
 
 
@@ -587,11 +872,31 @@ def build_next_round_decision_section(iteration_artifacts: object) -> dict[str, 
         }
         for cluster_id in getattr(next_round, "scheduled_cluster_ids", [])
     ]
+    items.extend(
+        {
+            "item_id": action_id,
+            "name": action_id,
+            "status": "scheduled",
+            "summary": "Retry action scheduled for the next round.",
+        }
+        for action_id in getattr(next_round, "scheduled_action_ids", [])
+    )
+    items.extend(
+        {
+            "item_id": cluster_id,
+            "name": cluster_id,
+            "status": "deferred",
+            "summary": "Failure cluster remained open but was not scheduled for this next round.",
+        }
+        for cluster_id in getattr(next_round, "deferred_cluster_ids", [])
+    )
     return {
         "title": "Next Round Decision",
+        "summary": summarize_next_round_decision(next_round),
         "facts": facts,
         "items": items,
         "notes": getattr(next_round, "notes", []),
+        "triggered_stop_conditions": list(getattr(next_round, "triggered_stop_conditions", [])),
     }
 
 
@@ -1740,9 +2045,11 @@ def write_structured_stage2_report(
     discovery_paths: dict[str, Path] | None = None,
     notes: list[str] | None = None,
     max_attempts: int | None = None,
+    round_input: dict[str, Any] | None = None,
 ) -> None:
     progress_snapshot = adapt_progress_snapshot(progress.snapshot)
     total_duration_ms = total_attempt_duration_ms(attempts)
+    resolved_round_input = round_input or {}
     report_payload = {
         "summary": {
             "run_id": artifacts.run_dir.name,
@@ -1752,6 +2059,7 @@ def write_structured_stage2_report(
             "started_at": progress.snapshot.started_at,
             "finished_at": progress.snapshot.updated_at,
             "duration_seconds": round(total_duration_ms / 1000, 3) if total_duration_ms else None,
+            "current_round": resolved_round_input.get("round_index") or progress_snapshot.current_round,
             "stop_reason": classification.get("reason"),
             "next_action": progress.snapshot.next_action,
             "counts": [
@@ -1762,6 +2070,8 @@ def write_structured_stage2_report(
                 {"label": "page_url", "value": page_url},
                 {"label": "model_name", "value": profile.name},
                 {"label": "classification_category", "value": classification.get("category")},
+                {"label": "orchestration_stream_id", "value": resolved_round_input.get("orchestration_stream_id")},
+                {"label": "orchestration_round", "value": resolved_round_input.get("round_index")},
             ],
         },
         "page_entries": build_report_page_entries(
@@ -1870,6 +2180,12 @@ def write_structured_stage2_report(
             format_status_line(progress.snapshot),
         ],
     }
+    if resolved_round_input:
+        report_payload["round_input"] = resolved_round_input
+        report_payload["summary"]["orchestration_stream_id"] = resolved_round_input.get("orchestration_stream_id")
+        report_payload["summary"]["orchestration_round"] = resolved_round_input.get("round_index")
+        report_payload["summary"]["previous_run_id"] = resolved_round_input.get("previous_run_id")
+        report_payload["summary"]["target_stage"] = resolved_round_input.get("target_stage")
     if discovery_paths:
         report_payload["project_assets"].append(
             {
@@ -1887,16 +2203,52 @@ def write_structured_stage2_report(
         status_snapshot=progress_snapshot,
         attempts=attempts,
         max_attempts=max_attempts,
+        round_input=resolved_round_input,
     )
-    report_payload["summary"]["current_round"] = progress_snapshot.current_round
-    report_payload["summary"]["next_round_status"] = iteration_artifacts.next_round_decision.status
-    report_payload["summary"]["next_round_should_start"] = (
-        iteration_artifacts.next_round_decision.should_start_next_round
+    round_input_record = iteration_artifacts.round_input
+    execution_hints = round_input_record.execution_hints if round_input_record else {}
+    stop_conditions = iteration_artifacts.stop_conditions
+    next_round_decision = iteration_artifacts.next_round_decision
+    report_payload["summary"]["verification_round"] = progress_snapshot.current_round
+    report_payload["summary"]["next_round_status"] = next_round_decision.status
+    report_payload["summary"]["next_round_should_start"] = next_round_decision.should_start_next_round
+    report_payload["summary"]["next_round_primary_reason"] = next_round_decision.primary_reason
+    report_payload["summary"]["next_round_target_stage"] = next_round_decision.target_stage
+    report_payload["summary"]["stop_status"] = stop_conditions.status if stop_conditions else None
+    report_payload["summary"]["stop_should_stop"] = (
+        stop_conditions.should_stop if stop_conditions else None
+    )
+    report_payload["summary"]["stop_primary_reason"] = (
+        stop_conditions.primary_reason if stop_conditions else None
+    )
+    report_payload["summary"]["triggered_stop_conditions"] = (
+        list(stop_conditions.triggered_conditions) if stop_conditions else []
     )
     report_payload["summary"]["failure_cluster_count"] = len(iteration_artifacts.failure_clusters)
     report_payload["summary"]["promotion_candidate_count"] = len(
         iteration_artifacts.promotion_candidates
     )
+    report_payload["summary"]["scheduled_cluster_count"] = len(
+        getattr(next_round_decision, "scheduled_cluster_ids", []) or []
+    )
+    report_payload["summary"]["scheduled_action_count"] = len(
+        getattr(next_round_decision, "scheduled_action_ids", []) or []
+    )
+    report_payload["summary"]["execution_hint_keys"] = sorted(execution_hints.keys())
+    report_payload["summary"]["execution_hint_modes"] = {
+        key: value
+        for key, value in execution_hints.items()
+        if key.endswith("_mode")
+        or key
+        in {
+            "requires_human_review",
+            "stop_after_current_round",
+            "skip_completed_discovery",
+            "preserve_generated_files",
+            "regenerate_runtime_data",
+            "capture_network_on_retry",
+        }
+    }
     report_payload["project_assets"].append(
         {
             "name": "Iteration Outputs",
@@ -1907,8 +2259,26 @@ def write_structured_stage2_report(
     report_payload["failure_clusters"] = build_report_failure_clusters(iteration_artifacts)
     report_payload["promotion_candidates"] = build_report_promotion_candidates(iteration_artifacts)
     report_payload["daily_summary"] = {
-        "summary": "本轮 run 已完成真实 discovery / verification / iteration 产物输出。",
+        "summary": "本轮 run 已完成真实 discovery / verification / iteration 产物输出，并给出 stop / next-round 解释。",
         "new_failure_fix_strategies": [
+            {
+                "name": action.title,
+                "status": action.priority,
+                "summary": action.strategy or action.reason or "retry strategy",
+                "owner": action.owner,
+                "source": action.stage,
+                "facts": [
+                    {"label": "cluster_id", "value": action.cluster_id},
+                    {"label": "expected_outcome", "value": action.expected_outcome},
+                ]
+                + [
+                    {"label": key, "value": value}
+                    for key, value in sorted((action.execution_hints or {}).items())
+                ],
+            }
+            for action in iteration_artifacts.retry_plan.actions[:5]
+        ]
+        or [
             {
                 "name": classification.get("category", "unknown"),
                 "status": "observed",
@@ -1917,10 +2287,43 @@ def write_structured_stage2_report(
         ],
         "watch_items": [
             {
-                "name": "iteration_follow_up",
-                "status": "pending",
-                "summary": "结合本轮 stop_conditions 和 iteration_comparison 决定下一轮动作。",
-            }
+                "name": "stop_conditions",
+                "status": stop_conditions.status if stop_conditions else "unknown",
+                "summary": summarize_stop_conditions(stop_conditions) if stop_conditions else None,
+                "facts": [
+                    {"label": "should_stop", "value": stop_conditions.should_stop},
+                    {
+                        "label": "triggered_conditions",
+                        "value": list(stop_conditions.triggered_conditions),
+                    },
+                ]
+                if stop_conditions
+                else [],
+            },
+            {
+                "name": "next_round_decision",
+                "status": next_round_decision.status,
+                "summary": summarize_next_round_decision(next_round_decision),
+                "facts": [
+                    {"label": "should_start_next_round", "value": next_round_decision.should_start_next_round},
+                    {"label": "next_round", "value": next_round_decision.next_round},
+                    {"label": "target_stage", "value": next_round_decision.target_stage},
+                ],
+            },
+            {
+                "name": "execution_hints",
+                "status": "ready" if execution_hints else "empty",
+                "summary": summarize_execution_hints(execution_hints) if execution_hints else "No execution hints were carried into this run.",
+                "facts": [
+                    {"label": "hint_keys", "value": sorted(execution_hints.keys())},
+                    {"label": "scheduled_strategies", "value": execution_hints.get("scheduled_strategies")},
+                ],
+            },
+        ],
+        "facts": [
+            {"label": "failure_cluster_count", "value": len(iteration_artifacts.failure_clusters)},
+            {"label": "retry_action_count", "value": len(iteration_artifacts.retry_plan.actions)},
+            {"label": "next_round_status", "value": next_round_decision.status},
         ],
     }
     report_payload["model_comparison_summary"] = {
@@ -1960,7 +2363,41 @@ def write_structured_stage2_report(
             "至少提供成功执行证据、失败归因对比和关键步骤截图。",
         ],
     }
-    extra_sections = build_retry_plan_section(iteration_artifacts)
+    progress_snapshot.extra.update(
+        {
+            "classification_category": classification.get("category"),
+            "failure_categories": [cluster.category for cluster in iteration_artifacts.failure_clusters if cluster.category],
+            "stop_conditions": stop_conditions.to_dict() if stop_conditions else {},
+            "next_round_decision": next_round_decision.to_dict() if next_round_decision else {},
+            "execution_hints": execution_hints,
+            "applied_execution_hints": execution_hints,
+            "round_input": round_input_record.to_dict() if round_input_record else {},
+            "retry_plan": (
+                iteration_artifacts.retry_plan.to_dict()
+                if iteration_artifacts.retry_plan
+                else {}
+            ),
+            "phase_label": progress.snapshot.current_phase_label,
+            "waiting_reason": progress.snapshot.waiting_reason,
+        }
+    )
+    progress_snapshot.notes.extend(
+        [
+            summarize_stop_conditions(stop_conditions),
+            summarize_next_round_decision(next_round_decision),
+        ]
+    )
+    if execution_hints:
+        progress_snapshot.notes.append(summarize_execution_hints(execution_hints))
+
+    extra_sections: list[dict[str, Any]] = []
+    round_input_section = build_round_input_section(iteration_artifacts)
+    execution_hints_section = build_execution_hints_section(iteration_artifacts)
+    if round_input_section:
+        extra_sections.append(round_input_section)
+    if execution_hints_section:
+        extra_sections.append(execution_hints_section)
+    extra_sections.extend(build_retry_plan_section(iteration_artifacts))
     comparison_section = build_iteration_comparison_section(iteration_artifacts)
     stop_section = build_stop_conditions_section(iteration_artifacts)
     next_round_section = build_next_round_decision_section(iteration_artifacts)
@@ -2092,8 +2529,16 @@ async def detect_submission_path(page: Page) -> dict[str, Any]:
     return {"path": path, "state": state}
 
 
-async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: int) -> Path:
+async def run_single_profile(
+    profile: ModelProfile,
+    cdp_url: str,
+    max_attempts: int,
+    *,
+    round_input: dict[str, Any] | None = None,
+) -> Path:
     artifacts = ArtifactWriter(ARTIFACT_ROOT, profile.name)
+    resolved_round_input = round_input or {}
+    execution_hints = resolved_round_input.get("execution_hints") or {}
     runtime_data = TemplateDataFactory(artifacts.run_dir.name).build(
         baseline=SUCCESS_BASELINE,
         schema=TEMPLATE_BUNDLE.data_schema,
@@ -2108,9 +2553,25 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
     progress.start_phase(
         "preflight",
         phase_label="预检",
-        message="初始化线上备案申请模板样本运行",
+        round_kind="orchestration",
+        round_index=resolved_round_input.get("round_index"),
+        round_label=(
+            f"编排第 {resolved_round_input.get('round_index')} 轮"
+            if resolved_round_input.get("round_index")
+            else None
+        ),
+        message=(
+            "初始化线上备案申请模板样本运行"
+            if not resolved_round_input
+            else "初始化带调度输入的线上备案申请模板样本运行"
+        ),
         next_action="写入运行时快照并准备生成附件",
-        stats={"template_steps": len(TEMPLATE_BUNDLE.template.get("steps", []))},
+        stats={
+            "template_steps": len(TEMPLATE_BUNDLE.template.get("steps", [])),
+            "scheduled_cluster_count": len(resolved_round_input.get("scheduled_cluster_ids") or []),
+            "scheduled_action_count": len(resolved_round_input.get("scheduled_action_ids") or []),
+        },
+        details={"round_input": resolved_round_input} if resolved_round_input else None,
     )
     artifacts.write_json(
         "run_meta.json",
@@ -2124,8 +2585,11 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
             "cdp_url": cdp_url,
             "started_at": datetime.now().isoformat(),
             "max_attempts": max_attempts,
+            "orchestration": resolved_round_input,
         },
     )
+    if resolved_round_input:
+        artifacts.write_json("round_input.json", resolved_round_input)
     artifacts.write_json("template_snapshot.json", TEMPLATE_BUNDLE.template)
     artifacts.write_json("baseline_snapshot.json", SUCCESS_BASELINE)
     artifacts.write_json("runtime_data.json", runtime_data)
@@ -2143,13 +2607,29 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
         "preflight",
         phase_label="预检",
         message="运行时数据和生成附件已准备完成",
-        next_action="进入发现阶段并连接浏览器执行受控遍历",
+        next_action=(
+            "进入发现阶段并连接浏览器执行受控遍历"
+            if not execution_hints.get("skip_completed_discovery")
+            else "保留 discovery 结构并优先进入受控验证"
+        ),
     )
     progress.start_phase(
         "discovery",
         phase_label="发现",
-        message="先生成模板播种结果，并尝试升级到真实页面受控遍历",
+        round_kind="orchestration",
+        round_index=resolved_round_input.get("round_index"),
+        round_label=(
+            f"编排第 {resolved_round_input.get('round_index')} 轮"
+            if resolved_round_input.get("round_index")
+            else None
+        ),
+        message=(
+            "先生成模板播种结果，并尝试升级到真实页面受控遍历"
+            if not execution_hints.get("skip_completed_discovery")
+            else "本轮沿用已有 discovery 结论，并在必要时刷新真实页面上下文"
+        ),
         next_action="连接浏览器并 enrich discovery 结果",
+        details={"execution_hints": execution_hints} if execution_hints else None,
     )
     discovery_result, discovery_paths = build_discovery_seed(artifacts)
 
@@ -2196,8 +2676,13 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                 round_kind="verification",
                 round_index=1,
                 round_label="验证第 1 轮",
-                message="连接可见浏览器并准备执行模板样本",
+                message=(
+                    "连接可见浏览器并准备执行模板样本"
+                    if not resolved_round_input
+                    else "连接可见浏览器并准备执行带调度输入的模板样本"
+                ),
                 next_action="执行线上备案申请主路径",
+                details={"round_input": resolved_round_input} if resolved_round_input else None,
             )
 
             artifacts.write_json(
@@ -2261,9 +2746,13 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                 try:
                     actions.append({"step": "reset_online_apply_page", "result": await reset_online_apply_page(page)})
                     actions.append({"step": "close_visible_panel", "result": await close_visible_panel(page)})
+                    if execution_hints.get("validation_retry_mode") == "inspect_visible_errors":
+                        actions.append({"step": "dismiss_overlays", "result": await dismiss_overlays(page)})
                     await page.wait_for_load_state("domcontentloaded")
                     path_info = await detect_submission_path(page)
                     actions.append({"step": "detect_submission_path", "result": path_info})
+                    if execution_hints:
+                        actions.append({"step": "execution_hints", "result": execution_hints})
 
                     if path_info["path"] == "new_application":
                         progress.start_step(
@@ -2297,6 +2786,13 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                         execution_summary = summarize_attempt_execution(flow_actions)
                     else:
                         step_executions = []
+                        if execution_hints.get("workflow_retry_mode") == "resume_detected_branch":
+                            actions.append(
+                                {
+                                    "step": "workflow_retry_mode",
+                                    "result": {"mode": execution_hints.get("workflow_retry_mode"), "path": path_info["path"]},
+                                }
+                            )
                         actions.append({"step": "click_first_continue_action", "result": await click_first_continue_action(page)})
                         await page.wait_for_timeout(1500)
                         after_click_state = await get_apply_state(page)
@@ -2342,6 +2838,13 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                                     "result": await ensure_checkbox(page, "本人承诺"),
                                 }
                             )
+                        elif execution_hints.get("validation_retry_mode") == "inspect_visible_errors":
+                            actions.append(
+                                {
+                                    "step": "ensure_checkbox_after_validation_hint",
+                                    "result": await ensure_checkbox(page, "本人承诺"),
+                                }
+                            )
                         elif not after_click_state.get("ok"):
                             actions.append(
                                 {
@@ -2366,6 +2869,14 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                         full_page=True,
                     )
                     if path_info["path"] != "new_application":
+                        if execution_hints.get("ui_retry_mode") == "refresh_locator_and_rerun":
+                            await page.wait_for_timeout(800)
+                            actions.append(
+                                {
+                                    "step": "ui_retry_wait",
+                                    "result": {"applied": True, "mode": execution_hints.get("ui_retry_mode")},
+                                }
+                            )
                         submit_result = await submit_dialog(page)
                         execution_summary = summarize_attempt_execution(actions)
                     final_submit = submit_result
@@ -2453,6 +2964,7 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                         discovery_paths=discovery_paths,
                         notes=["真实执行样本已成功完成最终备案提交。"],
                         max_attempts=max_attempts,
+                        round_input=resolved_round_input,
                     )
                     return artifacts.run_dir
 
@@ -2507,6 +3019,7 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                         discovery_paths=discovery_paths,
                         notes=["真实执行样本命中了已识别的阻塞类型。"],
                         max_attempts=max_attempts,
+                        round_input=resolved_round_input,
                     )
                     return artifacts.run_dir
 
@@ -2549,6 +3062,7 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                         discovery_paths=discovery_paths,
                         notes=["真实执行样本未继续收敛，已提前结束当前 run。"],
                         max_attempts=max_attempts,
+                        round_input=resolved_round_input,
                     )
                     return artifacts.run_dir
 
@@ -2586,6 +3100,7 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                 discovery_paths=discovery_paths,
                 notes=["真实执行样本耗尽最大尝试次数。"],
                 max_attempts=max_attempts,
+                round_input=resolved_round_input,
             )
             return artifacts.run_dir
         except Exception as exc:
@@ -2634,6 +3149,7 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                 discovery_paths=discovery_paths,
                 notes=["验证阶段在连接浏览器或接管已登录会话之前失败。"],
                 max_attempts=max_attempts,
+                round_input=resolved_round_input,
             )
             return artifacts.run_dir
         finally:
@@ -2650,20 +3166,36 @@ async def run_profile_with_iterations(
 ) -> dict[str, Any]:
     rounds: list[dict[str, Any]] = []
     latest_run_dir: Path | None = None
+    previous_decision: dict[str, Any] | None = None
 
     for round_index in range(1, max_rounds + 1):
-        run_dir = await run_single_profile(profile, cdp_url, max_attempts)
+        round_input = build_round_input(
+            profile,
+            round_index=round_index,
+            max_rounds=max_rounds,
+            previous_run_dir=latest_run_dir,
+            previous_decision=previous_decision,
+        )
+        run_dir = await run_single_profile(
+            profile,
+            cdp_url,
+            max_attempts,
+            round_input=round_input,
+        )
         latest_run_dir = run_dir
         status_payload = _read_json_file(run_dir / "current_status.json")
         next_round_decision = load_next_round_decision(run_dir)
+        persisted_round_input = read_round_input(run_dir) or round_input
         round_payload = {
             "round": round_index,
             "run_dir": str(run_dir),
             "status": status_payload.get("overall_status"),
             "elapsed_ms": status_payload.get("elapsed_ms"),
+            "round_input": persisted_round_input,
             "next_round_decision": next_round_decision,
         }
         rounds.append(round_payload)
+        previous_decision = next_round_decision
         if not should_auto_continue_next_round(next_round_decision):
             break
 

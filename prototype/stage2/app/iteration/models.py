@@ -19,6 +19,7 @@ class IterationBuildInput:
     attempts: list[Any] = field(default_factory=list)
     previous_iteration: Any = None
     max_attempts: int | None = None
+    round_input: Any = None
 
 
 @dataclass(slots=True)
@@ -51,6 +52,31 @@ class RetryAction:
     strategy: str | None = None
     reason: str | None = None
     expected_outcome: str | None = None
+    execution_hints: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _compact_dict(asdict(self))
+
+
+@dataclass(slots=True)
+class RoundExecutionInputRecord:
+    orchestration_stream_id: str | None = None
+    template_name: str | None = None
+    model_name: str | None = None
+    project_name: str | None = None
+    round_index: int | None = None
+    max_rounds: int | None = None
+    previous_run_id: str | None = None
+    previous_run_dir: str | None = None
+    retry_run_dir: str | None = None
+    target_stage: str | None = None
+    goal: str | None = None
+    source_decision_status: str | None = None
+    source_decision_reason: str | None = None
+    scheduled_cluster_ids: list[str] = field(default_factory=list)
+    scheduled_action_ids: list[str] = field(default_factory=list)
+    execution_hints: dict[str, Any] = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return _compact_dict(asdict(self))
@@ -219,6 +245,7 @@ class IterationSummary:
 @dataclass(slots=True)
 class IterationArtifacts:
     summary: IterationSummary
+    round_input: RoundExecutionInputRecord | None = None
     failure_clusters: list[FailureClusterRecord] = field(default_factory=list)
     retry_plan: RetryPlanRecord | None = None
     promotion_candidates: list[PromotionCandidateRecord] = field(default_factory=list)
@@ -229,6 +256,7 @@ class IterationArtifacts:
     def to_dict(self) -> dict[str, Any]:
         return {
             "summary": self.summary.to_dict(),
+            "round_input": self.round_input.to_dict() if self.round_input else None,
             "failure_clusters": [cluster.to_dict() for cluster in self.failure_clusters],
             "retry_plan": self.retry_plan.to_dict() if self.retry_plan else None,
             "promotion_candidates": [

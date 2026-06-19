@@ -48,6 +48,7 @@ def render_progress_markdown(
             lines.append(f"  - {note}")
     lines.append("")
 
+    lines.extend(_render_decision_section(normalized))
     lines.extend(_render_counter_section(normalized.counters))
     lines.extend(_render_event_section(events))
     return "\n".join(lines).rstrip() + "\n"
@@ -108,6 +109,11 @@ def render_progress_text(
             lines.extend(_wrap(f"- {note}", inner_width))
 
     lines.append("")
+    lines.append("Decision View")
+    lines.append("-" * inner_width)
+    lines.extend(_render_decision_text(normalized, inner_width))
+
+    lines.append("")
     lines.append("Progress Counters")
     lines.append("-" * inner_width)
     if normalized.counters:
@@ -140,6 +146,83 @@ def _render_counter_section(counters: list[ProgressCounter]) -> list[str]:
     return lines
 
 
+def _render_decision_section(snapshot: ProgressSnapshot) -> list[str]:
+    lines = ["## Decision View", ""]
+    phase_label = _textish(snapshot.extra.get("phase_label"))
+    phase_summary = _phase_summary(snapshot)
+    if phase_label:
+        lines.append(f"- Platform Phase Label: {phase_label}")
+    if phase_summary:
+        lines.append(f"- Platform Phase Summary: {phase_summary}")
+
+    decision_reason = _decision_reason(snapshot)
+    if decision_reason:
+        lines.append(f"- Why This State: {decision_reason}")
+
+    blocked_or_waiting = snapshot.blocked_reason or _textish(snapshot.extra.get("waiting_reason"))
+    if blocked_or_waiting:
+        lines.append(f"- Blocked Or Waiting Reason: {blocked_or_waiting}")
+
+    if snapshot.next_action:
+        lines.append(f"- Next Action: {snapshot.next_action}")
+
+    classification_category = (
+        _textish(snapshot.extra.get("classification_category"))
+        or _textish(snapshot.extra.get("failure_category"))
+        or _textish(snapshot.extra.get("failure_type"))
+    )
+    if classification_category:
+        lines.append(f"- Structured Failure Category: `{classification_category}`")
+
+    failure_categories = _collect_failure_categories(snapshot.extra)
+    if failure_categories:
+        lines.append(f"- Structured Failure Categories: {', '.join(failure_categories)}")
+
+    stop_payload = _mappingish(snapshot.extra.get("stop_conditions"))
+    next_round_payload = _mappingish(snapshot.extra.get("next_round_decision"))
+    execution_hints = _mappingish(
+        snapshot.extra.get("applied_execution_hints") or snapshot.extra.get("execution_hints")
+    )
+
+    if stop_payload:
+        lines.append(f"- Stop Decision Status: {_format_inline(stop_payload.get('status'))}")
+        if "should_stop" in stop_payload:
+            lines.append(f"- Should Stop: {_format_inline(stop_payload.get('should_stop'))}")
+        primary_reason = _textish(stop_payload.get("primary_reason"))
+        if primary_reason:
+            lines.append(f"- Stop Condition Result: {primary_reason}")
+        triggered = _string_listish(stop_payload.get("triggered_conditions"))
+        if triggered:
+            lines.append(f"- Triggered Stop Conditions: {', '.join(triggered)}")
+
+    if next_round_payload:
+        lines.append(f"- Next-Round Status: {_format_inline(next_round_payload.get('status'))}")
+        if "should_start_next_round" in next_round_payload:
+            lines.append(
+                f"- Should Start Next Round: {_format_inline(next_round_payload.get('should_start_next_round'))}"
+            )
+        if next_round_payload.get("next_round") is not None:
+            lines.append(f"- Planned Next Round: {_format_inline(next_round_payload.get('next_round'))}")
+        if next_round_payload.get("target_stage"):
+            lines.append(f"- Planned Target Stage: `{next_round_payload.get('target_stage')}`")
+        primary_reason = _textish(next_round_payload.get("primary_reason"))
+        if primary_reason:
+            lines.append(f"- Next-Round Rationale: {primary_reason}")
+        scheduled_ids = _string_listish(next_round_payload.get("scheduled_action_ids"))
+        if scheduled_ids:
+            lines.append(f"- Scheduled Action IDs: {', '.join(scheduled_ids)}")
+
+    if execution_hints:
+        lines.append("- Applied Execution Hints:")
+        for key, value in sorted(execution_hints.items()):
+            lines.append(f"  - {key}: {_format_inline(value)}")
+
+    if len(lines) == 2:
+        lines.append("- No structured decision details recorded.")
+    lines.append("")
+    return lines
+
+
 def _render_event_section(events: list[ProgressEvent]) -> list[str]:
     lines = ["## Recent Events", ""]
     if not events:
@@ -159,9 +242,29 @@ def _render_event_section(events: list[ProgressEvent]) -> list[str]:
             lines.append(f"  - rounds: {round_text}")
         if event.next_action:
             lines.append(f"  - next: {event.next_action}")
+        event_failure_categories = _collect_failure_categories(event.extra)
+        if event_failure_categories:
+            lines.append(f"  - failure categories: {', '.join(event_failure_categories)}")
+        event_hints = _mappingish(
+            event.extra.get("applied_execution_hints") or event.extra.get("execution_hints")
+        )
+        if event_hints:
+            lines.append(f"  - execution hints: {_format_hint_summary(event_hints)}")
         for fact in event.facts:
             lines.append(f"  - {fact.label}: {_format_inline(fact.value)}")
         for key, value in sorted(event.extra.items()):
+            if key in {
+                "stop_conditions",
+                "next_round_decision",
+                "execution_hints",
+                "applied_execution_hints",
+                "failure_clusters",
+                "failure_categories",
+                "classification_category",
+                "failure_category",
+                "failure_type",
+            }:
+                continue
             lines.append(f"  - {key}: {_format_inline(value)}")
     lines.append("")
     return lines
@@ -186,6 +289,86 @@ def _render_event_text(event: ProgressEvent, width: int) -> list[str]:
         lines.extend(_wrap(f"  {event.message}", width))
     if event.next_action:
         lines.extend(_wrap(f"  next: {event.next_action}", width))
+    event_failure_categories = _collect_failure_categories(event.extra)
+    if event_failure_categories:
+        lines.extend(_wrap(f"  failure categories: {', '.join(event_failure_categories)}", width))
+    event_hints = _mappingish(
+        event.extra.get("applied_execution_hints") or event.extra.get("execution_hints")
+    )
+    if event_hints:
+        lines.extend(_wrap(f"  execution hints: {_format_hint_summary(event_hints)}", width))
+    return lines
+
+
+def _render_decision_text(snapshot: ProgressSnapshot, width: int) -> list[str]:
+    lines: list[str] = []
+    phase_label = _textish(snapshot.extra.get("phase_label"))
+    phase_summary = _phase_summary(snapshot)
+    if phase_label:
+        lines.extend(_wrap(f"Phase label: {phase_label}", width))
+    if phase_summary:
+        lines.extend(_wrap(f"Phase summary: {phase_summary}", width))
+
+    decision_reason = _decision_reason(snapshot)
+    if decision_reason:
+        lines.extend(_wrap(f"Why this state: {decision_reason}", width))
+
+    blocked_or_waiting = snapshot.blocked_reason or _textish(snapshot.extra.get("waiting_reason"))
+    if blocked_or_waiting:
+        lines.extend(_wrap(f"Blocked/waiting: {blocked_or_waiting}", width))
+
+    if snapshot.next_action:
+        lines.extend(_wrap(f"Next action: {snapshot.next_action}", width))
+
+    classification_category = (
+        _textish(snapshot.extra.get("classification_category"))
+        or _textish(snapshot.extra.get("failure_category"))
+        or _textish(snapshot.extra.get("failure_type"))
+    )
+    if classification_category:
+        lines.extend(_wrap(f"Structured failure category: {classification_category}", width))
+
+    failure_categories = _collect_failure_categories(snapshot.extra)
+    if failure_categories:
+        lines.extend(_wrap(f"Failure categories: {', '.join(failure_categories)}", width))
+
+    stop_payload = _mappingish(snapshot.extra.get("stop_conditions"))
+    if stop_payload:
+        lines.extend(_wrap(f"Stop decision: status={_format_inline(stop_payload.get('status'))}", width))
+        if "should_stop" in stop_payload:
+            lines.extend(_wrap(f"  should stop: {_format_inline(stop_payload.get('should_stop'))}", width))
+        primary_reason = _textish(stop_payload.get("primary_reason"))
+        if primary_reason:
+            lines.extend(_wrap(f"  reason: {primary_reason}", width))
+
+    next_round_payload = _mappingish(snapshot.extra.get("next_round_decision"))
+    if next_round_payload:
+        lines.extend(
+            _wrap(f"Next-round decision: status={_format_inline(next_round_payload.get('status'))}", width)
+        )
+        if "should_start_next_round" in next_round_payload:
+            lines.extend(
+                _wrap(
+                    f"  should start next round: {_format_inline(next_round_payload.get('should_start_next_round'))}",
+                    width,
+                )
+            )
+        if next_round_payload.get("next_round") is not None:
+            lines.extend(
+                _wrap(f"  planned next round: {_format_inline(next_round_payload.get('next_round'))}", width)
+            )
+        primary_reason = _textish(next_round_payload.get("primary_reason"))
+        if primary_reason:
+            lines.extend(_wrap(f"  rationale: {primary_reason}", width))
+
+    execution_hints = _mappingish(
+        snapshot.extra.get("applied_execution_hints") or snapshot.extra.get("execution_hints")
+    )
+    if execution_hints:
+        lines.extend(_wrap(f"Applied execution hints: {_format_hint_summary(execution_hints)}", width))
+
+    if not lines:
+        lines.append("No structured decision details recorded.")
     return lines
 
 
@@ -276,3 +459,98 @@ def _format_duration(seconds: int | float | None) -> str | None:
 
 def _wrap(text: str, width: int) -> list[str]:
     return textwrap.wrap(text, width=width) or [text]
+
+
+def _mappingish(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
+def _textish(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _string_listish(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, (list, tuple, set)):
+        values: list[str] = []
+        for item in value:
+            text = _textish(item)
+            if text:
+                values.append(text)
+        return values
+    text = _textish(value)
+    return [text] if text else []
+
+
+def _collect_failure_categories(extra: dict[str, Any]) -> list[str]:
+    categories: set[str] = set()
+    direct_keys = ("classification_category", "failure_category", "failure_type")
+    for key in direct_keys:
+        text = _textish(extra.get(key))
+        if text:
+            categories.add(text)
+
+    for item in _string_listish(extra.get("failure_categories")):
+        categories.add(item)
+
+    clusters = extra.get("failure_clusters")
+    if isinstance(clusters, list):
+        for cluster in clusters:
+            if isinstance(cluster, dict):
+                text = _textish(cluster.get("category") or cluster.get("failure_category"))
+                if text:
+                    categories.add(text)
+
+    if len(categories) > 1:
+        direct_category = _textish(extra.get("classification_category"))
+        if direct_category and direct_category.startswith("unknown_") and "unknown" in categories:
+            categories.discard("unknown")
+
+    return sorted(categories)
+
+
+def _phase_summary(snapshot: ProgressSnapshot) -> str | None:
+    stage = _textish(snapshot.stage)
+    status = _textish(snapshot.status)
+    if not stage and not status:
+        return None
+    target = " / ".join(part for part in [snapshot.target_type, snapshot.target_name] if part)
+    parts = []
+    if status:
+        parts.append(status)
+    if stage:
+        parts.append(stage)
+    if snapshot.step:
+        parts.append(snapshot.step)
+    if target:
+        parts.append(target)
+    return " -> ".join(parts)
+
+
+def _decision_reason(snapshot: ProgressSnapshot) -> str | None:
+    extra = snapshot.extra
+    next_round_payload = _mappingish(extra.get("next_round_decision"))
+    stop_payload = _mappingish(extra.get("stop_conditions"))
+    for value in (
+        next_round_payload.get("primary_reason"),
+        stop_payload.get("primary_reason"),
+        snapshot.blocked_reason,
+        snapshot.next_action,
+    ):
+        text = _textish(value)
+        if text:
+            return text
+    return None
+
+
+def _format_hint_summary(hints: dict[str, Any]) -> str:
+    return "; ".join(f"{key}={_format_inline(value)}" for key, value in sorted(hints.items()))

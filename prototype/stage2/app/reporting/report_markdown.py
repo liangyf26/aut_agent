@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from .models import (
@@ -24,9 +25,11 @@ from .models import (
 def render_run_report_markdown(report: RunReport | dict[str, Any]) -> str:
     normalized = coerce_run_report(report)
     normalized = _with_derived_sections(normalized)
+    iteration_artifacts = _load_iteration_artifact_payloads(normalized)
     lines = [f"# Run Report: {normalized.summary.run_id}", ""]
 
     lines.extend(_render_summary(normalized.summary))
+    lines.extend(_render_iteration_decision_summary(normalized, iteration_artifacts))
     lines.extend(_render_item_section("Page Entries", normalized.page_entries, "No page entries recorded."))
     lines.extend(_render_item_section("Feature Points", normalized.feature_points, "No feature points recorded."))
     lines.extend(_render_item_section("Success Items", normalized.success_items, "No successful items recorded."))
@@ -55,7 +58,7 @@ def render_run_report_markdown(report: RunReport | dict[str, Any]) -> str:
     lines.extend(_render_section_block(normalized.model_comparison_summary, default_title="Model Comparison Summary"))
     lines.extend(_render_skill_inventory_summary(normalized.skill_inventory_summary))
     lines.extend(_render_promotion_candidate_summary(normalized.promotion_candidate_summary))
-    lines.extend(_render_extra_sections(normalized.extra_sections))
+    lines.extend(_render_extra_sections(normalized.extra_sections, iteration_artifacts))
 
     if normalized.notes:
         lines.append("## Notes")
@@ -174,6 +177,10 @@ def _render_summary(summary: RunSummary) -> list[str]:
         ("Attribution Round", summary.attribution_round),
         ("Stop Reason", summary.stop_reason),
         ("Next Action", summary.next_action),
+        ("Next Round Status", summary.extra.get("next_round_status")),
+        ("Next Round Should Start", summary.extra.get("next_round_should_start")),
+        ("Failure Cluster Count", summary.extra.get("failure_cluster_count")),
+        ("Promotion Candidate Count", summary.extra.get("promotion_candidate_count")),
     ]
     for label, value in summary_pairs:
         if value is None:
@@ -632,12 +639,21 @@ def _render_section_block(section: SectionBlock | None, default_title: str | Non
             markdown=section.markdown,
             extra=section.extra,
         )
-    return _render_extra_sections([section])
+    return _render_extra_sections([section], {})
 
 
-def _render_extra_sections(sections: list[SectionBlock]) -> list[str]:
+def _render_extra_sections(
+    sections: list[SectionBlock],
+    iteration_artifacts: dict[str, dict[str, Any]] | None = None,
+) -> list[str]:
     lines: list[str] = []
+    payloads = iteration_artifacts or {}
     for section in sections:
+        specialized = _render_special_section(section, payloads)
+        if specialized is not None:
+            lines.extend(specialized)
+            continue
+
         lines.append(f"## {section.title}")
         lines.append("")
         if section.summary:
@@ -673,6 +689,419 @@ def _render_nested_item_group(title: str, items: list[ReportItem], empty_message
         for line in rendered[1:]:
             lines.append(f"  {line}")
     return lines
+
+
+def _render_iteration_decision_summary(
+    report: RunReport,
+    iteration_artifacts: dict[str, dict[str, Any]],
+) -> list[str]:
+    stop_payload = iteration_artifacts.get("stop_conditions", {})
+    next_round_payload = iteration_artifacts.get("next_round_decision", {})
+    retry_payload = iteration_artifacts.get("retry_plan", {})
+    round_input_payload = iteration_artifacts.get("round_input", {})
+    failure_categories = sorted({cluster.category for cluster in report.failure_clusters if cluster.category})
+    scheduled_actions = retry_payload.get("actions") if isinstance(retry_payload.get("actions"), list) else []
+
+    if not any(
+        (
+            stop_payload,
+            next_round_payload,
+            retry_payload,
+            round_input_payload,
+            failure_categories,
+            scheduled_actions,
+        )
+    ):
+        return []
+
+    lines = ["## Iteration Decision Summary", ""]
+    if failure_categories:
+        lines.append(f"- Structured Failure Categories: {', '.join(failure_categories)}")
+    classification_category = _summary_fact_value(report.summary, "classification_category")
+    if classification_category:
+        lines.append(f"- Final Classification Category: `{classification_category}`")
+
+    stop_status = stop_payload.get("status") or report.summary.extra.get("stop_status")
+    if stop_status is not None:
+        lines.append(f"- Stop Decision Status: {_format_inline(stop_status)}")
+    if "should_stop" in stop_payload:
+        lines.append(f"- Should Stop: {_format_inline(stop_payload.get('should_stop'))}")
+    stop_primary_reason = _textish(stop_payload.get("primary_reason"))
+    if stop_primary_reason:
+        lines.append(f"- Stop Condition Result: {stop_primary_reason}")
+    elif report.summary.stop_reason:
+        lines.append(f"- Run Stop Reason: {report.summary.stop_reason}")
+    triggered_stop_conditions = _string_listish(
+        stop_payload.get("triggered_conditions") or next_round_payload.get("triggered_stop_conditions")
+    )
+    if triggered_stop_conditions:
+        lines.append(f"- Triggered Stop Conditions: {', '.join(triggered_stop_conditions)}")
+
+    next_round_status = next_round_payload.get("status") or report.summary.extra.get("next_round_status")
+    if next_round_status is not None:
+        lines.append(f"- Next-Round Status: {_format_inline(next_round_status)}")
+    if "should_start_next_round" in next_round_payload:
+        lines.append(
+            f"- Should Start Next Round: {_format_inline(next_round_payload.get('should_start_next_round'))}"
+        )
+    if next_round_payload.get("next_round") is not None:
+        lines.append(f"- Planned Next Round: {_format_inline(next_round_payload.get('next_round'))}")
+    if next_round_payload.get("target_stage"):
+        lines.append(f"- Planned Target Stage: `{next_round_payload.get('target_stage')}`")
+    if next_round_payload.get("primary_reason"):
+        lines.append(f"- Next-Round Rationale: {next_round_payload.get('primary_reason')}")
+
+    if retry_payload.get("status") is not None:
+        lines.append(f"- Retry Plan Status: {_format_inline(retry_payload.get('status'))}")
+    if retry_payload.get("goal"):
+        lines.append(f"- Retry Goal: {retry_payload.get('goal')}")
+    if scheduled_actions:
+        lines.append(f"- Scheduled Actions: {len(scheduled_actions)}")
+        for action in scheduled_actions:
+            title = _textish(action.get("title")) or _textish(action.get("action_id")) or "scheduled action"
+            cluster_id = _textish(action.get("cluster_id"))
+            stage = _textish(action.get("stage"))
+            priority = _textish(action.get("priority"))
+            owner = _textish(action.get("owner"))
+            headline_bits = [title]
+            suffix_bits = []
+            if cluster_id:
+                suffix_bits.append(cluster_id)
+            if stage:
+                suffix_bits.append(stage)
+            if priority:
+                suffix_bits.append(f"priority={priority}")
+            if owner:
+                suffix_bits.append(f"owner={owner}")
+            if suffix_bits:
+                headline_bits.append(f"({', '.join(suffix_bits)})")
+            lines.append(f"  - {' '.join(headline_bits)}")
+            reason = _textish(action.get("reason"))
+            if reason:
+                lines.append(f"    - why: {reason}")
+            expected_outcome = _textish(action.get("expected_outcome"))
+            if expected_outcome:
+                lines.append(f"    - expected: {expected_outcome}")
+            execution_hints = _mappingish(action.get("execution_hints"))
+            if execution_hints:
+                lines.append(f"    - execution hints: {_format_hint_summary(execution_hints)}")
+    elif retry_payload:
+        lines.append("- Scheduled Actions: none")
+
+    applied_hints = _mappingish(round_input_payload.get("execution_hints"))
+    if applied_hints:
+        lines.append("- Applied Execution Hints:")
+        for key, value in sorted(applied_hints.items()):
+            lines.append(f"  - {key}: {_format_inline(value)}")
+
+    lines.append("")
+    return lines
+
+
+def _render_special_section(
+    section: SectionBlock,
+    iteration_artifacts: dict[str, dict[str, Any]],
+) -> list[str] | None:
+    title = section.title.strip().lower()
+    if title == "retry plan":
+        return _render_retry_plan_section(section, iteration_artifacts.get("retry_plan", {}))
+    if title == "stop conditions":
+        return _render_stop_conditions_section(section, iteration_artifacts.get("stop_conditions", {}))
+    if title == "next round decision":
+        return _render_next_round_section(
+            section,
+            iteration_artifacts.get("next_round_decision", {}),
+            iteration_artifacts.get("retry_plan", {}),
+            iteration_artifacts.get("round_input", {}),
+        )
+    return None
+
+
+def _render_retry_plan_section(section: SectionBlock, payload: dict[str, Any]) -> list[str]:
+    lines = ["## Retry Plan", ""]
+    if section.summary:
+        lines.append(section.summary)
+        lines.append("")
+
+    facts = _facts_to_mapping(section.facts)
+    status = _textish(payload.get("status")) or _textish(facts.get("status"))
+    goal = _textish(payload.get("goal")) or _textish(facts.get("goal"))
+    stop_reason = _textish(payload.get("stop_reason")) or _textish(facts.get("stop_reason"))
+    next_round = payload.get("next_round", facts.get("next_round"))
+
+    if status:
+        lines.append(f"- Status: `{status}`")
+    if goal:
+        lines.append(f"- Goal: {goal}")
+    if stop_reason:
+        lines.append(f"- Originating Stop Reason: {stop_reason}")
+    if next_round is not None:
+        lines.append(f"- Intended Next Round: {_format_inline(next_round)}")
+
+    actions = payload.get("actions") if isinstance(payload.get("actions"), list) else None
+    if actions is None:
+        actions = [_report_item_to_retry_action(item) for item in section.items]
+    if not actions:
+        lines.append("- Scheduled Actions: none")
+    else:
+        lines.append(f"- Scheduled Actions: {len(actions)}")
+        for action in actions:
+            title = _textish(action.get("title")) or _textish(action.get("name")) or "retry action"
+            action_id = _textish(action.get("action_id")) or _textish(action.get("item_id"))
+            cluster_id = _textish(action.get("cluster_id"))
+            priority = _textish(action.get("priority") or action.get("status"))
+            stage = _textish(action.get("stage") or action.get("source"))
+            owner = _textish(action.get("owner"))
+            header_bits = [title]
+            detail_bits = [bit for bit in [action_id, cluster_id, stage, priority, owner] if bit]
+            if detail_bits:
+                header_bits.append(f"({', '.join(detail_bits)})")
+            lines.append(f"  - {' '.join(header_bits)}")
+            reason = _textish(action.get("reason") or action.get("summary"))
+            if reason:
+                lines.append(f"    - why: {reason}")
+            strategy = _textish(action.get("strategy"))
+            if strategy:
+                lines.append(f"    - strategy: `{strategy}`")
+            expected_outcome = _textish(action.get("expected_outcome"))
+            if expected_outcome:
+                lines.append(f"    - expected: {expected_outcome}")
+            execution_hints = _mappingish(action.get("execution_hints"))
+            if execution_hints:
+                lines.append(f"    - execution hints: {_format_hint_summary(execution_hints)}")
+
+    if section.notes:
+        lines.append("- Notes:")
+        for note in section.notes:
+            lines.append(f"  - {note}")
+    lines.append("")
+    return lines
+
+
+def _render_stop_conditions_section(section: SectionBlock, payload: dict[str, Any]) -> list[str]:
+    lines = ["## Stop Conditions", ""]
+    if section.summary:
+        lines.append(section.summary)
+        lines.append("")
+
+    facts = _facts_to_mapping(section.facts)
+    status = _textish(payload.get("status")) or _textish(facts.get("status"))
+    should_stop = payload.get("should_stop", facts.get("should_stop"))
+    primary_reason = _textish(payload.get("primary_reason")) or _textish(facts.get("primary_reason"))
+    no_improvement_streak = payload.get("no_improvement_streak", facts.get("no_improvement_streak"))
+    triggered = _string_listish(payload.get("triggered_conditions"))
+
+    if status:
+        lines.append(f"- Decision Status: `{status}`")
+    if should_stop is not None:
+        lines.append(f"- Should Stop: {_format_inline(should_stop)}")
+    if primary_reason:
+        lines.append(f"- Primary Reason: {primary_reason}")
+    if triggered:
+        lines.append(f"- Triggered Conditions: {', '.join(triggered)}")
+    if no_improvement_streak is not None:
+        lines.append(f"- No-Improvement Streak: {_format_inline(no_improvement_streak)}")
+
+    conditions = payload.get("conditions") if isinstance(payload.get("conditions"), list) else None
+    if conditions is None:
+        conditions = [_report_item_to_stop_condition(item) for item in section.items]
+    if conditions:
+        lines.append("- Condition Breakdown:")
+        for condition in conditions:
+            condition_type = _textish(condition.get("condition_type") or condition.get("name")) or "condition"
+            condition_status = _textish(condition.get("status"))
+            lines.append(f"  - {condition_type}: `{condition_status or 'unknown'}`")
+            summary = _textish(condition.get("summary"))
+            if summary:
+                lines.append(f"    - explanation: {summary}")
+            if "stop" in condition:
+                lines.append(f"    - stop signal: {_format_inline(condition.get('stop'))}")
+            evidence = condition.get("evidence")
+            evidence_count = len(evidence) if isinstance(evidence, list) else None
+            if evidence_count is not None:
+                lines.append(f"    - evidence count: {evidence_count}")
+
+    if section.notes:
+        lines.append("- Notes:")
+        for note in section.notes:
+            lines.append(f"  - {note}")
+    lines.append("")
+    return lines
+
+
+def _render_next_round_section(
+    section: SectionBlock,
+    payload: dict[str, Any],
+    retry_payload: dict[str, Any],
+    round_input_payload: dict[str, Any],
+) -> list[str]:
+    lines = ["## Next Round Decision", ""]
+    if section.summary:
+        lines.append(section.summary)
+        lines.append("")
+
+    facts = _facts_to_mapping(section.facts)
+    status = _textish(payload.get("status")) or _textish(facts.get("status"))
+    should_start = payload.get("should_start_next_round", facts.get("should_start_next_round"))
+    current_round = payload.get("current_round", facts.get("current_round"))
+    next_round = payload.get("next_round", facts.get("next_round"))
+    target_stage = _textish(payload.get("target_stage")) or _textish(facts.get("target_stage"))
+    primary_reason = _textish(payload.get("primary_reason")) or _textish(facts.get("primary_reason"))
+    remaining_budget = payload.get("remaining_attempt_budget", facts.get("remaining_attempt_budget"))
+    improvement = _textish(payload.get("improvement_judgement"))
+    triggered = _string_listish(payload.get("triggered_stop_conditions"))
+
+    if status:
+        lines.append(f"- Status: `{status}`")
+    if should_start is not None:
+        lines.append(f"- Should Start Next Round: {_format_inline(should_start)}")
+    if current_round is not None:
+        lines.append(f"- Current Round: {_format_inline(current_round)}")
+    if next_round is not None:
+        lines.append(f"- Next Round: {_format_inline(next_round)}")
+    if target_stage:
+        lines.append(f"- Target Stage: `{target_stage}`")
+    if primary_reason:
+        lines.append(f"- Rationale: {primary_reason}")
+    if improvement:
+        lines.append(f"- Comparison Outcome: `{improvement}`")
+    if triggered:
+        lines.append(f"- Triggered Stop Conditions: {', '.join(triggered)}")
+    if remaining_budget is not None:
+        lines.append(f"- Remaining Attempt Budget: {_format_inline(remaining_budget)}")
+
+    scheduled_cluster_ids = _string_listish(payload.get("scheduled_cluster_ids"))
+    scheduled_action_ids = _string_listish(payload.get("scheduled_action_ids"))
+    if scheduled_cluster_ids:
+        lines.append(f"- Scheduled Cluster IDs: {', '.join(scheduled_cluster_ids)}")
+    if scheduled_action_ids:
+        lines.append(f"- Scheduled Action IDs: {', '.join(scheduled_action_ids)}")
+
+    actions = retry_payload.get("actions") if isinstance(retry_payload.get("actions"), list) else []
+    if actions:
+        lines.append("- Scheduled Action Breakdown:")
+        for action in actions:
+            action_id = _textish(action.get("action_id")) or "action"
+            title = _textish(action.get("title")) or action_id
+            cluster_id = _textish(action.get("cluster_id"))
+            lines.append(f"  - {action_id}: {title}")
+            if cluster_id:
+                lines.append(f"    - cluster: {cluster_id}")
+            if action.get("execution_hints"):
+                lines.append(
+                    f"    - execution hints: {_format_hint_summary(_mappingish(action.get('execution_hints')))}"
+                )
+
+    applied_hints = _mappingish(round_input_payload.get("execution_hints"))
+    if applied_hints:
+        lines.append("- Applied Execution Hints:")
+        for key, value in sorted(applied_hints.items()):
+            lines.append(f"  - {key}: {_format_inline(value)}")
+
+    if section.notes:
+        lines.append("- Notes:")
+        for note in section.notes:
+            lines.append(f"  - {note}")
+    lines.append("")
+    return lines
+
+
+def _load_iteration_artifact_payloads(report: RunReport) -> dict[str, dict[str, Any]]:
+    payloads: dict[str, dict[str, Any]] = {}
+    for item in report.project_assets:
+        for artifact in item.artifacts:
+            path = artifact.path.strip() if artifact.path else ""
+            label = artifact.label.strip() if artifact.label else ""
+            if not path.lower().endswith(".json") or not label:
+                continue
+            key = label[:-5] if label.lower().endswith(".json") else label
+            if key in payloads:
+                continue
+            data = _read_json_file(path)
+            if data:
+                payloads[key] = data
+    return payloads
+
+
+def _read_json_file(path: str) -> dict[str, Any]:
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _summary_fact_value(summary: RunSummary, label: str) -> Any:
+    for fact in summary.facts:
+        if fact.label == label:
+            return fact.value
+    return None
+
+
+def _facts_to_mapping(facts: list[Fact]) -> dict[str, Any]:
+    return {fact.label: fact.value for fact in facts}
+
+
+def _report_item_to_retry_action(item: ReportItem) -> dict[str, Any]:
+    facts = _facts_to_mapping(item.facts)
+    return {
+        "item_id": item.item_id,
+        "action_id": item.item_id,
+        "title": item.name,
+        "status": item.status,
+        "summary": item.summary,
+        "stage": item.source,
+        "owner": item.owner,
+        "strategy": facts.get("strategy"),
+        "expected_outcome": facts.get("expected_outcome"),
+        "execution_hints": item.extra.get("execution_hints"),
+    }
+
+
+def _report_item_to_stop_condition(item: ReportItem) -> dict[str, Any]:
+    facts = _facts_to_mapping(item.facts)
+    return {
+        "condition_id": item.item_id,
+        "condition_type": item.name,
+        "status": item.status,
+        "summary": item.summary,
+        "stop": facts.get("stop"),
+        "evidence": [facts.get("evidence_count")] if facts.get("evidence_count") is not None else [],
+    }
+
+
+def _mappingish(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
+def _string_listish(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, (list, tuple, set)):
+        results: list[str] = []
+        for item in value:
+            text = _textish(item)
+            if text:
+                results.append(text)
+        return results
+    text = _textish(value)
+    return [text] if text else []
+
+
+def _textish(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _format_hint_summary(hints: dict[str, Any]) -> str:
+    parts = [f"{key}={_format_inline(value)}" for key, value in sorted(hints.items())]
+    return "; ".join(parts)
 
 
 def _matches_skill_hint(item: ReportItem, keywords: tuple[str, ...]) -> bool:

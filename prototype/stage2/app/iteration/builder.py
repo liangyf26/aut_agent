@@ -17,6 +17,7 @@ from .models import (
     IterationSummary,
     NextRoundDecisionRecord,
     PromotionCandidateRecord,
+    RoundExecutionInputRecord,
     RetryAction,
     RetryPlanRecord,
     StopConditionRecord,
@@ -35,6 +36,7 @@ def build_iteration_outputs(
     attempts: Sequence[Any] | None = None,
     previous_iteration: Any = None,
     max_attempts: int | None = None,
+    round_input: Any = None,
 ) -> IterationArtifacts:
     payload = IterationBuildInput(
         run_report=run_report,
@@ -42,6 +44,7 @@ def build_iteration_outputs(
         attempts=list(attempts or []),
         previous_iteration=previous_iteration,
         max_attempts=max_attempts,
+        round_input=round_input,
     )
     return _IterationBuilder(payload).build()
 
@@ -55,6 +58,7 @@ class _IterationBuilder:
         self.attempts = [_normalize_attempt(item) for item in payload.attempts]
         self.previous_iteration = _normalize_previous_iteration(payload.previous_iteration)
         self.max_attempts = payload.max_attempts
+        self.round_input = _normalize_round_input(payload.round_input)
 
     def build(self) -> IterationArtifacts:
         failure_clusters = self._build_failure_clusters()
@@ -100,6 +104,7 @@ class _IterationBuilder:
         )
         return IterationArtifacts(
             summary=summary,
+            round_input=self.round_input or None,
             failure_clusters=failure_clusters,
             retry_plan=retry_plan,
             promotion_candidates=promotion_candidates,
@@ -238,6 +243,7 @@ class _IterationBuilder:
 
         for attempt in self.attempts:
             if attempt["status"] in FAILURE_STATUSES:
+                classification_payload = _to_mapping(attempt.get("classification_payload"))
                 signals.append(
                     {
                         "source": "attempt",
@@ -245,16 +251,19 @@ class _IterationBuilder:
                         "item_id": attempt["attempt_id"],
                         "title": attempt["title"],
                         "category": _classify_failure(
+                            classification_payload.get("category"),
                             attempt["classification"],
                             attempt["error_type"],
                             attempt["message"],
                         ),
                         "stage": attempt["stage"] or self.snapshot.stage,
                         "root_cause_hint": _root_cause_hint(
+                            classification_payload.get("reason"),
                             attempt["error_type"],
                             attempt["message"],
                         ),
                         "message": attempt["message"],
+                        "classification_payload": classification_payload,
                     }
                 )
 
@@ -304,6 +313,7 @@ class _IterationBuilder:
                     strategy=_strategy_for_cluster(cluster),
                     reason=cluster.summary or cluster.recommendation,
                     expected_outcome=_expected_outcome(cluster),
+                    execution_hints=_execution_hints_for_cluster(cluster),
                 )
             )
 
@@ -544,46 +554,10 @@ class _IterationBuilder:
         no_improvement = self._condition_no_improvement(comparison)
         conditions.append(no_improvement)
 
-        safety_boundary = self._condition_text_signal(
-            condition_id="stop-safety-boundary",
-            condition_type="safety_boundary",
-            keywords=(
-                "safety boundary",
-                "security boundary",
-                "policy blocked",
-                "policy block",
-                "forbidden by policy",
-                "blocked by policy",
-                "whitelist",
-                "white list",
-                "allowlist",
-                "安全边界",
-                "策略拦截",
-                "白名单",
-            ),
-        )
+        safety_boundary = self._condition_safety_boundary(failure_clusters)
         conditions.append(safety_boundary)
 
-        manual_takeover = self._condition_text_signal(
-            condition_id="stop-manual-takeover",
-            condition_type="manual_takeover",
-            keywords=(
-                "manual takeover",
-                "human takeover",
-                "manual handoff",
-                "handoff to human",
-                "needs human review",
-                "human review required",
-                "takeover",
-                "handoff",
-                "人工接管",
-                "人工介入",
-                "人工处理",
-                "人工审核",
-                "转人工",
-            ),
-            default_status="not_hit",
-        )
+        manual_takeover = self._condition_manual_takeover(failure_clusters)
         conditions.append(manual_takeover)
 
         resource_budget = self._condition_resource_budget()
@@ -614,7 +588,7 @@ class _IterationBuilder:
             no_improvement_streak=comparison.no_improvement_streak_after,
             conditions=conditions,
             notes=[
-                "Stop decisions stay conservative and only trigger automatically on explicit hit signals.",
+                "Stop decisions stay conservative and prefer structured iteration signals over free-text inference.",
             ],
         )
 
@@ -852,6 +826,93 @@ class _IterationBuilder:
             ),
         )
 
+    def _condition_safety_boundary(
+        self,
+        failure_clusters: list[FailureClusterRecord],
+    ) -> StopConditionRecord:
+        boundary_clusters = [
+            cluster
+            for cluster in failure_clusters
+            if cluster.category in {"permission"}
+        ]
+        if boundary_clusters:
+            return StopConditionRecord(
+                condition_id="stop-safety-boundary",
+                condition_type="safety_boundary",
+                status="hit",
+                summary="A structured safety or permission boundary was detected in the current failure clusters.",
+                stop=True,
+                evidence=[
+                    {
+                        "cluster_ids": [cluster.cluster_id for cluster in boundary_clusters],
+                        "categories": [cluster.category for cluster in boundary_clusters],
+                    }
+                ],
+            )
+        return self._condition_text_signal(
+            condition_id="stop-safety-boundary",
+            condition_type="safety_boundary",
+            keywords=(
+                "safety boundary",
+                "security boundary",
+                "policy blocked",
+                "policy block",
+                "forbidden by policy",
+                "blocked by policy",
+                "whitelist",
+                "white list",
+                "allowlist",
+                "安全边界",
+                "策略拦截",
+                "白名单",
+            ),
+        )
+
+    def _condition_manual_takeover(
+        self,
+        failure_clusters: list[FailureClusterRecord],
+    ) -> StopConditionRecord:
+        manual_clusters = [
+            cluster
+            for cluster in failure_clusters
+            if cluster.category in {"workflow_branch", "backend_data"}
+            or cluster.recommendation and "human" in cluster.recommendation.lower()
+        ]
+        if manual_clusters:
+            return StopConditionRecord(
+                condition_id="stop-manual-takeover",
+                condition_type="manual_takeover",
+                status="manual_review_needed",
+                summary="Structured failure clusters indicate that a human takeover or review is likely required.",
+                stop=None,
+                evidence=[
+                    {
+                        "cluster_ids": [cluster.cluster_id for cluster in manual_clusters],
+                        "categories": [cluster.category for cluster in manual_clusters],
+                    }
+                ],
+            )
+        return self._condition_text_signal(
+            condition_id="stop-manual-takeover",
+            condition_type="manual_takeover",
+            keywords=(
+                "manual takeover",
+                "human takeover",
+                "manual handoff",
+                "handoff to human",
+                "needs human review",
+                "human review required",
+                "takeover",
+                "handoff",
+                "人工接管",
+                "人工介入",
+                "人工处理",
+                "人工审核",
+                "转人工",
+            ),
+            default_status="not_hit",
+        )
+
     def _condition_text_signal(
         self,
         *,
@@ -904,10 +965,37 @@ class _IterationBuilder:
     @property
     def _current_round_index(self) -> int:
         return (
-            _coerce_int(self.report.summary.current_round)
+            _coerce_int(getattr(self.round_input, "round_index", None))
+            or _coerce_int(self.report.summary.extra.get("orchestration_round"))
+            or _coerce_int(self.report.summary.current_round)
             or _coerce_round_index(self.snapshot.current_round)
             or 0
         )
+
+
+def _normalize_round_input(value: Any) -> RoundExecutionInputRecord | None:
+    data = _to_mapping(value)
+    if not data:
+        return None
+    return RoundExecutionInputRecord(
+        orchestration_stream_id=_text(data.get("orchestration_stream_id")),
+        template_name=_text(data.get("template_name") or data.get("template")),
+        model_name=_text(data.get("model_name") or data.get("model")),
+        project_name=_text(data.get("project_name") or data.get("project")),
+        round_index=_coerce_int(data.get("round_index") or data.get("round")),
+        max_rounds=_coerce_int(data.get("max_rounds")),
+        previous_run_id=_text(data.get("previous_run_id")),
+        previous_run_dir=_text(data.get("previous_run_dir")),
+        retry_run_dir=_text(data.get("retry_run_dir")),
+        target_stage=_text(data.get("target_stage")),
+        goal=_text(data.get("goal")),
+        source_decision_status=_text(data.get("source_decision_status")),
+        source_decision_reason=_text(data.get("source_decision_reason")),
+        scheduled_cluster_ids=_string_list(data.get("scheduled_cluster_ids")),
+        scheduled_action_ids=_string_list(data.get("scheduled_action_ids")),
+        execution_hints=_to_mapping(data.get("execution_hints")),
+        notes=_string_list(data.get("notes")),
+    )
 
 
 def _normalize_previous_iteration(value: Any) -> dict[str, Any]:
@@ -960,6 +1048,10 @@ def _normalize_previous_iteration(value: Any) -> dict[str, Any]:
 
     return {
         "run_id": _text(summary.get("run_id")) or _text(data.get("run_id")),
+        "orchestration_stream_id": _text(data.get("orchestration_stream_id")),
+        "template_name": _text(data.get("template_name") or summary.get("template_name")),
+        "model_name": _text(data.get("model_name")),
+        "project_name": _text(data.get("project_name") or summary.get("project_name")),
         "metrics": metrics,
         "failure_clusters": normalized_clusters,
         "no_improvement_streak_after": comparison_streak or 0,
@@ -974,16 +1066,27 @@ def _normalize_attempt(value: Any) -> dict[str, Any]:
     attempt_id = _text(data.get("attempt_id") or data.get("id") or data.get("key")) or "attempt"
     status = (_text(data.get("status") or data.get("result") or data.get("state")) or "unknown").lower()
     title = _text(data.get("title") or data.get("name") or data.get("step")) or attempt_id
-    classification = _text(data.get("classification") or data.get("category") or data.get("failure_type"))
-    error_type = _text(data.get("error_type") or data.get("reason") or data.get("blocked_reason"))
+    classification_payload = _to_mapping(data.get("classification"))
+    classification = (
+        _text(classification_payload.get("category"))
+        or _text(data.get("classification") or data.get("category") or data.get("failure_type"))
+    )
+    error_type = (
+        _text(classification_payload.get("reason"))
+        or _text(data.get("error_type") or data.get("reason") or data.get("blocked_reason"))
+    )
     stage = _text(data.get("stage") or data.get("phase"))
-    message = _text(data.get("message") or data.get("summary") or data.get("description"))
+    message = (
+        _text(classification_payload.get("reason"))
+        or _text(data.get("message") or data.get("summary") or data.get("description"))
+    )
 
     return {
         "attempt_id": attempt_id,
         "status": status,
         "title": title,
         "classification": classification,
+        "classification_payload": classification_payload,
         "error_type": error_type,
         "stage": stage,
         "message": message,
@@ -1057,6 +1160,18 @@ def _failure_signal_from_report_item(item: ReportItem) -> dict[str, Any] | None:
 
 def _classify_failure(*parts: Any) -> str:
     text = " ".join(_flatten_text(parts)).lower()
+    explicit = {
+        "account_policy_block": "permission",
+        "backend_update_primary_key_error": "backend_data",
+        "front_validation_missing_commitment": "front_validation",
+        "pending_payment_modify_mode": "workflow_branch",
+        "environment_bootstrap_failure": "environment",
+        "max_attempts_exhausted": "stability",
+        "unknown_failure": "runtime",
+    }
+    for key, mapped in explicit.items():
+        if key in text:
+            return mapped
     if any(token in text for token in ("network", "http", "api", "socket", "dns")):
         return "network"
     if any(token in text for token in ("selector", "locator", "ui", "dom", "render")):
@@ -1090,6 +1205,14 @@ def _summarize_cluster(category: str, stage: str, signals: list[dict[str, Any]])
 
 
 def _recommendation_for_category(category: str, stage: str) -> str:
+    if category == "permission":
+        return "Stop automatic retry and request account, role, or organization confirmation before another round."
+    if category == "front_validation":
+        return "Inspect the visible validation errors and fill the missing required inputs before retrying."
+    if category == "workflow_branch":
+        return "Resume from the detected workflow branch instead of replaying the default new-application path."
+    if category == "backend_data":
+        return "Avoid blind retry; inspect server-side data prerequisites or modify-mode assumptions first."
     if category == "network":
         return "Re-run the affected step with network capture and confirm whether the dependency is transient."
     if category == "ui":
@@ -1108,6 +1231,12 @@ def _recommendation_for_category(category: str, stage: str) -> str:
 
 
 def _action_level_for_category(category: str) -> str:
+    if category in {"permission", "workflow_branch"}:
+        return "workflow"
+    if category == "front_validation":
+        return "logic"
+    if category == "backend_data":
+        return "runtime"
     if category in {"data", "verification"}:
         return "logic"
     if category in {"environment", "network"}:
@@ -1136,6 +1265,14 @@ def _priority_for_cluster(cluster: FailureClusterRecord) -> str:
 
 
 def _strategy_for_cluster(cluster: FailureClusterRecord) -> str:
+    if cluster.category == "permission":
+        return "human_review_required"
+    if cluster.category == "front_validation":
+        return "inspect_validation_and_rerun"
+    if cluster.category == "workflow_branch":
+        return "resume_detected_branch"
+    if cluster.category == "backend_data":
+        return "inspect_backend_precondition"
     if cluster.category == "environment":
         return "fix_precondition_then_rerun"
     if cluster.category == "network":
@@ -1165,6 +1302,36 @@ def _retry_owner_for_cluster(cluster: FailureClusterRecord) -> str:
     if cluster.category in {"environment", "network"}:
         return "runtime"
     return "agent"
+
+
+def _execution_hints_for_cluster(cluster: FailureClusterRecord) -> dict[str, Any]:
+    hints: dict[str, Any] = {}
+    if cluster.category == "permission":
+        hints["requires_human_review"] = True
+        hints["stop_after_current_round"] = True
+    elif cluster.category == "front_validation":
+        hints["validation_retry_mode"] = "inspect_visible_errors"
+    elif cluster.category == "workflow_branch":
+        hints["workflow_retry_mode"] = "resume_detected_branch"
+    elif cluster.category == "backend_data":
+        hints["backend_retry_mode"] = "inspect_backend_precondition"
+    if cluster.category == "ui":
+        hints["ui_retry_mode"] = "refresh_locator_and_rerun"
+    elif cluster.category == "verification":
+        hints["verification_mode"] = "tighten_assertion_then_rerun"
+    elif cluster.category == "data":
+        hints["data_retry_mode"] = "repair_input_then_rerun"
+    elif cluster.category == "environment":
+        hints["preflight_mode"] = "fix_precondition_then_rerun"
+    elif cluster.category == "network":
+        hints["network_mode"] = "capture_and_retry"
+    elif cluster.category == "stability":
+        hints["stability_mode"] = "guard_and_retry"
+    if cluster.stage:
+        hints["focus_stage"] = cluster.stage
+    if cluster.related_items:
+        hints["related_items"] = list(cluster.related_items)
+    return hints
 
 
 def _signal_evidence(signal: Mapping[str, Any]) -> dict[str, Any]:

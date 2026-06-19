@@ -17,9 +17,12 @@ def write_iteration_artifacts(
     attempts: list[Any] | None = None,
     previous_iteration: Any = None,
     max_attempts: int | None = None,
+    round_input: Any = None,
 ) -> IterationArtifacts:
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
+    if round_input:
+        _write_json(root / "round_input.json", round_input)
     previous_iteration = previous_iteration or _load_previous_iteration(root)
     artifacts = build_iteration_outputs(
         run_report=run_report,
@@ -27,6 +30,11 @@ def write_iteration_artifacts(
         attempts=attempts,
         previous_iteration=previous_iteration,
         max_attempts=max_attempts,
+        round_input=round_input,
+    )
+    _write_json(
+        root / "round_input.json",
+        artifacts.round_input.to_dict() if artifacts.round_input else {},
     )
     _write_json(
         root / "failure_clusters.json",
@@ -79,6 +87,7 @@ def _load_previous_iteration(root: Path) -> dict[str, Any] | None:
 
 
 def _load_iteration_payload(root: Path) -> dict[str, Any] | None:
+    round_input = _read_json(root / "round_input.json")
     failure_payload = _read_json(root / "failure_clusters.json")
     retry_plan = _read_json(root / "retry_plan.json")
     promotion_payload = _read_json(root / "promotion_candidates.json")
@@ -95,6 +104,7 @@ def _load_iteration_payload(root: Path) -> dict[str, Any] | None:
             stop_conditions,
             iteration_comparison,
             next_round_decision,
+            round_input,
         )
     ):
         return None
@@ -106,6 +116,11 @@ def _load_iteration_payload(root: Path) -> dict[str, Any] | None:
     )
     return {
         "summary": summary,
+        "round_input": round_input,
+        "orchestration_stream_id": round_input.get("orchestration_stream_id"),
+        "template_name": round_input.get("template_name") or summary.get("template_name"),
+        "model_name": round_input.get("model_name"),
+        "project_name": round_input.get("project_name") or summary.get("project_name"),
         "failure_clusters": failure_payload.get("clusters", []),
         "retry_plan": retry_plan,
         "promotion_candidates": promotion_payload.get("candidates", []),
@@ -120,6 +135,7 @@ def _find_previous_iteration_root(root: Path) -> Path | None:
     if not parent.exists():
         return None
 
+    current_payload = _load_iteration_payload(root)
     candidates = [
         path
         for path in parent.iterdir()
@@ -127,6 +143,11 @@ def _find_previous_iteration_root(root: Path) -> Path | None:
     ]
     if not candidates:
         return None
+
+    if current_payload:
+        candidates = _filter_matching_candidates(candidates, current_payload)
+        if not candidates:
+            return None
 
     root_suffix = _run_name_suffix(root.name)
     if root_suffix:
@@ -145,6 +166,7 @@ def _has_iteration_artifacts(root: Path) -> bool:
     return any(
         (root / filename).exists()
         for filename in (
+            "round_input.json",
             "iteration_comparison.json",
             "next_round_decision.json",
             "failure_clusters.json",
@@ -159,6 +181,39 @@ def _run_name_suffix(name: str) -> str | None:
     if match:
         return match.group(1)
     return None
+
+
+def _filter_matching_candidates(candidates: list[Path], current_payload: dict[str, Any]) -> list[Path]:
+    current_stream = _normalize_text(current_payload.get("orchestration_stream_id"))
+    current_template = _normalize_text(current_payload.get("template_name"))
+    current_model = _normalize_text(current_payload.get("model_name"))
+    current_project = _normalize_text(current_payload.get("project_name"))
+    matched: list[Path] = []
+    for path in candidates:
+        payload = _load_iteration_payload(path)
+        if not payload:
+            continue
+        candidate_stream = _normalize_text(payload.get("orchestration_stream_id"))
+        candidate_template = _normalize_text(payload.get("template_name"))
+        candidate_model = _normalize_text(payload.get("model_name"))
+        candidate_project = _normalize_text(payload.get("project_name"))
+        if current_stream and candidate_stream != current_stream:
+            continue
+        if current_template and candidate_template != current_template:
+            continue
+        if current_model and candidate_model != current_model:
+            continue
+        if current_project and candidate_project != current_project:
+            continue
+        matched.append(path)
+    return matched
+
+
+def _normalize_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _read_json(path: Path) -> dict[str, Any]:
