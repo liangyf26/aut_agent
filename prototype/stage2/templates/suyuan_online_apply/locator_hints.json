@@ -1,0 +1,33 @@
+{
+  "page_entry": {
+    "button_text": "我要申请备案"
+  },
+  "wizard": {
+    "agreement_open": "签署溯源服务协议",
+    "agreement_accept": "同意签署",
+    "enter_form_text": "纳入溯源系统的拟备案信息录入"
+  },
+  "initial_form": {
+    "plant_label": "备案品种",
+    "register_type_label": "备案类型",
+    "promise_text": "本人承诺"
+  },
+  "cultivation_form": {
+    "submit_button_text": "信息纳入溯源系统",
+    "file_input_indexes": {
+      "personnel_file": 0,
+      "acceptance_file": 3
+    },
+    "notes": [
+      "当前上传逻辑仍依赖 file input 顺序，后续应升级为更稳妥的字段级定位。"
+    ]
+  },
+  "submit_dialog": {
+    "dept_label": "备案登记/监管单位",
+    "final_submit_text": "提交备案"
+  },
+  "state_probe": {
+    "vue_component_name": "RegistrationOnline",
+    "apply_ref_name": "apply"
+  }
+}

@@ -2,155 +2,167 @@ import asyncio
 import json
 import os
 import sys
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Locator, Page, async_playwright
+from prototype.stage2.app.config.models import (
+    ModelProfile,
+    load_model_profiles as load_stage2_model_profiles,
+)
+from prototype.stage2.app.data_factory.generator import TemplateDataFactory
+from prototype.stage2.app.discovery import DiscoveryArtifactWriter, DiscoveryPlanner
+from prototype.stage2.app.iteration import write_iteration_artifacts
+from prototype.stage2.app.progress import ProgressManager
+from prototype.stage2.app.progress.console import format_status_line
+from prototype.stage2.app.reporting import (
+    adapt_progress_snapshot,
+    render_progress_markdown,
+    render_progress_text,
+    render_run_report_markdown,
+)
+from prototype.stage2.app.runtime.artifacts import ArtifactWriter
+from prototype.stage2.app.runtime.templates import load_template_bundle
+from prototype.stage2.app.verification.generated_files import build_default_generated_files
 
 
 if sys.stdout.encoding != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
-ARTIFACT_ROOT = ROOT_DIR / "artifacts" / "suyuan_submit_loop"
+ARTIFACT_ROOT = ROOT_DIR / "artifacts" / "stage2"
 DEFAULT_CDP_URL = "http://localhost:9222"
 ONLINE_RECORD_URL = "https://www.zbsykj.com:19096/record/online"
 DEFAULT_ENV_FILES = [
     ROOT_DIR / "demo" / ".env",
     ROOT_DIR / "demo" / "local_qwen.env",
 ]
-
-SUCCESS_BASELINE = {
-    "verified_at": "2026-06-18",
-    "verified_from_record_id": "101371731601000105",
-    "initial_form": {
-        "plant_name": "墨兰",
-        "register_type_text": "育苗",
-    },
-    "cultivation_template": {
-        "deptId": "100",
-        "cityRegionId": "4501-450103-450103004-450103004014",
-        "cityRegionName": "南宁-青秀-南湖-厢竹社区居委会",
-        "rangeStr": "街心花园",
-        "seedlingSource": 0,
-        "cultivateType": 2,
-        "cultivateDate": "2026-06-01",
-        "cultivateNum": 120,
-        "cultivateArea": 8,
-        "remark": "自动化回填测试",
-        "acceptanceNum": 120,
-        "cultivatePurpose": 2,
-        "acceptanceDeptId": "100",
-        "acceptancePerson": "王五",
-        "acceptanceDate": "2026-06-17",
-        "isHardening": 0,
-    },
-    "filing_submit": {
-        "dept_id": "100",
-        "dept_label": "广西壮族自治区林业局",
-    },
-}
+STAGE2_TEMPLATE_DIR = ROOT_DIR / "prototype" / "stage2" / "templates" / "suyuan_online_apply"
+TEMPLATE_BUNDLE = load_template_bundle(STAGE2_TEMPLATE_DIR)
+SUCCESS_BASELINE = TEMPLATE_BUNDLE.baseline
 
 
-@dataclass
-class ModelProfile:
-    name: str
-    env_file: Path
-    base_url: str
-    api_key: str
-    model: str
+def build_discovery_seed(artifacts: ArtifactWriter) -> tuple[object, dict[str, Path]]:
+    result = DiscoveryPlanner().plan(
+        template_name=TEMPLATE_BUNDLE.name,
+        template=TEMPLATE_BUNDLE.template,
+        baseline=SUCCESS_BASELINE,
+    )
+    paths = DiscoveryArtifactWriter(artifacts.run_dir).write(result)
+    return result, paths
 
 
-class ArtifactWriter:
-    def __init__(self, model_name: str) -> None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_model = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in model_name)
-        self.run_dir = ARTIFACT_ROOT / f"{timestamp}_{safe_model}"
-        self.screenshots_dir = self.run_dir / "screenshots"
-        self.generated_dir = self.run_dir / "generated"
-        self.run_dir.mkdir(parents=True, exist_ok=True)
-        self.screenshots_dir.mkdir(parents=True, exist_ok=True)
-        self.generated_dir.mkdir(parents=True, exist_ok=True)
-        self.attempts_path = self.run_dir / "attempts.jsonl"
-        self.network_path = self.run_dir / "network_events.jsonl"
-        self.summary_path = self.run_dir / "final_report.md"
-
-    def write_json(self, name: str, payload: Any) -> Path:
-        path = self.run_dir / name
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        return path
-
-    def append_attempt(self, payload: Any) -> None:
-        with self.attempts_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
-
-    def append_network(self, payload: Any) -> None:
-        with self.network_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
-
-    def write_text(self, name: str, text: str) -> Path:
-        path = self.run_dir / name
-        path.write_text(text, encoding="utf-8")
-        return path
+def build_report_page_entries(discovery_result: object, fallback_name: str, page_url: str, success: bool) -> list[dict[str, Any]]:
+    result = getattr(discovery_result, "page_entries", [])
+    if result:
+        return [
+            {
+                "item_id": item.page_entry_id,
+                "name": item.name,
+                "status": "执行通过" if success else "执行失败",
+                "summary": page_url or item.url,
+                "source": item.source,
+            }
+            for item in result
+        ]
+    return [{"name": fallback_name, "status": "执行通过" if success else "执行失败", "summary": page_url}]
 
 
-def load_model_profiles() -> list[ModelProfile]:
-    profiles: list[ModelProfile] = []
-    for env_file in DEFAULT_ENV_FILES:
-        if not env_file.exists():
-            continue
-        values = dotenv_values(env_file)
-        model = values.get("LOCAL_LLM_MODEL", "").strip()
-        if not model:
-            continue
-        profiles.append(
-            ModelProfile(
-                name=model,
-                env_file=env_file,
-                base_url=values.get("LOCAL_LLM_BASE_URL", "").strip(),
-                api_key=values.get("LOCAL_LLM_API_KEY", "").strip(),
-                model=model,
-            )
+def build_report_feature_points(discovery_result: object, fallback_name: str, summary: str, success: bool) -> list[dict[str, Any]]:
+    result = getattr(discovery_result, "feature_points", [])
+    if result:
+        return [
+            {
+                "item_id": item.feature_point_id,
+                "name": item.name,
+                "status": "执行通过" if success else "执行失败",
+                "summary": summary,
+                "source": item.source,
+                "owner": item.page_entry_id,
+            }
+            for item in result
+        ]
+    return [{"name": fallback_name, "status": "执行通过" if success else "执行失败", "summary": summary}]
+
+
+def build_report_failure_clusters(iteration_artifacts: object) -> list[dict[str, Any]]:
+    clusters = getattr(iteration_artifacts, "failure_clusters", [])
+    result: list[dict[str, Any]] = []
+    for cluster in clusters:
+        facts = [{"label": "signal_count", "value": cluster.signal_count}]
+        if cluster.stage:
+            facts.append({"label": "stage", "value": cluster.stage})
+        result.append(
+            {
+                "cluster_id": cluster.cluster_id,
+                "category": cluster.category,
+                "status": cluster.status,
+                "summary": cluster.summary,
+                "root_cause": cluster.root_cause_hint,
+                "action_level": cluster.action_level,
+                "recommendation": cluster.recommendation,
+                "related_items": cluster.related_items,
+                "facts": facts,
+            }
         )
-    return profiles
-
-
-def dotenv_values(env_file: Path) -> dict[str, str]:
-    load_dotenv(env_file, override=True)
-    result: dict[str, str] = {}
-    for line in env_file.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, value = stripped.split("=", 1)
-        result[key.strip()] = value.strip()
     return result
 
 
-def build_dummy_pdf(path: Path, title: str, lines: list[str]) -> Path:
-    pdf = canvas.Canvas(str(path), pagesize=A4)
-    width, height = A4
-    y = height - 72
-    pdf.setFont("Helvetica", 14)
-    pdf.drawString(72, y, title)
-    y -= 32
-    pdf.setFont("Helvetica", 10)
-    for line in lines:
-        pdf.drawString(72, y, line[:100])
-        y -= 18
-        if y < 72:
-            pdf.showPage()
-            pdf.setFont("Helvetica", 10)
-            y = height - 72
-    pdf.save()
-    return path
+def build_report_promotion_candidates(iteration_artifacts: object) -> list[dict[str, Any]]:
+    candidates = getattr(iteration_artifacts, "promotion_candidates", [])
+    return [
+        {
+            "item_id": candidate.candidate_id,
+            "name": candidate.title,
+            "status": candidate.status,
+            "summary": candidate.reason,
+            "source": candidate.source,
+            "owner": candidate.promotion_level,
+        }
+        for candidate in candidates
+    ]
+
+
+def build_retry_plan_section(iteration_artifacts: object) -> list[dict[str, Any]]:
+    retry_plan = getattr(iteration_artifacts, "retry_plan", None)
+    if retry_plan is None:
+        return []
+    facts: list[dict[str, Any]] = [{"label": "status", "value": retry_plan.status}]
+    if retry_plan.next_round is not None:
+        facts.append({"label": "next_round", "value": retry_plan.next_round})
+    if retry_plan.goal:
+        facts.append({"label": "goal", "value": retry_plan.goal})
+    if retry_plan.stop_reason:
+        facts.append({"label": "stop_reason", "value": retry_plan.stop_reason})
+    items = [
+        {
+            "item_id": action.action_id,
+            "name": action.title,
+            "status": action.priority,
+            "summary": action.reason,
+            "owner": action.owner,
+            "source": action.stage,
+            "facts": [
+                {"label": "strategy", "value": action.strategy},
+                {"label": "expected_outcome", "value": action.expected_outcome},
+            ],
+        }
+        for action in retry_plan.actions
+    ]
+    return [
+        {
+            "title": "Retry Plan",
+            "facts": facts,
+            "items": items,
+            "notes": retry_plan.notes,
+        }
+    ]
 
 
 async def click_apply_button(page: Page) -> None:
@@ -950,64 +962,71 @@ async def submit_filing_dialog(page: Page) -> dict[str, Any]:
     return {"ok": False, "reason": "submit-record-not-found"}
 
 
+def template_data_ref(runtime_data: dict[str, Any], ref: str) -> Any:
+    current: Any = runtime_data
+    for part in ref.split("."):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+    return current
+
+
 async def execute_verified_new_application_flow(
     page: Page,
     artifacts: ArtifactWriter,
+    runtime_data: dict[str, Any],
     personnel_file: Path,
     acceptance_file: Path,
     apply_file: Path,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     actions: list[dict[str, Any]] = []
-    actions.extend(await run_apply_wizard(page))
-    actions.append(
-        {
-            "step": "select_initial_plant",
-            "result": await select_drawer_option(
-                page,
-                "备案品种",
-                SUCCESS_BASELINE["initial_form"]["plant_name"],
-            ),
-        }
-    )
-    actions.append(
-        {
-            "step": "select_initial_register_type",
-            "result": await select_drawer_option(
-                page,
-                "备案类型",
-                SUCCESS_BASELINE["initial_form"]["register_type_text"],
-            ),
-        }
-    )
-    actions.append({"step": "check_initial_promise", "result": await ensure_drawer_checkbox(page, "本人承诺")})
-    await page.screenshot(path=str(artifacts.screenshots_dir / "verified_flow_initial_form.png"), full_page=True)
-    actions.append({"step": "expand_cultivation_form", "result": await expand_cultivation_form(page)})
-    actions.append(
-        {
-            "step": "fill_success_template",
-            "result": await fill_success_template(page, SUCCESS_BASELINE["cultivation_template"]),
-        }
-    )
-    actions.append(
-        {
-            "step": "upload_required_files",
-            "result": await upload_drawer_required_files(page, personnel_file, acceptance_file),
-        }
-    )
-    await page.screenshot(path=str(artifacts.screenshots_dir / "verified_flow_full_form.png"), full_page=True)
-    actions.append({"step": "submit_cultivation_form", "result": await expand_cultivation_form(page)})
-    actions.append(
-        {
-            "step": "select_filing_dept",
-            "result": await select_submit_dialog_dept(
-                page,
-                SUCCESS_BASELINE["filing_submit"]["dept_label"],
-            ),
-        }
-    )
-    actions.append({"step": "upload_apply_form", "result": await upload_submit_dialog_apply_file(page, apply_file)})
-    await page.screenshot(path=str(artifacts.screenshots_dir / "verified_flow_submit_dialog.png"), full_page=True)
-    actions.append({"step": "submit_filing_dialog", "result": await submit_filing_dialog(page)})
+    for step in TEMPLATE_BUNDLE.template.get("steps", []):
+        action_name = step.get("action")
+        step_id = step.get("id", action_name)
+        if action_name == "run_apply_wizard":
+            actions.extend(await run_apply_wizard(page))
+        elif action_name == "select_drawer_option":
+            label = step.get("args", {}).get("label", "")
+            ref = step.get("args", {}).get("data_ref", "")
+            option_value = template_data_ref(runtime_data, ref) if ref else None
+            actions.append(
+                {
+                    "step": step_id,
+                    "result": await select_drawer_option(page, label, str(option_value or "")),
+                }
+            )
+        elif action_name == "ensure_drawer_checkbox":
+            label_text = step.get("args", {}).get("label_text", "")
+            actions.append({"step": step_id, "result": await ensure_drawer_checkbox(page, label_text)})
+        elif action_name == "expand_cultivation_form":
+            actions.append({"step": step_id, "result": await expand_cultivation_form(page)})
+        elif action_name == "fill_success_template":
+            ref = step.get("args", {}).get("data_ref", "")
+            data = template_data_ref(runtime_data, ref) if ref else {}
+            actions.append({"step": step_id, "result": await fill_success_template(page, data or {})})
+        elif action_name == "upload_drawer_required_files":
+            actions.append(
+                {
+                    "step": step_id,
+                    "result": await upload_drawer_required_files(page, personnel_file, acceptance_file),
+                }
+            )
+        elif action_name == "select_submit_dialog_dept":
+            ref = step.get("args", {}).get("data_ref", "")
+            dept_label = template_data_ref(runtime_data, ref) if ref else ""
+            actions.append({"step": step_id, "result": await select_submit_dialog_dept(page, str(dept_label or ""))})
+        elif action_name == "upload_submit_dialog_apply_file":
+            actions.append({"step": step_id, "result": await upload_submit_dialog_apply_file(page, apply_file)})
+        elif action_name == "submit_filing_dialog":
+            actions.append({"step": step_id, "result": await submit_filing_dialog(page)})
+
+        if step_id == "check_initial_promise":
+            await page.screenshot(path=str(artifacts.screenshots_dir / "verified_flow_initial_form.png"), full_page=True)
+        elif step_id == "upload_required_files":
+            await page.screenshot(path=str(artifacts.screenshots_dir / "verified_flow_full_form.png"), full_page=True)
+        elif step_id == "upload_apply_form":
+            await page.screenshot(path=str(artifacts.screenshots_dir / "verified_flow_submit_dialog.png"), full_page=True)
+
     await page.screenshot(path=str(artifacts.screenshots_dir / "verified_flow_final_result.png"), full_page=True)
     final_state = await snapshot_submit_dialog(page)
     return actions, final_state
@@ -1205,6 +1224,147 @@ def classify_submission_result(
     }
 
 
+def write_structured_stage2_report(
+    artifacts: ArtifactWriter,
+    profile: ModelProfile,
+    progress: ProgressManager,
+    *,
+    page_url: str,
+    success: bool,
+    classification: dict[str, Any],
+    attempts: list[dict[str, Any]],
+    generated_files: dict[str, Path],
+    discovery_result: object | None = None,
+    discovery_paths: dict[str, Path] | None = None,
+    notes: list[str] | None = None,
+) -> None:
+    progress_snapshot = adapt_progress_snapshot(progress.snapshot)
+    report_payload = {
+        "summary": {
+            "run_id": artifacts.run_dir.name,
+            "status": "completed" if success else "failed",
+            "project_name": "AI Agent 软件自动化评测平台第二阶段原型",
+            "template_name": TEMPLATE_BUNDLE.name,
+            "started_at": progress.snapshot.started_at,
+            "finished_at": progress.snapshot.updated_at,
+            "stop_reason": classification.get("reason"),
+            "next_action": progress.snapshot.next_action,
+            "counts": [
+                {"label": "attempts", "value": len(attempts)},
+                {"label": "template_steps", "value": len(TEMPLATE_BUNDLE.template.get("steps", []))},
+            ],
+            "facts": [
+                {"label": "page_url", "value": page_url},
+                {"label": "model_name", "value": profile.name},
+                {"label": "classification_category", "value": classification.get("category")},
+            ],
+        },
+        "page_entries": build_report_page_entries(
+            discovery_result,
+            TEMPLATE_BUNDLE.template.get("page_entry", {}).get("name", "页面入口"),
+            page_url,
+            success,
+        ),
+        "feature_points": build_report_feature_points(
+            discovery_result,
+            TEMPLATE_BUNDLE.template.get("feature_point", {}).get("name", "功能点"),
+            classification.get("reason"),
+            success,
+        ),
+        "success_items": [
+            {
+                "name": "线上申请备案模板样本",
+                "status": "passed",
+                "summary": classification.get("reason"),
+            }
+        ]
+        if success
+        else [],
+        "failure_items": []
+        if success
+        else [
+            {
+                "name": "线上申请备案模板样本",
+                "status": "failed",
+                "summary": classification.get("reason"),
+            }
+        ],
+        "project_assets": [
+            {
+                "name": "Template Snapshot",
+                "status": "generated",
+                "artifacts": [
+                    {"label": "template_snapshot.json", "path": str(artifacts.run_dir / "template_snapshot.json")}
+                ],
+            },
+            {
+                "name": "Runtime Data",
+                "status": "generated",
+                "artifacts": [
+                    {"label": "runtime_data.json", "path": str(artifacts.run_dir / "runtime_data.json")}
+                ],
+            },
+            {
+                "name": "Generated Attachments",
+                "status": "generated",
+                "artifacts": [
+                    {"label": key, "path": str(path)} for key, path in generated_files.items()
+                ],
+            },
+        ],
+        "network_highlights": [
+            {
+                "name": f"Attempt {item.get('attempt')}",
+                "status": item.get("classification", {}).get("category", "unknown"),
+                "summary": item.get("classification", {}).get("reason", ""),
+            }
+            for item in attempts
+        ],
+        "efficiency_observations": [
+            {"label": "attempt_count", "value": len(attempts)},
+            {"label": "platform_status", "value": progress.snapshot.overall_status},
+        ],
+        "notes": (notes or []) + [
+            f"当前平台级状态：{progress.snapshot.overall_status} / {progress.snapshot.current_phase}",
+            format_status_line(progress.snapshot),
+        ],
+    }
+    if discovery_paths:
+        report_payload["project_assets"].append(
+            {
+                "name": "Discovery Outputs",
+                "status": "generated",
+                "artifacts": [
+                    {"label": key, "path": str(path)}
+                    for key, path in discovery_paths.items()
+                ],
+            }
+        )
+    iteration_artifacts = write_iteration_artifacts(
+        artifacts.run_dir,
+        run_report=report_payload,
+        status_snapshot=progress_snapshot,
+        attempts=attempts,
+    )
+    report_payload["project_assets"].append(
+        {
+            "name": "Iteration Outputs",
+            "status": "generated",
+            "artifacts": [
+                {"label": "failure_clusters.json", "path": str(artifacts.run_dir / "failure_clusters.json")},
+                {"label": "retry_plan.json", "path": str(artifacts.run_dir / "retry_plan.json")},
+                {"label": "promotion_candidates.json", "path": str(artifacts.run_dir / "promotion_candidates.json")},
+            ],
+        }
+    )
+    report_payload["failure_clusters"] = build_report_failure_clusters(iteration_artifacts)
+    report_payload["promotion_candidates"] = build_report_promotion_candidates(iteration_artifacts)
+    report_payload["extra_sections"] = build_retry_plan_section(iteration_artifacts)
+    artifacts.write_text("reports/run_report.md", render_run_report_markdown(report_payload))
+    artifacts.write_text("reports/progress_view.md", render_progress_markdown(progress_snapshot))
+    artifacts.write_text("reports/progress_view.txt", render_progress_text(progress_snapshot))
+
+
 async def collect_registration_list(page: Page) -> dict[str, Any]:
     return await page.evaluate(
         """
@@ -1321,7 +1481,25 @@ async def detect_submission_path(page: Page) -> dict[str, Any]:
 
 
 async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: int) -> Path:
-    artifacts = ArtifactWriter(profile.name)
+    artifacts = ArtifactWriter(ARTIFACT_ROOT, profile.name)
+    runtime_data = TemplateDataFactory(artifacts.run_dir.name).build(
+        baseline=SUCCESS_BASELINE,
+        schema=TEMPLATE_BUNDLE.data_schema,
+    )
+    progress = ProgressManager(
+        run_id=artifacts.run_dir.name,
+        output_dir=artifacts.run_dir,
+        template_name=TEMPLATE_BUNDLE.name,
+        model_name=profile.name,
+        project_name="AI Agent 软件自动化评测平台第二阶段原型",
+    )
+    progress.start_phase(
+        "preflight",
+        phase_label="预检",
+        message="初始化线上备案申请模板样本运行",
+        next_action="写入运行时快照并准备生成附件",
+        stats={"template_steps": len(TEMPLATE_BUNDLE.template.get("steps", []))},
+    )
     artifacts.write_json(
         "run_meta.json",
         {
@@ -1336,32 +1514,51 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
             "max_attempts": max_attempts,
         },
     )
+    artifacts.write_json("template_snapshot.json", TEMPLATE_BUNDLE.template)
+    artifacts.write_json("baseline_snapshot.json", SUCCESS_BASELINE)
+    artifacts.write_json("runtime_data.json", runtime_data)
 
-    person_pdf = build_dummy_pdf(
-        artifacts.generated_dir / "nursery_personnel_form.pdf",
-        "Nursery Personnel Form",
-        [
-            f"Generated at: {datetime.now().isoformat()}",
-            f"Model tag: {profile.name}",
-            "Person: test",
-            "Role: nursery acceptance",
-            "Note: automated prototype attachment",
-        ],
+    generated_files = build_default_generated_files(artifacts.generated_dir, profile.name)
+    person_pdf = generated_files["personnel_file"]
+    accept_pdf = generated_files["acceptance_file"]
+    apply_pdf = generated_files["apply_file"]
+    progress.complete_phase(
+        "preflight",
+        phase_label="预检",
+        message="运行时数据和生成附件已准备完成",
+        next_action="进入发现阶段并播种页面入口",
     )
-    accept_pdf = build_dummy_pdf(
-        artifacts.generated_dir / "acceptance_file.pdf",
-        "Acceptance File",
-        [
-            f"Generated at: {datetime.now().isoformat()}",
-            f"Model tag: {profile.name}",
-            "Authority: Rongshui Forestry Bureau",
-            "Note: automated prototype attachment",
-        ],
+    progress.start_phase(
+        "discovery",
+        phase_label="发现",
+        message="基于已验证模板播种页面入口和功能点",
+        next_action="输出 discovery 最小闭环产物",
+    )
+    discovery_result, discovery_paths = build_discovery_seed(artifacts)
+    progress.complete_phase(
+        "discovery",
+        phase_label="发现",
+        message="已生成页面入口清单和功能点清单",
+        next_action="连接浏览器并进入验证阶段",
+        stats={
+            "page_entries_discovered": len(getattr(discovery_result, "page_entries", [])),
+            "feature_points_discovered": len(getattr(discovery_result, "feature_points", [])),
+        },
     )
 
     async with async_playwright() as p:
-        browser = await p.chromium.connect_over_cdp(cdp_url)
+        browser = None
+        progress.start_phase(
+            "verification",
+            phase_label="验证",
+            round_kind="verification",
+            round_index=1,
+            round_label="验证第 1 轮",
+            message="连接可见浏览器并准备执行模板样本",
+            next_action="执行线上备案申请主路径",
+        )
         try:
+            browser = await p.chromium.connect_over_cdp(cdp_url)
             contexts = browser.contexts
             if not contexts:
                 raise RuntimeError("未发现已连接的浏览器上下文")
@@ -1439,6 +1636,7 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
 
             last_errors: list[str] = before_state.get("errors", [])
             final_submit: dict[str, Any] | None = None
+            attempt_records: list[dict[str, Any]] = []
 
             for attempt in range(1, max_attempts + 1):
                 actions: list[dict[str, Any]] = []
@@ -1458,13 +1656,27 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                     actions.append({"step": "detect_submission_path", "result": path_info})
 
                     if path_info["path"] == "new_application":
+                        progress.start_step(
+                            "verification",
+                            phase_label="验证",
+                            round_kind="verification",
+                            round_index=attempt,
+                            round_label=f"验证第 {attempt} 轮",
+                            step_key="execute_template",
+                            step_label="执行模板回放",
+                            target_kind="feature_point",
+                            target_id="online_apply",
+                            target_label="线上申请备案",
+                            message="按模板执行线上备案申请成功路径",
+                        )
                         actions.append({"step": "dialog_visible", "ok": await dialog.is_visible()})
                         flow_actions, final_state = await execute_verified_new_application_flow(
                             page,
                             artifacts,
+                            runtime_data,
                             person_pdf,
                             accept_pdf,
-                            accept_pdf,
+                            apply_pdf,
                         )
                         actions.extend(flow_actions)
                         submit_result = {
@@ -1570,6 +1782,7 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                     "network_events": relevant_network,
                     "dialog_state": after_state,
                 }
+                attempt_records.append(payload)
                 artifacts.append_attempt(payload)
                 artifacts.write_json(f"dialog_after_attempt_{attempt:02d}.json", after_state)
                 artifacts.write_json(f"apply_state_after_attempt_{attempt:02d}.json", apply_state)
@@ -1577,6 +1790,27 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
 
                 current_errors = after_state.get("errors", [])
                 if classification["success"]:
+                    progress.complete_step(
+                        "verification",
+                        phase_label="验证",
+                        round_kind="verification",
+                        round_index=attempt,
+                        round_label=f"验证第 {attempt} 轮",
+                        step_key="execute_template",
+                        step_label="执行模板回放",
+                        target_kind="feature_point",
+                        target_id="online_apply",
+                        target_label="线上申请备案",
+                        message=classification["reason"],
+                        next_action="生成运行报告",
+                        stats={"verification_successes": 1},
+                    )
+                    progress.complete_phase(
+                        "verification",
+                        phase_label="验证",
+                        message="模板样本执行成功",
+                        next_action="输出报告与运行态视图",
+                    )
                     report = [
                         f"# 线上申请备案提交结果 - {profile.name}",
                         "",
@@ -1588,6 +1822,19 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                         f"- 提示消息: `{'; '.join(submit_result.get('messages', [])) or '无显式消息'}`",
                     ]
                     artifacts.write_text("final_report.md", "\n".join(report))
+                    write_structured_stage2_report(
+                        artifacts,
+                        profile,
+                        progress,
+                        page_url=page.url,
+                        success=True,
+                        classification=classification,
+                        attempts=attempt_records,
+                        generated_files=generated_files,
+                        discovery_result=discovery_result,
+                        discovery_paths=discovery_paths,
+                        notes=["真实执行样本已成功完成最终备案提交。"],
+                    )
                     return artifacts.run_dir
 
                 if classification["category"] in {
@@ -1595,6 +1842,27 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                     "backend_update_primary_key_error",
                     "pending_payment_modify_mode",
                 }:
+                    progress.fail_step(
+                        "verification",
+                        phase_label="验证",
+                        round_kind="verification",
+                        round_index=attempt,
+                        round_label=f"验证第 {attempt} 轮",
+                        step_key="execute_template",
+                        step_label="执行模板回放",
+                        target_kind="feature_point",
+                        target_id="online_apply",
+                        target_label="线上申请备案",
+                        message=classification["reason"],
+                        next_action="输出阻塞报告",
+                        stats={"verification_failures": 1},
+                    )
+                    progress.fail_phase(
+                        "verification",
+                        phase_label="验证",
+                        message="模板样本执行被阻塞",
+                        next_action="等待人工处理或后续归因",
+                    )
                     report = [
                         f"# 线上申请备案提交结果 - {profile.name}",
                         "",
@@ -1607,9 +1875,36 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                         f"- 最近消息: `{'; '.join(submit_result.get('messages', [])) or '无'}`",
                     ]
                     artifacts.write_text("final_report.md", "\n".join(report))
+                    write_structured_stage2_report(
+                        artifacts,
+                        profile,
+                        progress,
+                        page_url=page.url,
+                        success=False,
+                        classification=classification,
+                        attempts=attempt_records,
+                        generated_files=generated_files,
+                        discovery_result=discovery_result,
+                        discovery_paths=discovery_paths,
+                        notes=["真实执行样本命中了已识别的阻塞类型。"],
+                    )
                     return artifacts.run_dir
 
                 if current_errors == last_errors:
+                    progress.fail_step(
+                        "verification",
+                        phase_label="验证",
+                        round_kind="verification",
+                        round_index=attempt,
+                        round_label=f"验证第 {attempt} 轮",
+                        step_key="execute_template",
+                        step_label="执行模板回放",
+                        target_kind="feature_point",
+                        target_id="online_apply",
+                        target_label="线上申请备案",
+                        message="错误集未继续收敛",
+                        next_action="输出失败报告",
+                    )
                     report = [
                         f"# 线上申请备案提交结果 - {profile.name}",
                         "",
@@ -1621,6 +1916,19 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                         f"- 最近消息: `{'; '.join(submit_result.get('messages', [])) or '无'}`",
                     ]
                     artifacts.write_text("final_report.md", "\n".join(report))
+                    write_structured_stage2_report(
+                        artifacts,
+                        profile,
+                        progress,
+                        page_url=page.url,
+                        success=False,
+                        classification=classification,
+                        attempts=attempt_records,
+                        generated_files=generated_files,
+                        discovery_result=discovery_result,
+                        discovery_paths=discovery_paths,
+                        notes=["真实执行样本未继续收敛，已提前结束当前 run。"],
+                    )
                     return artifacts.run_dir
 
                 last_errors = current_errors
@@ -1635,13 +1943,72 @@ async def run_single_profile(profile: ModelProfile, cdp_url: str, max_attempts: 
                 f"- 最近消息: `{'; '.join((final_submit or {}).get('messages', [])) or '无'}`",
             ]
             artifacts.write_text("final_report.md", "\n".join(report))
+            progress.fail_phase(
+                "verification",
+                phase_label="验证",
+                message="达到最大尝试次数仍未成功",
+                next_action="输出失败报告",
+            )
+            write_structured_stage2_report(
+                artifacts,
+                profile,
+                progress,
+                page_url=page.url,
+                success=False,
+                classification={
+                    "category": "max_attempts_exhausted",
+                    "reason": "达到最大尝试次数仍未成功",
+                },
+                attempts=attempt_records,
+                generated_files=generated_files,
+                discovery_result=discovery_result,
+                discovery_paths=discovery_paths,
+                notes=["真实执行样本耗尽最大尝试次数。"],
+            )
+            return artifacts.run_dir
+        except Exception as exc:
+            error_text = f"{type(exc).__name__}: {exc}"
+            progress.fail_phase(
+                "verification",
+                phase_label="验证",
+                message=error_text,
+                next_action="检查 CDP 浏览器、远程调试端口和登录会话",
+            )
+            classification = {
+                "category": "environment_bootstrap_failure",
+                "reason": error_text,
+            }
+            report = [
+                f"# 线上申请备案提交结果 - {profile.name}",
+                "",
+                f"- 运行目录: `{artifacts.run_dir}`",
+                f"- 页面: `{ONLINE_RECORD_URL}`",
+                f"- 提交结论: 未启动执行链路",
+                f"- 判定类别: `{classification['category']}`",
+                f"- 原因: `{classification['reason']}`",
+            ]
+            artifacts.write_text("final_report.md", "\n".join(report))
+            write_structured_stage2_report(
+                artifacts,
+                profile,
+                progress,
+                page_url=ONLINE_RECORD_URL,
+                success=False,
+                classification=classification,
+                attempts=[],
+                generated_files=generated_files,
+                discovery_result=discovery_result,
+                discovery_paths=discovery_paths,
+                notes=["验证阶段在连接浏览器或接管已登录会话之前失败。"],
+            )
             return artifacts.run_dir
         finally:
-            await browser.close()
+            if browser is not None:
+                await browser.close()
 
 
 async def main() -> None:
-    profiles = load_model_profiles()
+    profiles = load_stage2_model_profiles(DEFAULT_ENV_FILES)
     if not profiles:
         raise RuntimeError("未从 demo 目录加载到模型配置")
 
