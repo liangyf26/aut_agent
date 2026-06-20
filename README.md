@@ -37,7 +37,9 @@ http://localhost:4173
 npm run check
 npm run dev
 python -m prototype.stage2.main
+python -m prototype.stage2.main --routing-summary --template suyuan_online_apply
 python -m prototype.stage2.main --run-sample --cdp-url http://localhost:9222
+python -m prototype.stage2.main --live-discovery --template suyuan_online_apply --model AI-tester --cdp-url http://localhost:9222
 python -m prototype.stage2.main --platform-daily-report
 ```
 
@@ -129,6 +131,7 @@ npm run check
 - 已实现模型能力预检脚本：`tools/probe_llm_capabilities.py`。
 - 已建立第二阶段统一入口：`python -m prototype.stage2.main`。
 - 已完成模板化原型骨架：`prototype/stage2/app/`、`prototype/stage2/templates/`、`artifacts/stage2/`。
+- 已实现按模型输出的路由/策略摘要：`python -m prototype.stage2.main --routing-summary`，并在运行目录落盘 `routing_summary.json`、`discovery_strategy.json`。
 - 已落地 5 个模板样本：
   - `suyuan_online_apply`
   - `suyuan_online_query_reset`
@@ -136,6 +139,7 @@ npm run check
   - `lab_query_filter`
   - `lab_create_add`
 - 已实现真实页面受控 discovery，可输出 `page_entries.json`、`feature_points.json`、`discovery_review_queue.json`、页面截图与进度事件。
+- 已把 discovery 阶段显式化为策略决策：当前会在 `blocked`、`template_seed_only`、`live_enrich`、`skip_completed_discovery` 之间选择，并把决策纳入 run 产物与报告。
 - 已实现验证阶段统一执行器，可输出执行日志、关键截图、失败簇、重试计划、运行报告、平台日报和模型对比结果。
 - 已实现运行态进度视图产物：`progress_events.jsonl`、`current_status.json`、`phase_summary.json`。
 - 已实现人工录制入口：`--capture-human-recording`，可输出 `recording_summary.json`、`key_screenshots.json` 和候选模板草稿。
@@ -158,9 +162,13 @@ npm run check
   - `json_object` 能力
   - `json_schema` 能力
   - Browser Use 封装层兼容性
+- 当前平台还要进一步区分“能力路由”和“发现策略”：
+  - 能力路由决定 discovery / verification / reporting 三个阶段允许采用的模式
+  - 发现策略决定本轮是阻断、仅模板播种、模板播种后 live enrich，还是复用上一轮 discovery 结果
 - 对于当前探测到的 `deepseek-v4-flash-260425`，它不应进入依赖 `response_format.type=json_schema` 的 Browser Use 结构化输出路径。
 - 对于当前探测到的原厂 `deepseek-v4-flash`，它也不应进入依赖 `response_format.type=json_schema` 或强制 `tool_choice` 的路径；可优先用于普通 chat、`json_object` 结构化输出和自动 tool calling 路径。
 - 本地模型结论必须按日期区分：2026-06-16 的原始能力探针显示 `AI-tester` 与 Qwen 都不稳定；2026-06-19 的真实样本联调则表明 `AI-tester` 已能完成当前样本，而 Qwen 仍未稳定通过。因此，现阶段两者都还不能被当成“无条件稳定”的唯一主路径，但 `AI-tester` 已具备继续作为当前样本主模型打磨的价值。
+- `--live-discovery` 现在会先遵守能力路由再决定是否执行 live enrich；即使路由可推荐 Browser Use 结构化 discovery，当前主线仍是“模板播种 + Playwright 受控 enrich”，不会把 Browser Use 伪装成 discovery 主执行器。
 - 第二阶段平台闭环已经成立，但当前更像“可演示的原型平台”，还不是可广泛复用的正式平台。
 - 自动续跑现在只会在 `next_round_decision.status=scheduled` 且 `should_start_next_round=true` 时继续；命中 `needs_review` 时会转入人工接管恢复路径，而不是盲目自动重试。
 - 当前最需要继续打磨的是：第二个真实业务模板族、P4 自动续跑实战样本、P5 真实站点复杂组件录制、P6 技能晋升审阅流。

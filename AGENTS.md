@@ -34,7 +34,8 @@ python -m prototype.stage2.main
 
 ```powershell
 python -m prototype.stage2.main --run-sample --cdp-url http://localhost:9222
-python -m prototype.stage2.main --live-discovery --template suyuan_online_apply --cdp-url http://localhost:9222
+python -m prototype.stage2.main --routing-summary --template suyuan_online_apply
+python -m prototype.stage2.main --live-discovery --template suyuan_online_apply --model AI-tester --cdp-url http://localhost:9222
 python -m prototype.stage2.main --capture-human-recording --template suyuan_online_apply --cdp-url http://localhost:9222
 python -m prototype.stage2.main --platform-daily-report
 python -m prototype.stage2.main --resume-human-takeover <run_dir> --cdp-url http://localhost:9222
@@ -43,8 +44,11 @@ python -m prototype.stage2.main --resume-human-takeover <run_dir> --cdp-url http
 ## 事实约束
 
 - 发现阶段允许受控 Browser Use / 页面理解；验证阶段默认由 Playwright 确定性执行
+- discovery 现在分成两层判断：先做 capability routing，再做 discovery strategy；不要把“模型支持 Browser Use 结构化输出”误解为“主流程一定会跑 Browser Use discovery”
+- 当前 live discovery 的真实执行边界仍是“模板播种 + Playwright 受控 enrich”；Browser Use readiness 目前主要作为路由提示，而不是 discovery 主执行器
 - 高风险真实提交默认禁止，除非项目级白名单显式允许
 - 运行态必须持续落盘结构化产物，至少包含进度事件、当前状态、页面入口、功能点、执行结果、失败簇、报告
+- 初始化/运行阶段现在还会落盘 `routing_summary.json` 与 `discovery_strategy.json`，用于说明模型路由与本轮发现策略
 - 项目级沉淀可以自动落盘；平台级基线沉淀必须人工审核后晋升
 - 生成的 `artifacts/`、日报、报告是证据，不是设计真相；设计真相以 `docs/` 和 `CONTEXT.md` 为准
 
