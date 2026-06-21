@@ -14,10 +14,24 @@
 3. `docs/第二阶段原型开发计划.md`
 4. `CONTEXT.md`
 
+当前围绕“泛化闭环”的专项执行计划采用四步：
+
+- G1：把“定义了但没接上”的抽象层接通（已完成）
+- G2：把复杂真实流程从“项目专用流”抽成“复用动作族”（已完成）
+- G3：补泛化回归测试护栏（当前优先级最高）
+- G4：引入新的真实业务系统做跨系统验证（待开始）
+
+执行节奏约束：
+
+- 先完成 G3，再继续拆剩余项目耦合点，例如 `fill_success_template`
+- 不要把 `fill_success_template` 误当成高于 G3 的独立优先级任务
+
 ## 关键目录
 
 - `prototype/stage2/app/`: 第二阶段平台原型模块
 - `prototype/stage2/templates/`: 项目级执行模板、基线、schema、locator hints
+- `prototype/stage2/app/verification/suyuan_shared_actions.py`: 溯源样本的 wizard / drawer 共享动作族
+- `prototype/stage2/app/verification/suyuan_submit_dialog_actions.py`: 溯源样本的 upload / submit dialog 共享动作族
 - `tools/suyuan_submit_loop.py`: 溯源系统样本闭环与迭代编排脚本
 - `prototype/stage2/tests/`: 第二阶段 smoke / regression 测试
 - `artifacts/stage2/`: 第二阶段运行产物，属于证据层，不是源码层
@@ -49,6 +63,7 @@ python -m prototype.stage2.main --resume-human-takeover <run_dir> --cdp-url http
 - 高风险真实提交默认禁止，除非项目级白名单显式允许
 - 运行态必须持续落盘结构化产物，至少包含进度事件、当前状态、页面入口、功能点、执行结果、失败簇、报告
 - 初始化/运行阶段现在还会落盘 `routing_summary.json` 与 `discovery_strategy.json`，用于说明模型路由与本轮发现策略
+- 当前验证层已经形成三层结构：通用模板动作、项目级复用动作族、少量项目胶水；继续抽象前先补 G3 护栏
 - 项目级沉淀可以自动落盘；平台级基线沉淀必须人工审核后晋升
 - 生成的 `artifacts/`、日报、报告是证据，不是设计真相；设计真相以 `docs/` 和 `CONTEXT.md` 为准
 
