@@ -134,6 +134,10 @@ _Avoid_: 仅看浏览器动作、只在最终报告里复盘、无实时状态
 当运行命中人工审核或人工接管条件时生成的结构化续跑说明，至少包含当前 run、待处理动作、下一轮目标阶段、恢复命令和备注，当前原型对应产物为 `human_takeover.json`。
 _Avoid_: 口头交接、仅靠终端日志恢复、无结构化续跑上下文
 
+**跨系统验证矩阵 (Cross-System Validation Matrix)**:
+第二阶段在 G4 中引入的统一验证汇总骨架，用于把不同模板族、不同系统样本和不同执行模式的 validation 结果放进同一份结构化矩阵中比较与归档。当前原型已支持把 `lab_*` 本地模板族与 `suyuan_*` 样本汇总到 `artifacts/stage2/validation_matrix/` 下的 json / markdown 产物中，但这仍属于跨系统验证的准备阶段，而不是“已完成多个真实业务系统验证”。
+_Avoid_: 单次 validation 结果、平台日报、已完成跨真实系统泛化
+
 ### 交付物
 
 **评测报告 (Assessment Report)**:

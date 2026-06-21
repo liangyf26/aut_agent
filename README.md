@@ -41,9 +41,11 @@ python -m prototype.stage2.main
 python -m prototype.stage2.main --routing-summary --template suyuan_online_apply
 python -m prototype.stage2.main --run-sample --cdp-url http://localhost:9222
 python -m prototype.stage2.main --live-discovery --template suyuan_online_apply --model AI-tester --cdp-url http://localhost:9222
+python -m prototype.stage2.main --validation-matrix --cdp-url http://localhost:9222
 python -m prototype.stage2.main --platform-daily-report
 .venv\Scripts\python.exe -m pytest prototype/stage2/tests/test_suyuan_shared_actions.py prototype/stage2/tests/test_suyuan_submit_dialog_actions.py prototype/stage2/tests/test_suyuan_registry_contract.py -q
 .venv\Scripts\python.exe -m pytest prototype/stage2/tests/smoke_stage2_regressions.py prototype/stage2/tests/test_runtime_policy_gate.py -q
+.venv\Scripts\python.exe -m pytest prototype/stage2/tests/test_g4_validation_matrix.py prototype/stage2/tests/test_generic_template_shared_verification.py -q
 ```
 
 ## 目录结构
@@ -145,16 +147,19 @@ npm run check
 - 已把 `suyuan_online_apply` 的复杂真实流程拆成两组项目级复用动作族：
   - `prototype/stage2/app/verification/suyuan_shared_actions.py`
   - `prototype/stage2/app/verification/suyuan_submit_dialog_actions.py`
-- 已补首批泛化回归护栏，覆盖：
+- 已补泛化回归护栏，覆盖：
   - 模板动作名到 registry 的 contract
   - 共享动作 handler 的 runtime 参数解析
   - 高风险提交的 policy bridge 不回退
+  - 复杂 flow 的失败传播
+  - `fill_success_template` 的输入契约与异常边界
 - 已实现真实页面受控 discovery，可输出 `page_entries.json`、`feature_points.json`、`discovery_review_queue.json`、页面截图与进度事件。
 - 已把 discovery 阶段显式化为策略决策：当前会在 `blocked`、`template_seed_only`、`live_enrich`、`skip_completed_discovery` 之间选择，并把决策纳入 run 产物与报告。
 - 已实现验证阶段统一执行器，可输出执行日志、关键截图、失败簇、重试计划、运行报告、平台日报和模型对比结果。
 - 已实现运行态进度视图产物：`progress_events.jsonl`、`current_status.json`、`phase_summary.json`。
 - 已实现人工录制入口：`--capture-human-recording`，可输出 `recording_summary.json`、`key_screenshots.json` 和候选模板草稿。
 - 已实现人工接管恢复续跑入口：`--resume-human-takeover`，并在需要人工审核/接管时输出 `human_takeover.json`。
+- 已实现 G4 骨架入口：`--validation-matrix`，可将 `lab_*` 本地模板族与 `suyuan_*` 样本放进同一套验证矩阵并输出 json / markdown 聚合结果。
 - 已完成多组对照验证：
   - 2026-06-16 的探针结果显示：`demo/.env` 指向的本地 `AI-tester` 对 `/chat/completions` 连通性不稳定，基础 chat、`json_object`、`json_schema`、tool calling 全部超时。
   - 2026-06-16 的探针结果显示：`demo/local_qwen.env` 指向的本地 `Qwen3.6-35B-A3B-UD-Q5_K_M-MTP` 对 `/chat/completions` 连通性不稳定，基础 chat、`json_object`、`json_schema`、forced tool calling、auto tool calling、Browser Use 封装路径全部超时或连接失败。
@@ -185,9 +190,9 @@ npm run check
 - 当前围绕“泛化闭环”的专项状态是：
   - G1 已完成：把定义了但没接上的共享抽象接通
   - G2 已完成：把复杂真实流程抽成复用动作族
-  - G3 下一步优先：补泛化回归测试护栏
-  - G4 待开始：引入新的真实业务系统做跨系统验证
-- `fill_success_template` 仍是剩余项目级耦合点，但它不高于 G3；当前节奏应先补护栏，再继续拆剩余耦合，再进入跨系统验证。
+  - G3 已完成：泛化回归测试护栏已落地并通过回归
+  - G4 已启动：已建立跨模板族/跨系统样本的统一验证矩阵骨架
+- `fill_success_template` 仍是剩余项目级耦合点，但当前已经补上输入契约护栏；下一步应继续拆剩余耦合，再接入新的真实业务系统。
 
 ### 验证产物
 
@@ -198,6 +203,8 @@ npm run check
   - `artifacts/stage2/latest_platform_daily_report.md`
   - `artifacts/stage2/latest_model_comparison.json`
   - `artifacts/stage2/latest_baseline_freeze_manifest.json`
+  - `artifacts/stage2/validation_matrix/latest_validation_matrix.json`
+  - `artifacts/stage2/validation_matrix/latest_validation_matrix.md`
 - 公网模型探测结果：
   - `artifacts/model_capability_probe/20260616_185018_deepseek-v4-flash-260425.json`
   - `artifacts/model_capability_probe/20260616_185142_deepseek-v4-flash-260425.json`
