@@ -127,8 +127,12 @@ _Avoid_: 测试结果、执行结果
 _Avoid_: 自动验收结论、业务通过率
 
 **运行态进度视图 (Runtime Progress View)**:
-第二阶段运行时面向监控、调试和人工接管的过程可视化层，展示当前阶段、当前步骤、当前轮次、当前对象、最近事件、阻塞原因和下一步动作，并持续落盘 `progress_events.jsonl`、`current_status.json`、`phase_summary.json`。
+第二阶段运行时面向监控、调试和人工接管的过程可视化层，展示当前阶段、当前步骤、当前轮次、当前对象、近期事件、阻塞原因和下一步动作，并持续落盘 `progress_events.jsonl`、`current_status.json`、`phase_summary.json`。
 _Avoid_: 仅看浏览器动作、只在最终报告里复盘、无实时状态
+
+**运行中心 (Run Center)**:
+当前 Node.js 主平台首页和后续平台 UI 的操作工作台，聚合当前项目阶段摘要、项目级近期事件、第二阶段运行摘要和选中 run 详情；当前通过 `GET /api/stage2/overview` 从 `artifacts/stage2/` 聚合读取。
+_Avoid_: 只看首页表单、只看浏览器窗口、把 run 产物散落在多个入口里
 
 **人工接管恢复包 (Human Takeover Packet)**:
 当运行命中人工审核或人工接管条件时生成的结构化续跑说明，至少包含当前 run、待处理动作、下一轮目标阶段、恢复命令和备注，当前原型对应产物为 `human_takeover.json`。

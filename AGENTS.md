@@ -32,6 +32,7 @@
 - `prototype/stage2/templates/`: 项目级执行模板、基线、schema、locator hints
 - `prototype/stage2/app/verification/suyuan_shared_actions.py`: 溯源样本的 wizard / drawer 共享动作族
 - `prototype/stage2/app/verification/suyuan_submit_dialog_actions.py`: 溯源样本的 upload / submit dialog 共享动作族
+- `src/stage2Dashboard.js`: Node.js 运行中心对 `artifacts/stage2/` 的聚合入口
 - `tools/suyuan_submit_loop.py`: 溯源系统样本闭环与迭代编排脚本
 - `prototype/stage2/tests/`: 第二阶段 smoke / regression 测试
 - `artifacts/stage2/`: 第二阶段运行产物，属于证据层，不是源码层
@@ -66,6 +67,7 @@ python -m prototype.stage2.main --validation-matrix --cdp-url http://localhost:9
 - 初始化/运行阶段现在还会落盘 `routing_summary.json` 与 `discovery_strategy.json`，用于说明模型路由与本轮发现策略
 - 当前验证层已经形成三层结构：通用模板动作、项目级复用动作族、少量项目胶水；后续抽象优先继续拆剩余项目耦合点，并在 G4 骨架上接入新的真实业务系统
 - 当前验证层已补 G3 护栏，并新增 G4 validation matrix 骨架：`lab_*` 本地模板族与 `suyuan_*` 样本可走进同一套统一汇总链路
+- Node.js 主平台首页现在默认是运行中心优先布局；涉及平台 UI 时，应从 `public/index.html`、`public/app.js`、`src/stage2Dashboard.js` 理解当前外壳，而不是假设仍是表单优先首页
 - 项目级沉淀可以自动落盘；平台级基线沉淀必须人工审核后晋升
 - 生成的 `artifacts/`、日报、报告是证据，不是设计真相；设计真相以 `docs/` 和 `CONTEXT.md` 为准
 
