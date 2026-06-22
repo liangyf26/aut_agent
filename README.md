@@ -143,9 +143,10 @@ npm run check
 - 已完成模板化原型骨架：`prototype/stage2/app/`、`prototype/stage2/templates/`、`artifacts/stage2/`。
 - 已实现按模型输出的路由/策略摘要：`python -m prototype.stage2.main --routing-summary`，并在运行目录落盘 `routing_summary.json`、`discovery_strategy.json`。
 - 已接通验证层共享抽象：`locator_hints` 解析链、共享规则评估器、共享验证结果路径和录制草稿 DSL 对齐已经纳入 stage2 执行主线。
-- 已落地 5 个模板样本：
+- 已落地 6 个模板样本：
   - `suyuan_online_apply`
   - `suyuan_online_query_reset`
+  - `suyuan_online_detail_view`
   - `lab_navigation`
   - `lab_query_filter`
   - `lab_create_add`
@@ -159,13 +160,14 @@ npm run check
   - 复杂 flow 的失败传播
   - `fill_success_template` 的输入契约与异常边界
 - 已实现真实页面受控 discovery，可输出 `page_entries.json`、`feature_points.json`、`discovery_review_queue.json`、页面截图与进度事件。
+- 已补 discovery 审核回填最小闭环：支持在已完成 discovery 上加载 `discovery_review_patch.json`，对页面入口和功能点执行忽略、重命名与字段修正，并让后续 discovery / verification 优先消费人工回填后的结果。
 - 已把 discovery 阶段显式化为策略决策：当前会在 `blocked`、`template_seed_only`、`live_enrich`、`skip_completed_discovery` 之间选择，并把决策纳入 run 产物与报告。
 - 已实现验证阶段统一执行器，可输出执行日志、关键截图、失败簇、重试计划、运行报告、平台日报和模型对比结果。
 - 已实现运行态进度视图产物：`progress_events.jsonl`、`current_status.json`、`phase_summary.json`。
 - 已把 Node.js 主平台首页调整为运行中心视图：当前可通过 `GET /api/stage2/overview` 聚合 stage2 run、验证矩阵、平台日报、模型对比、人工录制摘要，并展示选中 run 的阶段时间线、判停说明与人工接管摘要；页面空闲时默认每 15 秒刷新。
 - 已实现人工录制入口：`--capture-human-recording`，可输出 `recording_summary.json`、`key_screenshots.json` 和候选模板草稿。
 - 已实现人工接管恢复续跑入口：`--resume-human-takeover`，并在需要人工审核/接管时输出 `human_takeover.json`。
-- 已实现 G4 骨架入口：`--validation-matrix`，可将 `lab_*` 本地模板族与 `suyuan_*` 样本放进同一套验证矩阵并输出 json / markdown 聚合结果。
+- 已实现 G4 骨架入口：`--validation-matrix`，可将 `lab_*` 本地模板族与 `suyuan_*` 样本放进同一套验证矩阵并输出 json / markdown 聚合结果；默认目标已包含 `suyuan_online_query_reset` 与 `suyuan_online_detail_view` 两个 connected 样本。
 - 已完成多组对照验证：
   - 2026-06-16 的探针结果显示：`demo/.env` 指向的本地 `AI-tester` 对 `/chat/completions` 连通性不稳定，基础 chat、`json_object`、`json_schema`、tool calling 全部超时。
   - 2026-06-16 的探针结果显示：`demo/local_qwen.env` 指向的本地 `Qwen3.6-35B-A3B-UD-Q5_K_M-MTP` 对 `/chat/completions` 连通性不稳定，基础 chat、`json_object`、`json_schema`、forced tool calling、auto tool calling、Browser Use 封装路径全部超时或连接失败。
@@ -197,8 +199,9 @@ npm run check
   - G1 已完成：把定义了但没接上的共享抽象接通
   - G2 已完成：把复杂真实流程抽成复用动作族
   - G3 已完成：泛化回归测试护栏已落地并通过回归
-  - G4 已启动：已建立跨模板族/跨系统样本的统一验证矩阵骨架
+  - G4 已启动：已建立跨模板族/跨系统样本的统一验证矩阵骨架，并补入同一真实系统内的第三个模板样本 `suyuan_online_detail_view` 作为接线与回归对象
 - `fill_success_template` 仍是剩余项目级耦合点，但当前已经补上输入契约护栏；下一步应继续拆剩余耦合，再接入新的真实业务系统。
+- `suyuan_online_detail_view` 当前状态应理解为“已接线并纳入回归与矩阵目标”，而不是“已完成新的 connected live 实证”；该样本的连机验证证据仍需在可用 CDP 会话下补齐。
 
 ### 验证产物
 

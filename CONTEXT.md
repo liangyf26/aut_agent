@@ -74,6 +74,10 @@ _Avoid_: 一次性扫描、离线汇总、批处理发现
 第二阶段在发现阶段结束后可选地暂停，由人工审核页面入口清单和功能点清单并进行禁用、补充或重命名，然后再进入验证阶段。原型阶段默认允许发现后自动继续执行。
 _Avoid_: 强制人工审批、完全无复核入口
 
+**发现审核回填补丁 (Discovery Review Patch)**:
+第二阶段 discovery 完成后允许通过 `discovery_review_patch.json` 对页面入口和功能点执行忽略、重命名和字段修正。该补丁属于人工审核结果的最小结构化表达，后续 discovery 复用与 verification 初始化应优先消费补丁后的结果，而不是继续沿用未修订的原始清单。
+_Avoid_: 只改报告不改源清单、人工审核结果不落盘、审核后与后续执行脱节
+
 **沉淀分层 (Knowledge Promotion Layering)**:
 第二阶段对运行过程中的经验修正和资产沉淀分为三层：运行时临时修正、项目级沉淀、平台级基线沉淀。运行时临时修正仅作用于当前任务；项目级沉淀可自动落盘；平台级基线沉淀必须经过人工审核后才能晋升。
 _Avoid_: 直接写入全局基线、无审核共享经验
@@ -139,7 +143,7 @@ _Avoid_: 只看首页表单、只看浏览器窗口、把 run 产物散落在多
 _Avoid_: 口头交接、仅靠终端日志恢复、无结构化续跑上下文
 
 **跨系统验证矩阵 (Cross-System Validation Matrix)**:
-第二阶段在 G4 中引入的统一验证汇总骨架，用于把不同模板族、不同系统样本和不同执行模式的 validation 结果放进同一份结构化矩阵中比较与归档。当前原型已支持把 `lab_*` 本地模板族与 `suyuan_*` 样本汇总到 `artifacts/stage2/validation_matrix/` 下的 json / markdown 产物中，但这仍属于跨系统验证的准备阶段，而不是“已完成多个真实业务系统验证”。
+第二阶段在 G4 中引入的统一验证汇总骨架，用于把不同模板族、不同系统样本和不同执行模式的 validation 结果放进同一份结构化矩阵中比较与归档。当前原型已支持把 `lab_*` 本地模板族与 `suyuan_*` 样本汇总到 `artifacts/stage2/validation_matrix/` 下的 json / markdown 产物中；默认目标已包含 `suyuan_online_query_reset` 与 `suyuan_online_detail_view` 两个 connected 样本。但这仍属于跨系统验证的准备阶段，而不是“已完成多个真实业务系统验证”。
 _Avoid_: 单次 validation 结果、平台日报、已完成跨真实系统泛化
 
 ### 交付物
