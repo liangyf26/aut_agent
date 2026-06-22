@@ -135,12 +135,20 @@ _Avoid_: 自动验收结论、业务通过率
 _Avoid_: 仅看浏览器动作、只在最终报告里复盘、无实时状态
 
 **运行中心 (Run Center)**:
-当前 Node.js 主平台首页和后续平台 UI 的操作工作台，聚合当前项目阶段摘要、项目级近期事件、第二阶段运行摘要和选中 run 详情；当前通过 `GET /api/stage2/overview` 从 `artifacts/stage2/` 聚合读取。
+当前 Node.js 主平台首页和后续平台 UI 的操作工作台，聚合当前项目阶段摘要、项目级近期事件、第二阶段运行摘要、人工录制候选审阅摘要、基线冻结摘要和选中 run 详情，并提供打开关键 artifact 的动作入口；当前通过 `GET /api/stage2/overview` 从 `artifacts/stage2/` 聚合读取。
 _Avoid_: 只看首页表单、只看浏览器窗口、把 run 产物散落在多个入口里
+
+**候选模板审阅包 (Candidate Template Review Package)**:
+人工录制会话在候选模板草稿之外额外生成的审阅型结构化产物，当前原型对应 `candidate_template_review.json`。它面向项目实施者确认字段映射、alias 草案、候选定位器和项目字段上下文，而不是直接拿来执行。
+_Avoid_: 最终模板、直接执行脚本、只看草稿不看映射确认
 
 **人工接管恢复包 (Human Takeover Packet)**:
 当运行命中人工审核或人工接管条件时生成的结构化续跑说明，至少包含当前 run、待处理动作、下一轮目标阶段、恢复命令和备注，当前原型对应产物为 `human_takeover.json`。
 _Avoid_: 口头交接、仅靠终端日志恢复、无结构化续跑上下文
+
+**沉淀候选审阅摘要 (Promotion Review Summary)**:
+第二阶段对 `promotion_candidates.json` 中候选沉淀项做出的汇总型判断，当前通过 `promotion_candidate_summary` 表达，至少覆盖审阅状态、晋升目标、证据要求、基线冻结候选和待补跟进项。它用于运行中心、日报和报告层的人工决策入口，不等于平台级自动晋升。
+_Avoid_: 自动批准、平台级最终结论、只看单条候选不看汇总
 
 **跨系统验证矩阵 (Cross-System Validation Matrix)**:
 第二阶段在 G4 中引入的统一验证汇总骨架，用于把不同模板族、不同系统样本和不同执行模式的 validation 结果放进同一份结构化矩阵中比较与归档。当前原型已支持把 `lab_*` 本地模板族与 `suyuan_*` 样本汇总到 `artifacts/stage2/validation_matrix/` 下的 json / markdown 产物中；默认目标已包含 `suyuan_online_query_reset` 与 `suyuan_online_detail_view` 两个 connected 样本。但这仍属于跨系统验证的准备阶段，而不是“已完成多个真实业务系统验证”。

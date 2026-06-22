@@ -65,9 +65,10 @@ python -m prototype.stage2.main --validation-matrix --cdp-url http://localhost:9
 - 高风险真实提交默认禁止，除非项目级白名单显式允许
 - 运行态必须持续落盘结构化产物，至少包含进度事件、当前状态、页面入口、功能点、执行结果、失败簇、报告
 - 初始化/运行阶段现在还会落盘 `routing_summary.json` 与 `discovery_strategy.json`，用于说明模型路由与本轮发现策略
+- 人工录制会话当前除候选草稿外还会落盘 `candidate_template_review.json`；运行中心已消费其摘要和 artifact 链接
 - 当前验证层已经形成三层结构：通用模板动作、项目级复用动作族、少量项目胶水；后续抽象优先继续拆剩余项目耦合点，并在 G4 骨架上接入新的真实业务系统
 - 当前验证层已补 G3 护栏，并新增 G4 validation matrix 骨架：`lab_*` 本地模板族与 `suyuan_*` 样本可走进同一套统一汇总链路
-- Node.js 主平台首页现在默认是运行中心优先布局；涉及平台 UI 时，应从 `public/index.html`、`public/app.js`、`src/stage2Dashboard.js` 理解当前外壳，而不是假设仍是表单优先首页
+- Node.js 主平台首页现在默认是运行中心优先布局；涉及平台 UI 时，应从 `public/index.html`、`public/app.js`、`src/stage2Dashboard.js` 理解当前外壳，而不是假设仍是表单优先首页。当前 overview 还会聚合 `latest_baseline_freeze_manifest.json` 与 run 级 `promotion_candidate_summary`
 - 项目级沉淀可以自动落盘；平台级基线沉淀必须人工审核后晋升
 - 生成的 `artifacts/`、日报、报告是证据，不是设计真相；设计真相以 `docs/` 和 `CONTEXT.md` 为准
 
