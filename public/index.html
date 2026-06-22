@@ -18,89 +18,220 @@
         </div>
 
         <button class="primary-action" id="newProjectButton" type="button">新建评测项目</button>
-        <div class="project-list" id="projectList"></div>
+
+        <section class="sidebar-section">
+          <div class="sidebar-heading">
+            <strong>评测项目</strong>
+            <span id="projectListCount">0</span>
+          </div>
+          <div class="project-list" id="projectList"></div>
+        </section>
       </aside>
 
       <main class="workspace">
         <section class="toolbar">
-          <div>
-            <p class="eyebrow">第三方验收评测</p>
-            <h1 id="pageTitle">评测项目工作台</h1>
+          <div class="toolbar-copy">
+            <p class="eyebrow">第二阶段平台工作台</p>
+            <h1 id="pageTitle">自动化测试运行中心</h1>
+            <p class="toolbar-subtitle" id="pageSubtitle">把当前项目、阶段进度和最近运行放在同一块台面上。</p>
           </div>
-          <div class="pipeline">
-            <button data-action="analyze" type="button">解析需求</button>
-            <button data-action="generate-cases" type="button">生成用例</button>
-            <button data-action="run" type="button">执行评测</button>
-            <button data-action="report" type="button">生成报告</button>
+          <div class="toolbar-actions">
+            <button class="ghost-action" id="toggleProjectFormButton" type="button">项目设置</button>
+            <span class="status-pill" id="projectStatus">待创建</span>
           </div>
         </section>
 
-        <section class="content-grid">
-          <form class="panel project-form" id="projectForm">
+        <section class="hero-grid">
+          <article class="hero-panel">
+            <div class="hero-head">
+              <div>
+                <p class="section-kicker">当前项目阶段</p>
+                <h2 id="currentPhaseLabel">项目资料</h2>
+                <p class="hero-description" id="currentStepLabel">先保存项目资料并建立评测上下文。</p>
+              </div>
+              <div class="pipeline" id="pipeline">
+                <button data-action="analyze" type="button">解析需求</button>
+                <button data-action="generate-cases" type="button">生成用例</button>
+                <button data-action="run" type="button">执行评测</button>
+                <button data-action="report" type="button">生成报告</button>
+              </div>
+            </div>
+
+            <div class="hero-meta-grid">
+              <div class="meta-block">
+                <span>当前对象</span>
+                <strong id="currentObjectLabel">未选择项目</strong>
+              </div>
+              <div class="meta-block">
+                <span>当前轮次</span>
+                <strong id="currentRoundLabel">初始化轮</strong>
+              </div>
+              <div class="meta-block meta-block-wide">
+                <span>下一步动作</span>
+                <strong id="nextActionLabel">新建或选择项目开始</strong>
+              </div>
+              <div class="meta-block">
+                <span>最近更新</span>
+                <strong id="lastUpdatedLabel">-</strong>
+              </div>
+            </div>
+
+            <div class="stage-track" id="stageTrack"></div>
+          </article>
+
+          <aside class="summary-panel">
             <div class="panel-heading">
-              <h2>项目资料</h2>
+              <div>
+                <h2>操作摘要</h2>
+                <p class="panel-note">把当前项目最值得关注的动作先放到眼前。</p>
+              </div>
               <span id="saveState">未保存</span>
             </div>
-            <label>
-              项目名称
-              <input name="name" required placeholder="例如：OA 系统一期验收评测">
-            </label>
-            <div class="two-cols">
+
+            <dl class="summary-list">
+              <div>
+                <dt>推荐动作</dt>
+                <dd id="recommendedAction">保存项目资料</dd>
+              </div>
+              <div>
+                <dt>被测系统</dt>
+                <dd id="systemLabel">待补充</dd>
+              </div>
+              <div>
+                <dt>测试环境</dt>
+                <dd id="environmentLabel">测试环境</dd>
+              </div>
+              <div>
+                <dt>账号说明</dt>
+                <dd id="accountState">待补充</dd>
+              </div>
+              <div>
+                <dt>范围摘要</dt>
+                <dd id="scopeSummary">尚未填写评测范围</dd>
+              </div>
+            </dl>
+
+            <section class="blocker-panel">
+              <h3>阻塞与人工确认</h3>
+              <div id="projectBlockerList"></div>
+            </section>
+          </aside>
+        </section>
+
+        <section class="metric-strip">
+          <article class="metric-item">
+            <span>功能模块</span>
+            <strong id="moduleCount">0</strong>
+          </article>
+          <article class="metric-item">
+            <span>功能点</span>
+            <strong id="featurePointCount">0</strong>
+          </article>
+          <article class="metric-item">
+            <span>验收项</span>
+            <strong id="criteriaCount">0</strong>
+          </article>
+          <article class="metric-item">
+            <span>测试用例</span>
+            <strong id="caseCount">0</strong>
+          </article>
+          <article class="metric-item">
+            <span>已执行</span>
+            <strong id="executedCount">0</strong>
+          </article>
+          <article class="metric-item">
+            <span>通过率</span>
+            <strong id="passRate">0%</strong>
+          </article>
+        </section>
+
+        <section class="project-form-shell is-collapsed" id="projectFormShell">
+          <form class="project-form" id="projectForm">
+            <div class="panel-heading">
+              <div>
+                <h2>项目设置</h2>
+                <p class="panel-note">资料维护不再抢首页主视线，但仍然可以随时展开编辑。</p>
+              </div>
+            </div>
+
+            <div class="form-grid">
               <label>
-                甲方单位
-                <input name="client" placeholder="甲方">
+                项目名称
+                <input name="name" required placeholder="例如：OA 系统一期验收评测">
               </label>
+
+              <div class="two-cols">
+                <label>
+                  甲方单位
+                  <input name="client" placeholder="甲方">
+                </label>
+                <label>
+                  乙方单位
+                  <input name="vendor" placeholder="乙方">
+                </label>
+              </div>
+
+              <div class="two-cols">
+                <label>
+                  被测系统
+                  <input name="sutName" placeholder="系统名称">
+                </label>
+                <label>
+                  访问地址
+                  <input name="sutBaseUrl" placeholder="https://test.example.com">
+                </label>
+              </div>
+
               <label>
-                乙方单位
-                <input name="vendor" placeholder="乙方">
+                测试账号与环境说明
+                <textarea name="accountNotes" rows="3" placeholder="账号、角色、权限、环境限制"></textarea>
+              </label>
+
+              <label>
+                评测范围
+                <textarea name="scope" rows="4" placeholder="本次需要覆盖的功能模块、业务流程和不纳入范围"></textarea>
+              </label>
+
+              <label>
+                需求资料
+                <textarea name="documentText" rows="8" placeholder="粘贴需求说明书、功能说明书或验收项文本"></textarea>
               </label>
             </div>
-            <div class="two-cols">
-              <label>
-                被测系统
-                <input name="sutName" placeholder="系统名称">
-              </label>
-              <label>
-                访问地址
-                <input name="sutBaseUrl" placeholder="https://test.example.com">
-              </label>
-            </div>
-            <label>
-              测试账号与环境说明
-              <textarea name="accountNotes" rows="3" placeholder="账号、角色、权限、环境限制"></textarea>
-            </label>
-            <label>
-              评测范围
-              <textarea name="scope" rows="4" placeholder="本次需要覆盖的功能模块、业务流程和不纳入范围"></textarea>
-            </label>
-            <label>
-              需求资料
-              <textarea name="documentText" rows="10" placeholder="粘贴需求说明书、功能说明书或验收项文本"></textarea>
-            </label>
+
             <button class="submit-button" type="submit">保存项目</button>
           </form>
+        </section>
 
+        <section class="operator-grid">
+          <article class="panel event-panel">
+            <div class="panel-heading">
+              <div>
+                <h2>平台步骤流</h2>
+                <p class="panel-note">展示当前项目的阶段事件、最近动作和推荐方向。</p>
+              </div>
+            </div>
+            <div class="event-list" id="eventList"></div>
+          </article>
+
+          <article class="panel stage2-panel">
+            <div class="panel-heading">
+              <div>
+                <h2>第二阶段运行中心</h2>
+                <p class="panel-note" id="stage2Summary">读取真实 run 产物、编排会话、验证矩阵和模型对比摘要。</p>
+              </div>
+            </div>
+            <div class="stage2-overview" id="stage2OverviewCards"></div>
+            <div class="session-list" id="stage2SessionList"></div>
+            <div class="run-list" id="stage2RunList"></div>
+          </article>
+        </section>
+
+        <section class="detail-grid">
           <section class="panel overview-panel">
             <div class="panel-heading">
-              <h2>评测概览</h2>
-              <span id="projectStatus">待创建</span>
-            </div>
-            <div class="metric-grid">
-              <div class="metric">
-                <span>功能模块</span>
-                <strong id="moduleCount">0</strong>
-              </div>
-              <div class="metric">
-                <span>验收项</span>
-                <strong id="criteriaCount">0</strong>
-              </div>
-              <div class="metric">
-                <span>测试用例</span>
-                <strong id="caseCount">0</strong>
-              </div>
-              <div class="metric">
-                <span>通过率</span>
-                <strong id="passRate">0%</strong>
+              <div>
+                <h2>项目明细</h2>
+                <p class="panel-note">保留当前 MVP 的需求、用例、执行和报告明细作为项目透视层。</p>
               </div>
             </div>
 
@@ -118,6 +249,17 @@
             <div class="tab-body" id="reportTab"></div>
             <pre class="tab-body code-output" id="codeTab"></pre>
           </section>
+
+          <aside class="panel run-detail-panel">
+            <div class="panel-heading">
+              <div>
+                <h2>选中 Run 详情</h2>
+                <p class="panel-note">用于查看控制闭环、人工接管、恢复入口和可直接打开的关键产物。</p>
+              </div>
+            </div>
+            <div class="run-detail-empty" id="stage2RunEmpty">暂无第二阶段运行数据。</div>
+            <div class="run-detail-body" id="stage2RunDetail"></div>
+          </aside>
         </section>
       </main>
     </div>

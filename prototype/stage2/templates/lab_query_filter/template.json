@@ -24,7 +24,7 @@
       "kind": "field_input",
       "action": "fill_field_by_locator",
       "args": {
-        "locator": "#queryInput",
+        "locator_hint_key": "query_input",
         "data_ref": "query_form.keyword"
       }
     },
@@ -33,7 +33,7 @@
       "kind": "field_select",
       "action": "select_option_by_locator",
       "args": {
-        "locator": "#statusSelect",
+        "locator_hint_key": "status_select",
         "data_ref": "query_form.status"
       }
     },
@@ -42,7 +42,7 @@
       "kind": "action",
       "action": "click_by_locator",
       "args": {
-        "locator": "#searchButton"
+        "locator_hint_key": "search_button"
       }
     },
     {

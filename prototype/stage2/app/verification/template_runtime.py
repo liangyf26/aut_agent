@@ -10,6 +10,7 @@ class TemplateRuntimeData:
     baseline: dict[str, Any]
     run_data: dict[str, Any]
     generated_files: dict[str, Path] | None = None
+    locator_hints: dict[str, Any] | None = None
 
     def resolve_ref(self, ref: str | None) -> Any:
         if not ref:
@@ -20,6 +21,7 @@ class TemplateRuntimeData:
             "baseline": self.baseline,
             "run_data": self.run_data,
             "generated_files": self.generated_files or {},
+            "locator_hints": self.locator_hints or {},
         }
         for part in ref.split("."):
             if isinstance(current, Mapping):
@@ -27,6 +29,16 @@ class TemplateRuntimeData:
                 continue
             return None
         return current
+
+    def locator_hint(self, key: str | None) -> Any:
+        if not key:
+            return None
+        return (self.locator_hints or {}).get(key)
+
+    def has_locator_hint(self, key: str | None) -> bool:
+        if not key:
+            return False
+        return key in (self.locator_hints or {})
 
     def generated_file(self, ref: str) -> Path | None:
         value = self.resolve_ref(ref)

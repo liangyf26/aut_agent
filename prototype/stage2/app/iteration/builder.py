@@ -336,54 +336,120 @@ class _IterationBuilder:
         candidates: list[PromotionCandidateRecord] = []
 
         for item in self.report.success_items:
+            evidence = _item_evidence(item)
+            review_payload = self._promotion_review_payload(
+                promotion_level="verified_success",
+                evidence=evidence,
+                has_open_failure_clusters=bool(failure_clusters),
+            )
             candidates.append(
                 PromotionCandidateRecord(
-                    candidate_id=f"promotion-success-{len(candidates) + 1:03d}",
+                    candidate_id=item.item_id or f"promotion-success-{len(candidates) + 1:03d}",
                     source="run_report.success_items",
                     title=item.name,
                     promotion_level="verified_success",
                     status="candidate",
                     reason=item.summary or "Successful item recorded in run report.",
-                    evidence=_item_evidence(item),
+                    review_status=review_payload["review_status"],
+                    promotion_target=review_payload["promotion_target"],
+                    promotion_recommendation=review_payload["promotion_recommendation"],
+                    needs_manual_review=review_payload["needs_manual_review"],
+                    evidence_requirements=review_payload["evidence_requirements"],
+                    missing_evidence=review_payload["missing_evidence"],
+                    evidence=evidence,
                 )
             )
 
         for attempt in self.attempts:
             if attempt["status"] in SUCCESS_STATUSES:
+                evidence = [
+                    {
+                        "attempt_id": attempt["attempt_id"],
+                        "stage": attempt["stage"],
+                        "status": attempt["status"],
+                    }
+                ]
+                review_payload = self._promotion_review_payload(
+                    promotion_level="retry_baseline",
+                    evidence=evidence,
+                    has_open_failure_clusters=bool(failure_clusters),
+                )
                 candidates.append(
                     PromotionCandidateRecord(
-                        candidate_id=f"promotion-attempt-{len(candidates) + 1:03d}",
+                        candidate_id=attempt["attempt_id"] or f"promotion-attempt-{len(candidates) + 1:03d}",
                         source="attempts",
                         title=attempt["title"],
                         promotion_level="retry_baseline",
                         status="candidate",
                         reason=attempt["message"] or "Attempt completed successfully.",
-                        evidence=[
-                            {
-                                "attempt_id": attempt["attempt_id"],
-                                "stage": attempt["stage"],
-                                "status": attempt["status"],
-                            }
-                        ],
+                        review_status=review_payload["review_status"],
+                        promotion_target=review_payload["promotion_target"],
+                        promotion_recommendation=review_payload["promotion_recommendation"],
+                        needs_manual_review=review_payload["needs_manual_review"],
+                        evidence_requirements=review_payload["evidence_requirements"],
+                        missing_evidence=review_payload["missing_evidence"],
+                        evidence=evidence,
                     )
                 )
 
         if self._is_success_run() and not candidates:
+            evidence = [{"run_id": self._run_id, "status": self._run_status}]
+            review_payload = self._promotion_review_payload(
+                promotion_level="run_summary",
+                evidence=evidence,
+                has_open_failure_clusters=bool(failure_clusters),
+            )
             candidates.append(
                 PromotionCandidateRecord(
-                    candidate_id="promotion-run-001",
+                    candidate_id=f"{self._run_id}__promotion_run_summary",
                     source="run_status",
                     title="Successful run summary",
                     promotion_level="run_summary",
                     status="candidate",
                     reason="Run finished successfully and can be retained as a reference baseline.",
-                    evidence=[{"run_id": self._run_id, "status": self._run_status}],
+                    review_status=review_payload["review_status"],
+                    promotion_target=review_payload["promotion_target"],
+                    promotion_recommendation=review_payload["promotion_recommendation"],
+                    needs_manual_review=review_payload["needs_manual_review"],
+                    evidence_requirements=review_payload["evidence_requirements"],
+                    missing_evidence=review_payload["missing_evidence"],
+                    evidence=evidence,
                 )
             )
 
         if failure_clusters:
             return candidates
         return candidates
+
+    def _promotion_review_payload(
+        self,
+        *,
+        promotion_level: str,
+        evidence: list[dict[str, Any]],
+        has_open_failure_clusters: bool,
+    ) -> dict[str, Any]:
+        promotion_target = _promotion_target_for_level(promotion_level)
+        promotion_recommendation = _promotion_recommendation_for_level(promotion_level)
+        evidence_requirements = _promotion_evidence_requirements(
+            promotion_level=promotion_level,
+            promotion_target=promotion_target,
+        )
+        missing_evidence = list(_missing_promotion_evidence(evidence, evidence_requirements))
+        if has_open_failure_clusters:
+            missing_evidence.append("rerun after open failure clusters are cleared")
+        review_status = "ready_for_review"
+        if not evidence:
+            review_status = "needs_evidence"
+        elif has_open_failure_clusters:
+            review_status = "needs_followup_validation"
+        return {
+            "review_status": review_status,
+            "promotion_target": promotion_target,
+            "promotion_recommendation": promotion_recommendation,
+            "needs_manual_review": True,
+            "evidence_requirements": _sorted_unique(evidence_requirements),
+            "missing_evidence": _sorted_unique(missing_evidence),
+        }
 
     def _build_iteration_comparison(
         self,
@@ -833,7 +899,7 @@ class _IterationBuilder:
         boundary_clusters = [
             cluster
             for cluster in failure_clusters
-            if cluster.category in {"permission"}
+            if cluster.category in {"permission", "policy", "preflight"}
         ]
         if boundary_clusters:
             return StopConditionRecord(
@@ -1136,6 +1202,12 @@ def _normalize_promotion_candidates(value: Any) -> list[PromotionCandidateRecord
                 promotion_level=_text(data.get("promotion_level") or data.get("owner")) or "unknown",
                 status=_text(data.get("status")) or "candidate",
                 reason=_text(data.get("reason") or data.get("summary")),
+                review_status=_text(data.get("review_status")),
+                promotion_target=_text(data.get("promotion_target")),
+                promotion_recommendation=_text(data.get("promotion_recommendation")),
+                needs_manual_review=_coerce_bool(data.get("needs_manual_review")),
+                evidence_requirements=_string_list(data.get("evidence_requirements")),
+                missing_evidence=_string_list(data.get("missing_evidence")),
                 evidence=_coerce_evidence(data.get("evidence")),
             )
         )
@@ -1162,9 +1234,14 @@ def _classify_failure(*parts: Any) -> str:
     text = " ".join(_flatten_text(parts)).lower()
     explicit = {
         "account_policy_block": "permission",
+        "policy_blocked": "permission",
+        "policy_review_required": "policy",
         "backend_update_primary_key_error": "backend_data",
         "front_validation_missing_commitment": "front_validation",
         "pending_payment_modify_mode": "workflow_branch",
+        "preflight_capability_missing": "preflight",
+        "preflight_capability_stale": "preflight",
+        "preflight_capability_incompatible": "preflight",
         "environment_bootstrap_failure": "environment",
         "max_attempts_exhausted": "stability",
         "unknown_failure": "runtime",
@@ -1207,6 +1284,10 @@ def _summarize_cluster(category: str, stage: str, signals: list[dict[str, Any]])
 def _recommendation_for_category(category: str, stage: str) -> str:
     if category == "permission":
         return "Stop automatic retry and request account, role, or organization confirmation before another round."
+    if category == "policy":
+        return "Do not auto-submit again until a human reviews the high-risk action policy for this project."
+    if category == "preflight":
+        return "Refresh the model capability probe and capability routing inputs before another run."
     if category == "front_validation":
         return "Inspect the visible validation errors and fill the missing required inputs before retrying."
     if category == "workflow_branch":
@@ -1233,6 +1314,10 @@ def _recommendation_for_category(category: str, stage: str) -> str:
 def _action_level_for_category(category: str) -> str:
     if category in {"permission", "workflow_branch"}:
         return "workflow"
+    if category == "policy":
+        return "policy"
+    if category == "preflight":
+        return "runtime"
     if category == "front_validation":
         return "logic"
     if category == "backend_data":
@@ -1267,6 +1352,10 @@ def _priority_for_cluster(cluster: FailureClusterRecord) -> str:
 def _strategy_for_cluster(cluster: FailureClusterRecord) -> str:
     if cluster.category == "permission":
         return "human_review_required"
+    if cluster.category == "policy":
+        return "human_review_required"
+    if cluster.category == "preflight":
+        return "fix_precondition_then_rerun"
     if cluster.category == "front_validation":
         return "inspect_validation_and_rerun"
     if cluster.category == "workflow_branch":
@@ -1308,6 +1397,13 @@ def _execution_hints_for_cluster(cluster: FailureClusterRecord) -> dict[str, Any
     hints: dict[str, Any] = {}
     if cluster.category == "permission":
         hints["requires_human_review"] = True
+        hints["stop_after_current_round"] = True
+    elif cluster.category == "policy":
+        hints["requires_human_review"] = True
+        hints["stop_after_current_round"] = True
+        hints["policy_retry_mode"] = "review_project_allowlist"
+    elif cluster.category == "preflight":
+        hints["preflight_mode"] = "refresh_capability_probe"
         hints["stop_after_current_round"] = True
     elif cluster.category == "front_validation":
         hints["validation_retry_mode"] = "inspect_visible_errors"
@@ -1354,6 +1450,46 @@ def _item_evidence(item: ReportItem) -> list[dict[str, Any]]:
     if item.summary:
         evidence.append({"summary": item.summary})
     return evidence
+
+
+def _promotion_target_for_level(promotion_level: str) -> str:
+    if promotion_level == "run_summary":
+        return "project_reference_baseline"
+    return "project_baseline_freeze"
+
+
+def _promotion_recommendation_for_level(promotion_level: str) -> str:
+    if promotion_level == "retry_baseline":
+        return "freeze_retry_baseline"
+    if promotion_level == "run_summary":
+        return "retain_reference_run"
+    return "freeze_project_baseline"
+
+
+def _promotion_evidence_requirements(
+    *,
+    promotion_level: str,
+    promotion_target: str,
+) -> list[str]:
+    requirements = ["successful verification evidence"]
+    if promotion_target == "project_baseline_freeze":
+        requirements.append("key artifacts or screenshots")
+    if promotion_target == "project_reference_baseline":
+        requirements.append("final run summary or key iteration artifacts")
+    if promotion_level == "verified_success":
+        requirements.append("manual reviewer confirmation before promotion")
+    return requirements
+
+
+def _missing_promotion_evidence(
+    evidence: list[dict[str, Any]],
+    evidence_requirements: list[str],
+) -> list[str]:
+    if evidence:
+        return []
+    if not evidence_requirements:
+        return ["successful verification evidence"]
+    return list(evidence_requirements)
 
 
 def _metric_delta(current_value: Any, previous_value: Any) -> Any:
@@ -1580,6 +1716,22 @@ def _coerce_int(value: Any) -> int | None:
             return int(float(value.strip()))
         except ValueError:
             return None
+    return None
+
+
+def _coerce_bool(value: Any) -> bool | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "off"}:
+            return False
     return None
 
 

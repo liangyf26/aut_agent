@@ -4,7 +4,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -12,9 +12,15 @@ if str(ROOT_DIR) not in sys.path:
 
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Locator, Page, async_playwright
-from prototype.stage2.app.config.models import (
+from prototype.stage2.app.config import (
+    CapabilityRoutingDecision,
+    CapabilityGateDecision,
     ModelProfile,
+    RunPolicyLoadResult,
+    build_capability_routing,
     load_model_profiles as load_stage2_model_profiles,
+    load_run_policy as load_stage2_run_policy,
+    validate_model_capabilities,
 )
 from prototype.stage2.app.data_factory.generator import TemplateDataFactory
 from prototype.stage2.app.discovery import (
@@ -22,18 +28,35 @@ from prototype.stage2.app.discovery import (
     DiscoveryPlanner,
     plan_live_discovery,
 )
+from prototype.stage2.app.discovery.models import (
+    DiscoveryResult,
+    FeaturePointRecord,
+    PageEntryRecord,
+    ScreenshotRecord,
+)
+from prototype.stage2.app.discovery.strategy import DiscoveryStrategyDecision, select_discovery_strategy
 from prototype.stage2.app.iteration import write_iteration_artifacts
+from prototype.stage2.app.orchestration.routing_summary import build_routing_summary
+from prototype.stage2.app.orchestration.session_artifacts import sync_orchestration_session_artifacts
 from prototype.stage2.app.progress import ProgressManager
 from prototype.stage2.app.progress.console import format_status_line
 from prototype.stage2.app.reporting import (
     adapt_progress_snapshot,
+    build_decision_section,
     build_platform_daily_report,
+    build_routing_section,
     render_progress_markdown,
     render_progress_text,
     render_platform_daily_report_markdown,
     render_run_report_markdown,
 )
 from prototype.stage2.app.runtime.artifacts import ArtifactWriter
+from prototype.stage2.app.runtime import (
+    POLICY_ALLOWED,
+    PolicyGateDecision,
+    RISK_RISKY_SUBMIT,
+    evaluate_action_policy,
+)
 from prototype.stage2.app.runtime.templates import load_template_bundle
 from prototype.stage2.app.verification.generated_files import build_default_generated_files
 from prototype.stage2.app.verification.template_executor import (
@@ -42,6 +65,13 @@ from prototype.stage2.app.verification.template_executor import (
     TemplateStepExecution,
 )
 from prototype.stage2.app.verification.template_runtime import TemplateRuntimeData
+from prototype.stage2.app.verification.suyuan_shared_actions import (
+    register_suyuan_wizard_drawer_actions,
+)
+from prototype.stage2.app.verification.suyuan_submit_dialog_actions import (
+    register_suyuan_submit_dialog_actions,
+    submit_filing_dialog,
+)
 
 
 if sys.stdout.encoding != "utf-8":
@@ -58,6 +88,8 @@ DEFAULT_ENV_FILES = [
 STAGE2_TEMPLATE_DIR = ROOT_DIR / "prototype" / "stage2" / "templates" / "suyuan_online_apply"
 TEMPLATE_BUNDLE = load_template_bundle(STAGE2_TEMPLATE_DIR)
 SUCCESS_BASELINE = TEMPLATE_BUNDLE.baseline
+RUN_POLICY_FILE = ROOT_DIR / "prototype" / "stage2" / "run_policy.json"
+STAGE2_PROJECT_NAME = "AI Agent 软件自动化评测平台第二阶段原型"
 
 
 def build_orchestration_stream_id(template_name: str, model_name: str) -> str:
@@ -68,8 +100,69 @@ def profile_safe_name(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value)
 
 
+def _coerce_positive_int(value: Any) -> int | None:
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        return None
+    return coerced if coerced > 0 else None
+
+
+def _configured_round_limit(
+    round_input: Mapping[str, Any] | None,
+    fallback: int | None = None,
+) -> int | None:
+    if round_input:
+        configured = _coerce_positive_int(round_input.get("max_rounds"))
+        if configured is not None:
+            return configured
+    return _coerce_positive_int(fallback)
+
+
+def _derive_remaining_round_budget(round_input: Mapping[str, Any] | None) -> int | None:
+    configured = _configured_round_limit(round_input)
+    current_round = _coerce_positive_int((round_input or {}).get("round_index"))
+    if configured is None or current_round is None:
+        return None
+    remaining = configured - current_round
+    return remaining if remaining > 0 else None
+
+
+def resolve_resume_round_budget(
+    round_input: Mapping[str, Any] | None,
+    requested_max_rounds: int | None,
+) -> tuple[int, str]:
+    derived_remaining = _derive_remaining_round_budget(round_input)
+    requested = _coerce_positive_int(requested_max_rounds)
+
+    if requested is None:
+        if derived_remaining is not None:
+            return derived_remaining, "derived_from_round_input"
+        return 1, "fallback_single_round"
+
+    if derived_remaining is None:
+        return requested, "cli_override"
+
+    if requested == 1 and derived_remaining > 1:
+        return derived_remaining, "expanded_default_to_remaining_budget"
+
+    if requested > derived_remaining:
+        return derived_remaining, "capped_to_remaining_budget"
+
+    return requested, "cli_override"
+
+
 def read_round_input(run_dir: Path) -> dict[str, Any]:
     return _read_json_file(run_dir / "round_input.json")
+
+
+def resolve_model_profile(model_name: str) -> ModelProfile:
+    profiles = load_stage2_model_profiles(DEFAULT_ENV_FILES)
+    normalized_target = profile_safe_name(model_name)
+    for profile in profiles:
+        if profile.name == model_name or profile_safe_name(profile.name) == normalized_target:
+            return profile
+    raise RuntimeError(f"未找到模型配置：{model_name}")
 
 
 def build_round_input(
@@ -181,6 +274,114 @@ def build_execution_hints(
     hints["scheduled_cluster_stages"] = sorted(scheduled_stages)
     hints["scheduled_owners"] = sorted(scheduled_owners)
     return hints
+
+
+def build_human_resume_decision(
+    decision: dict[str, Any],
+    *,
+    operator_id: str | None = None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    if not decision:
+        raise RuntimeError("未找到上一轮 next_round_decision，无法恢复人工接管后的执行。")
+    scheduled_action_ids = list(decision.get("scheduled_action_ids") or [])
+    scheduled_cluster_ids = list(decision.get("scheduled_cluster_ids") or [])
+    if not scheduled_action_ids and not scheduled_cluster_ids:
+        raise RuntimeError("上一轮没有可继续的 scheduled actions / clusters，无法恢复人工接管后的执行。")
+
+    resumed = dict(decision)
+    notes = list(decision.get("notes") or [])
+    notes.append("Human takeover was acknowledged and the scheduled retry can continue.")
+    if operator_id:
+        notes.append(f"Human takeover operator: {operator_id}")
+    if note:
+        notes.append(note)
+    resumed.update(
+        {
+            "status": "scheduled",
+            "should_start_next_round": True,
+            "primary_reason": "Human takeover was completed and the scheduled retry can continue.",
+            "human_takeover_resolved": True,
+            "human_takeover_operator": operator_id,
+            "human_takeover_note": note,
+            "notes": notes,
+        }
+    )
+    return resumed
+
+
+def build_human_takeover_packet(
+    run_dir: Path,
+    *,
+    round_input: dict[str, Any],
+    retry_plan: dict[str, Any],
+    stop_conditions: dict[str, Any],
+    next_round_decision: dict[str, Any],
+    max_attempts: int | None = None,
+) -> dict[str, Any]:
+    scheduled_action_ids = list(next_round_decision.get("scheduled_action_ids") or [])
+    scheduled_cluster_ids = list(next_round_decision.get("scheduled_cluster_ids") or [])
+    pending_actions: list[dict[str, Any]] = []
+    for action in retry_plan.get("actions") or []:
+        if scheduled_action_ids and action.get("action_id") not in scheduled_action_ids:
+            continue
+        pending_actions.append(
+            {
+                "action_id": action.get("action_id"),
+                "cluster_id": action.get("cluster_id"),
+                "title": action.get("title"),
+                "stage": action.get("stage"),
+                "owner": action.get("owner"),
+                "strategy": action.get("strategy"),
+                "reason": action.get("reason"),
+                "expected_outcome": action.get("expected_outcome"),
+                "execution_hints": action.get("execution_hints") or {},
+            }
+        )
+
+    model_name = round_input.get("model_name") or "unknown-model"
+    resume_round_budget = _derive_remaining_round_budget(round_input) or 1
+    resume_attempt_budget = _coerce_positive_int(max_attempts) or 3
+    resume_command = (
+        "python -m prototype.stage2.main "
+        f'--resume-human-takeover "{run_dir}" '
+        f'--cdp-url "{DEFAULT_CDP_URL}" '
+        f"--max-attempts {resume_attempt_budget} "
+        f"--max-rounds {resume_round_budget}"
+    )
+    return {
+        "schema_version": "human_takeover_packet.v1",
+        "status": "waiting_human",
+        "source_run_id": run_dir.name,
+        "source_run_dir": str(run_dir),
+        "model_name": model_name,
+        "template_name": round_input.get("template_name"),
+        "project_name": round_input.get("project_name"),
+        "current_round": round_input.get("round_index"),
+        "resume_round": (int(round_input.get("round_index") or 0) + 1) if round_input.get("round_index") is not None else None,
+        "target_stage": next_round_decision.get("target_stage") or round_input.get("target_stage"),
+        "reason": next_round_decision.get("primary_reason") or stop_conditions.get("primary_reason"),
+        "stop_status": stop_conditions.get("status"),
+        "next_round_status": next_round_decision.get("status"),
+        "scheduled_cluster_ids": scheduled_cluster_ids,
+        "scheduled_action_ids": scheduled_action_ids,
+        "execution_hints": round_input.get("execution_hints") or {},
+        "resume_max_attempts": resume_attempt_budget,
+        "resume_max_rounds": resume_round_budget,
+        "configured_max_rounds": _configured_round_limit(round_input),
+        "pending_actions": pending_actions,
+        "resume_command": resume_command,
+        "notes": [
+            "Complete the required human takeover or review in the browser/system first.",
+            "Then use the resume command to continue the scheduled retry round.",
+        ],
+    }
+
+
+def write_human_takeover_packet(run_dir: Path, packet: dict[str, Any]) -> Path:
+    path = run_dir / "human_takeover.json"
+    path.write_text(json.dumps(packet, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
 
 
 def build_discovery_seed(artifacts: ArtifactWriter) -> tuple[object, dict[str, Path]]:
@@ -397,12 +598,14 @@ def build_report_promotion_candidates(iteration_artifacts: object) -> list[dict[
 def build_iteration_asset_refs(run_dir: Path) -> list[dict[str, str]]:
     labels = [
         "round_input.json",
+        "capability_preflight.json",
         "failure_clusters.json",
         "retry_plan.json",
         "promotion_candidates.json",
         "stop_conditions.json",
         "iteration_comparison.json",
         "next_round_decision.json",
+        "human_takeover.json",
     ]
     return [{"label": label, "path": str(run_dir / label)} for label in labels]
 
@@ -414,6 +617,52 @@ def _read_json_file(path: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return {}
+
+
+def _load_reused_discovery_result(run_dir: Path) -> DiscoveryResult | None:
+    payload = _read_json_file(run_dir / "discovery_result.json")
+    if not payload:
+        return None
+    try:
+        return DiscoveryResult(
+            template_name=str(payload.get("template_name") or TEMPLATE_BUNDLE.name),
+            generated_at=str(payload.get("generated_at") or datetime.now().isoformat()),
+            strategy=str(payload.get("strategy") or "reused_discovery"),
+            page_entries=[
+                PageEntryRecord(**item)
+                for item in payload.get("page_entries", [])
+                if isinstance(item, dict)
+            ],
+            feature_points=[
+                FeaturePointRecord(**item)
+                for item in payload.get("feature_points", [])
+                if isinstance(item, dict)
+            ],
+            screenshot_records=[
+                ScreenshotRecord(**item)
+                for item in payload.get("screenshot_records", [])
+                if isinstance(item, dict)
+            ],
+            review_queue=[
+                item for item in payload.get("review_queue", [])
+                if isinstance(item, dict)
+            ],
+            review_hints=dict(payload.get("review_hints") or {}),
+            stats=dict(payload.get("stats") or {}),
+            notes=list(payload.get("notes") or []),
+        )
+    except Exception:
+        return None
+
+
+def _build_reused_discovery_paths(run_dir: Path) -> dict[str, Path]:
+    return {
+        "page_entries": run_dir / "page_entries.json",
+        "feature_points": run_dir / "feature_points.json",
+        "screenshot_records": run_dir / "screenshot_records.json",
+        "review_queue": run_dir / "discovery_review_queue.json",
+        "discovery_summary": run_dir / "discovery_result.json",
+    }
 
 
 def load_run_report_payload(run_dir: Path) -> dict[str, Any]:
@@ -428,6 +677,245 @@ def should_auto_continue_next_round(decision: dict[str, Any]) -> bool:
     status = str(decision.get("status") or "").strip().lower()
     should_start = decision.get("should_start_next_round")
     return status == "scheduled" and should_start is True
+
+
+def load_run_policy() -> dict[str, Any]:
+    return load_run_policy_resolution().to_policy_gate_payload()
+
+
+def load_run_policy_resolution(
+    *,
+    project_name: str = STAGE2_PROJECT_NAME,
+    template_name: str = TEMPLATE_BUNDLE.name,
+) -> RunPolicyLoadResult:
+    return load_stage2_run_policy(
+        RUN_POLICY_FILE,
+        project_name=project_name,
+        template_name=template_name,
+    )
+
+
+def _routing_stage_summary(
+    decision: CapabilityRoutingDecision,
+    stage: str,
+) -> str:
+    route = getattr(decision, stage, None)
+    if route is None:
+        return "unknown"
+    return (
+        f"allowed={route.allowed}, mode={route.recommended_mode}, "
+        f"reason_code={route.reason_code}"
+    )
+
+
+def build_stage_route_decision_payload(
+    capability_routing: CapabilityRoutingDecision | None,
+    *,
+    stage: str,
+    requested_mode: str,
+    assigned_role: str,
+) -> dict[str, Any]:
+    if capability_routing is None:
+        return {}
+    route = getattr(capability_routing, stage, None)
+    if route is None:
+        return {}
+    selected_mode = route.recommended_mode
+    payload: dict[str, Any] = {
+        "status": (
+            "allowed"
+            if route.allowed
+            else "blocked"
+        ),
+        "stage": stage,
+        "requested_mode": requested_mode,
+        "selected_mode": selected_mode,
+        "assigned_role": assigned_role,
+        "reason": route.reason,
+        "required_tags": list(route.required_tags),
+        "missing_tags": list(route.missing_tags),
+        "routing_tags": list(route.routing_tags),
+        "capability_tags": dict(route.capability_tags),
+    }
+    if route.allowed and selected_mode != requested_mode:
+        payload["status"] = "degraded"
+        payload["fallback_mode"] = selected_mode
+        payload["fallback_role"] = assigned_role
+    return payload
+
+
+def _coerce_capability_gate_from_payload(run_dir: Path) -> CapabilityGateDecision | None:
+    payload = _read_json_file(run_dir / "capability_preflight.json")
+    if not payload:
+        return None
+    try:
+        return CapabilityGateDecision(
+            status=str(payload.get("status") or "blocked"),
+            reason_code=str(payload.get("reason_code") or "unknown"),
+            reason=str(payload.get("reason") or ""),
+            mode=str(payload.get("mode") or "unknown"),
+            profile_name=str(payload.get("profile_name") or ""),
+            required_tags=list(payload.get("required_tags") or []),
+            missing_tags=list(payload.get("missing_tags") or []),
+            capability_tags=dict(payload.get("capability_tags") or {}),
+            max_age_hours=int(payload.get("max_age_hours") or 0),
+            snapshot=None,
+            notes=list(payload.get("notes") or []),
+        )
+    except Exception:
+        return None
+
+
+def _coerce_capability_routing_from_payload(run_dir: Path) -> CapabilityRoutingDecision | None:
+    payload = _read_json_file(run_dir / "capability_routing.json")
+    if not payload:
+        return None
+    try:
+        discovery_payload = payload.get("discovery") or {}
+        verification_payload = payload.get("verification") or {}
+        reporting_payload = payload.get("reporting") or {}
+        return CapabilityRoutingDecision(
+            profile_name=str(payload.get("profile_name") or ""),
+            model=str(payload.get("model") or ""),
+            gate_status=str(payload.get("gate_status") or "unknown"),
+            gate_reason_code=str(payload.get("gate_reason_code") or "unknown"),
+            gate_reason=str(payload.get("gate_reason") or ""),
+            capability_tags=dict(payload.get("capability_tags") or {}),
+            routing_tags=list(payload.get("routing_tags") or []),
+            notes=list(payload.get("notes") or []),
+            discovery=_coerce_stage_route("discovery", discovery_payload),
+            verification=_coerce_stage_route("verification", verification_payload),
+            reporting=_coerce_stage_route("reporting", reporting_payload),
+        )
+    except Exception:
+        return None
+
+
+def _coerce_stage_route(
+    stage: str,
+    payload: dict[str, Any],
+):
+    if not payload:
+        return None
+    from prototype.stage2.app.config.capability_routing import CapabilityStageRoute
+
+    return CapabilityStageRoute(
+        stage=stage,
+        allowed=bool(payload.get("allowed")),
+        recommended_mode=str(payload.get("recommended_mode") or ""),
+        reason_code=str(payload.get("reason_code") or ""),
+        reason=str(payload.get("reason") or ""),
+        required_tags=list(payload.get("required_tags") or []),
+        missing_tags=list(payload.get("missing_tags") or []),
+        routing_tags=list(payload.get("routing_tags") or []),
+        capability_tags=dict(payload.get("capability_tags") or {}),
+        notes=list(payload.get("notes") or []),
+    )
+
+
+def _coerce_discovery_strategy_from_payload(run_dir: Path) -> DiscoveryStrategyDecision | None:
+    payload = _read_json_file(run_dir / "discovery_strategy.json")
+    if not payload:
+        return None
+    try:
+        return DiscoveryStrategyDecision(
+            selected_strategy=str(payload.get("selected_strategy") or "blocked"),
+            should_seed_discovery=bool(payload.get("should_seed_discovery")),
+            should_run_live_discovery=bool(payload.get("should_run_live_discovery")),
+            reason_code=str(payload.get("reason_code") or "unknown"),
+            reason=str(payload.get("reason") or ""),
+            route_mode=str(payload.get("route_mode")) if payload.get("route_mode") is not None else None,
+            route_allowed=bool(payload.get("route_allowed")),
+            reuse_completed_discovery=bool(payload.get("reuse_completed_discovery")),
+            reporting_only=bool(payload.get("reporting_only")),
+            execution_hints=dict(payload.get("execution_hints") or {}),
+            notes=list(payload.get("notes") or []),
+            route_summary=dict(payload.get("route_summary") or {}),
+        )
+    except Exception:
+        return None
+
+
+def classify_capability_gate_failure(decision: CapabilityGateDecision) -> dict[str, Any]:
+    category_map = {
+        "capability_probe_missing": "preflight_capability_missing",
+        "capability_probe_stale": "preflight_capability_stale",
+        "capability_probe_incompatible": "preflight_capability_incompatible",
+    }
+    return {
+        "success": False,
+        "category": category_map.get(decision.reason_code, "preflight_capability_blocked"),
+        "reason": decision.reason,
+        "reason_code": decision.reason_code,
+        "mode": decision.mode,
+        "required_tags": list(decision.required_tags),
+        "missing_tags": list(decision.missing_tags),
+        "capability_tags": dict(decision.capability_tags),
+        "snapshot": decision.snapshot.to_dict() if decision.snapshot else None,
+        "notes": list(decision.notes),
+    }
+
+
+def classify_policy_gate_failure(decision: PolicyGateDecision) -> dict[str, Any]:
+    category = "policy_review_required" if decision.needs_review else "policy_blocked"
+    return {
+        "success": False,
+        "category": category,
+        "reason": decision.reason or "The action was blocked by run policy.",
+        "reason_code": decision.reason_code,
+        "policy_status": decision.status,
+        "policy_source": decision.policy_source,
+        "matched_rule_id": decision.matched_rule_id,
+        "matched_allowlist": decision.matched_allowlist,
+        "requires_allowlist": decision.requires_allowlist,
+        "risk_level": decision.risk_level,
+        "notes": list(decision.notes),
+        "extra": dict(decision.extra),
+    }
+
+
+def build_preflight_capability_gate(
+    profile: ModelProfile,
+    *,
+    mode: str,
+) -> CapabilityGateDecision:
+    return validate_model_capabilities(profile, mode=mode)
+
+
+def build_submit_action_policy_decision(
+    *,
+    action_id: str,
+    template_name: str,
+    project_name: str,
+) -> PolicyGateDecision:
+    policy_payload = load_run_policy()
+    return evaluate_action_policy(
+        {
+            "action_id": action_id,
+            "template_name": template_name,
+            "project_name": project_name,
+            "action_type": "submit",
+        },
+        RISK_RISKY_SUBMIT,
+        payload=policy_payload,
+    )
+
+
+def require_submit_action_policy(
+    *,
+    action_id: str,
+    template_name: str,
+    project_name: str,
+) -> PolicyGateDecision:
+    decision = build_submit_action_policy_decision(
+        action_id=action_id,
+        template_name=template_name,
+        project_name=project_name,
+    )
+    if decision.status != POLICY_ALLOWED:
+        category = "policy_review_required" if decision.needs_review else "policy_blocked"
+        raise RuntimeError(f"{category}: {decision.reason}")
+    return decision
 
 
 def write_platform_daily_report_bundle(results: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -900,64 +1388,6 @@ def build_next_round_decision_section(iteration_artifacts: object) -> dict[str, 
     }
 
 
-async def click_apply_button(page: Page) -> None:
-    button = page.get_by_role("button", name="我要申请备案")
-    if await button.count():
-        await button.first.click(force=True)
-        await page.wait_for_timeout(1200)
-        return
-
-    text_match = page.get_by_text("我要申请备案", exact=True)
-    if await text_match.count():
-        await text_match.first.click(force=True)
-        await page.wait_for_timeout(1200)
-        return
-
-    raise RuntimeError("未找到“我要申请备案”按钮")
-
-
-async def click_exact_button(page: Page, name: str) -> dict[str, Any]:
-    locator = page.get_by_role("button", name=name)
-    if await locator.count():
-        await locator.first.click(force=True)
-        await page.wait_for_timeout(1200)
-        return {"ok": True, "name": name, "method": "role"}
-    locator = page.get_by_text(name, exact=True)
-    if await locator.count():
-        await locator.first.click(force=True)
-        await page.wait_for_timeout(1200)
-        return {"ok": True, "name": name, "method": "text"}
-    return {"ok": False, "name": name, "reason": "button-not-found"}
-
-
-async def click_partial_text(page: Page, text_fragment: str) -> dict[str, Any]:
-    result = await page.evaluate(
-        """
-        ({ textFragment }) => {
-          function text(node) {
-            return (node?.innerText || node?.textContent || '').replace(/\\s+/g, ' ').trim();
-          }
-          const candidates = Array.from(document.querySelectorAll('button, .el-button, [role="button"], span, a'))
-            .filter(el => el.offsetParent !== null && text(el).includes(textFragment));
-          if (!candidates.length) {
-            return { ok: false, reason: 'text-not-found', textFragment };
-          }
-          const target = candidates[candidates.length - 1];
-          target.click();
-          return {
-            ok: true,
-            textFragment,
-            clickedText: text(target),
-            candidates: candidates.map(text).slice(0, 20),
-          };
-        }
-        """,
-        {"textFragment": text_fragment},
-    )
-    await page.wait_for_timeout(1500)
-    return result
-
-
 async def reset_online_apply_page(page: Page) -> dict[str, Any]:
     await page.goto(ONLINE_RECORD_URL, wait_until="domcontentloaded")
     await page.wait_for_timeout(2500)
@@ -981,12 +1411,6 @@ async def reset_online_apply_page(page: Page) -> dict[str, Any]:
         }
         """
     )
-
-
-async def wait_for_dialog(page: Page) -> Locator:
-    dialog = page.locator(".el-dialog:visible").last
-    await dialog.wait_for(timeout=15000)
-    return dialog
 
 
 async def find_open_panel(page: Page) -> Locator | None:
@@ -1430,75 +1854,6 @@ async def set_attachment_validation_success(page: Page, prop: str) -> dict[str, 
     )
 
 
-async def run_apply_wizard(page: Page) -> list[dict[str, Any]]:
-    steps: list[dict[str, Any]] = []
-    await click_apply_button(page)
-    dialog = await wait_for_dialog(page)
-    steps.append({"step": "click_apply_button", "result": {"ok": await dialog.is_visible(), "method": "entry_opened"}})
-    steps.append(
-        {
-            "step": "click_intro_confirm",
-            "result": await click_exact_button(page, "拟备案信息纳入溯源系统"),
-        }
-    )
-    steps.append(
-        {
-            "step": "click_agreement_open",
-            "result": await click_exact_button(page, "签署溯源服务协议"),
-        }
-    )
-    steps.append({"step": "click_agreement_accept", "result": await click_exact_button(page, "同意签署")})
-    steps.append(
-        {
-            "step": "click_enter_initial_form",
-            "result": await click_partial_text(page, "纳入溯源系统的拟备案信息录入"),
-        }
-    )
-    return steps
-
-
-async def select_drawer_option(page: Page, label: str, option_keyword: str) -> dict[str, Any]:
-    drawer = page.locator(".el-drawer:visible, .el-drawer__wrapper:visible").last
-    items = drawer.locator(".el-form-item").filter(has=page.locator(".el-form-item__label", has_text=label))
-    count = await items.count()
-    if not count:
-        return {"ok": False, "label": label, "reason": "container-not-found"}
-    container = items.last
-    trigger = container.locator(".el-select .el-input__inner").first
-    if not await trigger.count():
-        trigger = container.locator(".el-input__inner").first
-    if not await trigger.count():
-        return {"ok": False, "label": label, "reason": "trigger-not-found"}
-    await trigger.click(force=True)
-    await page.wait_for_timeout(1200)
-    options = page.locator(".el-select-dropdown:visible .el-select-dropdown__item")
-    option_count = await options.count()
-    candidates: list[str] = []
-    for idx in range(option_count):
-        text = (await options.nth(idx).inner_text()).strip()
-        candidates.append(text)
-        if option_keyword in text:
-            await options.nth(idx).click(force=True)
-            await page.wait_for_timeout(900)
-            return {"ok": True, "label": label, "selected": text, "candidates": candidates}
-    return {"ok": False, "label": label, "reason": "option-not-found", "candidates": candidates}
-
-
-async def ensure_drawer_checkbox(page: Page, label_text: str) -> dict[str, Any]:
-    drawer = page.locator(".el-drawer:visible, .el-drawer__wrapper:visible").last
-    checkbox = drawer.locator("label.el-checkbox").filter(has_text=label_text).first
-    if await checkbox.count():
-        await checkbox.click(force=True)
-        await page.wait_for_timeout(500)
-        return {"ok": True, "method": "label"}
-    text_match = drawer.get_by_text(label_text, exact=False)
-    if await text_match.count():
-        await text_match.first.click(force=True)
-        await page.wait_for_timeout(500)
-        return {"ok": True, "method": "text"}
-    return {"ok": False, "reason": "checkbox-not-found"}
-
-
 async def fill_success_template(page: Page, template: dict[str, Any]) -> dict[str, Any]:
     return await page.evaluate(
         """
@@ -1555,190 +1910,9 @@ async def fill_success_template(page: Page, template: dict[str, Any]) -> dict[st
     )
 
 
-async def expand_cultivation_form(page: Page) -> dict[str, Any]:
-    drawer = page.locator(".el-drawer:visible, .el-drawer__wrapper:visible").last
-    submit = drawer.get_by_role("button", name="信息纳入溯源系统")
-    if await submit.count():
-        await submit.first.click(force=True)
-        await page.wait_for_timeout(3000)
-        return {"ok": True, "method": "role"}
-    return {"ok": False, "reason": "submit-not-found"}
-
-
-async def upload_drawer_required_files(
-    page: Page,
-    personnel_file: Path,
-    acceptance_file: Path,
-) -> dict[str, Any]:
-    personnel_file = personnel_file.resolve()
-    acceptance_file = acceptance_file.resolve()
-    inputs = page.locator("input[type=file]")
-    count = await inputs.count()
-    result: dict[str, Any] = {"count": count, "uploads": []}
-    if count < 4:
-        result["ok"] = False
-        result["reason"] = "expected-at-least-4-file-inputs"
-        return result
-    await inputs.nth(0).set_input_files(str(personnel_file))
-    await page.wait_for_timeout(2500)
-    result["uploads"].append({"index": 0, "file": str(personnel_file)})
-    await inputs.nth(3).set_input_files(str(acceptance_file))
-    await page.wait_for_timeout(2500)
-    result["uploads"].append({"index": 3, "file": str(acceptance_file)})
-    state = await page.evaluate(
-        """
-        () => {
-          function getApply() {
-            const root = document.querySelector('.app-main')?.__vue__;
-            const online = root?.$children?.find(x => x?.$options?.name === 'RegistrationOnline') ||
-              Array.from(document.querySelectorAll('*')).map(n => n.__vue__).find(x => x?.$options?.name === 'RegistrationOnline');
-            return online?.$refs?.apply || null;
-          }
-          const apply = getApply();
-          return apply ? {
-            cultivatorAttachments: apply.form.cultivatorAttachments,
-            acceptanceAttachments: apply.form.acceptanceAttachments,
-            pictures: apply.form.pictures,
-            attachments: apply.form.attachments,
-          } : null;
-        }
-        """
-    )
-    result["ok"] = True
-    result["state"] = state
-    return result
-
-
-async def select_submit_dialog_dept(page: Page, dept_label: str) -> dict[str, Any]:
-    dialog_tree = page.locator(".el-dialog:visible .vue-treeselect").first
-    if not await dialog_tree.count():
-        return {"ok": False, "reason": "treeselect-not-found", "target": dept_label}
-    await dialog_tree.click(force=True)
-    await page.wait_for_timeout(1200)
-    labels = page.locator(
-        ".vue-treeselect__menu:visible .vue-treeselect__label, .vue-treeselect__menu:visible .vue-treeselect__option"
-    )
-    count = await labels.count()
-    candidates: list[str] = []
-    for idx in range(count):
-        text = (await labels.nth(idx).inner_text()).strip()
-        candidates.append(text)
-        if dept_label in text:
-            await labels.nth(idx).click(force=True)
-            await page.wait_for_timeout(1000)
-            return {"ok": True, "target": dept_label, "selected": text, "candidates": candidates}
-    fallback = await page.evaluate(
-        """
-        ({ deptLabel }) => {
-          function getApply() {
-            const root = document.querySelector('.app-main')?.__vue__;
-            const online = root?.$children?.find(x => x?.$options?.name === 'RegistrationOnline') ||
-              Array.from(document.querySelectorAll('*')).map(n => n.__vue__).find(x => x?.$options?.name === 'RegistrationOnline');
-            return online?.$refs?.apply || null;
-          }
-          const dialog = getApply()?.$refs?.filingPayDialog;
-          if (!dialog) return { ok: false, reason: 'filing-dialog-not-found' };
-          const walk = (nodes, out = []) => {
-            for (const node of nodes || []) {
-              out.push({ id: node.id, label: node.label });
-              if (node.children) walk(node.children, out);
-            }
-            return out;
-          };
-          const options = walk(dialog.deptOptions || []);
-          const hit = options.find(item => (item.label || '').includes(deptLabel));
-          if (!hit) return { ok: false, reason: 'option-not-found', options };
-          dialog.selectedDeptId = hit.id;
-          return { ok: true, hit, options };
-        }
-        """,
-        {"deptLabel": dept_label},
-    )
-    if fallback.get("ok"):
-        return {
-            "ok": True,
-            "target": dept_label,
-            "selected": fallback["hit"]["label"],
-            "method": "fallback-state",
-        }
-    return {"ok": False, "target": dept_label, "reason": "option-not-found", "candidates": candidates}
-
-
-async def upload_submit_dialog_apply_file(page: Page, apply_file: Path) -> dict[str, Any]:
-    apply_file = apply_file.resolve()
-    input_loc = page.locator(".el-dialog:visible input[type=file]").first
-    if not await input_loc.count():
-        return {"ok": False, "reason": "file-input-not-found", "file": str(apply_file)}
-    await input_loc.set_input_files(str(apply_file))
-    await page.wait_for_timeout(3000)
-    state = await page.evaluate(
-        """
-        () => {
-          function getApply() {
-            const root = document.querySelector('.app-main')?.__vue__;
-            const online = root?.$children?.find(x => x?.$options?.name === 'RegistrationOnline') ||
-              Array.from(document.querySelectorAll('*')).map(n => n.__vue__).find(x => x?.$options?.name === 'RegistrationOnline');
-            return online?.$refs?.apply || null;
-          }
-          const dialog = getApply()?.$refs?.filingPayDialog;
-          return dialog ? {
-            selectedDeptId: dialog.selectedDeptId,
-            uploadFiles: dialog.uploadFiles,
-            registrationId: dialog.registrationId,
-          } : null;
-        }
-        """
-    )
-    return {"ok": True, "file": str(apply_file), "state": state}
-
-
-async def submit_filing_dialog(page: Page) -> dict[str, Any]:
-    submit = page.get_by_role("button", name="提交备案")
-    if await submit.count():
-        await submit.first.click(force=True)
-        await page.wait_for_timeout(5000)
-        return {"ok": True, "method": "role"}
-    return {"ok": False, "reason": "submit-record-not-found"}
-
-
 def build_verified_new_application_registry() -> TemplateActionRegistry:
     registry = TemplateActionRegistry()
-
-    async def handle_run_apply_wizard(
-        page: Page,
-        artifacts: ArtifactWriter,
-        runtime: TemplateRuntimeData,
-        step: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        return await run_apply_wizard(page)
-
-    async def handle_select_drawer_option(
-        page: Page,
-        artifacts: ArtifactWriter,
-        runtime: TemplateRuntimeData,
-        step: dict[str, Any],
-    ) -> dict[str, Any]:
-        label = step.get("args", {}).get("label", "")
-        ref = step.get("args", {}).get("data_ref", "")
-        option_value = runtime.resolve_ref(ref)
-        return await select_drawer_option(page, label, str(option_value or ""))
-
-    async def handle_ensure_drawer_checkbox(
-        page: Page,
-        artifacts: ArtifactWriter,
-        runtime: TemplateRuntimeData,
-        step: dict[str, Any],
-    ) -> dict[str, Any]:
-        label_text = step.get("args", {}).get("label_text", "")
-        return await ensure_drawer_checkbox(page, label_text)
-
-    async def handle_expand_cultivation_form(
-        page: Page,
-        artifacts: ArtifactWriter,
-        runtime: TemplateRuntimeData,
-        step: dict[str, Any],
-    ) -> dict[str, Any]:
-        return await expand_cultivation_form(page)
+    register_suyuan_wizard_drawer_actions(registry)
 
     async def handle_fill_success_template(
         page: Page,
@@ -1748,49 +1922,15 @@ def build_verified_new_application_registry() -> TemplateActionRegistry:
     ) -> dict[str, Any]:
         ref = step.get("args", {}).get("data_ref", "")
         data = runtime.resolve_ref(ref) if ref else {}
-        return await fill_success_template(page, data or {})
-
-    async def handle_upload_drawer_required_files(
-        page: Page,
-        artifacts: ArtifactWriter,
-        runtime: TemplateRuntimeData,
-        step: dict[str, Any],
-    ) -> dict[str, Any]:
-        files_ref = step.get("args", {}).get("files_ref", "")
-        generated_files = runtime.resolve_ref(files_ref) if files_ref else {}
-        personnel_file = runtime.generated_file(f"{files_ref}.personnel_file") if files_ref else None
-        acceptance_file = runtime.generated_file(f"{files_ref}.acceptance_file") if files_ref else None
-        if personnel_file is None:
-            personnel_file = runtime.generated_file("generated_files.personnel_file")
-        if acceptance_file is None:
-            acceptance_file = runtime.generated_file("generated_files.acceptance_file")
-        return await upload_drawer_required_files(
-            page,
-            personnel_file or Path(str((generated_files or {}).get("personnel_file", ""))),
-            acceptance_file or Path(str((generated_files or {}).get("acceptance_file", ""))),
-        )
-
-    async def handle_select_submit_dialog_dept(
-        page: Page,
-        artifacts: ArtifactWriter,
-        runtime: TemplateRuntimeData,
-        step: dict[str, Any],
-    ) -> dict[str, Any]:
-        ref = step.get("args", {}).get("data_ref", "")
-        dept_label = runtime.resolve_ref(ref) if ref else ""
-        return await select_submit_dialog_dept(page, str(dept_label or ""))
-
-    async def handle_upload_submit_dialog_apply_file(
-        page: Page,
-        artifacts: ArtifactWriter,
-        runtime: TemplateRuntimeData,
-        step: dict[str, Any],
-    ) -> dict[str, Any]:
-        file_ref = step.get("args", {}).get("file_ref", "")
-        apply_file = runtime.generated_file(file_ref) if file_ref else None
-        if apply_file is None:
-            apply_file = runtime.generated_file("generated_files.apply_file")
-        return await upload_submit_dialog_apply_file(page, apply_file or Path("apply_file_missing.pdf"))
+        if data is None:
+            template_data: dict[str, Any] = {}
+        elif isinstance(data, Mapping):
+            template_data = dict(data)
+        else:
+            raise RuntimeError(
+                f"fill_success_template_invalid_data: data_ref={ref or '<empty>'} expected mapping, got {type(data).__name__}"
+            )
+        return await fill_success_template(page, template_data)
 
     async def handle_submit_filing_dialog(
         page: Page,
@@ -1798,17 +1938,23 @@ def build_verified_new_application_registry() -> TemplateActionRegistry:
         runtime: TemplateRuntimeData,
         step: dict[str, Any],
     ) -> dict[str, Any]:
-        return await submit_filing_dialog(page)
+        decision = build_submit_action_policy_decision(
+            action_id=str(step.get("id") or "submit_filing_dialog"),
+            template_name=TEMPLATE_BUNDLE.name,
+            project_name=STAGE2_PROJECT_NAME,
+        )
+        if decision.status != POLICY_ALLOWED:
+            category = "policy_review_required" if decision.needs_review else "policy_blocked"
+            raise RuntimeError(f"{category}: {decision.reason}")
+        result = await submit_filing_dialog(page)
+        result["policy_decision"] = decision.to_dict()
+        return result
 
-    registry.register("run_apply_wizard", handle_run_apply_wizard)
-    registry.register("select_drawer_option", handle_select_drawer_option)
-    registry.register("ensure_drawer_checkbox", handle_ensure_drawer_checkbox)
-    registry.register("expand_cultivation_form", handle_expand_cultivation_form)
     registry.register("fill_success_template", handle_fill_success_template)
-    registry.register("upload_drawer_required_files", handle_upload_drawer_required_files)
-    registry.register("select_submit_dialog_dept", handle_select_submit_dialog_dept)
-    registry.register("upload_submit_dialog_apply_file", handle_upload_submit_dialog_apply_file)
-    registry.register("submit_filing_dialog", handle_submit_filing_dialog)
+    register_suyuan_submit_dialog_actions(
+        registry,
+        submit_filing_dialog_handler=handle_submit_filing_dialog,
+    )
     return registry
 
 
@@ -1858,6 +2004,14 @@ async def dismiss_overlays(page: Page) -> dict[str, Any]:
 
 
 async def submit_dialog(page: Page) -> dict[str, Any]:
+    decision = build_submit_action_policy_decision(
+        action_id="submit_online_apply_dialog",
+        template_name=TEMPLATE_BUNDLE.name,
+        project_name=STAGE2_PROJECT_NAME,
+    )
+    if decision.status != POLICY_ALLOWED:
+        category = "policy_review_required" if decision.needs_review else "policy_blocked"
+        raise RuntimeError(f"{category}: {decision.reason}")
     found = await page.evaluate(
         """
         () => {
@@ -1877,7 +2031,7 @@ async def submit_dialog(page: Page) -> dict[str, Any]:
     if not found.get("ok"):
         raise RuntimeError(f"未找到“信息纳入溯源系统”提交按钮: {found.get('visibleButtons', [])}")
     await page.wait_for_timeout(2500)
-    return await page.evaluate(
+    result = await page.evaluate(
         """
         () => {
           function text(node) {
@@ -1899,6 +2053,8 @@ async def submit_dialog(page: Page) -> dict[str, Any]:
         }
         """
     )
+    result["policy_decision"] = decision.to_dict()
+    return result
 
 
 def success_from_submission(result: dict[str, Any]) -> bool:
@@ -1936,6 +2092,24 @@ def classify_submission_result(
     joined = " ".join(submit_result.get("messages", []))
     body = submit_result.get("bodySnippet", "")
     all_text = " ".join([joined, body, " ".join(submit_result.get("errors", []))])
+
+    if any(token in all_text for token in ["policy_blocked", "risky_submit_unlisted_blocked"]):
+        return {
+            "success": False,
+            "category": "policy_blocked",
+            "reason": "高风险真实提交未在项目级白名单中显式允许，执行层已阻断提交动作",
+            "latest_request": None,
+            "latest_response": None,
+        }
+
+    if any(token in all_text for token in ["policy_review_required", "risky_submit_unlisted_review"]):
+        return {
+            "success": False,
+            "category": "policy_review_required",
+            "reason": "高风险真实提交需要人工审核后才能继续，执行层未自动提交",
+            "latest_request": None,
+            "latest_response": None,
+        }
 
     registration_events = [
         item for item in network_events if "/prod-api/zwsy/registration/apply/" in item.get("url", "")
@@ -2046,10 +2220,36 @@ def write_structured_stage2_report(
     notes: list[str] | None = None,
     max_attempts: int | None = None,
     round_input: dict[str, Any] | None = None,
+    capability_gate: CapabilityGateDecision | None = None,
+    capability_routing: CapabilityRoutingDecision | None = None,
+    run_policy_resolution: RunPolicyLoadResult | None = None,
+    discovery_strategy: DiscoveryStrategyDecision | None = None,
+    policy_decision: PolicyGateDecision | None = None,
 ) -> None:
     progress_snapshot = adapt_progress_snapshot(progress.snapshot)
     total_duration_ms = total_attempt_duration_ms(attempts)
     resolved_round_input = round_input or {}
+    iteration_budget = _configured_round_limit(resolved_round_input, max_attempts)
+    resolved_capability_gate = capability_gate or _coerce_capability_gate_from_payload(artifacts.run_dir)
+    resolved_capability_routing = capability_routing or _coerce_capability_routing_from_payload(artifacts.run_dir)
+    resolved_run_policy = run_policy_resolution or load_run_policy_resolution()
+    resolved_discovery_strategy = discovery_strategy or _coerce_discovery_strategy_from_payload(artifacts.run_dir)
+    selected_discovery_mode = (
+        resolved_capability_routing.discovery.recommended_mode
+        if resolved_capability_routing and resolved_capability_routing.discovery
+        else None
+    )
+    selected_verification_mode = (
+        resolved_capability_routing.verification.recommended_mode
+        if resolved_capability_routing and resolved_capability_routing.verification
+        else None
+    )
+    route_stages = [
+        stage
+        for stage in ("discovery", "verification", "reporting")
+        if getattr(resolved_capability_routing, stage, None) is not None
+        and getattr(getattr(resolved_capability_routing, stage), "allowed", False)
+    ]
     report_payload = {
         "summary": {
             "run_id": artifacts.run_dir.name,
@@ -2062,6 +2262,8 @@ def write_structured_stage2_report(
             "current_round": resolved_round_input.get("round_index") or progress_snapshot.current_round,
             "stop_reason": classification.get("reason"),
             "next_action": progress.snapshot.next_action,
+            "verification_max_attempts": max_attempts,
+            "orchestration_max_rounds": iteration_budget,
             "counts": [
                 {"label": "attempts", "value": len(attempts)},
                 {"label": "template_steps", "value": len(TEMPLATE_BUNDLE.template.get("steps", []))},
@@ -2072,6 +2274,13 @@ def write_structured_stage2_report(
                 {"label": "classification_category", "value": classification.get("category")},
                 {"label": "orchestration_stream_id", "value": resolved_round_input.get("orchestration_stream_id")},
                 {"label": "orchestration_round", "value": resolved_round_input.get("round_index")},
+                {"label": "capability_preflight_status", "value": resolved_capability_gate.status if resolved_capability_gate else None},
+                {"label": "capability_preflight_reason_code", "value": resolved_capability_gate.reason_code if resolved_capability_gate else None},
+                {"label": "discovery_route_mode", "value": selected_discovery_mode},
+                {"label": "discovery_strategy", "value": resolved_discovery_strategy.selected_strategy if resolved_discovery_strategy else None},
+                {"label": "verification_route_mode", "value": selected_verification_mode},
+                {"label": "run_policy_load_status", "value": resolved_run_policy.load_status},
+                {"label": "run_policy_default_decision", "value": resolved_run_policy.risky_submit_default_decision},
             ],
         },
         "page_entries": build_report_page_entries(
@@ -2106,9 +2315,11 @@ def write_structured_stage2_report(
         if success
         else [
             {
+                "item_id": classification.get("category"),
                 "name": "线上申请备案模板样本",
                 "status": "failed",
                 "summary": classification.get("reason"),
+                "tags": [classification.get("category")] if classification.get("category") else [],
             }
         ],
         "key_artifacts": build_report_key_artifacts(artifacts),
@@ -2165,13 +2376,60 @@ def write_structured_stage2_report(
             {
                 "model_name": profile.name,
                 "summary": classification.get("reason"),
-                "participated_stages": ["verification"],
-                "joined_discovery": True,
+                "precheck_tags": (
+                    sorted(
+                        key
+                        for key, enabled in (resolved_capability_routing.capability_tags if resolved_capability_routing else {}).items()
+                        if enabled
+                    )
+                ),
+                "participated_stages": route_stages or ["verification"],
+                "joined_discovery": bool(
+                    resolved_capability_routing
+                    and resolved_capability_routing.discovery
+                    and resolved_capability_routing.discovery.allowed
+                ),
                 "joined_attribution": True,
-                "comparison_summary": "Single-run observation; cross-model comparison requires multiple completed runs.",
+                "comparison_summary": (
+                    "Single-run observation; cross-model comparison requires multiple completed runs."
+                    if not resolved_capability_routing
+                    else (
+                        f"Discovery routed via {selected_discovery_mode or 'unknown'}; "
+                        f"verification routed via {selected_verification_mode or 'unknown'}."
+                    )
+                ),
+                "structured_output_stability": (
+                    "wrapper_ready"
+                    if resolved_capability_routing
+                    and resolved_capability_routing.discovery
+                    and "browser_use" in resolved_capability_routing.discovery.recommended_mode
+                    else (
+                        "not_required_for_current_verification_path"
+                        if resolved_capability_routing
+                        and resolved_capability_routing.verification
+                        and resolved_capability_routing.verification.allowed
+                        else None
+                    )
+                ),
+                "recommended_role": (
+                    "controlled_discovery"
+                    if resolved_capability_routing
+                    and resolved_capability_routing.discovery
+                    and resolved_capability_routing.discovery.allowed
+                    else (
+                        "verification"
+                        if resolved_capability_routing
+                        and resolved_capability_routing.verification
+                        and resolved_capability_routing.verification.allowed
+                        else None
+                    )
+                ),
                 "facts": [
                     {"label": "attempt_count", "value": len(attempts)},
                     {"label": "final_category", "value": classification.get("category")},
+                    {"label": "capability_gate_reason_code", "value": resolved_capability_gate.reason_code if resolved_capability_gate else None},
+                    {"label": "discovery_route_summary", "value": _routing_stage_summary(resolved_capability_routing, "discovery") if resolved_capability_routing else None},
+                    {"label": "verification_route_summary", "value": _routing_stage_summary(resolved_capability_routing, "verification") if resolved_capability_routing else None},
                 ],
             }
         ],
@@ -2202,7 +2460,7 @@ def write_structured_stage2_report(
         run_report=report_payload,
         status_snapshot=progress_snapshot,
         attempts=attempts,
-        max_attempts=max_attempts,
+        max_attempts=iteration_budget,
         round_input=resolved_round_input,
     )
     round_input_record = iteration_artifacts.round_input
@@ -2249,6 +2507,16 @@ def write_structured_stage2_report(
             "capture_network_on_retry",
         }
     }
+    if resolved_capability_gate:
+        report_payload["capability_preflight"] = resolved_capability_gate.to_dict()
+    if resolved_capability_routing:
+        report_payload["capability_routing"] = resolved_capability_routing.to_dict()
+    if resolved_run_policy:
+        report_payload["run_policy_resolution"] = resolved_run_policy.to_dict()
+    if resolved_discovery_strategy:
+        report_payload["discovery_strategy"] = resolved_discovery_strategy.to_dict()
+    if policy_decision:
+        report_payload["run_policy_decision"] = policy_decision.to_dict()
     report_payload["project_assets"].append(
         {
             "name": "Iteration Outputs",
@@ -2371,6 +2639,11 @@ def write_structured_stage2_report(
             "next_round_decision": next_round_decision.to_dict() if next_round_decision else {},
             "execution_hints": execution_hints,
             "applied_execution_hints": execution_hints,
+            "capability_preflight": resolved_capability_gate.to_dict() if resolved_capability_gate else {},
+            "capability_routing": resolved_capability_routing.to_dict() if resolved_capability_routing else {},
+            "run_policy_resolution": resolved_run_policy.to_dict() if resolved_run_policy else {},
+            "discovery_strategy": resolved_discovery_strategy.to_dict() if resolved_discovery_strategy else {},
+            "run_policy_decision": policy_decision.to_dict() if policy_decision else {},
             "round_input": round_input_record.to_dict() if round_input_record else {},
             "retry_plan": (
                 iteration_artifacts.retry_plan.to_dict()
@@ -2401,12 +2674,35 @@ def write_structured_stage2_report(
     comparison_section = build_iteration_comparison_section(iteration_artifacts)
     stop_section = build_stop_conditions_section(iteration_artifacts)
     next_round_section = build_next_round_decision_section(iteration_artifacts)
+    decision_section = build_decision_section(
+        stop_conditions=stop_conditions,
+        next_round_decision=next_round_decision,
+        retry_plan=iteration_artifacts.retry_plan,
+        round_input=round_input_record.to_dict() if round_input_record else {},
+        execution_hints=execution_hints,
+        title="Decision Explanation",
+    )
+    routing_section = build_routing_section(
+        capability_decision=(resolved_capability_gate.to_dict() if resolved_capability_gate else {}),
+        route_decision=build_stage_route_decision_payload(
+            resolved_capability_routing,
+            stage="verification",
+            requested_mode="stage2_run_sample",
+            assigned_role="verification",
+        ),
+        policy_decision=(policy_decision.to_dict() if policy_decision else {}),
+        title="Routing Explanation",
+    )
     if comparison_section:
         extra_sections.append(comparison_section)
     if stop_section:
         extra_sections.append(stop_section)
     if next_round_section:
         extra_sections.append(next_round_section)
+    if routing_section:
+        extra_sections.append(routing_section.to_dict())
+    if decision_section:
+        extra_sections.append(decision_section.to_dict())
     report_payload["extra_sections"] = extra_sections
     artifacts.write_json("reports/run_report.json", report_payload)
     artifacts.write_text("reports/run_report.md", render_run_report_markdown(report_payload))
@@ -2548,7 +2844,24 @@ async def run_single_profile(
         output_dir=artifacts.run_dir,
         template_name=TEMPLATE_BUNDLE.name,
         model_name=profile.name,
-        project_name="AI Agent 软件自动化评测平台第二阶段原型",
+        project_name=STAGE2_PROJECT_NAME,
+    )
+    capability_gate = build_preflight_capability_gate(profile, mode="stage2_run_sample")
+    capability_routing = build_capability_routing(profile, gate=capability_gate)
+    run_policy_resolution = load_run_policy_resolution()
+    previous_run_dir = Path(str(resolved_round_input.get("previous_run_dir", "")).strip()) if resolved_round_input.get("previous_run_dir") else None
+    has_completed_discovery = bool(previous_run_dir and (previous_run_dir / "discovery_result.json").exists())
+    discovery_strategy = select_discovery_strategy(
+        capability_routing=capability_routing,
+        execution_hints=execution_hints,
+        has_completed_discovery=has_completed_discovery,
+        allow_live_enrichment=True,
+    )
+    routing_summary = build_routing_summary(
+        profile,
+        capability_gate=capability_gate,
+        capability_routing=capability_routing,
+        run_policy=run_policy_resolution,
     )
     progress.start_phase(
         "preflight",
@@ -2561,17 +2874,34 @@ async def run_single_profile(
             else None
         ),
         message=(
-            "初始化线上备案申请模板样本运行"
+            "执行模型能力预检并初始化线上备案申请模板样本运行"
             if not resolved_round_input
-            else "初始化带调度输入的线上备案申请模板样本运行"
+            else "执行模型能力预检并初始化带调度输入的线上备案申请模板样本运行"
         ),
-        next_action="写入运行时快照并准备生成附件",
+        next_action="验证模型能力标签并写入运行时快照",
         stats={
             "template_steps": len(TEMPLATE_BUNDLE.template.get("steps", [])),
             "scheduled_cluster_count": len(resolved_round_input.get("scheduled_cluster_ids") or []),
             "scheduled_action_count": len(resolved_round_input.get("scheduled_action_ids") or []),
         },
-        details={"round_input": resolved_round_input} if resolved_round_input else None,
+        details=(
+            {
+                "round_input": resolved_round_input,
+                "capability_gate": capability_gate.to_dict(),
+                "capability_routing": capability_routing.to_dict(),
+                "run_policy_resolution": run_policy_resolution.to_dict(),
+                "discovery_strategy": discovery_strategy.to_dict(),
+                "routing_summary": routing_summary.to_dict(),
+            }
+            if resolved_round_input
+            else {
+                "capability_gate": capability_gate.to_dict(),
+                "capability_routing": capability_routing.to_dict(),
+                "run_policy_resolution": run_policy_resolution.to_dict(),
+                "discovery_strategy": discovery_strategy.to_dict(),
+                "routing_summary": routing_summary.to_dict(),
+            }
+        ),
     )
     artifacts.write_json(
         "run_meta.json",
@@ -2586,10 +2916,61 @@ async def run_single_profile(
             "started_at": datetime.now().isoformat(),
             "max_attempts": max_attempts,
             "orchestration": resolved_round_input,
+            "capability_preflight": capability_gate.to_dict(),
+            "capability_routing": capability_routing.to_dict(),
+            "run_policy_resolution": run_policy_resolution.to_dict(),
+            "discovery_strategy": discovery_strategy.to_dict(),
+            "routing_summary": routing_summary.to_dict(),
         },
     )
+    artifacts.write_json("capability_preflight.json", capability_gate.to_dict())
+    artifacts.write_json("capability_routing.json", capability_routing.to_dict())
+    artifacts.write_json("run_policy_resolution.json", run_policy_resolution.to_dict())
+    artifacts.write_json("discovery_strategy.json", discovery_strategy.to_dict())
+    artifacts.write_json("routing_summary.json", routing_summary.to_dict())
     if resolved_round_input:
         artifacts.write_json("round_input.json", resolved_round_input)
+
+    if not capability_gate.is_allowed:
+        progress.fail_phase(
+            "preflight",
+            phase_label="预检",
+            message=capability_gate.reason,
+            next_action="先刷新模型能力预检产物，再重新发起 stage-2 运行",
+            stats={"preflight_failures": 1},
+            details={"capability_gate": capability_gate.to_dict()},
+        )
+        classification = classify_capability_gate_failure(capability_gate)
+        report = [
+            f"# 线上申请备案提交结果 - {profile.name}",
+            "",
+            f"- 运行目录: `{artifacts.run_dir}`",
+            f"- 提交结论: 预检未通过，未进入 discovery / verification",
+            f"- 判定类别: `{classification['category']}`",
+            f"- 原因: `{classification['reason']}`",
+        ]
+        artifacts.write_text("final_report.md", "\n".join(report))
+        write_structured_stage2_report(
+            artifacts,
+            profile,
+            progress,
+            page_url=ONLINE_RECORD_URL,
+            success=False,
+            classification=classification,
+            attempts=[],
+            generated_files={},
+            discovery_result=None,
+            discovery_paths=None,
+            notes=["模型能力预检未通过，真实执行链路被强制前置阻断。"],
+            max_attempts=max_attempts,
+            round_input=resolved_round_input,
+            capability_gate=capability_gate,
+            capability_routing=capability_routing,
+            run_policy_resolution=run_policy_resolution,
+            discovery_strategy=discovery_strategy,
+        )
+        return artifacts.run_dir
+
     artifacts.write_json("template_snapshot.json", TEMPLATE_BUNDLE.template)
     artifacts.write_json("baseline_snapshot.json", SUCCESS_BASELINE)
     artifacts.write_json("runtime_data.json", runtime_data)
@@ -2599,6 +2980,7 @@ async def run_single_profile(
         baseline=SUCCESS_BASELINE,
         run_data=runtime_data,
         generated_files=generated_files,
+        locator_hints=TEMPLATE_BUNDLE.locator_hints,
     )
     person_pdf = generated_files["personnel_file"]
     accept_pdf = generated_files["acceptance_file"]
@@ -2606,10 +2988,10 @@ async def run_single_profile(
     progress.complete_phase(
         "preflight",
         phase_label="预检",
-        message="运行时数据和生成附件已准备完成",
+        message="模型能力预检通过，运行时数据和生成附件已准备完成",
         next_action=(
-            "进入发现阶段并连接浏览器执行受控遍历"
-            if not execution_hints.get("skip_completed_discovery")
+            "进入发现阶段并按显式 discovery 策略执行"
+            if discovery_strategy.selected_strategy != "skip_completed_discovery"
             else "保留 discovery 结构并优先进入受控验证"
         ),
     )
@@ -2624,14 +3006,24 @@ async def run_single_profile(
             else None
         ),
         message=(
-            "先生成模板播种结果，并尝试升级到真实页面受控遍历"
-            if not execution_hints.get("skip_completed_discovery")
+            "先生成模板播种结果，再按能力路由决定是否升级到真实页面受控遍历"
+            if discovery_strategy.selected_strategy != "skip_completed_discovery"
             else "本轮沿用已有 discovery 结论，并在必要时刷新真实页面上下文"
         ),
         next_action="连接浏览器并 enrich discovery 结果",
-        details={"execution_hints": execution_hints} if execution_hints else None,
+        details={
+            "execution_hints": execution_hints,
+            "discovery_route": capability_routing.discovery.to_dict() if capability_routing.discovery else {},
+            "discovery_strategy": discovery_strategy.to_dict(),
+        },
     )
-    discovery_result, discovery_paths = build_discovery_seed(artifacts)
+    if discovery_strategy.selected_strategy == "skip_completed_discovery" and previous_run_dir is not None:
+        discovery_result = _load_reused_discovery_result(previous_run_dir)
+        discovery_paths = _build_reused_discovery_paths(previous_run_dir)
+        if discovery_result is None:
+            discovery_result, discovery_paths = build_discovery_seed(artifacts)
+    else:
+        discovery_result, discovery_paths = build_discovery_seed(artifacts)
 
     async with async_playwright() as p:
         browser = None
@@ -2659,15 +3051,23 @@ async def run_single_profile(
                 await page.goto(ONLINE_RECORD_URL, wait_until="domcontentloaded")
                 await page.wait_for_timeout(3000)
 
-            discovery_result, discovery_paths = await build_live_discovery(page, artifacts)
+            if discovery_strategy.should_run_live_discovery:
+                discovery_result, discovery_paths = await build_live_discovery(page, artifacts)
             progress.complete_phase(
                 "discovery",
                 phase_label="发现",
-                message="已完成真实页面受控遍历并生成页面入口清单和功能点清单",
+                message=(
+                    "已完成真实页面受控遍历并生成页面入口清单和功能点清单"
+                    if discovery_strategy.should_run_live_discovery
+                    else "已复用上一轮 discovery 结果，并继续进入验证阶段"
+                    if discovery_strategy.reuse_completed_discovery
+                    else "按能力路由保留模板播种 discovery 结果，并继续进入验证阶段"
+                ),
                 next_action="进入验证阶段执行模板样本",
                 stats={
                     "page_entries_discovered": len(getattr(discovery_result, "page_entries", [])),
                     "feature_points_discovered": len(getattr(discovery_result, "feature_points", [])),
+                    "discovery_strategy": discovery_strategy.selected_strategy,
                 },
             )
             progress.start_phase(
@@ -2682,7 +3082,16 @@ async def run_single_profile(
                     else "连接可见浏览器并准备执行带调度输入的模板样本"
                 ),
                 next_action="执行线上备案申请主路径",
-                details={"round_input": resolved_round_input} if resolved_round_input else None,
+                details=(
+                    {
+                        "round_input": resolved_round_input,
+                        "verification_route": capability_routing.verification.to_dict() if capability_routing.verification else {},
+                    }
+                    if resolved_round_input
+                    else {
+                        "verification_route": capability_routing.verification.to_dict() if capability_routing.verification else {},
+                    }
+                ),
             )
 
             artifacts.write_json(
@@ -2736,6 +3145,7 @@ async def run_single_profile(
             last_errors: list[str] = before_state.get("errors", [])
             final_submit: dict[str, Any] | None = None
             attempt_records: list[dict[str, Any]] = []
+            latest_policy_decision: PolicyGateDecision | None = None
 
             for attempt in range(1, max_attempts + 1):
                 actions: list[dict[str, Any]] = []
@@ -2774,6 +3184,10 @@ async def run_single_profile(
                             runtime,
                         )
                         actions.extend(flow_actions)
+                        for action in flow_actions:
+                            result_payload = action.get("result") if isinstance(action, dict) else None
+                            if isinstance(result_payload, dict) and isinstance(result_payload.get("policy_decision"), dict):
+                                latest_policy_decision = PolicyGateDecision(**result_payload["policy_decision"])
                         await page.screenshot(
                             path=str(artifacts.screenshots_dir / "dialog_opened.png"),
                             full_page=True,
@@ -2878,16 +3292,33 @@ async def run_single_profile(
                                 }
                             )
                         submit_result = await submit_dialog(page)
+                        policy_payload = submit_result.get("policy_decision") if isinstance(submit_result, dict) else None
+                        if isinstance(policy_payload, dict):
+                            latest_policy_decision = PolicyGateDecision(**policy_payload)
                         execution_summary = summarize_attempt_execution(actions)
                     final_submit = submit_result
                 except (PlaywrightError, RuntimeError) as exc:
+                    error_text = f"{type(exc).__name__}: {exc}"
+                    policy_category = None
+                    if "policy_blocked:" in error_text:
+                        policy_category = "policy_blocked"
+                    elif "policy_review_required:" in error_text:
+                        policy_category = "policy_review_required"
                     step_executions = []
                     submit_result = {
                         "messages": [],
-                        "errors": [f"{type(exc).__name__}: {exc}"],
+                        "errors": [error_text],
                         "bodySnippet": "",
                     }
+                    if policy_category:
+                        submit_result["messages"].append(policy_category)
                     execution_summary = summarize_attempt_execution(actions)
+                    if policy_category:
+                        latest_policy_decision = build_submit_action_policy_decision(
+                            action_id="submit_online_apply_dialog",
+                            template_name=TEMPLATE_BUNDLE.name,
+                            project_name=STAGE2_PROJECT_NAME,
+                        )
 
                 after_state = await snapshot_dialog_state(page)
                 apply_state = await get_apply_state(page)
@@ -2965,6 +3396,11 @@ async def run_single_profile(
                         notes=["真实执行样本已成功完成最终备案提交。"],
                         max_attempts=max_attempts,
                         round_input=resolved_round_input,
+                        capability_gate=capability_gate,
+                        capability_routing=capability_routing,
+                        run_policy_resolution=run_policy_resolution,
+                        discovery_strategy=discovery_strategy,
+                        policy_decision=latest_policy_decision,
                     )
                     return artifacts.run_dir
 
@@ -3020,7 +3456,42 @@ async def run_single_profile(
                         notes=["真实执行样本命中了已识别的阻塞类型。"],
                         max_attempts=max_attempts,
                         round_input=resolved_round_input,
+                        capability_gate=capability_gate,
+                        capability_routing=capability_routing,
+                        run_policy_resolution=run_policy_resolution,
+                        discovery_strategy=discovery_strategy,
+                        policy_decision=latest_policy_decision,
                     )
+                    latest_round_input = read_round_input(artifacts.run_dir) or resolved_round_input
+                    stop_payload = _read_json_file(artifacts.run_dir / "stop_conditions.json")
+                    next_round_payload = _read_json_file(artifacts.run_dir / "next_round_decision.json")
+                    retry_plan_payload = _read_json_file(artifacts.run_dir / "retry_plan.json")
+                    if next_round_payload.get("status") == "needs_review":
+                        takeover_packet = build_human_takeover_packet(
+                            artifacts.run_dir,
+                            round_input=latest_round_input,
+                            retry_plan=retry_plan_payload,
+                            stop_conditions=stop_payload,
+                            next_round_decision=next_round_payload,
+                            max_attempts=max_attempts,
+                        )
+                        packet_path = write_human_takeover_packet(artifacts.run_dir, takeover_packet)
+                        progress.wait_for_human(
+                            "verification",
+                            phase_label="验证",
+                            round_kind="verification",
+                            round_index=attempt,
+                            round_label=f"验证第 {attempt} 轮",
+                            step_key="manual_takeover",
+                            step_label="人工接管",
+                            target_kind="feature_point",
+                            target_id="online_apply",
+                            target_label="线上申请备案",
+                            reason=takeover_packet["reason"] or "需要人工接管后继续下一轮",
+                            next_action=f"人工处理完成后执行恢复命令：{takeover_packet['resume_command']}",
+                            stats={"human_takeovers": 1},
+                            details={"human_takeover_packet": takeover_packet, "packet_path": str(packet_path)},
+                        )
                     return artifacts.run_dir
 
                 if current_errors == last_errors:
@@ -3063,6 +3534,11 @@ async def run_single_profile(
                         notes=["真实执行样本未继续收敛，已提前结束当前 run。"],
                         max_attempts=max_attempts,
                         round_input=resolved_round_input,
+                        capability_gate=capability_gate,
+                        capability_routing=capability_routing,
+                        run_policy_resolution=run_policy_resolution,
+                        discovery_strategy=discovery_strategy,
+                        policy_decision=latest_policy_decision,
                     )
                     return artifacts.run_dir
 
@@ -3101,6 +3577,11 @@ async def run_single_profile(
                 notes=["真实执行样本耗尽最大尝试次数。"],
                 max_attempts=max_attempts,
                 round_input=resolved_round_input,
+                capability_gate=capability_gate,
+                capability_routing=capability_routing,
+                run_policy_resolution=run_policy_resolution,
+                discovery_strategy=discovery_strategy,
+                policy_decision=latest_policy_decision,
             )
             return artifacts.run_dir
         except Exception as exc:
@@ -3150,6 +3631,10 @@ async def run_single_profile(
                 notes=["验证阶段在连接浏览器或接管已登录会话之前失败。"],
                 max_attempts=max_attempts,
                 round_input=resolved_round_input,
+                capability_gate=capability_gate,
+                capability_routing=capability_routing,
+                run_policy_resolution=run_policy_resolution,
+                discovery_strategy=discovery_strategy,
             )
             return artifacts.run_dir
         finally:
@@ -3213,6 +3698,97 @@ async def run_profile_with_iterations(
     }
 
 
+async def resume_profile_from_human_takeover(
+    run_dir: Path,
+    *,
+    cdp_url: str,
+    max_attempts: int,
+    max_rounds: int | None = 1,
+    operator_id: str | None = None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    previous_round_input = read_round_input(run_dir)
+    next_round_decision = load_next_round_decision(run_dir)
+    resumed_decision = build_human_resume_decision(
+        next_round_decision,
+        operator_id=operator_id,
+        note=note,
+    )
+    model_name = previous_round_input.get("model_name")
+    if not model_name:
+        raise RuntimeError("上一轮 round_input.json 缺少 model_name，无法恢复人工接管后的执行。")
+    profile = resolve_model_profile(str(model_name))
+
+    rounds: list[dict[str, Any]] = []
+    latest_run_dir: Path | None = run_dir
+    previous_decision: dict[str, Any] | None = resumed_decision
+    start_round = int(previous_round_input.get("round_index") or 1) + 1
+    effective_max_rounds, round_budget_source = resolve_resume_round_budget(
+        previous_round_input,
+        max_rounds,
+    )
+    final_round = start_round + effective_max_rounds - 1
+
+    for round_index in range(start_round, final_round + 1):
+        round_input = build_round_input(
+            profile,
+            round_index=round_index,
+            max_rounds=max(start_round, final_round),
+            previous_run_dir=latest_run_dir,
+            previous_decision=previous_decision,
+        )
+        round_input["notes"].append("This round resumed after a human takeover handoff.")
+        if operator_id:
+            round_input["notes"].append(f"Human takeover operator: {operator_id}")
+        if note:
+            round_input["notes"].append(note)
+
+        new_run_dir = await run_single_profile(
+            profile,
+            cdp_url,
+            max_attempts,
+            round_input=round_input,
+        )
+        latest_run_dir = new_run_dir
+        status_payload = _read_json_file(new_run_dir / "current_status.json")
+        next_round_decision = load_next_round_decision(new_run_dir)
+        persisted_round_input = read_round_input(new_run_dir) or round_input
+        rounds.append(
+            {
+                "round": round_index,
+                "run_dir": str(new_run_dir),
+                "status": status_payload.get("overall_status"),
+                "elapsed_ms": status_payload.get("elapsed_ms"),
+                "round_input": persisted_round_input,
+                "next_round_decision": next_round_decision,
+            }
+        )
+        previous_decision = next_round_decision
+        if not should_auto_continue_next_round(next_round_decision):
+            break
+
+    final_status = rounds[-1]["status"] if rounds else "unknown"
+    final_elapsed_ms = rounds[-1]["elapsed_ms"] if rounds else None
+    final_decision = rounds[-1]["next_round_decision"] if rounds else {}
+    sync_orchestration_session_artifacts(ARTIFACT_ROOT)
+    return {
+        "model": profile.name,
+        "resumed_from_run_dir": str(run_dir),
+        "run_dir": str(latest_run_dir) if latest_run_dir is not None else str(run_dir),
+        "status": final_status,
+        "elapsed_ms": final_elapsed_ms,
+        "round_count": len(rounds),
+        "final_next_round_decision": final_decision,
+        "rounds": rounds,
+        "human_takeover_resumed": True,
+        "requested_max_rounds": max_rounds,
+        "effective_max_rounds": effective_max_rounds,
+        "resume_round_budget_source": round_budget_source,
+        "operator_id": operator_id,
+        "note": note,
+    }
+
+
 async def run_stage2_sample(
     *,
     cdp_url: str | None = None,
@@ -3248,6 +3824,7 @@ async def run_stage2_sample(
         comparison_path=comparison_path,
         platform_daily_report=platform_daily_report,
     )
+    sync_orchestration_session_artifacts(ARTIFACT_ROOT)
     return {
         "template_name": TEMPLATE_BUNDLE.name,
         "model_count": len(results),

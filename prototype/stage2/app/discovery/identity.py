@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 _VOLATILE_QUERY_KEYS = {
     "_",
@@ -76,8 +76,17 @@ def slug(value: str | None, *, fallback: str = "item", max_length: int = 48) -> 
     return result or fallback
 
 
-def canonicalize_url(url: str | None) -> str:
+def absolutize_url(url: str | None, *, base_url: str | None = None) -> str:
     raw = normalize_text(url)
+    if not raw:
+        return ""
+    if base_url:
+        return normalize_text(urljoin(base_url, raw))
+    return raw
+
+
+def canonicalize_url(url: str | None, *, base_url: str | None = None) -> str:
+    raw = absolutize_url(url, base_url=base_url)
     if not raw:
         return ""
     parsed = urlsplit(raw)
@@ -103,8 +112,8 @@ def canonicalize_url(url: str | None) -> str:
     )
 
 
-def generalize_url_for_identity(url: str | None) -> str:
-    canonical = canonicalize_url(url)
+def generalize_url_for_identity(url: str | None, *, base_url: str | None = None) -> str:
+    canonical = canonicalize_url(url, base_url=base_url)
     if not canonical:
         return ""
     parsed = urlsplit(canonical)
@@ -199,12 +208,13 @@ def build_feature_point_identity(
     action_type: str,
     container_label: str | None = None,
     href: str | None = None,
+    page_url: str | None = None,
     locator: str | None = None,
 ) -> dict[str, Any]:
     normalized_name = normalize_text(name)
     normalized_container = normalize_text(container_label)
-    canonical_href = canonicalize_url(href)
-    generalized_href = generalize_url_for_identity(href)
+    canonical_href = canonicalize_url(href, base_url=page_url)
+    generalized_href = generalize_url_for_identity(href, base_url=page_url)
     locator_hint = locator_anchor(locator)
     stable_parts = [
         "feature_point",

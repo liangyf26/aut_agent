@@ -172,6 +172,7 @@ class HumanLoopRecorder:
             session_dir=session_dir,
             events_path=session_dir / "recording_events.jsonl",
             draft_path=session_dir / "candidate_template_draft.json",
+            candidate_review_path=session_dir / "candidate_template_review.json",
             metadata_path=session_dir / "session.json",
             summary_path=session_dir / "recording_summary.json",
             screenshot_index_path=session_dir / "key_screenshots.json",

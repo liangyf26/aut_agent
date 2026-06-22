@@ -22,6 +22,25 @@ from .models import (
 )
 from .adapters import adapt_progress_snapshot
 from .daily_digest import build_platform_daily_report
+from .decision_explainer import (
+    DecisionActionSummary,
+    DecisionExplanation,
+    DecisionPayloadBundle,
+    build_decision_explanation,
+    build_decision_facts,
+    build_decision_items,
+    build_decision_section,
+    extract_decision_payloads,
+)
+from .routing_explainer import (
+    RoutingExplanation,
+    RoutingPayloadBundle,
+    build_routing_explanation,
+    build_routing_facts,
+    build_routing_items,
+    build_routing_section,
+    extract_routing_payloads,
+)
 from .progress_view import render_progress_markdown, render_progress_text
 from .report_markdown import render_platform_daily_report_markdown, render_run_report_markdown
 
@@ -29,6 +48,9 @@ __all__ = [
     "adapt_progress_snapshot",
     "ArtifactRef",
     "DailySummary",
+    "DecisionActionSummary",
+    "DecisionExplanation",
+    "DecisionPayloadBundle",
     "FailureCluster",
     "Fact",
     "ModelEvaluation",
@@ -38,16 +60,28 @@ __all__ = [
     "ProgressEvent",
     "ProgressSnapshot",
     "ReportItem",
+    "RoutingExplanation",
+    "RoutingPayloadBundle",
     "RunReport",
     "RunSummary",
     "SectionBlock",
     "SkillInventorySummary",
     "build_platform_daily_report",
+    "build_decision_explanation",
+    "build_decision_facts",
+    "build_decision_items",
+    "build_decision_section",
+    "build_routing_explanation",
+    "build_routing_facts",
+    "build_routing_items",
+    "build_routing_section",
     "coerce_platform_daily_report",
     "coerce_progress_event",
     "coerce_progress_snapshot",
     "coerce_run_report",
     "coerce_run_summary",
+    "extract_decision_payloads",
+    "extract_routing_payloads",
     "render_platform_daily_report_markdown",
     "render_progress_markdown",
     "render_progress_text",

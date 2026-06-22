@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -17,10 +18,24 @@ from prototype.stage2.app.reporting import (
     render_platform_daily_report_markdown,
 )
 from prototype.stage2.app.verification.template_runtime import TemplateRuntimeData
+from prototype.stage2.app.verification.validation_matrix import (
+    VALIDATION_MODE_CONNECTED,
+    VALIDATION_MODE_LOCAL,
+    VALIDATION_STATUS_FAILED,
+    VALIDATION_STATUS_SKIPPED,
+    ValidationMatrixResult,
+    ValidationMatrixTarget,
+    build_default_g4_validation_targets,
+    build_validation_matrix_payload,
+    render_validation_matrix_markdown,
+)
 
 TEMPLATE_ROOT = ROOT_DIR / "prototype" / "stage2" / "templates"
 HUMAN_LOOP_ROOT = ROOT_DIR / "artifacts" / "stage2" / "human_loop"
 DEFAULT_CDP_URL = "http://localhost:9222"
+DEFAULT_G4_VALIDATION_GOAL = (
+    "验证第二阶段原型是否已具备跨模板族/跨系统样本的统一执行、验证与汇总能力。"
+)
 
 if sys.stdout.encoding != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -69,6 +84,53 @@ def initialize_runs(template_name: str) -> list[dict[str, str]]:
                 "page_entries": str(context.artifacts.run_dir / "page_entries.json"),
                 "feature_points": str(context.artifacts.run_dir / "feature_points.json"),
                 "retry_plan": str(context.artifacts.run_dir / "retry_plan.json"),
+                "discovery_strategy": str(context.artifacts.run_dir / "discovery_strategy.json"),
+                "routing_summary": str(context.artifacts.run_dir / "routing_summary.json"),
+            }
+        )
+    return results
+
+
+def build_routing_summaries(template_name: str) -> list[dict[str, Any]]:
+    from prototype.stage2.app.config import (
+        build_capability_routing,
+        load_model_profiles,
+        load_run_policy,
+        validate_model_capabilities,
+    )
+    from prototype.stage2.app.discovery.strategy import select_discovery_strategy
+    from prototype.stage2.app.orchestration.routing_summary import build_routing_summary
+    from prototype.stage2.app.verification.constants import DEFAULT_ENV_FILES
+
+    profiles = load_model_profiles(DEFAULT_ENV_FILES)
+    run_policy_path = ROOT_DIR / "prototype" / "stage2" / "run_policy.json"
+    results: list[dict[str, Any]] = []
+    for profile in profiles:
+        capability_gate = validate_model_capabilities(profile, mode="template_init")
+        capability_routing = build_capability_routing(profile, gate=capability_gate)
+        run_policy = load_run_policy(
+            run_policy_path,
+            project_name="AI Agent 软件自动化评测平台第二阶段原型",
+            template_name=template_name,
+        )
+        discovery_strategy = select_discovery_strategy(
+            capability_routing=capability_routing,
+            execution_hints={},
+            has_completed_discovery=False,
+            allow_live_enrichment=False,
+        )
+        routing_summary = build_routing_summary(
+            profile,
+            capability_gate=capability_gate,
+            capability_routing=capability_routing,
+            run_policy=run_policy,
+        )
+        results.append(
+            {
+                "model": profile.name,
+                "template": template_name,
+                "routing_summary": routing_summary.to_dict(),
+                "discovery_strategy": discovery_strategy.to_dict(),
             }
         )
     return results
@@ -83,9 +145,123 @@ def _read_json_file(path: Path) -> dict[str, Any]:
         return {}
 
 
+def _load_completed_discovery(output_dir: Path) -> tuple[Any | None, dict[str, Path]]:
+    from prototype.stage2.app.discovery import (
+        DiscoveryArtifactWriter,
+        apply_discovery_review_patch,
+        load_discovery_review_patch,
+    )
+
+    paths = DiscoveryArtifactWriter.load_paths(output_dir)
+    result = DiscoveryArtifactWriter.load(paths["discovery_summary"])
+    if result is None:
+        return None, paths
+    if not result.page_entries and not result.feature_points:
+        return None, paths
+    review_patch = load_discovery_review_patch(output_dir)
+    if review_patch:
+        result = apply_discovery_review_patch(result, review_patch)
+    return result, paths
+
+
 def load_run_report_payload(run_dir: str | Path) -> dict[str, Any]:
     root = Path(run_dir)
     return _read_json_file(root / "reports" / "run_report.json")
+
+
+def load_validation_result_payload(run_dir: str | Path) -> dict[str, Any]:
+    root = Path(run_dir)
+    return _read_json_file(root / "validation_result.json")
+
+
+def _resolve_cli_sample_max_rounds(value: int) -> int:
+    return value if value > 0 else 1
+
+
+def _resolve_cli_resume_max_rounds(value: int) -> int | None:
+    return value if value > 0 else None
+
+
+def _build_human_recording_template_metadata(bundle: Any) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    project_field_candidates = _collect_human_recording_project_field_candidates(bundle)
+    if project_field_candidates:
+        metadata["project_field_candidates"] = project_field_candidates
+    project_field_aliases = _collect_human_recording_field_aliases(bundle)
+    if project_field_aliases:
+        metadata["project_field_aliases"] = project_field_aliases
+    return metadata
+
+
+def _collect_human_recording_project_field_candidates(bundle: Any) -> list[str]:
+    seen: set[str] = set()
+    candidates: list[str] = []
+
+    def push(value: Any) -> None:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            return
+        seen.add(text)
+        candidates.append(text)
+
+    sections: list[dict[str, Any]] = []
+    for payload in (getattr(bundle, "data_schema", None), getattr(bundle, "baseline", None)):
+        if isinstance(payload, dict):
+            sections.append(payload)
+            human_recording = payload.get("human_recording")
+            if isinstance(human_recording, dict):
+                sections.append(human_recording)
+
+    for section in sections:
+        for key in ("field_rules", "field_constraints", "field_samples"):
+            nested = section.get(key)
+            if isinstance(nested, dict):
+                for field_key in nested.keys():
+                    push(field_key)
+        raw_candidates = section.get("project_field_candidates")
+        if isinstance(raw_candidates, list):
+            for field_key in raw_candidates:
+                push(field_key)
+
+    return candidates
+
+
+def _collect_human_recording_field_aliases(bundle: Any) -> dict[str, list[str]]:
+    aliases: dict[str, list[str]] = {}
+    for payload in (
+        getattr(bundle, "template", None),
+        getattr(bundle, "baseline", None),
+        getattr(bundle, "data_schema", None),
+        getattr(bundle, "locator_hints", None),
+    ):
+        if not isinstance(payload, dict):
+            continue
+        sections = [payload]
+        human_recording = payload.get("human_recording")
+        if isinstance(human_recording, dict):
+            sections.append(human_recording)
+        for section in sections:
+            for key in (
+                "project_field_aliases",
+                "field_aliases",
+                "candidate_field_aliases",
+                "human_recording_field_aliases",
+            ):
+                raw_aliases = section.get(key)
+                if not isinstance(raw_aliases, dict):
+                    continue
+                for canonical_key, values in raw_aliases.items():
+                    canonical_text = str(canonical_key or "").strip()
+                    if not canonical_text:
+                        continue
+                    bucket = aliases.setdefault(canonical_text, [])
+                    raw_values = values if isinstance(values, list) else [values]
+                    for value in raw_values:
+                        alias_text = str(value or "").strip()
+                        if not alias_text or alias_text in bucket:
+                            continue
+                        bucket.append(alias_text)
+    return aliases
 
 
 def load_latest_run_reports(limit: int = 20) -> list[dict[str, Any]]:
@@ -107,12 +283,105 @@ def load_latest_run_reports(limit: int = 20) -> list[dict[str, Any]]:
     return payloads
 
 
+def load_latest_validation_results(limit: int = 20) -> list[dict[str, Any]]:
+    artifact_root = ROOT_DIR / "artifacts" / "stage2" / "template_validation"
+    if not artifact_root.exists():
+        return []
+
+    payloads: list[dict[str, Any]] = []
+    for child in sorted(artifact_root.iterdir(), reverse=True):
+        if not child.is_dir():
+            continue
+        payload = load_validation_result_payload(child)
+        if payload:
+            payloads.append(payload)
+        if len(payloads) >= limit:
+            break
+    return payloads
+
+
+def _build_template_validation_metadata(
+    template_name: str,
+    template: dict[str, Any],
+    *,
+    mode: str,
+    model_name: str = "",
+) -> dict[str, Any]:
+    if template_name.startswith("lab_"):
+        family = "lab"
+        system_id = "template_lab"
+        system_name = "Template Lab"
+    elif template_name.startswith("suyuan_"):
+        family = "suyuan"
+        system_id = "suyuan_online_record"
+        system_name = "Suyuan Online Record"
+    else:
+        family = "generic"
+        system_id = "generic_template"
+        system_name = "Generic Template"
+
+    page_entry = template.get("page_entry", {}) if isinstance(template, dict) else {}
+    feature_point = template.get("feature_point", {}) if isinstance(template, dict) else {}
+    return {
+        "source_kind": "validation_result",
+        "template_name": template_name,
+        "family": family,
+        "system_id": system_id,
+        "system_name": system_name,
+        "scenario_id": template_name,
+        "mode": mode,
+        "model_name": model_name,
+        "page_entry_name": str(page_entry.get("name") or ""),
+        "page_entry_url": str(page_entry.get("url") or ""),
+        "feature_point_name": str(feature_point.get("name") or ""),
+        "feature_point_type": str(feature_point.get("type") or ""),
+        "notes": list(template.get("notes", [])) if isinstance(template.get("notes"), list) else [],
+    }
+
+
+def _build_template_validation_payload(
+    *,
+    bundle: Any,
+    artifacts: Any,
+    verification: Any,
+    mode: str,
+    model_name: str = "",
+) -> dict[str, Any]:
+    verification_payload = verification.to_dict()
+    steps = [item for item in verification_payload.get("steps", []) if isinstance(item, dict)]
+    verification_result = verification_payload.get("verification_result", {})
+    rule_evaluation = verification_result.get("rule_evaluation", {})
+    validation_path = artifacts.run_dir / "validation_result.json"
+    payload = {
+        **_build_template_validation_metadata(
+            bundle.name,
+            bundle.template,
+            mode=mode,
+            model_name=model_name,
+        ),
+        "template": bundle.name,
+        "run_dir": str(artifacts.run_dir),
+        "report_path": str(validation_path),
+        "duration_ms": sum(int(item.get("duration_ms") or 0) for item in steps),
+        "failed_step_ids": [str(item.get("step") or "") for item in steps if item.get("status") != "completed"],
+        "verification_status": str(verification_result.get("status") or ""),
+        "rule_summary": str(rule_evaluation.get("summary") or ""),
+        **verification_payload,
+    }
+    payload["artifacts"] = [
+        {"label": "validation_result.json", "path": str(validation_path)},
+        {"label": "verification_result.json", "path": str(artifacts.run_dir / "verification_result.json")},
+        {"label": "network_events.json", "path": str(artifacts.run_dir / "network_events.json")},
+    ]
+    return payload
+
+
 async def run_local_template_validation(template_name: str) -> dict[str, Any]:
     from playwright.async_api import async_playwright
 
     from prototype.stage2.app.data_factory.generator import TemplateDataFactory
     from prototype.stage2.app.runtime.artifacts import ArtifactWriter
-    from prototype.stage2.app.verification import execute_generic_template
+    from prototype.stage2.app.verification import execute_generic_template_with_shared_result
 
     bundle = load_template_bundle(TEMPLATE_ROOT / template_name)
     artifact_root = ROOT_DIR / "artifacts" / "stage2" / "template_validation"
@@ -126,28 +395,25 @@ async def run_local_template_validation(template_name: str) -> dict[str, Any]:
         baseline=bundle.baseline,
         run_data=run_data,
         generated_files={},
+        locator_hints=bundle.locator_hints,
     )
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
         page = await browser.new_page()
         try:
-            executions = await execute_generic_template(
+            verification = await execute_generic_template_with_shared_result(
                 page=page,
                 artifacts=artifacts,
                 runtime=runtime,
                 template=bundle.template,
             )
-            success = all(item.status == "completed" for item in executions)
-            payload = {
-                "template": template_name,
-                "run_dir": str(artifacts.run_dir),
-                "success": success,
-                "step_count": len(executions),
-                "steps": [item.to_attempt_action() for item in executions],
-                "final_url": page.url,
-                "final_title": await page.title(),
-            }
+            payload = _build_template_validation_payload(
+                bundle=bundle,
+                artifacts=artifacts,
+                verification=verification,
+                mode=VALIDATION_MODE_LOCAL,
+            )
             artifacts.write_json("validation_result.json", payload)
             return payload
         finally:
@@ -163,7 +429,7 @@ async def run_connected_template_validation(
 
     from prototype.stage2.app.data_factory.generator import TemplateDataFactory
     from prototype.stage2.app.runtime.artifacts import ArtifactWriter
-    from prototype.stage2.app.verification import execute_generic_template
+    from prototype.stage2.app.verification import execute_generic_template_with_shared_result
 
     bundle = load_template_bundle(TEMPLATE_ROOT / template_name)
     artifact_root = ROOT_DIR / "artifacts" / "stage2" / "template_validation"
@@ -177,6 +443,7 @@ async def run_connected_template_validation(
         baseline=bundle.baseline,
         run_data=run_data,
         generated_files={},
+        locator_hints=bundle.locator_hints,
     )
 
     async with async_playwright() as playwright:
@@ -193,27 +460,136 @@ async def run_connected_template_validation(
             if target_url and target_url not in page.url:
                 await page.goto(target_url, wait_until="domcontentloaded")
                 await page.wait_for_timeout(1500)
-            executions = await execute_generic_template(
+            verification = await execute_generic_template_with_shared_result(
                 page=page,
                 artifacts=artifacts,
                 runtime=runtime,
                 template=bundle.template,
             )
-            success = all(item.status == "completed" for item in executions)
-            payload = {
-                "template": template_name,
-                "run_dir": str(artifacts.run_dir),
-                "success": success,
-                "step_count": len(executions),
-                "steps": [item.to_attempt_action() for item in executions],
-                "final_url": page.url,
-                "final_title": await page.title(),
-                "mode": "connected_cdp",
-            }
+            payload = _build_template_validation_payload(
+                bundle=bundle,
+                artifacts=artifacts,
+                verification=verification,
+                mode=VALIDATION_MODE_CONNECTED,
+            )
             artifacts.write_json("validation_result.json", payload)
             return payload
         finally:
             await browser.close()
+
+
+def _coerce_validation_matrix_result(
+    target: ValidationMatrixTarget,
+    payload: dict[str, Any],
+) -> ValidationMatrixResult:
+    status = str(payload.get("status") or "").strip().lower()
+    if status not in {"passed", "failed", "skipped"}:
+        status = "passed" if payload.get("success") else "failed"
+    reason = str(
+        payload.get("reason")
+        or payload.get("rule_summary")
+        or payload.get("verification_result", {}).get("rule_evaluation", {}).get("summary")
+        or ""
+    )
+    return ValidationMatrixResult(
+        target=target,
+        status=status,
+        success=bool(payload.get("success")) and status == "passed",
+        run_dir=str(payload.get("run_dir") or ""),
+        reason=reason,
+        payload=payload,
+    )
+
+
+def _failed_validation_matrix_result(
+    target: ValidationMatrixTarget,
+    *,
+    reason: str,
+    payload: dict[str, Any] | None = None,
+) -> ValidationMatrixResult:
+    return ValidationMatrixResult(
+        target=target,
+        status=VALIDATION_STATUS_FAILED,
+        success=False,
+        reason=reason,
+        run_dir=str((payload or {}).get("run_dir") or ""),
+        payload=payload or {},
+    )
+
+
+def _skipped_validation_matrix_result(target: ValidationMatrixTarget, *, reason: str) -> ValidationMatrixResult:
+    return ValidationMatrixResult(
+        target=target,
+        status=VALIDATION_STATUS_SKIPPED,
+        success=False,
+        reason=reason,
+        payload={},
+    )
+
+
+async def run_g4_validation_matrix(
+    *,
+    cdp_url: str,
+    targets: list[ValidationMatrixTarget] | None = None,
+    output_root: Path | None = None,
+    local_runner: Any = None,
+    connected_runner: Any = None,
+) -> dict[str, Any]:
+    selected_targets = list(targets or build_default_g4_validation_targets())
+    local_runner = local_runner or run_local_template_validation
+    connected_runner = connected_runner or run_connected_template_validation
+    results: list[ValidationMatrixResult] = []
+
+    for target in selected_targets:
+        try:
+            if target.mode == VALIDATION_MODE_LOCAL:
+                payload = await local_runner(target.template_name)
+                results.append(_coerce_validation_matrix_result(target, payload))
+                continue
+
+            if target.mode == VALIDATION_MODE_CONNECTED:
+                if not cdp_url:
+                    results.append(_skipped_validation_matrix_result(target, reason="cdp_url_missing"))
+                    continue
+                payload = await connected_runner(target.template_name, cdp_url=cdp_url)
+                results.append(_coerce_validation_matrix_result(target, payload))
+                continue
+
+            results.append(_skipped_validation_matrix_result(target, reason=f"unsupported_mode:{target.mode}"))
+        except Exception as exc:
+            results.append(
+                _failed_validation_matrix_result(
+                    target,
+                    reason=f"{type(exc).__name__}: {exc}",
+                    payload={"template_name": target.template_name, "mode": target.mode},
+                )
+            )
+
+    payload = build_validation_matrix_payload(
+        goal=DEFAULT_G4_VALIDATION_GOAL,
+        results=results,
+    )
+    matrix_root = (output_root or (ROOT_DIR / "artifacts" / "stage2")) / "validation_matrix"
+    history_root = matrix_root / "history"
+    matrix_root.mkdir(parents=True, exist_ok=True)
+    history_root.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    latest_json_path = matrix_root / "latest_validation_matrix.json"
+    latest_markdown_path = matrix_root / "latest_validation_matrix.md"
+    history_json_path = history_root / f"{timestamp}_validation_matrix.json"
+    history_markdown_path = history_root / f"{timestamp}_validation_matrix.md"
+
+    payload["json_path"] = str(latest_json_path)
+    payload["markdown_path"] = str(latest_markdown_path)
+    payload["history_json_path"] = str(history_json_path)
+    payload["history_markdown_path"] = str(history_markdown_path)
+
+    latest_json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    latest_markdown_path.write_text(render_validation_matrix_markdown(payload), encoding="utf-8")
+    history_json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    history_markdown_path.write_text(render_validation_matrix_markdown(payload), encoding="utf-8")
+    return payload
 
 
 def generate_platform_daily_report(
@@ -264,7 +640,10 @@ def bootstrap_human_recording(
         start_url=start_url or bundle.template.get("page_entry", {}).get("url"),
         task_description=task_description or "人工演示首条成功路径并生成候选模板草稿",
         artifact_root=HUMAN_LOOP_ROOT,
-        metadata={"bootstrap_mode": "placeholder_seed"},
+        metadata={
+            "bootstrap_mode": "placeholder_seed",
+            **_build_human_recording_template_metadata(bundle),
+        },
     )
     recorder = HumanLoopRecorder(config)
     paths = recorder.start_session()
@@ -275,10 +654,11 @@ def bootstrap_human_recording(
     )
     recorder.end_session("初始化人工录制入口占位会话")
     events = recorder.load_events()
-    MinimalCandidateTemplateDraftGenerator().write_draft(
+    MinimalCandidateTemplateDraftGenerator().write_artifacts(
         config=config,
         events=events,
-        output_path=str(paths.draft_path),
+        draft_output_path=str(paths.draft_path),
+        candidate_review_output_path=str(paths.candidate_review_path),
     )
     return {
         "template": template_name,
@@ -287,16 +667,107 @@ def bootstrap_human_recording(
         "metadata_path": str(paths.metadata_path),
         "events_path": str(paths.events_path),
         "draft_path": str(paths.draft_path),
+        "candidate_review_path": str(paths.candidate_review_path),
+        "summary_path": str(paths.summary_path),
+        "screenshot_index_path": str(paths.screenshot_index_path),
         "event_count": len(events),
     }
 
 
-async def run_live_discovery(template_name: str, *, cdp_url: str) -> dict[str, str | int]:
+async def run_live_discovery(
+    template_name: str,
+    *,
+    cdp_url: str,
+    model_name: str | None = None,
+    reuse_completed_discovery: bool = False,
+) -> dict[str, Any]:
+    from prototype.stage2.app.config import (
+        build_capability_routing,
+        load_model_profiles,
+        validate_model_capabilities,
+    )
     from prototype.stage2.app.discovery import DiscoveryArtifactWriter, run_live_discovery_session
+    from prototype.stage2.app.discovery.strategy import select_discovery_strategy
+    from prototype.stage2.app.orchestration.routing_summary import build_routing_summary
+    from prototype.stage2.app.verification.constants import DEFAULT_ENV_FILES
 
     bundle = load_template_bundle(TEMPLATE_ROOT / template_name)
+    profiles = load_model_profiles(DEFAULT_ENV_FILES)
+    if not profiles:
+        raise RuntimeError("未从 demo 目录加载到模型配置，无法判断 live discovery 路由。")
+    profile = profiles[0]
+    if model_name:
+        normalized_target = "".join(ch.lower() if ch.isalnum() else "_" for ch in model_name)
+        matched = next(
+            (
+                item
+                for item in profiles
+                if item.name == model_name
+                or "".join(ch.lower() if ch.isalnum() else "_" for ch in item.name) == normalized_target
+            ),
+            None,
+        )
+        if matched is None:
+            raise RuntimeError(f"未找到模型配置：{model_name}")
+        profile = matched
+    capability_gate = validate_model_capabilities(profile, mode="stage2_run_sample")
+    capability_routing = build_capability_routing(profile, gate=capability_gate)
+    run_policy_summary = build_routing_summary(
+        profile,
+        capability_gate=capability_gate,
+        capability_routing=capability_routing,
+        run_policy=None,
+    )
     output_dir = ROOT_DIR / "artifacts" / "stage2" / f"live_discovery_{template_name}"
     output_dir.mkdir(parents=True, exist_ok=True)
+    completed_result, completed_paths = _load_completed_discovery(output_dir)
+    has_completed_discovery = completed_result is not None
+    discovery_strategy = select_discovery_strategy(
+        capability_routing=capability_routing,
+        execution_hints={"skip_completed_discovery": reuse_completed_discovery},
+        has_completed_discovery=has_completed_discovery,
+        allow_live_enrichment=True,
+    )
+    if not discovery_strategy.should_run_live_discovery:
+        payload = {
+            "template": template_name,
+            "model": profile.name,
+            "status": "reused" if discovery_strategy.reuse_completed_discovery else "blocked",
+            "reason": discovery_strategy.reason,
+            "selected_strategy": discovery_strategy.selected_strategy,
+            "routing_summary": run_policy_summary.to_dict(),
+            "discovery_strategy": discovery_strategy.to_dict(),
+            "output_dir": str(output_dir),
+            "requested_reuse_completed_discovery": reuse_completed_discovery,
+            "reused_completed_discovery": discovery_strategy.reuse_completed_discovery,
+            "has_completed_discovery": has_completed_discovery,
+        }
+        if completed_result is not None:
+            payload.update(
+                {
+                    "strategy": completed_result.strategy,
+                    "page_entry_count": len(completed_result.page_entries),
+                    "feature_point_count": len(completed_result.feature_points),
+                    "screenshot_record_count": len(completed_result.screenshot_records),
+                    "page_entries_path": str(completed_paths["page_entries"]),
+                    "feature_points_path": str(completed_paths["feature_points"]),
+                    "screenshot_records_path": str(completed_paths["screenshot_records"]),
+                    "discovery_result_path": str(completed_paths["discovery_summary"]),
+                }
+            )
+        (output_dir / "routing_summary.json").write_text(
+            json.dumps(run_policy_summary.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (output_dir / "discovery_strategy.json").write_text(
+            json.dumps(discovery_strategy.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (output_dir / "live_discovery_blocked.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return payload
     result = await run_live_discovery_session(
         cdp_url=cdp_url,
         template_name=template_name,
@@ -306,9 +777,19 @@ async def run_live_discovery(template_name: str, *, cdp_url: str) -> dict[str, s
     )
 
     paths = DiscoveryArtifactWriter(output_dir).write(result)
+    (output_dir / "routing_summary.json").write_text(
+        json.dumps(run_policy_summary.to_dict(), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (output_dir / "discovery_strategy.json").write_text(
+        json.dumps(discovery_strategy.to_dict(), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return {
         "template": template_name,
+        "model": profile.name,
         "strategy": result.strategy,
+        "selected_strategy": discovery_strategy.selected_strategy,
         "output_dir": str(output_dir),
         "page_entry_count": len(result.page_entries),
         "feature_point_count": len(result.feature_points),
@@ -340,7 +821,10 @@ async def capture_human_recording(
         start_url=start_url or bundle.template.get("page_entry", {}).get("url"),
         task_description=task_description,
         artifact_root=HUMAN_LOOP_ROOT,
-        metadata={"capture_mode": "playwright_cdp"},
+        metadata={
+            "capture_mode": "playwright_cdp",
+            **_build_human_recording_template_metadata(bundle),
+        },
     )
     result = await record_human_loop_from_cdp(
         cdp_url=cdp_url,
@@ -354,6 +838,7 @@ async def capture_human_recording(
         "metadata_path": result.metadata_path,
         "events_path": result.events_path,
         "draft_path": result.draft_path,
+        "candidate_review_path": result.candidate_review_path,
         "summary_path": result.summary_path,
         "screenshot_index_path": result.screenshot_index_path,
         "capture_summary": result.capture_summary,
@@ -373,7 +858,28 @@ async def run_stage2_sample_entrypoint(
     return await run_stage2_sample(
         cdp_url=cdp_url,
         max_attempts=max_attempts,
-        max_rounds=max_rounds,
+        max_rounds=_resolve_cli_sample_max_rounds(max_rounds),
+    )
+
+
+async def resume_human_takeover_entrypoint(
+    *,
+    run_dir: str,
+    cdp_url: str,
+    max_attempts: int,
+    max_rounds: int,
+    operator_id: str | None,
+    note: str | None,
+) -> dict[str, Any]:
+    from tools.suyuan_submit_loop import resume_profile_from_human_takeover
+
+    return await resume_profile_from_human_takeover(
+        Path(run_dir),
+        cdp_url=cdp_url,
+        max_attempts=max_attempts,
+        max_rounds=_resolve_cli_resume_max_rounds(max_rounds),
+        operator_id=operator_id,
+        note=note,
     )
 
 
@@ -420,6 +926,21 @@ def main() -> None:
         help="Run controlled live discovery against the currently connected Chrome CDP session.",
     )
     parser.add_argument(
+        "--reuse-completed-discovery",
+        action="store_true",
+        help="When running live discovery, reuse an existing completed discovery_result.json if one is already present for the template output directory.",
+    )
+    parser.add_argument(
+        "--routing-summary",
+        action="store_true",
+        help="Show per-model routing and discovery-strategy summaries for the current template.",
+    )
+    parser.add_argument(
+        "--model",
+        default="",
+        help="Optional model/profile name used by live discovery or for filtering routing summaries.",
+    )
+    parser.add_argument(
         "--capture-human-recording",
         action="store_true",
         help="Capture real DOM events from the currently connected Chrome CDP session.",
@@ -450,12 +971,27 @@ def main() -> None:
         "--max-rounds",
         type=int,
         default=1,
-        help="Maximum orchestration rounds used by the stage-2 sample pipeline.",
+        help="Maximum orchestration rounds. On human-takeover resume, the requested value is capped by the remaining round budget from round_input.json.",
     )
     parser.add_argument(
         "--platform-daily-report",
         action="store_true",
         help="Aggregate the latest run reports into a platform daily report bundle.",
+    )
+    parser.add_argument(
+        "--resume-human-takeover",
+        default="",
+        help="Resume a previously blocked run directory after human takeover or manual review is completed.",
+    )
+    parser.add_argument(
+        "--resume-operator",
+        default="",
+        help="Optional operator id recorded when resuming a human takeover.",
+    )
+    parser.add_argument(
+        "--resume-note",
+        default="",
+        help="Optional note recorded when resuming a human takeover.",
     )
     parser.add_argument(
         "--validate-template",
@@ -466,6 +1002,11 @@ def main() -> None:
         "--validate-connected-template",
         default="",
         help="Run a generic-template validation against the currently connected Chrome CDP session.",
+    )
+    parser.add_argument(
+        "--validation-matrix",
+        action="store_true",
+        help="Run the G4 cross-system validation matrix and write aggregated json/markdown artifacts.",
     )
     parser.add_argument(
         "--report-date",
@@ -503,11 +1044,31 @@ def main() -> None:
     if args.live_discovery:
         print(
             json.dumps(
-                asyncio.run(run_live_discovery(args.template, cdp_url=args.cdp_url)),
+                asyncio.run(
+                    run_live_discovery(
+                        args.template,
+                        cdp_url=args.cdp_url,
+                        model_name=args.model or None,
+                        reuse_completed_discovery=args.reuse_completed_discovery,
+                    )
+                ),
                 ensure_ascii=False,
                 indent=2,
             )
         )
+        return
+
+    if args.routing_summary:
+        summaries = build_routing_summaries(template_name=args.template)
+        if args.model:
+            normalized_target = "".join(ch.lower() if ch.isalnum() else "_" for ch in args.model)
+            summaries = [
+                item
+                for item in summaries
+                if item.get("model") == args.model
+                or "".join(ch.lower() if ch.isalnum() else "_" for ch in str(item.get("model", ""))) == normalized_target
+            ]
+        print(json.dumps(summaries, ensure_ascii=False, indent=2))
         return
 
     if args.capture_human_recording:
@@ -559,6 +1120,25 @@ def main() -> None:
         )
         return
 
+    if args.resume_human_takeover:
+        print(
+            json.dumps(
+                asyncio.run(
+                    resume_human_takeover_entrypoint(
+                        run_dir=args.resume_human_takeover,
+                        cdp_url=args.cdp_url,
+                        max_attempts=args.max_attempts,
+                        max_rounds=args.max_rounds,
+                        operator_id=args.resume_operator or None,
+                        note=args.resume_note or None,
+                    )
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+
     if args.validate_template:
         print(
             json.dumps(
@@ -575,6 +1155,20 @@ def main() -> None:
                 asyncio.run(
                     run_connected_template_validation(
                         args.validate_connected_template,
+                        cdp_url=args.cdp_url,
+                    )
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+
+    if args.validation_matrix:
+        print(
+            json.dumps(
+                asyncio.run(
+                    run_g4_validation_matrix(
                         cdp_url=args.cdp_url,
                     )
                 ),

@@ -4,9 +4,11 @@ from .identity import build_feature_point_identity, build_page_entry_identity, g
 from .live import LiveDiscoveryConfig, plan_live_discovery, run_live_discovery_session
 from .models import DiscoveryResult
 from .planner import DiscoveryPlanner
+from .review import apply_discovery_review_patch, load_discovery_review_patch
 from .writer import DiscoveryArtifactWriter
 
 __all__ = [
+    "apply_discovery_review_patch",
     "build_feature_point_identity",
     "build_page_entry_identity",
     "DiscoveryArtifactWriter",
@@ -14,6 +16,7 @@ __all__ = [
     "DiscoveryResult",
     "generalize_url_for_identity",
     "LiveDiscoveryConfig",
+    "load_discovery_review_patch",
     "plan_live_discovery",
     "run_live_discovery_session",
 ]

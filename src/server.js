@@ -4,7 +4,18 @@ const path = require('path');
 const { URL } = require('url');
 const storage = require('./storage');
 const {
+  loadStage2Overview,
+  resolveHumanLoopArtifact,
+  resolveStage2RunArtifact
+} = require('./stage2Dashboard');
+const {
+  markHumanTakeoverResolved,
+  resumeHumanTakeover
+} = require('./stage2Actions');
+const {
   createProject,
+  updateProject,
+  hydrateProject,
   analyzeProject,
   designTestCases,
   executeProject,
@@ -19,8 +30,17 @@ const mimeTypes = {
   '.css': 'text/css; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
+  '.jsonl': 'text/plain; charset=utf-8',
+  '.md': 'text/markdown; charset=utf-8',
+  '.txt': 'text/plain; charset=utf-8',
   '.svg': 'image/svg+xml',
-  '.png': 'image/png'
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+  '.bmp': 'image/bmp',
+  '.pdf': 'application/pdf'
 };
 
 function sendJson(res, statusCode, payload) {
@@ -81,15 +101,104 @@ async function handleApi(req, res, pathname) {
   }
 
   if (req.method === 'GET' && pathname === '/api/projects') {
-    const projects = await storage.listProjects();
+    const projects = (await storage.listProjects()).map(hydrateProject);
     sendJson(res, 200, { projects });
+    return true;
+  }
+
+  if (req.method === 'GET' && pathname === '/api/stage2/overview') {
+    const overview = await loadStage2Overview();
+    sendJson(res, 200, { overview });
+    return true;
+  }
+
+  const stage2RunActionParams = routeMatch(pathname, '/api/stage2/runs/:runId/:action');
+  if (stage2RunActionParams && req.method === 'POST') {
+    const body = await readJson(req);
+    let result;
+
+    if (stage2RunActionParams.action === 'mark-human-takeover-resolved') {
+      result = await markHumanTakeoverResolved({
+        runId: stage2RunActionParams.runId,
+        operatorId: body.operatorId,
+        note: body.note,
+        readyToResume: body.readyToResume,
+        handledActionIds: body.handledActionIds
+      });
+    } else if (stage2RunActionParams.action === 'resume-human-takeover') {
+      result = await resumeHumanTakeover({
+        runId: stage2RunActionParams.runId,
+        cdpUrl: body.cdpUrl,
+        maxAttempts: body.maxAttempts,
+        maxRounds: body.maxRounds,
+        operatorId: body.operatorId,
+        note: body.note
+      });
+    } else {
+      sendError(res, 404, 'Unknown stage-2 run action.');
+      return true;
+    }
+
+    const overview = await loadStage2Overview();
+    sendJson(res, 200, { result, overview });
+    return true;
+  }
+
+  const humanLoopArtifactParams = routeMatch(pathname, '/api/stage2/human-loop/:sessionId/artifacts/:artifactKey');
+  if (humanLoopArtifactParams && req.method === 'GET') {
+    const artifact = await resolveHumanLoopArtifact(humanLoopArtifactParams.sessionId, humanLoopArtifactParams.artifactKey);
+    if (!artifact) {
+      sendError(res, 404, 'Human-loop artifact not found.');
+      return true;
+    }
+
+    try {
+      const content = await fs.readFile(artifact.path);
+      res.writeHead(200, {
+        'Content-Type': mimeTypes[path.extname(artifact.path).toLowerCase()] || 'application/octet-stream',
+        'Cache-Control': 'no-store',
+        'Content-Disposition': `inline; filename="${encodeURIComponent(artifact.fileName)}"`
+      });
+      res.end(content);
+    } catch {
+      sendError(res, 404, 'Human-loop artifact file is unavailable.');
+    }
+    return true;
+  }
+
+  const stage2ArtifactParams = routeMatch(pathname, '/api/stage2/runs/:runId/artifacts/:artifactKey');
+  if (stage2ArtifactParams && req.method === 'GET') {
+    const artifact = await resolveStage2RunArtifact(stage2ArtifactParams.runId, stage2ArtifactParams.artifactKey);
+    if (!artifact) {
+      sendError(res, 404, 'Stage-2 artifact not found.');
+      return true;
+    }
+
+    try {
+      const content = await fs.readFile(artifact.path);
+      res.writeHead(200, {
+        'Content-Type': mimeTypes[path.extname(artifact.path).toLowerCase()] || 'application/octet-stream',
+        'Cache-Control': 'no-store',
+        'Content-Disposition': `inline; filename="${encodeURIComponent(artifact.fileName)}"`
+      });
+      res.end(content);
+    } catch {
+      sendError(res, 404, 'Stage-2 artifact file is unavailable.');
+    }
     return true;
   }
 
   if (req.method === 'POST' && pathname === '/api/projects') {
     const body = await readJson(req);
-    const project = await storage.saveProject(createProject(body));
-    sendJson(res, 201, { project });
+    const project = body.id
+      ? await getProjectOr404(res, body.id)
+      : null;
+    if (body.id && !project) {
+      return true;
+    }
+    const nextProject = project ? updateProject(project, body) : createProject(body);
+    const saved = await storage.saveProject(nextProject);
+    sendJson(res, project ? 200 : 201, { project: saved });
     return true;
   }
 
@@ -97,7 +206,7 @@ async function handleApi(req, res, pathname) {
   if (projectParams && req.method === 'GET') {
     const project = await getProjectOr404(res, projectParams.id);
     if (project) {
-      sendJson(res, 200, { project });
+      sendJson(res, 200, { project: hydrateProject(project) });
     }
     return true;
   }

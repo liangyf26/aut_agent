@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from .models import DiscoveryResult
@@ -87,6 +88,33 @@ class DiscoveryArtifactWriter:
         }
 
     def _json(self, payload: dict[str, object]) -> str:
-        import json
-
         return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def load(result_path: str | Path) -> DiscoveryResult | None:
+        path = Path(result_path)
+        if path.is_dir():
+            path = path / "discovery_result.json"
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        try:
+            return DiscoveryResult.from_dict(payload)
+        except TypeError:
+            return None
+
+    @staticmethod
+    def load_paths(output_dir: str | Path) -> dict[str, Path]:
+        root = Path(output_dir)
+        return {
+            "page_entries": root / "page_entries.json",
+            "feature_points": root / "feature_points.json",
+            "screenshot_records": root / "screenshot_records.json",
+            "review_queue": root / "discovery_review_queue.json",
+            "discovery_summary": root / "discovery_result.json",
+        }

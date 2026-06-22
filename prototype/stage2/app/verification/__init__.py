@@ -3,6 +3,7 @@
 from .generic_templates import (
     build_generic_template_registry,
     execute_generic_template,
+    execute_generic_template_with_shared_result,
     navigate_to_url,
     fill_field_by_locator,
     select_option_by_locator,
@@ -11,8 +12,42 @@ from .generic_templates import (
     assert_text_visible,
     capture_named_screenshot,
 )
+from .suyuan_shared_actions import (
+    ensure_drawer_checkbox,
+    expand_cultivation_form,
+    register_suyuan_wizard_drawer_actions,
+    run_apply_wizard,
+    select_drawer_option,
+)
+from .suyuan_submit_dialog_actions import (
+    register_suyuan_submit_dialog_actions,
+    select_submit_dialog_dept,
+    submit_filing_dialog,
+    upload_drawer_required_files,
+    upload_submit_dialog_apply_file,
+)
+from .rule_evaluator import (
+    evaluate_template_rules,
+    SharedTemplateVerificationResult,
+    TemplateRuleEvaluationResult,
+    TemplateVerificationEvidence,
+)
 from .template_executor import TemplateActionRegistry, TemplateFlowExecutor, TemplateStepExecution
 from .template_runtime import TemplateRuntimeData
+from .validation_matrix import (
+    VALIDATION_MODE_CONNECTED,
+    VALIDATION_MODE_LOCAL,
+    VALIDATION_STATUS_FAILED,
+    VALIDATION_STATUS_PARTIAL,
+    VALIDATION_STATUS_PASSED,
+    VALIDATION_STATUS_SKIPPED,
+    ValidationMatrixResult,
+    ValidationMatrixTarget,
+    build_default_g4_validation_targets,
+    build_validation_matrix_payload,
+    render_validation_matrix_markdown,
+    summarize_validation_matrix,
+)
 
 __all__ = [
     "build_generic_template_registry",
@@ -24,8 +59,35 @@ __all__ = [
     "assert_text_visible",
     "capture_named_screenshot",
     "execute_generic_template",
+    "execute_generic_template_with_shared_result",
+    "run_apply_wizard",
+    "select_drawer_option",
+    "ensure_drawer_checkbox",
+    "expand_cultivation_form",
+    "register_suyuan_wizard_drawer_actions",
+    "upload_drawer_required_files",
+    "select_submit_dialog_dept",
+    "upload_submit_dialog_apply_file",
+    "submit_filing_dialog",
+    "register_suyuan_submit_dialog_actions",
+    "evaluate_template_rules",
+    "SharedTemplateVerificationResult",
+    "TemplateRuleEvaluationResult",
+    "TemplateVerificationEvidence",
     "TemplateActionRegistry",
     "TemplateFlowExecutor",
     "TemplateRuntimeData",
     "TemplateStepExecution",
+    "VALIDATION_MODE_CONNECTED",
+    "VALIDATION_MODE_LOCAL",
+    "VALIDATION_STATUS_FAILED",
+    "VALIDATION_STATUS_PARTIAL",
+    "VALIDATION_STATUS_PASSED",
+    "VALIDATION_STATUS_SKIPPED",
+    "ValidationMatrixResult",
+    "ValidationMatrixTarget",
+    "build_default_g4_validation_targets",
+    "build_validation_matrix_payload",
+    "render_validation_matrix_markdown",
+    "summarize_validation_matrix",
 ]

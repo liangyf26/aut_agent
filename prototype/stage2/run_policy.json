@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "risky_submit_default_decision": "blocked",
+  "projects": {
+    "AI Agent 软件自动化评测平台第二阶段原型": {
+      "note": "Default stage-2 policy stays conservative. High-risk real submit must be explicitly allowlisted at project/template scope before automation can continue.",
+      "templates": {
+        "suyuan_online_apply": {
+          "note": "No risky submit rule is enabled by default for the demo template."
+        }
+      }
+    }
+  }
+}

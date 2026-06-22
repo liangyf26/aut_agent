@@ -11,6 +11,12 @@ if str(ROOT_DIR) not in sys.path:
 
 from prototype.stage2.app.runtime.artifacts import ArtifactWriter
 from prototype.stage2.app.iteration.writer import write_iteration_artifacts
+from tools.suyuan_submit_loop import build_human_resume_decision, build_human_takeover_packet
+from prototype.stage2.app.config.capability_preflight import CapabilityGateDecision
+from prototype.stage2.app.config.capability_routing import build_capability_routing
+from prototype.stage2.app.config.models import ModelProfile
+from prototype.stage2.app.config.run_policy_loader import resolve_run_policy_payload
+from prototype.stage2.app.reporting import build_routing_section
 
 
 def test_should_auto_continue_only_for_scheduled_true() -> None:
@@ -40,6 +46,195 @@ def test_should_auto_continue_only_for_scheduled_true() -> None:
             "should_start_next_round": False,
         }
     )
+
+
+def test_discovery_strategy_smoke_guardrail_preserves_skip_completed_as_hint_not_override() -> None:
+    from prototype.stage2.app.config.capability_routing import CapabilityRoutingDecision, CapabilityStageRoute
+    from prototype.stage2.app.discovery.strategy import select_discovery_strategy
+
+    discovery_route = CapabilityStageRoute(
+        stage="discovery",
+        allowed=True,
+        recommended_mode="browser_use_structured_candidate",
+        reason_code="browser_use_structured_candidate",
+        reason="Structured discovery may be possible.",
+        routing_tags=["discovery_enabled", "structured_candidate"],
+        capability_tags={"chat_completion": True, "json_schema_response_format": True},
+    )
+    routing = CapabilityRoutingDecision(
+        profile_name="Qwen",
+        model="Qwen",
+        gate_status="ok",
+        gate_reason_code="capability_probe_ok",
+        gate_reason="Capability preflight passed.",
+        capability_tags={"chat_completion": True, "json_schema_response_format": True},
+        routing_tags=list(discovery_route.routing_tags),
+        discovery=discovery_route,
+        verification=CapabilityStageRoute(
+            stage="verification",
+            allowed=True,
+            recommended_mode="playwright_deterministic_verification",
+            reason_code="playwright_verification_ready",
+            reason="Verification is allowed.",
+            routing_tags=["verification_enabled"],
+            capability_tags={"chat_completion": True},
+        ),
+        reporting=CapabilityStageRoute(
+            stage="reporting",
+            allowed=True,
+            recommended_mode="llm_assisted_reporting",
+            reason_code="llm_reporting_ready",
+            reason="Reporting is allowed.",
+            routing_tags=["reporting_enabled"],
+            capability_tags={"chat_completion": True},
+        ),
+    )
+
+    decision = select_discovery_strategy(
+        capability_routing=routing,
+        execution_hints={"skip_completed_discovery": True},
+        has_completed_discovery=False,
+        allow_live_enrichment=True,
+    )
+
+    assert decision.selected_strategy == "live_enrich"
+    assert decision.reuse_completed_discovery is False
+    assert decision.should_run_live_discovery is True
+    assert "no completed discovery artifacts are available" in " ".join(decision.notes)
+
+
+def test_discovery_strategy_smoke_guardrail_keeps_template_seed_when_live_enrichment_is_disabled() -> None:
+    from prototype.stage2.app.config.capability_routing import CapabilityRoutingDecision, CapabilityStageRoute
+    from prototype.stage2.app.discovery.strategy import select_discovery_strategy
+
+    discovery_route = CapabilityStageRoute(
+        stage="discovery",
+        allowed=True,
+        recommended_mode="browser_use_structured_candidate",
+        reason_code="browser_use_structured_candidate",
+        reason="Structured discovery may be possible.",
+        routing_tags=["discovery_enabled", "structured_candidate"],
+        capability_tags={"chat_completion": True, "json_schema_response_format": True},
+    )
+    routing = CapabilityRoutingDecision(
+        profile_name="Qwen",
+        model="Qwen",
+        gate_status="ok",
+        gate_reason_code="capability_probe_ok",
+        gate_reason="Capability preflight passed.",
+        capability_tags={"chat_completion": True, "json_schema_response_format": True},
+        routing_tags=list(discovery_route.routing_tags),
+        discovery=discovery_route,
+        verification=CapabilityStageRoute(
+            stage="verification",
+            allowed=True,
+            recommended_mode="playwright_deterministic_verification",
+            reason_code="playwright_verification_ready",
+            reason="Verification is allowed.",
+            routing_tags=["verification_enabled"],
+            capability_tags={"chat_completion": True},
+        ),
+        reporting=CapabilityStageRoute(
+            stage="reporting",
+            allowed=True,
+            recommended_mode="llm_assisted_reporting",
+            reason_code="llm_reporting_ready",
+            reason="Reporting is allowed.",
+            routing_tags=["reporting_enabled"],
+            capability_tags={"chat_completion": True},
+        ),
+    )
+
+    decision = select_discovery_strategy(
+        capability_routing=routing,
+        execution_hints={"skip_completed_discovery": True},
+        has_completed_discovery=False,
+        allow_live_enrichment=False,
+    )
+
+    assert decision.selected_strategy == "template_seed_only"
+    assert decision.reuse_completed_discovery is False
+    assert decision.should_run_live_discovery is False
+    assert decision.reason_code == "live_enrichment_disabled"
+
+
+def test_stage_b_routing_and_policy_explanation_remains_structured() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        env_file = root / "demo.env"
+        env_file.write_text("LOCAL_LLM_MODEL=AI-tester\n", encoding="utf-8")
+        profile = ModelProfile(
+            name="AI-tester",
+            env_file=env_file,
+            base_url="http://localhost:30000/v1",
+            api_key="test",
+            model="AI-tester",
+        )
+        gate = CapabilityGateDecision(
+            status="allowed",
+            reason_code="capability_probe_ok",
+            reason="Capability probe for model AI-tester satisfies mode stage2_run_sample.",
+            mode="stage2_run_sample",
+            profile_name=profile.name,
+            required_tags=["chat_completion"],
+            capability_tags={"chat_completion": True},
+            notes=["Current routing mode only requires the tags listed in required_tags."],
+        )
+        routing = build_capability_routing(profile, gate=gate)
+        policy = resolve_run_policy_payload(
+            {
+                "run_policy": {
+                    "risky_submit_default_decision": "blocked",
+                    "projects": {
+                        "AI Agent 软件自动化评测平台第二阶段原型": {
+                            "templates": {
+                                "suyuan_online_apply": {
+                                    "whitelist": [
+                                        {
+                                            "action_id": "submit_online_apply_dialog",
+                                            "decision": "allowed",
+                                            "risk_level": "risky_submit",
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            project_name="AI Agent 软件自动化评测平台第二阶段原型",
+            template_name="suyuan_online_apply",
+            policy_path=root / "run_policy.json",
+            source_name="fixture",
+        )
+        section = build_routing_section(
+            None,
+            capability_decision=gate.to_dict(),
+            route_decision={
+                "status": "degraded",
+                "model_name": profile.name,
+                "requested_mode": "browser_use_chatopenai_structured",
+                "selected_mode": routing.verification.recommended_mode if routing.verification else "stage2_run_sample",
+                "assigned_role": "verification",
+                "fallback_mode": routing.discovery.recommended_mode if routing.discovery else None,
+                "reason": "Structured Browser Use is unavailable, so the profile falls back to deterministic verification.",
+            },
+            policy_decision={
+                "status": "allowed",
+                "action_id": "submit_online_apply_dialog",
+                "action_name": "Submit online apply dialog",
+                "risk_level": "risky_submit",
+                "reason": "Action was explicitly resolved by the project allowlist.",
+                "policy_source": policy.allow_rules[0].source if policy.allow_rules else "unknown",
+                "matched_allowlist": True,
+                "requires_allowlist": True,
+            },
+        )
+
+        assert section.title == "Routing Explanation"
+        assert section.extra["degraded"] is True
+        assert any(fact.label == "policy_status" and fact.value == "allowed" for fact in section.facts)
+        assert any(item.item_id == "capability-routing" for item in section.items)
 
 
 def test_artifact_writer_avoids_same_second_name_collision() -> None:
@@ -195,6 +390,49 @@ def test_structured_permission_failure_hits_safety_boundary_stop() -> None:
                         "reason": "账号缺少新增备案所需机构信息，新增分支被后台拒绝",
                     },
                     "message": "账号缺少新增备案所需机构信息，新增分支被后台拒绝",
+                }
+            ],
+            max_attempts=3,
+            round_input={
+                "orchestration_stream_id": "tpl::modelA",
+                "template_name": "tpl",
+                "model_name": "modelA",
+                "project_name": "proj",
+                "round_index": 1,
+            },
+        )
+        assert artifacts.stop_conditions is not None
+        assert "safety_boundary" in artifacts.stop_conditions.triggered_conditions
+        assert artifacts.next_round_decision is not None
+        assert artifacts.next_round_decision.status == "stopped"
+
+
+def test_policy_gate_failure_hits_safety_boundary_stop() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        run_dir = Path(tmpdir) / "20260620_130500_modelA"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        artifacts = write_iteration_artifacts(
+            run_dir,
+            run_report={
+                "summary": {
+                    "run_id": run_dir.name,
+                    "status": "failed",
+                    "project_name": "proj",
+                    "template_name": "tpl",
+                    "current_round": 1,
+                },
+                "failure_items": [{"name": "policy_blocked", "status": "failed", "summary": "高风险真实提交未在白名单中显式允许"}],
+            },
+            status_snapshot={"run_id": run_dir.name, "overall_status": "failed"},
+            attempts=[
+                {
+                    "attempt_id": "a1",
+                    "status": "failed",
+                    "classification": {
+                        "category": "policy_blocked",
+                        "reason": "高风险真实提交未在项目级白名单中显式允许，执行层已阻断提交动作",
+                    },
+                    "message": "高风险真实提交未在项目级白名单中显式允许，执行层已阻断提交动作",
                 }
             ],
             max_attempts=3,
@@ -666,3 +904,69 @@ def test_iteration_sections_include_round_hint_stop_and_next_round_explanations(
         assert next_round_section is not None
         assert "manual review before scheduling the next round" in str(next_round_section["summary"])
         assert any(item["status"] == "scheduled" for item in next_round_section["items"])
+
+
+def test_human_takeover_packet_contains_resume_command_and_pending_actions() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        run_dir = Path(tmpdir) / "20260620_150000_modelA"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        packet = build_human_takeover_packet(
+            run_dir,
+            round_input={
+                "template_name": "tpl",
+                "project_name": "proj",
+                "model_name": "modelA",
+                "round_index": 2,
+                "target_stage": "verification",
+                "execution_hints": {"workflow_retry_mode": "resume_detected_branch"},
+            },
+            retry_plan={
+                "actions": [
+                    {
+                        "action_id": "retry-001",
+                        "cluster_id": "cluster-001",
+                        "title": "Resume branch",
+                        "stage": "verification",
+                        "owner": "agent",
+                        "strategy": "resume_detected_branch",
+                        "reason": "Detected pending branch",
+                        "expected_outcome": "Resume existing workflow",
+                        "execution_hints": {"workflow_retry_mode": "resume_detected_branch"},
+                    }
+                ]
+            },
+            stop_conditions={"status": "needs_review", "primary_reason": "manual_takeover"},
+            next_round_decision={
+                "status": "needs_review",
+                "primary_reason": "Stop decision requires manual review before scheduling the next round.",
+                "target_stage": "verification",
+                "scheduled_cluster_ids": ["cluster-001"],
+                "scheduled_action_ids": ["retry-001"],
+            },
+        )
+        assert packet["status"] == "waiting_human"
+        assert packet["scheduled_action_ids"] == ["retry-001"]
+        assert packet["pending_actions"][0]["execution_hints"]["workflow_retry_mode"] == "resume_detected_branch"
+        assert "--resume-human-takeover" in packet["resume_command"]
+        assert packet["target_stage"] == "verification"
+
+
+def test_human_resume_decision_converts_review_to_scheduled() -> None:
+    resumed = build_human_resume_decision(
+        {
+            "status": "needs_review",
+            "should_start_next_round": None,
+            "primary_reason": "Stop decision requires manual review before scheduling the next round.",
+            "target_stage": "verification",
+            "scheduled_cluster_ids": ["cluster-001"],
+            "scheduled_action_ids": ["retry-001"],
+            "notes": ["manual review required"],
+        },
+        operator_id="tester-1",
+        note="human fixed prerequisite",
+    )
+    assert resumed["status"] == "scheduled"
+    assert resumed["should_start_next_round"] is True
+    assert resumed["human_takeover_resolved"] is True
+    assert resumed["human_takeover_operator"] == "tester-1"
+    assert "human fixed prerequisite" in resumed["notes"]

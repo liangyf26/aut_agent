@@ -31,6 +31,7 @@ class PlaywrightCaptureResult:
     metadata_path: str
     events_path: str
     draft_path: str
+    candidate_review_path: str
     event_count: int
     summary_path: str | None = None
     screenshot_index_path: str | None = None
@@ -69,10 +70,11 @@ class PlaywrightHumanLoopCapture:
         if self._frame_attach_handler is not None:
             self.page.remove_listener("frameattached", self._frame_attach_handler)
         events = self.recorder.load_events()
-        MinimalCandidateTemplateDraftGenerator().write_draft(
+        MinimalCandidateTemplateDraftGenerator().write_artifacts(
             config=self.recorder.config,
             events=events,
-            output_path=str(self.recorder.paths.draft_path),
+            draft_output_path=str(self.recorder.paths.draft_path),
+            candidate_review_output_path=str(self.recorder.paths.candidate_review_path),
         )
         capture_summary = self._load_capture_summary(events)
         return PlaywrightCaptureResult(
@@ -80,6 +82,7 @@ class PlaywrightHumanLoopCapture:
             metadata_path=str(self.recorder.paths.metadata_path),
             events_path=str(self.recorder.paths.events_path),
             draft_path=str(self.recorder.paths.draft_path),
+            candidate_review_path=str(self.recorder.paths.candidate_review_path),
             summary_path=str(self.recorder.paths.summary_path),
             screenshot_index_path=str(self.recorder.paths.screenshot_index_path),
             event_count=len(events),

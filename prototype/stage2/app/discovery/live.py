@@ -9,6 +9,7 @@ from urllib.parse import urljoin, urlparse
 from playwright.async_api import Browser, Page, async_playwright
 
 from .identity import (
+    absolutize_url,
     build_feature_point_identity,
     build_page_entry_identity,
     canonicalize_url,
@@ -75,6 +76,7 @@ async def plan_live_discovery(
     )
     page_entry_id = entry_identity["record_id"]
     page_entry_key = entry_identity["stable_key"]
+    entry_canonical_url = canonicalize_url(entry_url) or entry_url
     landing_dir = Path(config.screenshot_root) / slug(page_entry_id, fallback="page_entry", max_length=96)
     landing_path = landing_dir / "landing.png"
     await page.screenshot(path=str(screenshots_dir / landing_path), full_page=True)
@@ -96,7 +98,7 @@ async def plan_live_discovery(
         execution_path=execution_path,
         evidence={
             "title": await page.title(),
-            "canonical_url": canonicalize_url(entry_url) or entry_url,
+            "canonical_url": entry_canonical_url,
             "baseline_reference_record_id": (baseline or {}).get("reference_success_record_id"),
             "raw_nav_candidate_count": len(scan["nav_candidates"]),
             "raw_action_candidate_count": len(scan["action_candidates"]),
@@ -199,6 +201,7 @@ async def plan_live_discovery(
         notes=[
             "发现结果来自真实页面受控遍历。",
             "页面入口优先使用 canonical_url 生成稳定 ID，并保留 dedupe_basis 作为后续人工审核依据。",
+            "同 URL 的 hash / volatile query 变体会在 canonical_url 与 generalized_url 层统一，减少重复入口。",
             "同源链接使用独立页面探测，避免扰动当前已登录主页面。",
             "功能点已区分 page_action、row_action、modal_action，并补充 action_type 与 discovery_depth。",
             "已遍历的同源页面会追加独立 page_entry，并可按配置补采该页的 feature_points。",
@@ -437,7 +440,7 @@ async def _discover_same_origin_targets(
 ) -> tuple[list[PageEntryRecord], dict[str, Any]]:
     base_origin = urlparse(base_url).netloc
     context = page.context
-    discovered_urls = {canonicalize_url(base_url) or base_url}
+    discovered_urls = {canonicalize_url(base_url) or normalize_text(base_url)}
     discovered_keys = {page_entry_key}
     results: list[PageEntryRecord] = []
     discovered_feature_points: list[FeaturePointRecord] = []
@@ -479,7 +482,7 @@ async def _discover_same_origin_targets(
                 stats["nav_targets_skipped_without_href"] += 1
                 continue
 
-            absolute_url = urljoin(current["url"], href)
+            absolute_url = absolutize_url(href, base_url=current["url"])
             allowed, block_reason = _is_navigation_target(
                 absolute_url,
                 base_origin=base_origin,
@@ -774,7 +777,11 @@ def _ordered_nav_candidates(nav_candidates: list[dict[str, Any]]) -> list[dict[s
     for candidate in nav_candidates:
         href = normalize_text(candidate.get("href"))
         text = normalize_text(candidate.get("text"))
-        key = canonicalize_url(href) or f"{text}|{candidate.get('role') or ''}|{locator_anchor(candidate.get('locator'))}"
+        page_url = normalize_text(candidate.get("page_url"))
+        key = canonicalize_url(href, base_url=page_url) or (
+            f"{text}|{candidate.get('role') or ''}|{normalize_text(candidate.get('container_type'))}|"
+            f"{normalize_text(candidate.get('container_label'))}|{locator_anchor(candidate.get('locator'))}"
+        )
         if not key or key in seen:
             continue
         seen.add(key)
@@ -814,14 +821,18 @@ def _group_action_candidates(
         feature_scope = _infer_feature_scope(candidate)
         action_type = _infer_action_type(candidate, text, feature_scope=feature_scope)
         feature_type = _infer_feature_type(text, action_type=action_type)
+        identity_container_label = candidate.get("container_label")
+        if feature_scope != "row_action" and not normalize_text(identity_container_label):
+            identity_container_label = candidate.get("context_text")
         identity = build_feature_point_identity(
             template_name,
             page_entry_key=page_entry_key,
             name=text,
             feature_scope=feature_scope,
             action_type=action_type,
-            container_label=candidate.get("container_label") or candidate.get("context_text"),
+            container_label=identity_container_label,
             href=candidate.get("href"),
+            page_url=candidate.get("page_url"),
             locator=candidate.get("locator"),
         )
         key = identity["stable_key"]
@@ -840,7 +851,7 @@ def _group_action_candidates(
         grouped[key]["occurrence_count"] += 1
 
         locator = normalize_text(candidate.get("locator"))
-        href = normalize_text(candidate.get("href"))
+        href = canonicalize_url(candidate.get("href"), base_url=candidate.get("page_url"))
         if locator and locator not in grouped[key]["locator_samples"]:
             grouped[key]["locator_samples"].append(locator)
         if href and href not in grouped[key]["href_samples"]:

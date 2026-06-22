@@ -97,3 +97,32 @@ class DiscoveryResult:
             "stats": dict(self.stats),
             "notes": list(self.notes),
         }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "DiscoveryResult":
+        return cls(
+            template_name=str(payload.get("template_name") or ""),
+            generated_at=str(payload.get("generated_at") or utc_now_iso()),
+            strategy=str(payload.get("strategy") or ""),
+            page_entries=[
+                PageEntryRecord(**item)
+                for item in payload.get("page_entries", [])
+                if isinstance(item, dict)
+            ],
+            feature_points=[
+                FeaturePointRecord(**item)
+                for item in payload.get("feature_points", [])
+                if isinstance(item, dict)
+            ],
+            screenshot_records=[
+                ScreenshotRecord(**item)
+                for item in payload.get("screenshot_records", [])
+                if isinstance(item, dict)
+            ],
+            review_queue=[
+                item for item in payload.get("review_queue", []) if isinstance(item, dict)
+            ],
+            review_hints=dict(payload.get("review_hints", {})),
+            stats=dict(payload.get("stats", {})),
+            notes=[str(item) for item in payload.get("notes", [])],
+        )

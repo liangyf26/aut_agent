@@ -106,6 +106,12 @@ class PromotionCandidateRecord:
     promotion_level: str
     status: str
     reason: str | None = None
+    review_status: str | None = None
+    promotion_target: str | None = None
+    promotion_recommendation: str | None = None
+    needs_manual_review: bool | None = None
+    evidence_requirements: list[str] = field(default_factory=list)
+    missing_evidence: list[str] = field(default_factory=list)
     evidence: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:

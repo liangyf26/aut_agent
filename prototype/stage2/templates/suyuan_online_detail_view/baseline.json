@@ -1,0 +1,12 @@
+{
+  "page_entry": {
+    "url": "https://www.zbsykj.com:19096/record/online"
+  },
+  "detail_view": {
+    "row_strategy": "first_visible_detail_row",
+    "expected_visible_actions": [
+      "去支付",
+      "修 改"
+    ]
+  }
+}

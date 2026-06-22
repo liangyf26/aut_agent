@@ -51,6 +51,9 @@ def write_iteration_artifacts(
         root / "promotion_candidates.json",
         {
             "summary": artifacts.summary.to_dict(),
+            "promotion_candidate_summary": _build_promotion_candidate_summary_payload(
+                artifacts.promotion_candidates
+            ),
             "candidates": [candidate.to_dict() for candidate in artifacts.promotion_candidates],
         },
     )
@@ -124,6 +127,11 @@ def _load_iteration_payload(root: Path) -> dict[str, Any] | None:
         "failure_clusters": failure_payload.get("clusters", []),
         "retry_plan": retry_plan,
         "promotion_candidates": promotion_payload.get("candidates", []),
+        "promotion_candidate_summary": (
+            promotion_payload.get("promotion_candidate_summary")
+            or promotion_payload.get("candidate_summary")
+            or {}
+        ),
         "stop_conditions": stop_conditions,
         "iteration_comparison": iteration_comparison,
         "next_round_decision": next_round_decision,
@@ -223,3 +231,80 @@ def _read_json(path: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return {}
+
+
+def _build_promotion_candidate_summary_payload(candidates: list[Any]) -> dict[str, Any]:
+    if not candidates:
+        return {}
+
+    review_status_breakdown: dict[str, int] = {}
+    promotion_target_breakdown: dict[str, int] = {}
+    recommendation_breakdown: dict[str, int] = {}
+    evidence_requirements: set[str] = set()
+    baseline_freeze_candidate_ids: list[str] = []
+    ready_candidate_ids: list[str] = []
+    deferred_candidate_ids: list[str] = []
+    manual_review_required = False
+
+    for candidate in candidates:
+        review_status = _text_value(getattr(candidate, "review_status", None)) or "needs_review"
+        review_status_breakdown[review_status] = review_status_breakdown.get(review_status, 0) + 1
+
+        promotion_target = _text_value(getattr(candidate, "promotion_target", None)) or "unspecified"
+        promotion_target_breakdown[promotion_target] = promotion_target_breakdown.get(promotion_target, 0) + 1
+        if "baseline_freeze" in promotion_target:
+            candidate_id = _text_value(getattr(candidate, "candidate_id", None))
+            if candidate_id:
+                baseline_freeze_candidate_ids.append(candidate_id)
+
+        recommendation = _text_value(getattr(candidate, "promotion_recommendation", None)) or "review_candidate"
+        recommendation_breakdown[recommendation] = recommendation_breakdown.get(recommendation, 0) + 1
+
+        for requirement in getattr(candidate, "evidence_requirements", []) or []:
+            text = _text_value(requirement)
+            if text:
+                evidence_requirements.add(text)
+
+        candidate_id = _text_value(getattr(candidate, "candidate_id", None))
+        if review_status == "ready_for_review" and candidate_id:
+            ready_candidate_ids.append(candidate_id)
+        elif candidate_id:
+            deferred_candidate_ids.append(candidate_id)
+
+        if getattr(candidate, "needs_manual_review", None) is True:
+            manual_review_required = True
+
+    facts = [
+        {"label": "candidate_count", "value": len(candidates)},
+        {"label": "review_status", "value": "needs_review" if manual_review_required else "ready_for_review"},
+        {"label": "manual_review_required", "value": manual_review_required},
+        {"label": "baseline_freeze_candidate_count", "value": len(baseline_freeze_candidate_ids)},
+        {"label": "ready_for_review_count", "value": len(ready_candidate_ids)},
+        {"label": "deferred_candidate_count", "value": len(deferred_candidate_ids)},
+    ]
+    approval_notes = ["Platform-level promotion still requires manual evidence review before approval."]
+    notes = ["Promotion candidate summary was derived from iteration promotion_candidates output."]
+    if deferred_candidate_ids:
+        notes.append("Deferred candidates still need follow-up evidence or rerun confirmation.")
+    return {
+        "summary": f"Collected {len(candidates)} promotion candidate(s) for manual review and baseline-freeze decisions.",
+        "approval_notes": approval_notes,
+        "evidence_requirements": sorted(evidence_requirements),
+        "facts": facts,
+        "notes": notes,
+        "review_status": "needs_review" if manual_review_required else "ready_for_review",
+        "manual_review_required": manual_review_required,
+        "review_status_breakdown": review_status_breakdown,
+        "promotion_target_breakdown": promotion_target_breakdown,
+        "promotion_recommendation_breakdown": recommendation_breakdown,
+        "baseline_freeze_candidate_ids": sorted(set(baseline_freeze_candidate_ids)),
+        "ready_candidate_ids": sorted(set(ready_candidate_ids)),
+        "deferred_candidate_ids": sorted(set(deferred_candidate_ids)),
+    }
+
+
+def _text_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None

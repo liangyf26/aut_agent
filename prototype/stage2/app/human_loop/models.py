@@ -52,6 +52,7 @@ class RecordingArtifactPaths:
     session_dir: Path
     events_path: Path
     draft_path: Path
+    candidate_review_path: Path
     metadata_path: Path
     summary_path: Path
     screenshot_index_path: Path

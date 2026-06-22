@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .decision_explainer import build_decision_explanation
 from .models import (
     ArtifactRef,
     DailySummary,
@@ -120,6 +121,33 @@ def render_platform_daily_report_markdown(
 
 
 def _with_derived_sections(report: RunReport) -> RunReport:
+    iteration_artifacts = _load_iteration_artifact_payloads(report)
+    promotion_payload = iteration_artifacts.get("promotion_candidates", {})
+    promotion_candidates = _merge_promotion_candidates(report.promotion_candidates, promotion_payload)
+    if promotion_candidates != report.promotion_candidates:
+        report = RunReport(
+            summary=report.summary,
+            page_entries=report.page_entries,
+            feature_points=report.feature_points,
+            success_items=report.success_items,
+            failure_items=report.failure_items,
+            failure_clusters=report.failure_clusters,
+            key_artifacts=report.key_artifacts,
+            network_highlights=report.network_highlights,
+            data_observations=report.data_observations,
+            efficiency_observations=report.efficiency_observations,
+            project_assets=report.project_assets,
+            promotion_candidates=promotion_candidates,
+            model_evaluations=report.model_evaluations,
+            daily_summary=report.daily_summary,
+            model_comparison_summary=report.model_comparison_summary,
+            skill_inventory_summary=report.skill_inventory_summary,
+            promotion_candidate_summary=report.promotion_candidate_summary,
+            extra_sections=report.extra_sections,
+            notes=report.notes,
+            extra=report.extra,
+        )
+
     daily_summary = report.daily_summary or _derive_daily_summary(report)
     model_comparison_summary = (
         report.model_comparison_summary or _derive_model_comparison_summary(report)
@@ -128,13 +156,17 @@ def _with_derived_sections(report: RunReport) -> RunReport:
         report.skill_inventory_summary or _derive_skill_inventory_summary(report)
     )
     promotion_candidate_summary = (
-        report.promotion_candidate_summary or _derive_promotion_candidate_summary(report)
+        _resolve_promotion_candidate_summary(
+            report,
+            promotion_payload=promotion_payload,
+        )
     )
     if (
         daily_summary is report.daily_summary
         and model_comparison_summary is report.model_comparison_summary
         and skill_inventory_summary is report.skill_inventory_summary
         and promotion_candidate_summary is report.promotion_candidate_summary
+        and promotion_candidates == report.promotion_candidates
     ):
         return report
     return RunReport(
@@ -149,7 +181,7 @@ def _with_derived_sections(report: RunReport) -> RunReport:
         data_observations=report.data_observations,
         efficiency_observations=report.efficiency_observations,
         project_assets=report.project_assets,
-        promotion_candidates=report.promotion_candidates,
+        promotion_candidates=promotion_candidates,
         model_evaluations=report.model_evaluations,
         daily_summary=daily_summary,
         model_comparison_summary=model_comparison_summary,
@@ -346,18 +378,209 @@ def _derive_promotion_candidate_summary(report: RunReport) -> PromotionCandidate
     candidates = list(report.promotion_candidates[:8])
     if not candidates:
         return None
+    facts, extra = _promotion_candidate_summary_metrics(candidates)
+    evidence_requirements = _promotion_candidate_evidence_requirements(candidates)
     return PromotionCandidateSummary(
         summary="Derived platform promotion candidate summary from promotion_candidates.",
         candidates=candidates,
         approval_notes=[
             "Auto-derived candidates still require evidence review before platform-level promotion."
         ],
-        evidence_requirements=[
+        evidence_requirements=evidence_requirements or [
             "successful verification evidence",
             "repeatability across runs or models",
         ],
+        facts=facts,
         notes=["This summary was auto-derived because no explicit promotion_candidate_summary payload was provided."],
+        extra=extra,
     )
+
+
+def _resolve_promotion_candidate_summary(
+    report: RunReport,
+    *,
+    promotion_payload: dict[str, Any],
+) -> PromotionCandidateSummary | None:
+    artifact_summary = _promotion_candidate_summary_from_iteration_payload(
+        promotion_payload,
+        report.promotion_candidates,
+    )
+    if report.promotion_candidate_summary is None:
+        return artifact_summary or _derive_promotion_candidate_summary(report)
+    if artifact_summary is None:
+        return report.promotion_candidate_summary
+    return PromotionCandidateSummary(
+        summary=report.promotion_candidate_summary.summary or artifact_summary.summary,
+        candidates=(
+            report.promotion_candidate_summary.candidates
+            or artifact_summary.candidates
+            or list(report.promotion_candidates[:8])
+        ),
+        approval_notes=(
+            report.promotion_candidate_summary.approval_notes
+            or artifact_summary.approval_notes
+        ),
+        evidence_requirements=(
+            report.promotion_candidate_summary.evidence_requirements
+            or artifact_summary.evidence_requirements
+        ),
+        facts=report.promotion_candidate_summary.facts or artifact_summary.facts,
+        notes=_dedupe_strings(
+            [*report.promotion_candidate_summary.notes, *artifact_summary.notes]
+        ),
+        extra={**artifact_summary.extra, **report.promotion_candidate_summary.extra},
+    )
+
+
+def _merge_promotion_candidates(
+    existing: list[ReportItem],
+    promotion_payload: dict[str, Any],
+) -> list[ReportItem]:
+    artifact_candidates = _promotion_candidates_from_iteration_payload(promotion_payload)
+    if artifact_candidates:
+        return artifact_candidates
+    return list(existing)
+
+
+def _promotion_candidates_from_iteration_payload(payload: dict[str, Any]) -> list[ReportItem]:
+    raw_candidates = payload.get("candidates")
+    if not isinstance(raw_candidates, list):
+        return []
+    results: list[ReportItem] = []
+    for item in raw_candidates:
+        data = item if isinstance(item, dict) else {}
+        if not data:
+            continue
+        evidence_requirements = _string_listish(data.get("evidence_requirements"))
+        missing_evidence = _string_listish(data.get("missing_evidence"))
+        evidence = data.get("evidence") if isinstance(data.get("evidence"), list) else []
+        facts = [
+            Fact(label="review_status", value=_textish(data.get("review_status")) or "needs_review"),
+            Fact(label="promotion_target", value=_textish(data.get("promotion_target")) or "unspecified"),
+            Fact(
+                label="promotion_recommendation",
+                value=_textish(data.get("promotion_recommendation")) or "review_candidate",
+            ),
+            Fact(label="manual_review_required", value=bool(data.get("needs_manual_review"))),
+            Fact(label="evidence_count", value=len(evidence)),
+            Fact(label="missing_evidence_count", value=len(missing_evidence)),
+        ]
+        notes = [f"missing evidence: {value}" for value in missing_evidence]
+        results.append(
+            ReportItem(
+                item_id=_textish(data.get("candidate_id")) or _textish(data.get("item_id")),
+                name=_textish(data.get("title")) or _textish(data.get("name")) or "candidate",
+                status=_textish(data.get("status")) or "candidate",
+                summary=_textish(data.get("reason")) or _textish(data.get("summary")),
+                source=_textish(data.get("source")),
+                owner=_textish(data.get("promotion_level")) or _textish(data.get("owner")),
+                facts=facts,
+                notes=notes,
+                extra={
+                    key: value
+                    for key, value in {
+                        "evidence_requirements": evidence_requirements,
+                        "missing_evidence": missing_evidence,
+                    }.items()
+                    if value not in (None, [], {})
+                },
+            )
+        )
+    return results
+
+
+def _promotion_candidate_summary_from_iteration_payload(
+    payload: dict[str, Any],
+    candidates: list[ReportItem],
+) -> PromotionCandidateSummary | None:
+    raw_summary = payload.get("promotion_candidate_summary") or payload.get("candidate_summary")
+    if not isinstance(raw_summary, dict):
+        return None
+    merged_payload = dict(raw_summary)
+    merged_payload["candidates"] = merged_payload.get("candidates") or list(candidates[:8])
+    if not merged_payload.get("facts"):
+        facts, extra = _promotion_candidate_summary_metrics(candidates)
+        merged_payload["facts"] = [fact.to_dict() for fact in facts]
+        for key, value in extra.items():
+            merged_payload.setdefault(key, value)
+    return PromotionCandidateSummary.from_value(merged_payload)
+
+
+def _promotion_candidate_summary_metrics(
+    candidates: list[ReportItem],
+) -> tuple[list[Fact], dict[str, Any]]:
+    review_status_breakdown: dict[str, int] = {}
+    promotion_target_breakdown: dict[str, int] = {}
+    recommendation_breakdown: dict[str, int] = {}
+    baseline_freeze_candidate_ids: list[str] = []
+    ready_candidate_ids: list[str] = []
+    deferred_candidate_ids: list[str] = []
+    manual_review_required = False
+
+    for item in candidates:
+        review_status = _promotion_candidate_fact(item, "review_status") or "needs_review"
+        review_status_breakdown[review_status] = review_status_breakdown.get(review_status, 0) + 1
+
+        promotion_target = _promotion_candidate_fact(item, "promotion_target") or "unspecified"
+        promotion_target_breakdown[promotion_target] = promotion_target_breakdown.get(promotion_target, 0) + 1
+        if "baseline_freeze" in promotion_target and item.item_id:
+            baseline_freeze_candidate_ids.append(item.item_id)
+
+        recommendation = _promotion_candidate_fact(item, "promotion_recommendation") or "review_candidate"
+        recommendation_breakdown[recommendation] = recommendation_breakdown.get(recommendation, 0) + 1
+
+        if _promotion_candidate_fact(item, "manual_review_required") is True:
+            manual_review_required = True
+        if review_status == "ready_for_review" and item.item_id:
+            ready_candidate_ids.append(item.item_id)
+        elif item.item_id:
+            deferred_candidate_ids.append(item.item_id)
+
+    facts = [
+        Fact(label="candidate_count", value=len(candidates)),
+        Fact(label="review_status", value="needs_review" if manual_review_required else "ready_for_review"),
+        Fact(label="manual_review_required", value=manual_review_required),
+        Fact(label="baseline_freeze_candidate_count", value=len(baseline_freeze_candidate_ids)),
+        Fact(label="ready_for_review_count", value=len(ready_candidate_ids)),
+        Fact(label="deferred_candidate_count", value=len(deferred_candidate_ids)),
+    ]
+    extra = {
+        "review_status_breakdown": review_status_breakdown,
+        "promotion_target_breakdown": promotion_target_breakdown,
+        "promotion_recommendation_breakdown": recommendation_breakdown,
+        "baseline_freeze_candidate_ids": sorted(set(baseline_freeze_candidate_ids)),
+        "ready_candidate_ids": sorted(set(ready_candidate_ids)),
+        "deferred_candidate_ids": sorted(set(deferred_candidate_ids)),
+    }
+    return facts, extra
+
+
+def _promotion_candidate_evidence_requirements(candidates: list[ReportItem]) -> list[str]:
+    values: list[str] = []
+    for item in candidates:
+        for requirement in _string_listish(item.extra.get("evidence_requirements")):
+            if requirement:
+                values.append(requirement)
+    return _dedupe_strings(values)
+
+
+def _promotion_candidate_fact(item: ReportItem, label: str) -> Any:
+    for fact in item.facts:
+        if fact.label == label:
+            return fact.value
+    return item.extra.get(label)
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    results: list[str] = []
+    for value in values:
+        text = _textish(value)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        results.append(text)
+    return results
 
 
 def _render_item_section(title: str, items: list[ReportItem], empty_message: str) -> list[str]:
@@ -699,6 +922,12 @@ def _render_iteration_decision_summary(
     next_round_payload = iteration_artifacts.get("next_round_decision", {})
     retry_payload = iteration_artifacts.get("retry_plan", {})
     round_input_payload = iteration_artifacts.get("round_input", {})
+    decision = build_decision_explanation(
+        stop_conditions=stop_payload,
+        next_round_decision=next_round_payload,
+        retry_plan=retry_payload,
+        round_input=round_input_payload,
+    )
     failure_categories = sorted({cluster.category for cluster in report.failure_clusters if cluster.category})
     scheduled_actions = retry_payload.get("actions") if isinstance(retry_payload.get("actions"), list) else []
 
@@ -715,46 +944,69 @@ def _render_iteration_decision_summary(
         return []
 
     lines = ["## Iteration Decision Summary", ""]
+    lines.append(f"- Decision Status: {decision.status}")
+    if decision.headline:
+        lines.append(f"- Decision Headline: {decision.headline}")
+    if decision.summary:
+        lines.append(f"- Decision Summary: {decision.summary}")
     if failure_categories:
         lines.append(f"- Structured Failure Categories: {', '.join(failure_categories)}")
     classification_category = _summary_fact_value(report.summary, "classification_category")
     if classification_category:
         lines.append(f"- Final Classification Category: `{classification_category}`")
 
-    stop_status = stop_payload.get("status") or report.summary.extra.get("stop_status")
+    stop_status = decision.stop_status or stop_payload.get("status") or report.summary.extra.get("stop_status")
     if stop_status is not None:
         lines.append(f"- Stop Decision Status: {_format_inline(stop_status)}")
-    if "should_stop" in stop_payload:
+    if decision.should_stop is not None:
+        lines.append(f"- Should Stop: {_format_inline(decision.should_stop)}")
+    elif "should_stop" in stop_payload:
         lines.append(f"- Should Stop: {_format_inline(stop_payload.get('should_stop'))}")
-    stop_primary_reason = _textish(stop_payload.get("primary_reason"))
+    stop_primary_reason = decision.stop_reason or _textish(stop_payload.get("primary_reason"))
     if stop_primary_reason:
         lines.append(f"- Stop Condition Result: {stop_primary_reason}")
     elif report.summary.stop_reason:
         lines.append(f"- Run Stop Reason: {report.summary.stop_reason}")
     triggered_stop_conditions = _string_listish(
-        stop_payload.get("triggered_conditions") or next_round_payload.get("triggered_stop_conditions")
+        decision.triggered_stop_conditions
+        or stop_payload.get("triggered_conditions")
+        or next_round_payload.get("triggered_stop_conditions")
     )
     if triggered_stop_conditions:
         lines.append(f"- Triggered Stop Conditions: {', '.join(triggered_stop_conditions)}")
 
-    next_round_status = next_round_payload.get("status") or report.summary.extra.get("next_round_status")
+    next_round_status = decision.next_round_status or next_round_payload.get("status") or report.summary.extra.get("next_round_status")
     if next_round_status is not None:
         lines.append(f"- Next-Round Status: {_format_inline(next_round_status)}")
-    if "should_start_next_round" in next_round_payload:
+    if decision.should_start_next_round is not None:
+        lines.append(f"- Should Start Next Round: {_format_inline(decision.should_start_next_round)}")
+    elif "should_start_next_round" in next_round_payload:
         lines.append(
             f"- Should Start Next Round: {_format_inline(next_round_payload.get('should_start_next_round'))}"
         )
-    if next_round_payload.get("next_round") is not None:
+    if decision.next_round is not None:
+        lines.append(f"- Planned Next Round: {_format_inline(decision.next_round)}")
+    elif next_round_payload.get("next_round") is not None:
         lines.append(f"- Planned Next Round: {_format_inline(next_round_payload.get('next_round'))}")
-    if next_round_payload.get("target_stage"):
+    if decision.target_stage:
+        lines.append(f"- Planned Target Stage: `{decision.target_stage}`")
+    elif next_round_payload.get("target_stage"):
         lines.append(f"- Planned Target Stage: `{next_round_payload.get('target_stage')}`")
-    if next_round_payload.get("primary_reason"):
+    if decision.primary_reason:
+        lines.append(f"- Next-Round Rationale: {decision.primary_reason}")
+    elif next_round_payload.get("primary_reason"):
         lines.append(f"- Next-Round Rationale: {next_round_payload.get('primary_reason')}")
+    if decision.manual_review_required:
+        lines.append("- Manual Review Required: true")
 
     if retry_payload.get("status") is not None:
         lines.append(f"- Retry Plan Status: {_format_inline(retry_payload.get('status'))}")
     if retry_payload.get("goal"):
         lines.append(f"- Retry Goal: {retry_payload.get('goal')}")
+    if decision.scheduled_action_count:
+        lines.append(f"- Planned Retry Actions: {decision.scheduled_action_count}")
+    if decision.scheduled_cluster_count:
+        lines.append(f"- Planned Retry Clusters: {decision.scheduled_cluster_count}")
     if scheduled_actions:
         lines.append(f"- Scheduled Actions: {len(scheduled_actions)}")
         for action in scheduled_actions:
@@ -793,6 +1045,8 @@ def _render_iteration_decision_summary(
         lines.append("- Applied Execution Hints:")
         for key, value in sorted(applied_hints.items()):
             lines.append(f"  - {key}: {_format_inline(value)}")
+    if decision.execution_hint_texts:
+        lines.append(f"- Execution Focus: {'; '.join(decision.execution_hint_texts[:3])}")
 
     lines.append("")
     return lines
@@ -936,20 +1190,32 @@ def _render_next_round_section(
     round_input_payload: dict[str, Any],
 ) -> list[str]:
     lines = ["## Next Round Decision", ""]
+    decision = build_decision_explanation(
+        next_round_decision=payload,
+        retry_plan=retry_payload,
+        round_input=round_input_payload,
+    )
     if section.summary:
         lines.append(section.summary)
         lines.append("")
+    lines.append(f"- Decision Status: {decision.status}")
+    if decision.headline:
+        lines.append(f"- Decision Headline: {decision.headline}")
+    if decision.summary:
+        lines.append(f"- Decision Summary: {decision.summary}")
 
     facts = _facts_to_mapping(section.facts)
-    status = _textish(payload.get("status")) or _textish(facts.get("status"))
-    should_start = payload.get("should_start_next_round", facts.get("should_start_next_round"))
+    status = decision.next_round_status or _textish(payload.get("status")) or _textish(facts.get("status"))
+    should_start = decision.should_start_next_round
+    if should_start is None:
+        should_start = payload.get("should_start_next_round", facts.get("should_start_next_round"))
     current_round = payload.get("current_round", facts.get("current_round"))
-    next_round = payload.get("next_round", facts.get("next_round"))
-    target_stage = _textish(payload.get("target_stage")) or _textish(facts.get("target_stage"))
-    primary_reason = _textish(payload.get("primary_reason")) or _textish(facts.get("primary_reason"))
+    next_round = decision.next_round if decision.next_round is not None else payload.get("next_round", facts.get("next_round"))
+    target_stage = decision.target_stage or _textish(payload.get("target_stage")) or _textish(facts.get("target_stage"))
+    primary_reason = decision.primary_reason or _textish(payload.get("primary_reason")) or _textish(facts.get("primary_reason"))
     remaining_budget = payload.get("remaining_attempt_budget", facts.get("remaining_attempt_budget"))
     improvement = _textish(payload.get("improvement_judgement"))
-    triggered = _string_listish(payload.get("triggered_stop_conditions"))
+    triggered = decision.triggered_stop_conditions or _string_listish(payload.get("triggered_stop_conditions"))
 
     if status:
         lines.append(f"- Status: `{status}`")
@@ -969,6 +1235,12 @@ def _render_next_round_section(
         lines.append(f"- Triggered Stop Conditions: {', '.join(triggered)}")
     if remaining_budget is not None:
         lines.append(f"- Remaining Attempt Budget: {_format_inline(remaining_budget)}")
+    if decision.manual_review_required:
+        lines.append("- Manual Review Required: true")
+    if decision.scheduled_action_count:
+        lines.append(f"- Planned Retry Actions: {decision.scheduled_action_count}")
+    if decision.scheduled_cluster_count:
+        lines.append(f"- Planned Retry Clusters: {decision.scheduled_cluster_count}")
 
     scheduled_cluster_ids = _string_listish(payload.get("scheduled_cluster_ids"))
     scheduled_action_ids = _string_listish(payload.get("scheduled_action_ids"))
@@ -997,6 +1269,8 @@ def _render_next_round_section(
         lines.append("- Applied Execution Hints:")
         for key, value in sorted(applied_hints.items()):
             lines.append(f"  - {key}: {_format_inline(value)}")
+    if decision.execution_hint_texts:
+        lines.append(f"- Execution Focus: {'; '.join(decision.execution_hint_texts[:3])}")
 
     if section.notes:
         lines.append("- Notes:")

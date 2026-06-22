@@ -135,16 +135,24 @@ _Avoid_: 自动验收结论、业务通过率
 _Avoid_: 仅看浏览器动作、只在最终报告里复盘、无实时状态
 
 **运行中心 (Run Center)**:
-当前 Node.js 主平台首页和后续平台 UI 的操作工作台，聚合当前项目阶段摘要、项目级近期事件、第二阶段运行摘要、人工录制候选审阅摘要、基线冻结摘要和选中 run 详情，并提供打开关键 artifact 的动作入口；当前通过 `GET /api/stage2/overview` 从 `artifacts/stage2/` 聚合读取。
+当前 Node.js 主平台首页和后续平台 UI 的操作工作台，聚合当前项目阶段摘要、项目级近期事件、第二阶段运行摘要、orchestration session 摘要、人工录制候选审阅摘要、基线冻结摘要和选中 run 详情，并提供打开关键 artifact 与受控恢复动作入口；当前通过 `GET /api/stage2/overview` 从 `artifacts/stage2/` 聚合读取。
 _Avoid_: 只看首页表单、只看浏览器窗口、把 run 产物散落在多个入口里
 
 **候选模板审阅包 (Candidate Template Review Package)**:
 人工录制会话在候选模板草稿之外额外生成的审阅型结构化产物，当前原型对应 `candidate_template_review.json`。它面向项目实施者确认字段映射、alias 草案、候选定位器和项目字段上下文，而不是直接拿来执行。
 _Avoid_: 最终模板、直接执行脚本、只看草稿不看映射确认
 
+**编排会话视图 (Orchestration Session View)**:
+第二阶段围绕同一个 `orchestration_stream_id` 对多轮 run 做出的 session 级聚合视图。当前原型会在 `artifacts/stage2/sessions/` 下落盘 `index.json`、`session_summary.json`、`session_timeline.json`，并由运行中心优先消费，用于展示跨轮次状态、待人工处理 run 和恢复入口。
+_Avoid_: 只看单个 run、每次都临时扫描推导、session 与 run 语义混写
+
 **人工接管恢复包 (Human Takeover Packet)**:
 当运行命中人工审核或人工接管条件时生成的结构化续跑说明，至少包含当前 run、待处理动作、下一轮目标阶段、恢复命令和备注，当前原型对应产物为 `human_takeover.json`。
 _Avoid_: 口头交接、仅靠终端日志恢复、无结构化续跑上下文
+
+**人工处理记录 (Human Takeover Resolution)**:
+对 `human_takeover.json` 的后续人工处理结果所做的结构化记录，当前原型对应 `human_takeover_resolution.json`，至少包含 operator、note、ready_to_resume 和 handled actions。它只表达“人工已处理 / 允许继续”的状态，不等价于“系统问题已被自动判定解决”。
+_Avoid_: 用 resolution 覆盖原始阻塞上下文、直接回写 success、把人工确认误写成自动结论
 
 **沉淀候选审阅摘要 (Promotion Review Summary)**:
 第二阶段对 `promotion_candidates.json` 中候选沉淀项做出的汇总型判断，当前通过 `promotion_candidate_summary` 表达，至少覆盖审阅状态、晋升目标、证据要求、基线冻结候选和待补跟进项。它用于运行中心、日报和报告层的人工决策入口，不等于平台级自动晋升。

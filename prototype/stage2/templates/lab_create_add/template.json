@@ -24,7 +24,7 @@
       "kind": "field_input",
       "action": "fill_field_by_locator",
       "args": {
-        "locator": "#createName",
+        "locator_hint_key": "create_name",
         "data_ref": "create_form.name"
       }
     },
@@ -33,7 +33,7 @@
       "kind": "field_select",
       "action": "select_option_by_locator",
       "args": {
-        "locator": "#createType",
+        "locator_hint_key": "create_type",
         "data_ref": "create_form.type"
       }
     },
@@ -42,7 +42,7 @@
       "kind": "action",
       "action": "click_by_locator",
       "args": {
-        "locator": "#createButton"
+        "locator_hint_key": "create_button"
       }
     },
     {

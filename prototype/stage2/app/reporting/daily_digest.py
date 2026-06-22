@@ -4,6 +4,7 @@ from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from .decision_explainer import build_decision_explanation
 from .models import (
     DailySummary,
     Fact,
@@ -131,9 +132,11 @@ def _latest_report_date(reports: list[RunReport]) -> str | None:
 
 
 def _build_run_summary_item(report: RunReport, signal_context: Mapping[str, Any]) -> ReportItem:
+    decision_status = _decision_item_status(report, signal_context)
     model_names = [model.model_name for model in report.model_evaluations if model.model_name]
     facts = [
         Fact(label="status", value=report.summary.status),
+        Fact(label="decision_status", value=decision_status),
         Fact(label="template", value=report.summary.template_name),
         Fact(label="duration_seconds", value=report.summary.duration_seconds),
         Fact(label="failure_clusters", value=len(report.failure_clusters)),
@@ -185,7 +188,7 @@ def _build_run_summary_item(report: RunReport, signal_context: Mapping[str, Any]
     return ReportItem(
         item_id=report.summary.run_id,
         name=report.summary.template_name or report.summary.run_id,
-        status=report.summary.status,
+        status=decision_status,
         summary=_compose_run_summary(report, signal_context),
         facts=facts,
         notes=signal_context.get("decision_notes", []),
@@ -518,13 +521,56 @@ def _aggregate_promotion_candidate_summary(reports: list[RunReport]) -> Promotio
             "successful verification evidence",
             "repeatability across runs or models",
         ]
+
+    review_status_breakdown: Counter[str] = Counter()
+    promotion_target_breakdown: Counter[str] = Counter()
+    recommendation_breakdown: Counter[str] = Counter()
+    baseline_freeze_candidate_ids: list[str] = []
+    ready_candidate_ids: list[str] = []
+    deferred_candidate_ids: list[str] = []
+    manual_review_required = False
+
+    for item in candidates:
+        review_status = _promotion_candidate_fact_value(item, "review_status") or "needs_review"
+        review_status_breakdown[review_status] += 1
+
+        promotion_target = _promotion_candidate_fact_value(item, "promotion_target") or "unspecified"
+        promotion_target_breakdown[promotion_target] += 1
+        if "baseline_freeze" in promotion_target and item.item_id:
+            baseline_freeze_candidate_ids.append(item.item_id)
+
+        recommendation = _promotion_candidate_fact_value(item, "promotion_recommendation") or "review_candidate"
+        recommendation_breakdown[recommendation] += 1
+
+        if _promotion_candidate_fact_value(item, "manual_review_required") is True:
+            manual_review_required = True
+        if review_status == "ready_for_review" and item.item_id:
+            ready_candidate_ids.append(item.item_id)
+        elif item.item_id:
+            deferred_candidate_ids.append(item.item_id)
+
     return PromotionCandidateSummary(
         summary="Cross-run promotion candidate summary aggregated from run reports.",
         candidates=candidates,
         approval_notes=approval_notes,
         evidence_requirements=evidence_requirements,
-        facts=[Fact(label="candidate_count", value=len(candidates))],
+        facts=[
+            Fact(label="candidate_count", value=len(candidates)),
+            Fact(label="review_status", value="needs_review" if manual_review_required else "ready_for_review"),
+            Fact(label="manual_review_required", value=manual_review_required),
+            Fact(label="baseline_freeze_candidate_count", value=len(set(baseline_freeze_candidate_ids))),
+            Fact(label="ready_for_review_count", value=len(set(ready_candidate_ids))),
+            Fact(label="deferred_candidate_count", value=len(set(deferred_candidate_ids))),
+        ],
         notes=["Candidates were deduplicated across the supplied run reports."],
+        extra={
+            "review_status_breakdown": dict(review_status_breakdown),
+            "promotion_target_breakdown": dict(promotion_target_breakdown),
+            "promotion_recommendation_breakdown": dict(recommendation_breakdown),
+            "baseline_freeze_candidate_ids": sorted(set(baseline_freeze_candidate_ids)),
+            "ready_candidate_ids": sorted(set(ready_candidate_ids)),
+            "deferred_candidate_ids": sorted(set(deferred_candidate_ids)),
+        },
     )
 
 
@@ -582,6 +628,16 @@ def _dedupe_items(items: Any) -> list[ReportItem]:
     return list(deduped.values())
 
 
+def _promotion_candidate_fact_value(item: ReportItem, label: str) -> Any:
+    for fact in item.facts:
+        if fact.label == label and fact.value not in (None, "", [], {}):
+            return fact.value
+    extra_value = item.extra.get(label)
+    if extra_value not in (None, "", [], {}):
+        return extra_value
+    return None
+
+
 def _collect_model_names(reports: list[RunReport]) -> set[str]:
     return {
         model.model_name
@@ -635,10 +691,21 @@ def _model_aggregate_summary(
 
 
 def _extract_run_signal_context(report: RunReport) -> dict[str, Any]:
-    stop_conditions = _mapping_dict(_lookup_extra_value(report, "stop_conditions"))
-    next_round_decision = _mapping_dict(_lookup_extra_value(report, "next_round_decision"))
-    retry_plan = _mapping_dict(_lookup_extra_value(report, "retry_plan"))
-    round_input = _mapping_dict(_lookup_extra_value(report, "round_input"))
+    from .report_markdown import _load_iteration_artifact_payloads
+
+    iteration_artifacts = _load_iteration_artifact_payloads(report)
+    stop_conditions = _mapping_dict(_lookup_extra_value(report, "stop_conditions")) or _mapping_dict(
+        iteration_artifacts.get("stop_conditions")
+    )
+    next_round_decision = _mapping_dict(_lookup_extra_value(report, "next_round_decision")) or _mapping_dict(
+        iteration_artifacts.get("next_round_decision")
+    )
+    retry_plan = _mapping_dict(_lookup_extra_value(report, "retry_plan")) or _mapping_dict(
+        iteration_artifacts.get("retry_plan")
+    )
+    round_input = _mapping_dict(_lookup_extra_value(report, "round_input")) or _mapping_dict(
+        iteration_artifacts.get("round_input")
+    )
 
     stop_status = _text_value(stop_conditions.get("status")) or _text_value(
         _lookup_value(report, "stop_status")
@@ -675,6 +742,13 @@ def _extract_run_signal_context(report: RunReport) -> dict[str, Any]:
         round_input.get("source_decision_reason"),
         _lookup_value(report, "next_round_primary_reason"),
     )
+    explanation = build_decision_explanation(
+        stop_conditions=stop_conditions,
+        next_round_decision=next_round_decision,
+        retry_plan=retry_plan,
+        round_input=round_input,
+        execution_hints=_mapping_dict(_lookup_extra_value(report, "execution_hints")),
+    )
 
     actions = _mapping_list(retry_plan.get("actions"))
     planned_actions = _unique_texts(
@@ -701,23 +775,33 @@ def _extract_run_signal_context(report: RunReport) -> dict[str, Any]:
         next_round_decision,
         watch_signals,
     )
-    manual_review_required = bool(manual_review_signals) or stop_status == "needs_review" or next_round_status == "needs_review"
+    manual_review_required = explanation.manual_review_required or bool(manual_review_signals)
     decision_notes = _unique_texts(
-        manual_review_signals
+        [explanation.summary, explanation.headline]
+        + explanation.notes
+        + manual_review_signals
         + action_summaries[:3]
         + execution_hints[:2]
     )
 
     return {
-        "stop_status": stop_status,
-        "should_stop": should_stop,
-        "stop_reason": stop_reason,
-        "triggered_stop_conditions": triggered_stop_conditions,
-        "next_round_status": next_round_status,
-        "next_round_should_start": next_round_should_start,
-        "next_round": next_round,
-        "next_round_target_stage": next_round_target_stage,
-        "next_round_primary_reason": next_round_primary_reason,
+        "decision_status": explanation.status,
+        "decision_headline": explanation.headline,
+        "decision_summary": explanation.summary,
+        "decision_primary_reason": explanation.primary_reason,
+        "stop_status": explanation.stop_status or stop_status,
+        "should_stop": explanation.should_stop if explanation.should_stop is not None else should_stop,
+        "stop_reason": explanation.stop_reason or stop_reason,
+        "triggered_stop_conditions": explanation.triggered_stop_conditions or triggered_stop_conditions,
+        "next_round_status": explanation.next_round_status or next_round_status,
+        "next_round_should_start": (
+            explanation.should_start_next_round
+            if explanation.should_start_next_round is not None
+            else next_round_should_start
+        ),
+        "next_round": explanation.next_round if explanation.next_round is not None else next_round,
+        "next_round_target_stage": explanation.target_stage or next_round_target_stage,
+        "next_round_primary_reason": explanation.primary_reason or next_round_primary_reason,
         "planned_actions": planned_actions[:5],
         "action_summaries": action_summaries[:3],
         "execution_hints": execution_hints[:5],
@@ -749,6 +833,13 @@ def _compose_run_summary(report: RunReport, signal_context: Mapping[str, Any]) -
 
 
 def _decision_summary(signal_context: Mapping[str, Any]) -> str | None:
+    direct_summary = _first_text(
+        signal_context.get("decision_summary"),
+        signal_context.get("decision_headline"),
+    )
+    if direct_summary:
+        return direct_summary
+
     if signal_context.get("next_round_should_start") is True:
         round_index = signal_context.get("next_round")
         target_stage = signal_context.get("next_round_target_stage")
@@ -844,6 +935,9 @@ def _decision_item_facts(
 
 
 def _decision_item_status(report: RunReport, signal_context: Mapping[str, Any]) -> str:
+    decision_status = _text_value(signal_context.get("decision_status"))
+    if decision_status in {"stopped", "scheduled", "needs_review", "no_retry_needed"}:
+        return decision_status
     if signal_context.get("should_stop") is True or signal_context.get("next_round_status") == "stopped":
         return "stopped"
     if signal_context.get("next_round_should_start") is True:
@@ -856,6 +950,8 @@ def _decision_item_status(report: RunReport, signal_context: Mapping[str, Any]) 
 def _has_decision_signal(signal_context: Mapping[str, Any]) -> bool:
     return any(
         (
+            signal_context.get("decision_summary"),
+            signal_context.get("decision_headline"),
             signal_context.get("should_stop") is True,
             signal_context.get("manual_review_required"),
             signal_context.get("next_round_should_start") is True,
