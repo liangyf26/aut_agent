@@ -222,13 +222,14 @@ function updateStage2OnboardingField(name, value) {
 
 function getStage2OnboardingParameters() {
   const form = state.onboardingForm;
+  const systemKeyTemplate = normalizeSystemMapTemplateBase(form.systemKeyTemplate.trim());
   return {
     systemName: form.systemName.trim(),
-    systemKeyTemplate: form.systemKeyTemplate.trim(),
+    systemKeyTemplate,
     homeUrl: form.homeUrl.trim(),
     targetName: form.systemName.trim(),
-    systemKey: form.systemKeyTemplate.trim(),
-    systemMapTemplate: form.systemKeyTemplate.trim() ? `${form.systemKeyTemplate.trim()}_system_map` : '',
+    systemKey: systemKeyTemplate,
+    systemMapTemplate: systemKeyTemplate ? `${systemKeyTemplate}_system_map` : '',
     startUrl: form.homeUrl.trim(),
     pageUrl: form.homeUrl.trim(),
     cdpUrl: form.cdpUrl.trim(),
@@ -239,6 +240,14 @@ function getStage2OnboardingParameters() {
     captureSeconds: Number(form.captureSeconds) || 0,
     runDir: form.runDir.trim()
   };
+}
+
+function normalizeSystemMapTemplateBase(value) {
+  const text = String(value || '').trim();
+  if (!text) {
+    return '';
+  }
+  return text.replace(/(?:_system_map)+$/i, '');
 }
 
 function getStage2OperationSessionId() {
@@ -501,6 +510,7 @@ async function runStage2OperationStep(stepId) {
       artifactHref: result.session?.sessionId
         ? operationArtifactHref(result.session.sessionId, `command_result_${step.operation}_json`)
         : (commandResult.artifacts?.result?.href || result.artifactHref || result.artifact_href || null),
+      stepArtifacts: Array.isArray(result.stepArtifacts) ? result.stepArtifacts : [],
       artifacts: session?.artifacts || result.artifacts || [],
       updatedAt: commandResult.finishedAt || commandResult.updatedAt || commandResult.updated_at || new Date().toISOString()
     };
@@ -1066,7 +1076,7 @@ function renderStage2OnboardingTab() {
         </div>
         <div class="onboarding-field-grid">
           ${renderOnboardingField('systemName', '系统名称', form.systemName, '公交业务系统')}
-          ${renderOnboardingField('systemKeyTemplate', 'system key/template', form.systemKeyTemplate, 'bus_system_map')}
+          ${renderOnboardingField('systemKeyTemplate', 'system key/template', form.systemKeyTemplate, 'bus')}
           ${renderOnboardingField('homeUrl', '首页 URL', form.homeUrl, 'https://example.com/home', 'url')}
           ${renderOnboardingField('cdpUrl', 'CDP URL', form.cdpUrl, 'http://localhost:9222', 'url')}
           ${renderOnboardingField('targetTemplate', '目标模板', form.targetTemplate, 'bus_station_query_reset')}
@@ -1137,6 +1147,7 @@ function renderOnboardingStepCard(step) {
     manual: '人工确认',
     artifact: '产物查看'
   }[step.mode];
+  const artifactLinks = resolveOnboardingStepArtifactLinks(step, result);
 
   return `
     <article class="onboarding-step-card ${step.mode} ${status}">
@@ -1155,6 +1166,7 @@ function renderOnboardingStepCard(step) {
       ${renderArtifactChips(step.artifacts)}
       ${result.message ? `<p class="inline-note">${escapeHtml(result.message)}</p>` : ''}
       ${result.runId ? `<p class="inline-note">Run：${escapeHtml(result.runId)}</p>` : ''}
+      ${renderInlineArtifactLinks(artifactLinks, '')}
       <div class="inline-actions">
         <button
           class="ghost-action compact-action"
@@ -1163,10 +1175,86 @@ function renderOnboardingStepCard(step) {
           type="button"
           ${(running || (step.mode === 'executable' && missingFields.length)) ? 'disabled' : ''}
         >${escapeHtml(buttonLabel)}</button>
-        ${result.artifactHref ? `<a class="inline-link compact-link" href="${escapeHtml(result.artifactHref)}" target="_blank" rel="noreferrer">打开产物</a>` : ''}
+        ${result.artifactHref ? `<a class="inline-link compact-link" href="${escapeHtml(result.artifactHref)}" target="_blank" rel="noreferrer">步骤结果</a>` : ''}
       </div>
     </article>
   `;
+}
+
+function resolveOnboardingStepArtifactLinks(step, result = {}) {
+  if (Array.isArray(result.stepArtifacts) && result.stepArtifacts.length) {
+    const directLinks = result.stepArtifacts
+      .filter((item) => item && item.href && item.label)
+      .map((item) => ({
+        label: item.label,
+        href: item.href,
+        fileName: item.label
+      }));
+    if (result.artifactHref) {
+      directLinks.push({
+        label: 'command_result.json',
+        href: result.artifactHref,
+        fileName: '步骤命令结果'
+      });
+    }
+    return directLinks;
+  }
+
+  const sessionId = getStage2OperationSessionId() || state.stage2Overview?.operationCenter?.currentSession?.sessionId;
+  if (!sessionId) {
+    return [];
+  }
+
+  const artifactKeyMap = {
+    1: [
+      ['navigation_tree.json', 'systemMapTemplate_navigation_tree.json'],
+      ['page_semantic_summary.json', 'systemMapTemplate_page_semantic_summary.json'],
+      ['page_entries.json', 'systemMapTemplate_page_entries.json']
+    ],
+    6: [
+      ['page_entries.json', 'targetTemplate_page_entries.json'],
+      ['feature_points.json', 'targetTemplate_feature_points.json'],
+      ['discovery_review_queue.json', 'targetTemplate_discovery_review_queue.json']
+    ],
+    8: [
+      ['template_revision_checklist.json', 'checklist_output_dir_template_revision_checklist.json'],
+      ['template_revision_checklist.md', 'checklist_output_dir_template_revision_checklist.md']
+    ],
+    10: [
+      ['validation_result.json', 'run_dir_validation_result.json'],
+      ['verification_result.json', 'run_dir_verification_result.json'],
+      ['network_events.json', 'run_dir_network_events.json']
+    ],
+    15: [
+      ['latest_validation_matrix.json', 'latest_validation_matrix.json'],
+      ['latest_validation_matrix.md', 'latest_validation_matrix.md']
+    ]
+  };
+
+  const candidates = artifactKeyMap[step.id] || [];
+  const links = candidates
+    .map(([label, artifactKey]) => {
+      const href = operationArtifactHref(sessionId, artifactKey);
+      if (!href) {
+        return null;
+      }
+      return {
+        label,
+        href,
+        fileName: label
+      };
+    })
+    .filter(Boolean);
+
+  if (result.artifactHref) {
+    links.push({
+      label: 'command_result.json',
+      href: result.artifactHref,
+      fileName: '步骤命令结果'
+    });
+  }
+
+  return links;
 }
 
 function renderArtifactChips(artifacts = []) {

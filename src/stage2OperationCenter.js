@@ -402,6 +402,10 @@ function trimPreview(value) {
   return text.length > 2000 ? `${text.slice(0, 2000)}...` : text;
 }
 
+function buildOperationArtifactHref(sessionId, artifactKey) {
+  return `/api/stage2/operation/artifacts/${encodeURIComponent(sessionId)}/${encodeURIComponent(artifactKey)}`;
+}
+
 async function createOrLoadSession(sessionId, operationsDir) {
   if (sessionId) {
     if (!SAFE_SESSION_PATTERN.test(sessionId)) {
@@ -653,6 +657,7 @@ async function runOperationStep(body = {}, dependencies = {}) {
   const runningState = {
     ...state,
     status: 'running',
+    params,
     currentStepId: stepId,
     updatedAt: startedAt,
     latestResult: {
@@ -692,7 +697,8 @@ async function runOperationStep(body = {}, dependencies = {}) {
       parsedStdout: commandResult.parsedStdout,
       stdoutPreview: commandResult.stdoutPreview,
       stderrPreview: commandResult.stderrPreview,
-      artifacts: commandResult.artifacts
+      artifacts: commandResult.artifacts,
+      resultArtifact: commandResult.artifacts?.result || null
     },
     stepHistory: [
       ...(runningState.stepHistory || []),
@@ -718,7 +724,8 @@ async function runOperationStep(body = {}, dependencies = {}) {
 
   return {
     session: buildPublicState(nextState),
-    result: commandResult
+    result: commandResult,
+    stepArtifacts: buildStepArtifactRefs(stepId, sessionId, params)
   };
 }
 
@@ -786,17 +793,36 @@ async function resolveOperationArtifact(sessionId, artifactKey, options = {}) {
   }
 
   const fileName = fileNameByKey[artifactKey];
-  if (!fileName) {
+  if (fileName) {
+    const filePath = path.join(operationsDir, sessionId, fileName);
+    if (!isWithinDir(filePath, operationsDir) || !(await pathExists(filePath))) {
+      return null;
+    }
+    return {
+      key: artifactKey,
+      path: filePath,
+      fileName,
+      relativePath: relativeArtifact(filePath)
+    };
+  }
+
+  const state = await readJsonIfExists(path.join(operationsDir, sessionId, 'operation_state.json'));
+  const indexedArtifact = state?.artifacts?.[artifactKey];
+  const indexedPath = typeof indexedArtifact?.path === 'string' ? indexedArtifact.path : null;
+  if (!indexedPath) {
     return null;
   }
-  const filePath = path.join(operationsDir, sessionId, fileName);
-  if (!isWithinDir(filePath, operationsDir) || !(await pathExists(filePath))) {
+  const filePath = path.resolve(indexedPath);
+  if (!isWithinDir(filePath, STAGE2_DIR) && !isWithinDir(filePath, TEMPLATE_ROOT)) {
+    return null;
+  }
+  if (!(await pathExists(filePath))) {
     return null;
   }
   return {
     key: artifactKey,
     path: filePath,
-    fileName,
+    fileName: indexedArtifact.fileName || path.basename(filePath),
     relativePath: relativeArtifact(filePath)
   };
 }
@@ -814,10 +840,45 @@ function buildOperationCommand(stepId, params = {}, context = { sessionId: 'op_2
   };
 }
 
+function buildStepArtifactRefs(stepId, sessionId, params = {}) {
+  const referencesByStep = {
+    explore_system_map: [
+      ['navigation_tree.json', `${params.templateName || params.systemMapTemplate}_navigation_tree.json`],
+      ['page_semantic_summary.json', `${params.templateName || params.systemMapTemplate}_page_semantic_summary.json`],
+      ['page_entries.json', `${params.templateName || params.systemMapTemplate}_page_entries.json`]
+    ],
+    live_discovery: [
+      ['page_entries.json', `${params.templateName}_page_entries.json`],
+      ['feature_points.json', `${params.templateName}_feature_points.json`],
+      ['discovery_review_queue.json', `${params.templateName}_discovery_review_queue.json`]
+    ],
+    template_revision_checklist: [
+      ['template_revision_checklist.json', 'checklist_output_dir_template_revision_checklist.json'],
+      ['template_revision_checklist.md', 'checklist_output_dir_template_revision_checklist.md']
+    ],
+    validate_connected_template: [
+      ['validation_result.json', 'run_dir_validation_result.json'],
+      ['verification_result.json', 'run_dir_verification_result.json'],
+      ['network_events.json', 'run_dir_network_events.json']
+    ],
+    validation_matrix: [
+      ['latest_validation_matrix.json', 'latest_validation_matrix.json'],
+      ['latest_validation_matrix.md', 'latest_validation_matrix.md']
+    ]
+  };
+  const pairs = referencesByStep[stepId] || [];
+  return pairs.map(([label, artifactKey]) => ({
+    label,
+    artifactKey,
+    href: buildOperationArtifactHref(sessionId, artifactKey)
+  }));
+}
+
 module.exports = {
   STEP_DEFINITIONS,
   OperationInputError,
   buildOperationCommand,
+  buildStepArtifactRefs,
   checkEnvironment,
   checkOperationEnvironment: checkEnvironment,
   getOperationState,

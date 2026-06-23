@@ -1,0 +1,14 @@
+{
+  "bootstrap_hints": {
+    "page_keywords": [
+      "追本溯源管理系统系统入口"
+    ],
+    "candidate_button_texts": [],
+    "candidate_field_labels": [],
+    "candidate_dialog_titles": [],
+    "notes": [
+      "Keep this file minimal in round 1.",
+      "Use live discovery artifacts or candidate_template_review.json to add stable locators in round 2."
+    ]
+  }
+}

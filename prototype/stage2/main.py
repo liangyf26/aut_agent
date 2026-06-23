@@ -90,24 +90,13 @@ def bootstrap_template(
         scenario_kind=scenario_kind,
         overwrite=overwrite,
     )
-    return {
-        "template": result.template_name,
-        "template_dir": str(result.template_dir),
-        "page_name": result.page_name,
-        "feature_name": result.feature_name,
-        "feature_type": result.feature_type,
-        "scenario_kind": result.scenario_kind,
-        "template_path": str(result.files["template"]),
-        "baseline_path": str(result.files["baseline"]),
-        "data_schema_path": str(result.files["data_schema"]),
-        "locator_hints_path": str(result.files["locator_hints"]),
-        "next_steps": [
-            "python -m prototype.stage2.main --routing-summary --template <template_name>",
-            "python -m prototype.stage2.main --live-discovery --template <template_name> --model AI-tester --cdp-url http://localhost:9222",
-            "python -m prototype.stage2.main --capture-human-recording --template <template_name> --cdp-url http://localhost:9222",
-            "python -m prototype.stage2.main --validate-connected-template <template_name> --cdp-url http://localhost:9222",
-        ],
-    }
+    bundle = load_template_bundle(result.template_dir)
+    return _build_bootstrap_template_payload(
+        template_name=result.template_name,
+        template_dir=result.template_dir,
+        template_payload=bundle.template,
+        scenario_kind=result.scenario_kind,
+    )
 
 
 def bootstrap_system_exploration_template(
@@ -124,15 +113,34 @@ def bootstrap_system_exploration_template(
     resolved_template_name = str(template_name or "").strip() or _default_system_map_template_name(
         normalized_target_name
     )
-    payload = bootstrap_template(
-        resolved_template_name,
-        page_url=normalized_start_url,
-        page_name=f"{normalized_target_name}系统入口",
-        feature_name=f"{normalized_target_name}系统地图探索",
-        feature_type="导航",
-        scenario_kind="navigation",
-        overwrite=overwrite,
-    )
+    try:
+        payload = bootstrap_template(
+            resolved_template_name,
+            page_url=normalized_start_url,
+            page_name=f"{normalized_target_name}系统入口",
+            feature_name=f"{normalized_target_name}系统地图探索",
+            feature_type="导航",
+            scenario_kind="navigation",
+            overwrite=overwrite,
+        )
+    except FileExistsError:
+        existing_bundle = _load_existing_system_map_template_bundle(resolved_template_name)
+        existing_url = str(
+            existing_bundle.template.get("page_entry", {}).get("url") or ""
+        ).strip()
+        if existing_url and existing_url != normalized_start_url:
+            raise FileExistsError(
+                "系统地图模板目录已存在，且绑定的页面入口 URL 与当前探索目标不同："
+                f"{existing_bundle.template_dir}。当前模板 URL={existing_url}，"
+                f"本次请求 URL={normalized_start_url}。如需覆盖，请使用 bootstrap_overwrite=True。"
+            )
+        payload = _build_bootstrap_template_payload(
+            template_name=existing_bundle.name,
+            template_dir=existing_bundle.template_dir,
+            template_payload=existing_bundle.template,
+            scenario_kind="navigation",
+            reused_existing_template=True,
+        )
     payload["target_name"] = normalized_target_name
     payload["mode"] = "system_map_bootstrap"
     payload["recommended_next_steps"] = [
@@ -187,6 +195,56 @@ def _find_latest_candidate_review_for_template(template_name: str) -> Path | Non
     if not candidates:
         return None
     return sorted(candidates, reverse=True)[0]
+
+
+def _build_bootstrap_template_payload(
+    *,
+    template_name: str,
+    template_dir: Path,
+    template_payload: dict[str, Any],
+    scenario_kind: str,
+    reused_existing_template: bool = False,
+) -> dict[str, Any]:
+    page_entry = template_payload.get("page_entry", {}) if isinstance(template_payload, dict) else {}
+    feature_point = template_payload.get("feature_point", {}) if isinstance(template_payload, dict) else {}
+    bootstrap_meta = template_payload.get("bootstrap", {}) if isinstance(template_payload, dict) else {}
+    resolved_scenario_kind = str(
+        bootstrap_meta.get("scenario_kind") or scenario_kind or DEFAULT_SCENARIO_KIND
+    )
+    return {
+        "template": template_name,
+        "template_dir": str(template_dir),
+        "page_name": str(page_entry.get("name") or ""),
+        "feature_name": str(feature_point.get("name") or ""),
+        "feature_type": str(feature_point.get("type") or ""),
+        "scenario_kind": resolved_scenario_kind,
+        "template_path": str(template_dir / "template.json"),
+        "baseline_path": str(template_dir / "baseline.json"),
+        "data_schema_path": str(template_dir / "data_schema.json"),
+        "locator_hints_path": str(template_dir / "locator_hints.json"),
+        "reused_existing_template": reused_existing_template,
+        "next_steps": [
+            "python -m prototype.stage2.main --routing-summary --template <template_name>",
+            "python -m prototype.stage2.main --live-discovery --template <template_name> --model AI-tester --cdp-url http://localhost:9222",
+            "python -m prototype.stage2.main --capture-human-recording --template <template_name> --cdp-url http://localhost:9222",
+            "python -m prototype.stage2.main --validate-connected-template <template_name> --cdp-url http://localhost:9222",
+        ],
+    }
+
+
+def _load_existing_system_map_template_bundle(template_name: str):
+    template_dir = TEMPLATE_ROOT / template_name
+    required = [
+        template_dir / "template.json",
+        template_dir / "baseline.json",
+        template_dir / "data_schema.json",
+        template_dir / "locator_hints.json",
+    ]
+    if not all(path.exists() for path in required):
+        raise FileExistsError(
+            f"模板目录已存在但缺少系统地图模板所需文件：{template_dir}。如需覆盖，请使用 bootstrap_overwrite=True。"
+        )
+    return load_template_bundle(template_dir)
 
 
 def _default_system_map_template_name(target_name: str) -> str:

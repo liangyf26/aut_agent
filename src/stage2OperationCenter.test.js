@@ -79,3 +79,45 @@ test('buildOperationCommand allows local CDP URLs', () => {
 
   assert.deepEqual(command.args.slice(-2), ['--cdp-url', 'http://127.0.0.1:9222/']);
 });
+
+test('runOperationStep passes through bootstrap-overwrite for explore_system_map', async () => {
+  const operationsDir = await fs.mkdtemp(path.join(os.tmpdir(), 'stage2-operation-'));
+  let capturedArgs = null;
+
+  try {
+    const result = await runOperationStep({
+      stepId: 'explore_system_map',
+      parameters: {
+        targetName: '追本溯源管理系统',
+        systemMapTemplate: 'suyuan_system_map',
+        startUrl: 'https://example.com/home',
+        cdpUrl: 'http://localhost:9222',
+        bootstrapOverwrite: true
+      }
+    }, {
+      operationsDir,
+      execFileRunner: (_command, args, _options, callback) => {
+        capturedArgs = args;
+        callback(null, '{"template":"suyuan_system_map"}', '');
+      }
+    });
+
+    assert.equal(result.result.status, 'completed');
+    assert.deepEqual(capturedArgs, [
+      '-m',
+      'prototype.stage2.main',
+      '--explore-system-map',
+      '--target-name',
+      '追本溯源管理系统',
+      '--template',
+      'suyuan_system_map',
+      '--page-url',
+      'https://example.com/home',
+      '--cdp-url',
+      'http://localhost:9222/',
+      '--bootstrap-overwrite'
+    ]);
+  } finally {
+    await fs.rm(operationsDir, { recursive: true, force: true });
+  }
+});
