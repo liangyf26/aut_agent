@@ -44,9 +44,10 @@ http://localhost:4173
 npm run check
 npm run dev
 python -m prototype.stage2.main
+python -m prototype.stage2.main --explore-system-map --target-name "示例系统" --template demo_system_map --page-url https://example.com/home --cdp-url http://localhost:9222
 python -m prototype.stage2.main --bootstrap-template --template demo_query_entry --page-url https://example.com/query --page-name "示例查询页" --scenario-kind query
 python -m prototype.stage2.main --routing-summary --template demo_query_entry
-python -m prototype.stage2.main --live-discovery --template demo_query_entry --model AI-tester --cdp-url http://localhost:9222
+python -m prototype.stage2.main --live-discovery --template demo_query_entry --model <your_model_profile> --cdp-url http://localhost:9222
 python -m prototype.stage2.main --capture-human-recording --template demo_query_entry --cdp-url http://localhost:9222
 python -m prototype.stage2.main --template-revision-checklist --template demo_query_entry
 python -m prototype.stage2.main --resume-human-takeover <run_dir> --cdp-url http://localhost:9222
@@ -79,12 +80,13 @@ artifacts/           运行产物、报告、截图和阶段性证据
 
 - [第二阶段新系统接入测试手册](docs/第二阶段新系统接入测试手册.md)
 
-新系统首次接入建议按“两轮法”执行：
+新系统首次接入建议按“先系统地图、再模板收敛”的顺序执行：
 
-1. 先用 `--bootstrap-template` 生成最小模板骨架。
-2. 再跑 `--live-discovery` 或 `--capture-human-recording` 收集页面入口、功能点和候选定位线索。
-3. 再用 `--template-revision-checklist` 自动汇总建议回填项，生成按文件分组的修订清单。
-4. 最后由测试人员按清单修订模板，再执行 `--validate-connected-template` 做深入连机验证。
+1. 先用 `--explore-system-map` 生成 `navigation_tree.json`、`page_semantic_summary.json` 等系统地图产物。
+2. 再从系统地图里选一个低风险页面，用 `--bootstrap-template` 生成目标模板骨架。
+3. 再跑目标页面 `--live-discovery` 或 `--capture-human-recording` 收集功能点和候选定位线索。
+4. 再用 `--template-revision-checklist` 自动汇总建议回填项，生成按文件分组的修订清单。
+5. 最后由测试人员按清单修订模板，再执行 `--validate-connected-template` 做深入连机验证。
 
 ## 技术路线
 
@@ -178,7 +180,8 @@ npm run check
   - 高风险提交的 policy bridge 不回退
   - 复杂 flow 的失败传播
   - `fill_success_template` 的输入契约与异常边界
-- 已实现真实页面受控 discovery，可输出 `page_entries.json`、`feature_points.json`、`discovery_review_queue.json`、页面截图与进度事件。
+- 已实现真实页面受控 discovery，可输出 `page_entries.json`、`feature_points.json`、`navigation_nodes.json`、`navigation_tree.json`、`page_semantic_summary.json`、`discovery_review_queue.json`、页面截图与进度事件。
+- 已实现新系统系统地图探索入口：`--explore-system-map`，可先为新系统生成最小导航模板，再直接产出系统地图树和页面类型初分，减少首轮人工判断。
 - 已实现模板 bootstrap 入口：`--bootstrap-template`，可为新系统快速生成 `template.json`、`baseline.json`、`data_schema.json`、`locator_hints.json` 四件套的最小草稿，供第一轮 discovery / human recording 直接使用。
 - 已补 discovery 审核回填最小闭环：支持在已完成 discovery 上加载 `discovery_review_patch.json`，对页面入口和功能点执行忽略、重命名与字段修正，并让后续 discovery / verification 优先消费人工回填后的结果。
 - 已把 discovery 阶段显式化为策略决策：当前会在 `blocked`、`template_seed_only`、`live_enrich`、`skip_completed_discovery` 之间选择，并把决策纳入 run 产物与报告。

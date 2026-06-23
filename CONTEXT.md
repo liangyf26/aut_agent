@@ -143,8 +143,12 @@ _Avoid_: 只看首页表单、只看浏览器窗口、把 run 产物散落在多
 _Avoid_: 最终模板、直接执行脚本、只看草稿不看映射确认
 
 **模板 bootstrap 草稿 (Template Bootstrap Scaffold)**:
-第二阶段为新系统首次接入提供的最小模板骨架。当前通过 `python -m prototype.stage2.main --bootstrap-template ...` 生成，自动创建 `template.json`、`baseline.json`、`data_schema.json`、`locator_hints.json`，用于先启动 discovery 和人工录制，再由测试人员做第二轮人工修订。
+第二阶段为具体目标页面收敛模板时提供的最小骨架。当前通过 `python -m prototype.stage2.main --bootstrap-template ...` 生成，自动创建 `template.json`、`baseline.json`、`data_schema.json`、`locator_hints.json`，通常在系统地图探索之后使用，用于把已选页面正式收敛为模板。
 _Avoid_: 最终模板、完整自动生成模板、一步到位的回归脚本
+
+**系统地图探索 (System Map Exploration)**:
+第二阶段为新系统第一次接入提供的前置探索入口。当前通过 `python -m prototype.stage2.main --explore-system-map ...` 先生成最小导航模板，再执行 live discovery，产出 `navigation_tree.json`、`navigation_nodes.json`、`page_semantic_summary.json`、`page_entries.json`、`feature_points.json` 等系统地图产物，用于先理解系统入口结构和页面类型初分，再决定后续模板收敛目标。
+_Avoid_: 最终模板、完整真实菜单真相、完全替代人工审核
 
 **模板修订清单 (Template Revision Checklist)**:
 第二阶段在第一轮 discovery / human recording 之后生成的半自动修订建议包。当前通过 `python -m prototype.stage2.main --template-revision-checklist --template <template_name>` 生成，输出按 `template.json`、`locator_hints.json`、`baseline.json`、`data_schema.json` 分组的建议片段和待确认项，帮助测试人员在第二轮更快完成模板收敛。
