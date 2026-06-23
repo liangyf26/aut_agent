@@ -13,6 +13,8 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from prototype.stage2.app.runtime.templates import load_template_bundle
+from prototype.stage2.app.runtime.template_bootstrap import bootstrap_template_bundle
+from prototype.stage2.app.runtime.template_revision_checklist import build_template_revision_checklist
 from prototype.stage2.app.reporting import (
     build_platform_daily_report,
     render_platform_daily_report_markdown,
@@ -66,6 +68,92 @@ def list_templates() -> list[dict[str, str]]:
             }
         )
     return items
+
+
+def bootstrap_template(
+    template_name: str,
+    *,
+    page_url: str,
+    page_name: str = "",
+    feature_name: str = "",
+    feature_type: str = "",
+    scenario_kind: str = "navigation",
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    result = bootstrap_template_bundle(
+        TEMPLATE_ROOT,
+        template_name=template_name,
+        page_url=page_url,
+        page_name=page_name,
+        feature_name=feature_name,
+        feature_type=feature_type,
+        scenario_kind=scenario_kind,
+        overwrite=overwrite,
+    )
+    return {
+        "template": result.template_name,
+        "template_dir": str(result.template_dir),
+        "page_name": result.page_name,
+        "feature_name": result.feature_name,
+        "feature_type": result.feature_type,
+        "scenario_kind": result.scenario_kind,
+        "template_path": str(result.files["template"]),
+        "baseline_path": str(result.files["baseline"]),
+        "data_schema_path": str(result.files["data_schema"]),
+        "locator_hints_path": str(result.files["locator_hints"]),
+        "next_steps": [
+            "python -m prototype.stage2.main --routing-summary --template <template_name>",
+            "python -m prototype.stage2.main --live-discovery --template <template_name> --model AI-tester --cdp-url http://localhost:9222",
+            "python -m prototype.stage2.main --capture-human-recording --template <template_name> --cdp-url http://localhost:9222",
+            "python -m prototype.stage2.main --validate-connected-template <template_name> --cdp-url http://localhost:9222",
+        ],
+    }
+
+
+def generate_template_revision_checklist(
+    template_name: str,
+    *,
+    discovery_dir: str = "",
+    candidate_review_path: str = "",
+    output_dir: str = "",
+) -> dict[str, Any]:
+    template_dir = TEMPLATE_ROOT / template_name
+    resolved_discovery_dir = Path(discovery_dir) if discovery_dir else ROOT_DIR / "artifacts" / "stage2" / f"live_discovery_{template_name}"
+    resolved_candidate_review_path = (
+        Path(candidate_review_path) if candidate_review_path else _find_latest_candidate_review_for_template(template_name)
+    )
+    result = build_template_revision_checklist(
+        template_dir,
+        discovery_dir=resolved_discovery_dir if resolved_discovery_dir.exists() else None,
+        candidate_review_path=resolved_candidate_review_path if resolved_candidate_review_path and resolved_candidate_review_path.exists() else None,
+        output_dir=Path(output_dir) if output_dir else None,
+    )
+    return {
+        "template": result.template_name,
+        "output_dir": str(result.output_dir),
+        "checklist_path": str(result.checklist_path),
+        "markdown_path": str(result.markdown_path),
+        "discovery_dir": str(resolved_discovery_dir) if resolved_discovery_dir else "",
+        "candidate_review_path": str(resolved_candidate_review_path) if resolved_candidate_review_path else "",
+        "summary": result.payload.get("summary", {}),
+    }
+
+
+def _find_latest_candidate_review_for_template(template_name: str) -> Path | None:
+    if not HUMAN_LOOP_ROOT.exists():
+        return None
+    candidates: list[Path] = []
+    for path in HUMAN_LOOP_ROOT.glob("*/candidate_template_review.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if str(payload.get("template_name") or "").strip() != template_name:
+            continue
+        candidates.append(path)
+    if not candidates:
+        return None
+    return sorted(candidates, reverse=True)[0]
 
 
 def initialize_runs(template_name: str) -> list[dict[str, str]]:
@@ -886,6 +974,16 @@ async def resume_human_takeover_entrypoint(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Stage 2 prototype entrypoint.")
     parser.add_argument(
+        "--bootstrap-template",
+        action="store_true",
+        help="Create a minimal template scaffold so discovery and human recording can start without hand-writing all four template files.",
+    )
+    parser.add_argument(
+        "--template-revision-checklist",
+        action="store_true",
+        help="Build a semi-automatic revision checklist from discovery and human recording artifacts for the given template.",
+    )
+    parser.add_argument(
         "--init-run",
         action="store_true",
         help="Initialize run directories, progress artifacts, and runtime snapshots for the template.",
@@ -894,6 +992,51 @@ def main() -> None:
         "--template",
         default="suyuan_online_apply",
         help="Template name to inspect or initialize.",
+    )
+    parser.add_argument(
+        "--page-url",
+        default="",
+        help="Start URL used by --bootstrap-template.",
+    )
+    parser.add_argument(
+        "--page-name",
+        default="",
+        help="Optional page entry name used by --bootstrap-template.",
+    )
+    parser.add_argument(
+        "--feature-name",
+        default="",
+        help="Optional feature point name used by --bootstrap-template.",
+    )
+    parser.add_argument(
+        "--feature-type",
+        default="",
+        help="Optional feature point type override used by --bootstrap-template.",
+    )
+    parser.add_argument(
+        "--scenario-kind",
+        default="navigation",
+        help="Bootstrap scenario kind: navigation, query, detail, create, edit, or generic.",
+    )
+    parser.add_argument(
+        "--bootstrap-overwrite",
+        action="store_true",
+        help="Allow --bootstrap-template to overwrite an existing template directory.",
+    )
+    parser.add_argument(
+        "--discovery-dir",
+        default="",
+        help="Optional explicit discovery artifact directory used by --template-revision-checklist.",
+    )
+    parser.add_argument(
+        "--candidate-review",
+        default="",
+        help="Optional explicit candidate_template_review.json path used by --template-revision-checklist.",
+    )
+    parser.add_argument(
+        "--checklist-output-dir",
+        default="",
+        help="Optional explicit output directory used by --template-revision-checklist.",
     )
     parser.add_argument(
         "--init-human-recording",
@@ -1020,6 +1163,39 @@ def main() -> None:
         help="Maximum number of recent run reports to include when aggregating the platform daily report.",
     )
     args = parser.parse_args()
+
+    if args.bootstrap_template:
+        print(
+            json.dumps(
+                bootstrap_template(
+                    args.template,
+                    page_url=args.page_url,
+                    page_name=args.page_name,
+                    feature_name=args.feature_name,
+                    feature_type=args.feature_type,
+                    scenario_kind=args.scenario_kind,
+                    overwrite=args.bootstrap_overwrite,
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+
+    if args.template_revision_checklist:
+        print(
+            json.dumps(
+                generate_template_revision_checklist(
+                    args.template,
+                    discovery_dir=args.discovery_dir,
+                    candidate_review_path=args.candidate_review,
+                    output_dir=args.checklist_output_dir,
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
 
     if args.init_run:
         print(json.dumps(initialize_runs(template_name=args.template), ensure_ascii=False, indent=2))

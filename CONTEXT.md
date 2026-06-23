@@ -142,6 +142,14 @@ _Avoid_: 只看首页表单、只看浏览器窗口、把 run 产物散落在多
 人工录制会话在候选模板草稿之外额外生成的审阅型结构化产物，当前原型对应 `candidate_template_review.json`。它面向项目实施者确认字段映射、alias 草案、候选定位器和项目字段上下文，而不是直接拿来执行。
 _Avoid_: 最终模板、直接执行脚本、只看草稿不看映射确认
 
+**模板 bootstrap 草稿 (Template Bootstrap Scaffold)**:
+第二阶段为新系统首次接入提供的最小模板骨架。当前通过 `python -m prototype.stage2.main --bootstrap-template ...` 生成，自动创建 `template.json`、`baseline.json`、`data_schema.json`、`locator_hints.json`，用于先启动 discovery 和人工录制，再由测试人员做第二轮人工修订。
+_Avoid_: 最终模板、完整自动生成模板、一步到位的回归脚本
+
+**模板修订清单 (Template Revision Checklist)**:
+第二阶段在第一轮 discovery / human recording 之后生成的半自动修订建议包。当前通过 `python -m prototype.stage2.main --template-revision-checklist --template <template_name>` 生成，输出按 `template.json`、`locator_hints.json`、`baseline.json`、`data_schema.json` 分组的建议片段和待确认项，帮助测试人员在第二轮更快完成模板收敛。
+_Avoid_: 自动直接改模板、完全替代人工判断、另起一套执行模板格式
+
 **编排会话视图 (Orchestration Session View)**:
 第二阶段围绕同一个 `orchestration_stream_id` 对多轮 run 做出的 session 级聚合视图。当前原型会在 `artifacts/stage2/sessions/` 下落盘 `index.json`、`session_summary.json`、`session_timeline.json`，并由运行中心优先消费，用于展示跨轮次状态、待人工处理 run 和恢复入口。
 _Avoid_: 只看单个 run、每次都临时扫描推导、session 与 run 语义混写

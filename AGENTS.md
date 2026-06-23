@@ -48,10 +48,13 @@ python -m prototype.stage2.main
 常用命令：
 
 ```powershell
+python -m prototype.stage2.main --bootstrap-template --template demo_query_entry --page-url https://example.com/query --page-name "示例查询页" --scenario-kind query
+python -m prototype.stage2.main --routing-summary --template demo_query_entry
+python -m prototype.stage2.main --live-discovery --template demo_query_entry --model AI-tester --cdp-url http://localhost:9222
+python -m prototype.stage2.main --capture-human-recording --template demo_query_entry --cdp-url http://localhost:9222
+python -m prototype.stage2.main --template-revision-checklist --template demo_query_entry
+python -m prototype.stage2.main --validate-connected-template <template_name> --cdp-url http://localhost:9222
 python -m prototype.stage2.main --run-sample --cdp-url http://localhost:9222
-python -m prototype.stage2.main --routing-summary --template suyuan_online_apply
-python -m prototype.stage2.main --live-discovery --template suyuan_online_apply --model AI-tester --cdp-url http://localhost:9222
-python -m prototype.stage2.main --capture-human-recording --template suyuan_online_apply --cdp-url http://localhost:9222
 python -m prototype.stage2.main --platform-daily-report
 python -m prototype.stage2.main --resume-human-takeover <run_dir> --cdp-url http://localhost:9222
 python -m prototype.stage2.main --validation-matrix --cdp-url http://localhost:9222
@@ -66,6 +69,7 @@ python -m prototype.stage2.main --validation-matrix --cdp-url http://localhost:9
 - 运行态必须持续落盘结构化产物，至少包含进度事件、当前状态、页面入口、功能点、执行结果、失败簇、报告
 - 初始化/运行阶段现在还会落盘 `routing_summary.json` 与 `discovery_strategy.json`，用于说明模型路由与本轮发现策略
 - 人工录制会话当前除候选草稿外还会落盘 `candidate_template_review.json`；运行中心已消费其摘要和 artifact 链接
+- 新系统首次接入现在建议走“两轮法”：先用 `--bootstrap-template` 建最小草稿，再跑 discovery / human recording，随后用 `--template-revision-checklist` 生成按文件分组的修订清单，最后再做 connected validation
 - 当前验证层已经形成三层结构：通用模板动作、项目级复用动作族、少量项目胶水；后续抽象优先继续拆剩余项目耦合点，并在 G4 骨架上接入新的真实业务系统
 - 当前验证层已补 G3 护栏，并新增 G4 validation matrix 骨架：`lab_*` 本地模板族与 `suyuan_*` 样本可走进同一套统一汇总链路
 - Node.js 主平台首页现在默认是运行中心优先布局；涉及平台 UI 时，应从 `public/index.html`、`public/app.js`、`src/stage2Dashboard.js` 理解当前外壳，而不是假设仍是表单优先首页。当前 overview 还会聚合 `latest_baseline_freeze_manifest.json` 与 run 级 `promotion_candidate_summary`
