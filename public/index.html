@@ -17,9 +17,14 @@
           </div>
         </div>
 
-        <button class="primary-action" id="newProjectButton" type="button">新建评测项目</button>
+        <nav class="workspace-nav" aria-label="工作台导航">
+          <a href="/" data-workspace-link="stage1">第一阶段评测</a>
+          <a href="/stage2" data-workspace-link="stage2">第二阶段运行中心</a>
+        </nav>
 
-        <section class="sidebar-section">
+        <button class="primary-action stage1-sidebar-only" id="newProjectButton" type="button">新建评测项目</button>
+
+        <section class="sidebar-section stage1-sidebar-only">
           <div class="sidebar-heading">
             <strong>评测项目</strong>
             <span id="projectListCount">0</span>
@@ -36,6 +41,8 @@
             <p class="toolbar-subtitle" id="pageSubtitle">把当前项目、阶段进度和最近运行放在同一块台面上。</p>
           </div>
           <div class="toolbar-actions">
+            <a class="ghost-link stage2-entry-link" href="/stage2">打开第二阶段</a>
+            <a class="ghost-link stage1-entry-link" href="/">返回第一阶段</a>
             <button class="ghost-action" id="toggleProjectFormButton" type="button">项目设置</button>
             <span class="status-pill" id="projectStatus">待创建</span>
           </div>
@@ -220,9 +227,20 @@
                 <p class="panel-note" id="stage2Summary">读取真实 run 产物、编排会话、验证矩阵和模型对比摘要。</p>
               </div>
             </div>
-            <div class="stage2-overview" id="stage2OverviewCards"></div>
-            <div class="session-list" id="stage2SessionList"></div>
-            <div class="run-list" id="stage2RunList"></div>
+            <div class="stage2-tabs" id="stage2Tabs" role="tablist" aria-label="第二阶段运行中心">
+              <button data-stage2-tab="summary" type="button">运行摘要</button>
+              <button data-stage2-tab="onboarding" type="button">新系统接入</button>
+              <button data-stage2-tab="matrix" type="button">验证矩阵</button>
+              <button data-stage2-tab="human" type="button">人工接管</button>
+            </div>
+            <div class="stage2-tab-body" id="stage2SummaryTab">
+              <div class="stage2-overview" id="stage2OverviewCards"></div>
+              <div class="session-list" id="stage2SessionList"></div>
+              <div class="run-list" id="stage2RunList"></div>
+            </div>
+            <div class="stage2-tab-body" id="stage2OnboardingTab"></div>
+            <div class="stage2-tab-body" id="stage2MatrixTab"></div>
+            <div class="stage2-tab-body" id="stage2HumanTab"></div>
           </article>
         </section>
 

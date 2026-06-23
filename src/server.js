@@ -13,6 +13,12 @@ const {
   resumeHumanTakeover
 } = require('./stage2Actions');
 const {
+  checkOperationEnvironment,
+  loadOperationCenter,
+  resolveOperationArtifact,
+  runOperationStep
+} = require('./stage2OperationCenter');
+const {
   createProject,
   updateProject,
   hydrateProject,
@@ -53,6 +59,10 @@ function sendJson(res, statusCode, payload) {
 
 function sendError(res, statusCode, message) {
   sendJson(res, statusCode, { error: message });
+}
+
+function sendOperationError(res, error) {
+  sendError(res, error.statusCode || 500, error.message || 'Stage-2 operation failed.');
 }
 
 async function readJson(req) {
@@ -112,6 +122,50 @@ async function handleApi(req, res, pathname) {
     return true;
   }
 
+  if (req.method === 'GET' && pathname === '/api/stage2/operation/state') {
+    try {
+      const operationCenter = await loadOperationCenter();
+      sendJson(res, 200, { operationCenter });
+    } catch (error) {
+      sendOperationError(res, error);
+    }
+    return true;
+  }
+
+  if (req.method === 'GET' && pathname === '/api/stage2/operation/sessions') {
+    try {
+      const operationCenter = await loadOperationCenter();
+      sendJson(res, 200, { sessions: operationCenter.sessions, operationCenter });
+    } catch (error) {
+      sendOperationError(res, error);
+    }
+    return true;
+  }
+
+  if (req.method === 'POST' && pathname === '/api/stage2/operation/check-environment') {
+    try {
+      const body = await readJson(req);
+      const result = await checkOperationEnvironment(body);
+      const overview = await loadStage2Overview();
+      sendJson(res, 200, { result, overview });
+    } catch (error) {
+      sendOperationError(res, error);
+    }
+    return true;
+  }
+
+  if (req.method === 'POST' && pathname === '/api/stage2/operation/run-step') {
+    try {
+      const body = await readJson(req);
+      const result = await runOperationStep(body);
+      const overview = await loadStage2Overview();
+      sendJson(res, 200, { result, overview });
+    } catch (error) {
+      sendOperationError(res, error);
+    }
+    return true;
+  }
+
   const stage2RunActionParams = routeMatch(pathname, '/api/stage2/runs/:runId/:action');
   if (stage2RunActionParams && req.method === 'POST') {
     const body = await readJson(req);
@@ -162,6 +216,31 @@ async function handleApi(req, res, pathname) {
       res.end(content);
     } catch {
       sendError(res, 404, 'Human-loop artifact file is unavailable.');
+    }
+    return true;
+  }
+
+  const operationArtifactParams = routeMatch(pathname, '/api/stage2/operation/artifacts/:sessionId/:artifactKey');
+  if (operationArtifactParams && req.method === 'GET') {
+    const artifact = await resolveOperationArtifact(
+      operationArtifactParams.sessionId,
+      operationArtifactParams.artifactKey
+    );
+    if (!artifact) {
+      sendError(res, 404, 'Operation artifact not found.');
+      return true;
+    }
+
+    try {
+      const content = await fs.readFile(artifact.path);
+      res.writeHead(200, {
+        'Content-Type': mimeTypes[path.extname(artifact.path).toLowerCase()] || 'application/octet-stream',
+        'Cache-Control': 'no-store',
+        'Content-Disposition': `inline; filename="${encodeURIComponent(path.basename(artifact.path))}"`
+      });
+      res.end(content);
+    } catch {
+      sendError(res, 404, 'Operation artifact file is unavailable.');
     }
     return true;
   }

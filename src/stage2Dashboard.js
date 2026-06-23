@@ -4,8 +4,12 @@ const path = require('path');
 
 const STAGE2_DIR = path.join(__dirname, '..', 'artifacts', 'stage2');
 const SESSIONS_DIR = path.join(STAGE2_DIR, 'sessions');
+const OPERATIONS_DIR = path.join(STAGE2_DIR, 'operations');
+const TEMPLATE_ROOT = path.join(__dirname, '..', 'prototype', 'stage2', 'templates');
 const RUN_DIR_PATTERN = /^\d{8}_\d{6}_.+/;
 const HUMAN_LOOP_SESSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const OPERATION_SESSION_PATTERN = /^[A-Za-z0-9_-]{1,120}$/;
+const OPERATION_ARTIFACT_KEY_PATTERN = /^[A-Za-z0-9_-]{1,120}$/;
 const TEXT_EXTENSIONS = new Set(['.json', '.jsonl', '.md', '.txt', '.log']);
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.svg']);
 const DOCUMENT_EXTENSIONS = new Set(['.pdf']);
@@ -596,6 +600,37 @@ function buildRunArtifactHref(runId, artifactKey) {
 
 function buildHumanLoopArtifactHref(sessionId, artifactKey) {
   return `/api/stage2/human-loop/${encodeURIComponent(sessionId)}/artifacts/${encodeURIComponent(artifactKey)}`;
+}
+
+function buildOperationArtifactHref(sessionId, artifactKey) {
+  return `/api/stage2/operation/artifacts/${encodeURIComponent(sessionId)}/${encodeURIComponent(artifactKey)}`;
+}
+
+function isWithinRoot(filePath, rootPath) {
+  const resolvedRoot = path.resolve(rootPath);
+  const resolvedPath = path.resolve(filePath);
+  return resolvedPath === resolvedRoot || resolvedPath.startsWith(`${resolvedRoot}${path.sep}`);
+}
+
+function safeOperationArtifactPath(filePath) {
+  if (!filePath || typeof filePath !== 'string') {
+    return null;
+  }
+
+  const resolvedPath = path.resolve(__dirname, '..', filePath);
+  if (![STAGE2_DIR, TEMPLATE_ROOT].some((root) => isWithinRoot(resolvedPath, root))) {
+    return null;
+  }
+  return resolvedPath;
+}
+
+async function fileExists(filePath) {
+  try {
+    const stat = await fs.stat(filePath);
+    return stat.isFile();
+  } catch {
+    return false;
+  }
 }
 
 async function buildStaticArtifactDescriptor({
@@ -1369,6 +1404,444 @@ async function summarizeBaselineFreezeManifest(manifest) {
   };
 }
 
+function buildOperationParamSummary(params = {}) {
+  return {
+    systemName: textOrNull(firstPresent(params.systemName, params.targetName)),
+    systemKey: textOrNull(firstPresent(params.systemKey)),
+    systemMapTemplate: textOrNull(firstPresent(params.systemMapTemplate)),
+    targetTemplate: textOrNull(firstPresent(params.targetTemplate)),
+    startUrl: textOrNull(firstPresent(params.startUrl)),
+    pageUrl: textOrNull(firstPresent(params.pageUrl)),
+    pageName: textOrNull(firstPresent(params.pageName)),
+    scenarioKind: textOrNull(firstPresent(params.scenarioKind)),
+    model: textOrNull(firstPresent(params.model)),
+    cdpUrl: textOrNull(firstPresent(params.cdpUrl)),
+    runDir: textOrNull(firstPresent(params.runDir))
+  };
+}
+
+function normalizeOperationStep(step = {}) {
+  return {
+    stepId: textOrNull(firstPresent(step.step_id, step.stepId)),
+    label: textOrNull(firstPresent(step.label)),
+    manualStep: Number(firstPresent(step.manual_step, step.manualStep, 0)) || 0,
+    status: textOrNull(firstPresent(step.status, 'unknown')),
+    startedAt: textOrNull(firstPresent(step.started_at, step.startedAt)),
+    finishedAt: textOrNull(firstPresent(step.finished_at, step.finishedAt)),
+    resultPath: textOrNull(firstPresent(step.result_path, step.resultPath)),
+    stdoutPreview: textOrNull(firstPresent(step.stdout_preview, step.stdoutPreview)),
+    stderrPreview: textOrNull(firstPresent(step.stderr_preview, step.stderrPreview)),
+    error: textOrNull(firstPresent(step.error))
+  };
+}
+
+function sortOperationSteps(steps = {}) {
+  return Object.values(steps || {})
+    .map(normalizeOperationStep)
+    .filter((step) => step.stepId)
+    .sort((left, right) => {
+      const manualOrder = Number(left.manualStep || 0) - Number(right.manualStep || 0);
+      if (manualOrder) {
+        return manualOrder;
+      }
+      return String(left.startedAt || '').localeCompare(String(right.startedAt || ''));
+    });
+}
+
+function summarizeOperationStatus(steps, lastStepId) {
+  if (!steps.length) {
+    return {
+      status: 'idle',
+      lastStepId: lastStepId || null,
+      lastStepStatus: null,
+      runningStepId: null,
+      failedStepCount: 0,
+      completedStepCount: 0
+    };
+  }
+
+  const runningStep = steps.find((step) => step.status === 'running') || null;
+  const lastStep = steps.find((step) => step.stepId === lastStepId) || steps.at(-1);
+  const failedStepCount = steps.filter((step) => step.status === 'failed').length;
+  const completedStepCount = steps.filter((step) => step.status === 'completed').length;
+  const status = runningStep
+    ? 'running'
+    : (lastStep?.status || (failedStepCount ? 'failed' : 'idle'));
+
+  return {
+    status,
+    lastStepId: lastStep?.stepId || lastStepId || null,
+    lastStepStatus: lastStep?.status || null,
+    runningStepId: runningStep?.stepId || null,
+    failedStepCount,
+    completedStepCount
+  };
+}
+
+function collectOperationPayloadPaths(payload, candidates) {
+  if (!payload || typeof payload !== 'object') {
+    return;
+  }
+
+  const add = (filePath, label, groupKey, preferredKey, description) => {
+    if (typeof filePath === 'string' && filePath.trim()) {
+      candidates.push({ filePath, label, groupKey, preferredKey, description });
+    }
+  };
+
+  for (const key of [
+    'progress_file',
+    'progress_view',
+    'page_entries',
+    'feature_points',
+    'retry_plan',
+    'discovery_strategy',
+    'routing_summary',
+    'checklist_path',
+    'markdown_path',
+    'json_path',
+    'navigation_tree_path',
+    'page_semantic_summary_path',
+    'navigation_nodes_path',
+    'discovery_result_path',
+    'screenshot_records_path',
+    'candidate_review_path',
+    'report_path'
+  ]) {
+    add(payload[key], path.basename(String(payload[key] || key)), 'evidence', key, '命令输出引用');
+  }
+
+  for (const directoryKey of ['run_dir', 'output_dir']) {
+    const directory = textOrNull(firstPresent(payload[directoryKey]));
+    if (!directory) {
+      continue;
+    }
+    for (const fileName of [
+      'validation_result.json',
+      'verification_result.json',
+      'network_events.json',
+      'routing_summary.json',
+      'discovery_strategy.json',
+      'page_entries.json',
+      'feature_points.json',
+      'discovery_result.json',
+      'navigation_tree.json',
+      'navigation_nodes.json',
+      'page_semantic_summary.json'
+    ]) {
+      add(path.join(directory, fileName), fileName, fileName.includes('validation') || fileName.includes('verification') || fileName.includes('network')
+        ? 'validation'
+        : 'discovery', `${directoryKey}_${fileName}`, '命令输出目录中的关键产物');
+    }
+  }
+
+  for (const artifact of payload.artifacts || []) {
+    add(
+      artifact?.path,
+      artifact?.label || path.basename(String(artifact?.path || 'artifact')),
+      'validation',
+      artifact?.label || path.basename(String(artifact?.path || 'artifact')),
+      '验证产物'
+    );
+  }
+}
+
+async function readOperationCommandPayloads(steps) {
+  const payloads = [];
+  for (const step of steps) {
+    const resultPath = safeOperationArtifactPath(step.resultPath);
+    if (!resultPath || !(await fileExists(resultPath))) {
+      continue;
+    }
+    const result = await readJsonIfExists(resultPath);
+    if (result?.payload && typeof result.payload === 'object') {
+      payloads.push(result.payload);
+    }
+  }
+  return payloads;
+}
+
+function buildOperationArtifactCandidates(sessionId, sessionDir, state, params, steps, commandPayloads) {
+  const classifyArtifactGroup = (filePath, fallback = 'evidence') => {
+    const fileName = path.basename(String(filePath || '')).toLowerCase();
+    if ([
+      'operation_state.json',
+      'events.jsonl'
+    ].includes(fileName) || fileName.startsWith('command_result_')) {
+      return 'operations';
+    }
+    if ([
+      'navigation_tree.json',
+      'page_semantic_summary.json',
+      'navigation_nodes.json',
+      'page_entries.json',
+      'feature_points.json',
+      'discovery_result.json',
+      'discovery_review_queue.json',
+      'routing_summary.json',
+      'discovery_strategy.json'
+    ].includes(fileName)) {
+      return 'discovery';
+    }
+    if (fileName.startsWith('template_revision_checklist')) {
+      return 'checklist';
+    }
+    if ([
+      'validation_result.json',
+      'verification_result.json',
+      'network_events.json'
+    ].includes(fileName)) {
+      return 'validation';
+    }
+    if (fileName.startsWith('latest_validation_matrix')) {
+      return 'matrix';
+    }
+    return fallback;
+  };
+
+  const candidates = [
+    {
+      groupKey: 'operations',
+      key: 'operation_state',
+      label: 'Operation State',
+      description: '新系统接入操作状态',
+      filePath: path.join(sessionDir, 'operation_state.json')
+    },
+    {
+      groupKey: 'operations',
+      key: 'events',
+      label: 'Events',
+      description: '新系统接入事件流',
+      filePath: path.join(sessionDir, 'events.jsonl')
+    }
+  ];
+
+  for (const step of steps) {
+    if (!step.resultPath) {
+      continue;
+    }
+    candidates.push({
+      groupKey: 'operations',
+      key: `command_result_${step.stepId}`,
+      label: `${step.label || step.stepId}结果`,
+      description: '步骤命令执行结果',
+      filePath: step.resultPath
+    });
+  }
+
+  for (const [key, artifact] of Object.entries(state.artifacts || {})) {
+    candidates.push({
+      groupKey: classifyArtifactGroup(artifact?.path, 'operations'),
+      key,
+      label: artifact?.label || path.basename(String(artifact?.path || key)),
+      description: '操作会话已登记产物',
+      filePath: artifact?.path
+    });
+  }
+
+  const templateNames = uniqueTexts(params.systemMapTemplate, params.targetTemplate);
+  for (const templateName of templateNames) {
+    const discoveryRoot = path.join(STAGE2_DIR, `live_discovery_${templateName}`);
+    for (const fileName of [
+      'navigation_tree.json',
+      'page_semantic_summary.json',
+      'navigation_nodes.json',
+      'page_entries.json',
+      'feature_points.json',
+      'discovery_result.json',
+      'discovery_review_queue.json',
+      'routing_summary.json',
+      'discovery_strategy.json'
+    ]) {
+      candidates.push({
+        groupKey: 'discovery',
+        label: fileName,
+        description: '系统地图 / 页面发现产物',
+        filePath: path.join(discoveryRoot, fileName),
+        preferredKey: `${templateName}_${fileName}`
+      });
+    }
+  }
+
+  const checklistTemplate = textOrNull(firstPresent(params.targetTemplate));
+  if (checklistTemplate) {
+    for (const fileName of ['template_revision_checklist.json', 'template_revision_checklist.md']) {
+      candidates.push({
+        groupKey: 'checklist',
+        label: fileName,
+        description: '模板修订清单',
+        filePath: path.join(TEMPLATE_ROOT, checklistTemplate, '_revision_checklist', fileName),
+        preferredKey: `${checklistTemplate}_${fileName}`
+      });
+    }
+  }
+
+  for (const fileName of ['latest_validation_matrix.json', 'latest_validation_matrix.md']) {
+    candidates.push({
+      groupKey: 'matrix',
+      label: fileName,
+      description: '统一验证汇总产物',
+      filePath: path.join(STAGE2_DIR, 'validation_matrix', fileName),
+      preferredKey: fileName
+    });
+  }
+
+  for (const payload of commandPayloads) {
+    collectOperationPayloadPaths(payload, candidates);
+  }
+
+  return candidates.map((candidate) => ({
+    ...candidate,
+    key: candidate.key || candidate.preferredKey || candidate.label || path.basename(String(candidate.filePath || 'artifact'))
+  }));
+}
+
+async function buildOperationArtifactGroups(sessionId, sessionDir, state, params, steps, commandPayloads) {
+  const groupOrder = [
+    { key: 'operations', label: '操作会话' },
+    { key: 'discovery', label: '发现产物' },
+    { key: 'checklist', label: '修订清单' },
+    { key: 'validation', label: '验证产物' },
+    { key: 'matrix', label: '验证矩阵' },
+    { key: 'evidence', label: '输出引用' }
+  ];
+  const groupMap = new Map(groupOrder.map((group) => [group.key, []]));
+  const usedKeys = new Set();
+  const seenPaths = new Set();
+  const nextArtifactIndex = { ...(state.artifacts || {}) };
+  let shouldPersistArtifactIndex = false;
+
+  for (const candidate of buildOperationArtifactCandidates(sessionId, sessionDir, state, params, steps, commandPayloads)) {
+    const resolvedPath = safeOperationArtifactPath(candidate.filePath);
+    if (!resolvedPath || seenPaths.has(resolvedPath) || !(await fileExists(resolvedPath))) {
+      continue;
+    }
+    const key = ensureUniqueKey(candidate.key, usedKeys);
+    if (!OPERATION_ARTIFACT_KEY_PATTERN.test(key)) {
+      continue;
+    }
+
+    seenPaths.add(resolvedPath);
+    const groupKey = groupMap.has(candidate.groupKey) ? candidate.groupKey : 'evidence';
+    const descriptor = {
+      key,
+      label: candidate.label || path.basename(resolvedPath),
+      description: candidate.description || '',
+      kind: inferArtifactKind(resolvedPath),
+      fileName: path.basename(resolvedPath),
+      href: buildOperationArtifactHref(sessionId, key),
+      path: resolvedPath
+    };
+    groupMap.get(groupKey).push(descriptor);
+
+    const indexedDescriptor = {
+      key: descriptor.key,
+      label: descriptor.label,
+      fileName: descriptor.fileName,
+      path: descriptor.path,
+      href: descriptor.href
+    };
+    const currentDescriptor = nextArtifactIndex[key] || {};
+    const currentResolvedPath = safeOperationArtifactPath(currentDescriptor.path);
+    if (
+      currentDescriptor.label !== indexedDescriptor.label
+      || currentDescriptor.fileName !== indexedDescriptor.fileName
+      || currentResolvedPath !== indexedDescriptor.path
+      || currentDescriptor.href !== indexedDescriptor.href
+    ) {
+      nextArtifactIndex[key] = indexedDescriptor;
+      shouldPersistArtifactIndex = true;
+    }
+  }
+
+  if (shouldPersistArtifactIndex) {
+    await fs.writeFile(
+      path.join(sessionDir, 'operation_state.json'),
+      JSON.stringify({ ...state, artifacts: nextArtifactIndex }, null, 2),
+      'utf8'
+    );
+  }
+
+  return groupOrder
+    .map((group) => ({
+      key: group.key,
+      label: group.label,
+      items: (groupMap.get(group.key) || []).map(toPublicArtifactDescriptor)
+    }))
+    .filter((group) => group.items.length > 0);
+}
+
+async function readOperationSession(sessionId) {
+  if (!OPERATION_SESSION_PATTERN.test(sessionId)) {
+    return null;
+  }
+
+  const sessionDir = path.join(OPERATIONS_DIR, sessionId);
+  const state = await readJsonIfExists(path.join(sessionDir, 'operation_state.json'));
+  if (!state || typeof state !== 'object') {
+    return null;
+  }
+
+  const params = state.params && typeof state.params === 'object' ? state.params : {};
+  const steps = sortOperationSteps(state.steps);
+  const statusSummary = summarizeOperationStatus(steps, textOrNull(firstPresent(state.last_step_id, state.lastStepId)));
+  const commandPayloads = await readOperationCommandPayloads(steps);
+  const artifactGroups = await buildOperationArtifactGroups(sessionId, sessionDir, state, params, steps, commandPayloads);
+
+  return {
+    sessionId: textOrNull(firstPresent(state.session_id, sessionId)),
+    createdAt: textOrNull(firstPresent(state.created_at)),
+    updatedAt: textOrNull(firstPresent(state.updated_at)),
+    status: statusSummary.status,
+    lastStepId: statusSummary.lastStepId,
+    lastStepStatus: statusSummary.lastStepStatus,
+    runningStepId: statusSummary.runningStepId,
+    failedStepCount: statusSummary.failedStepCount,
+    completedStepCount: statusSummary.completedStepCount,
+    paramsSummary: buildOperationParamSummary(params),
+    steps,
+    artifactGroups,
+    artifacts: artifactGroups.flatMap((group) => group.items)
+  };
+}
+
+async function readOperationCenterOverview() {
+  let entries = [];
+  try {
+    entries = await fs.readdir(OPERATIONS_DIR, { withFileTypes: true });
+  } catch {
+    return {
+      summary: {
+        sessionCount: 0,
+        latestSessionId: null,
+        runningCount: 0,
+        failedCount: 0,
+        completedCount: 0
+      },
+      latestSession: null,
+      sessions: []
+    };
+  }
+
+  const sessions = (await Promise.all(entries
+    .filter((entry) => entry.isDirectory() && OPERATION_SESSION_PATTERN.test(entry.name))
+    .map((entry) => readOperationSession(entry.name))))
+    .filter(Boolean)
+    .sort((left, right) => compareIsoDesc(left.updatedAt, right.updatedAt) || right.sessionId.localeCompare(left.sessionId));
+
+  return {
+    summary: {
+      sessionCount: sessions.length,
+      latestSessionId: sessions[0]?.sessionId || null,
+      runningCount: sessions.filter((session) => session.status === 'running').length,
+      failedCount: sessions.filter((session) => session.status === 'failed' || session.failedStepCount > 0).length,
+      completedCount: sessions.filter((session) => session.status === 'completed').length
+    },
+    latestSession: sessions[0] || null,
+    sessions
+  };
+}
+
 async function loadStage2Overview() {
   const [
     latestDailyReport,
@@ -1376,6 +1849,7 @@ async function loadStage2Overview() {
     latestValidationMatrix,
     latestModelComparison,
     humanLoopSummary,
+    operationCenter,
     runDirectories
   ] = await Promise.all([
     readJsonIfExists(path.join(STAGE2_DIR, 'latest_platform_daily_report.json')),
@@ -1383,6 +1857,7 @@ async function loadStage2Overview() {
     readJsonIfExists(path.join(STAGE2_DIR, 'validation_matrix', 'latest_validation_matrix.json')),
     readJsonIfExists(path.join(STAGE2_DIR, 'latest_model_comparison.json')),
     readLatestHumanLoopSummary(),
+    readOperationCenterOverview(),
     listRunDirectories()
   ]);
 
@@ -1426,6 +1901,7 @@ async function loadStage2Overview() {
     } : null,
     latestBaselineFreezeManifest: await summarizeBaselineFreezeManifest(latestBaselineFreezeManifest),
     humanLoopSummary,
+    operationCenter,
     sessionSummaries,
     runSummaries
   };

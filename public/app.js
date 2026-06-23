@@ -1,12 +1,165 @@
+const STAGE2_ONBOARDING_FORM_KEY = 'stage2_new_system_onboarding_form';
+const STAGE2_ONBOARDING_RESULTS_KEY = 'stage2_new_system_onboarding_results';
+const WORKSPACE_VIEW = window.location.pathname.replace(/\/+$/, '') === '/stage2' ? 'stage2' : 'stage1';
+
+const stage2OnboardingDefaults = {
+  systemName: '',
+  systemKeyTemplate: '',
+  homeUrl: '',
+  cdpUrl: 'http://localhost:9222',
+  targetTemplate: '',
+  pageName: '',
+  scenarioKind: 'query',
+  model: '',
+  captureSeconds: '20',
+  runDir: ''
+};
+
+const stage2OnboardingSteps = [
+  {
+    id: 1,
+    phase: 'map',
+    mode: 'executable',
+    operation: 'explore_system_map',
+    title: '先探索系统地图',
+    detail: '生成菜单/页面入口树和页面类型初分。',
+    artifacts: ['navigation_tree.json', 'page_semantic_summary.json', 'page_entries.json']
+  },
+  {
+    id: 2,
+    phase: 'map',
+    mode: 'artifact',
+    title: '检查系统地图产物',
+    detail: '确认导航树、页面类型初分和候选功能点是否可信。',
+    artifacts: ['navigation_tree.json', 'feature_points.json', 'discovery_result.json']
+  },
+  {
+    id: 3,
+    phase: 'map',
+    mode: 'manual',
+    title: '确认首批目标',
+    detail: '优先选择查询列表页、详情展示页或导航页。',
+    artifacts: ['page_semantic_summary.json', 'feature_points.json']
+  },
+  {
+    id: 4,
+    phase: 'template',
+    mode: 'executable',
+    operation: 'routing_summary',
+    title: '查看模型路由摘要',
+    detail: '确认 discovery 和 verification 会走哪种策略。',
+    artifacts: ['routing_summary.json', 'discovery_strategy.json']
+  },
+  {
+    id: 5,
+    phase: 'template',
+    mode: 'executable',
+    operation: 'bootstrap_template',
+    title: '生成最小模板骨架',
+    detail: '为目标页面固定模板目录结构。',
+    artifacts: ['template.json', 'locator_hints.json', 'baseline.json', 'data_schema.json']
+  },
+  {
+    id: 6,
+    phase: 'template',
+    mode: 'executable',
+    operation: 'live_discovery',
+    title: '执行首轮自主探索',
+    detail: '补页面入口、候选功能点和稳定文本线索。',
+    artifacts: ['page_entries.json', 'feature_points.json', 'discovery_review_queue.json']
+  },
+  {
+    id: 7,
+    phase: 'template',
+    mode: 'executable',
+    operation: 'capture_human_recording',
+    title: '补人工录制线索',
+    detail: '用于表格、弹窗和复杂交互页面的演示路径。',
+    artifacts: ['recording_summary.json', 'candidate_template_review.json', 'key_screenshots.json']
+  },
+  {
+    id: 8,
+    phase: 'template',
+    mode: 'executable',
+    operation: 'template_revision_checklist',
+    title: '生成模板修订清单',
+    detail: '把 discovery 和录制结果转成可审阅清单。',
+    artifacts: ['template_revision_checklist.json', 'template_revision_checklist.md']
+  },
+  {
+    id: 9,
+    phase: 'template',
+    mode: 'manual',
+    title: '按清单人工改模板',
+    detail: '修订 template、locator hints、baseline 和 data schema。',
+    artifacts: ['template.json', 'locator_hints.json', 'baseline.json', 'data_schema.json']
+  },
+  {
+    id: 10,
+    phase: 'validation',
+    mode: 'executable',
+    operation: 'validate_connected_template',
+    title: '执行单模板连机验证',
+    detail: '验证新系统单模板、单功能点最小闭环。',
+    artifacts: ['validation_result.json', 'verification_result.json', 'network_events.json']
+  },
+  {
+    id: 11,
+    phase: 'validation',
+    mode: 'artifact',
+    title: '检查验证产物',
+    detail: '根据状态、截图和网络事件判断失败原因。',
+    artifacts: ['validation_result.json', 'verification_result.json', 'screenshots/']
+  },
+  {
+    id: 12,
+    phase: 'validation',
+    mode: 'manual',
+    title: '失败后修订并重跑',
+    detail: '一次只改一类问题，再回到单模板连机验证。',
+    artifacts: ['locator_hints.json', 'template_revision_checklist.md']
+  },
+  {
+    id: 13,
+    phase: 'validation',
+    mode: 'executable',
+    operation: 'resume_human_takeover',
+    title: '需要人工补齐时处理',
+    detail: '录制演示或生成恢复续跑入口。',
+    artifacts: ['human_takeover.json', 'candidate_template_review.json']
+  },
+  {
+    id: 14,
+    phase: 'validation',
+    mode: 'manual',
+    title: '接入统一验证汇总',
+    detail: '把新模板接入 validation matrix 和对应回归测试。',
+    artifacts: ['validation_matrix.py', 'test_g4_validation_matrix.py']
+  },
+  {
+    id: 15,
+    phase: 'validation',
+    mode: 'executable',
+    operation: 'validation_matrix',
+    title: '查看统一验证汇总',
+    detail: '运行验证矩阵并确认新模板出现在汇总里。',
+    artifacts: ['latest_validation_matrix.json', 'latest_validation_matrix.md']
+  }
+];
+
 const state = {
   projects: [],
   currentProject: null,
   activeTab: 'analysis',
+  activeStage2Tab: 'onboarding',
   showProjectForm: false,
   pendingAction: null,
   stage2Overview: null,
   selectedRunId: null,
-  selectedSessionId: null
+  selectedSessionId: null,
+  onboardingOperationSessionId: null,
+  onboardingForm: loadStage2OnboardingForm(),
+  onboardingStepResults: loadStage2OnboardingStepResults()
 };
 
 const AUTO_REFRESH_MS = 15000;
@@ -33,6 +186,112 @@ async function api(path, options = {}) {
     throw new Error(payload.error || '请求失败');
   }
   return payload;
+}
+
+function loadStage2OnboardingForm() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(STAGE2_ONBOARDING_FORM_KEY) || '{}');
+    return { ...stage2OnboardingDefaults, ...saved };
+  } catch {
+    return { ...stage2OnboardingDefaults };
+  }
+}
+
+function saveStage2OnboardingForm() {
+  localStorage.setItem(STAGE2_ONBOARDING_FORM_KEY, JSON.stringify(state.onboardingForm));
+}
+
+function loadStage2OnboardingStepResults() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(STAGE2_ONBOARDING_RESULTS_KEY) || '{}');
+    return saved && typeof saved === 'object' ? saved : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveStage2OnboardingStepResults() {
+  localStorage.setItem(STAGE2_ONBOARDING_RESULTS_KEY, JSON.stringify(state.onboardingStepResults));
+}
+
+function updateStage2OnboardingField(name, value) {
+  state.onboardingForm[name] = value;
+  saveStage2OnboardingForm();
+  renderStage2Overview();
+}
+
+function getStage2OnboardingParameters() {
+  const form = state.onboardingForm;
+  return {
+    systemName: form.systemName.trim(),
+    systemKeyTemplate: form.systemKeyTemplate.trim(),
+    homeUrl: form.homeUrl.trim(),
+    targetName: form.systemName.trim(),
+    systemKey: form.systemKeyTemplate.trim(),
+    systemMapTemplate: form.systemKeyTemplate.trim() ? `${form.systemKeyTemplate.trim()}_system_map` : '',
+    startUrl: form.homeUrl.trim(),
+    pageUrl: form.homeUrl.trim(),
+    cdpUrl: form.cdpUrl.trim(),
+    targetTemplate: form.targetTemplate.trim(),
+    pageName: form.pageName.trim(),
+    scenarioKind: form.scenarioKind.trim(),
+    model: form.model.trim(),
+    captureSeconds: Number(form.captureSeconds) || 0,
+    runDir: form.runDir.trim()
+  };
+}
+
+function getStage2OperationSessionId() {
+  return state.onboardingOperationSessionId;
+}
+
+function operationArtifactHref(sessionId, artifactKey) {
+  if (!sessionId || !artifactKey) {
+    return null;
+  }
+  return `/api/stage2/operation/artifacts/${encodeURIComponent(sessionId)}/${encodeURIComponent(artifactKey)}`;
+}
+
+function getStage2StepParams(step) {
+  const params = getStage2OnboardingParameters();
+  const templateName = step.id === 1 ? params.systemMapTemplate : params.targetTemplate;
+  return {
+    ...params,
+    templateName,
+    pageUrl: step.id === 1 ? params.startUrl : params.pageUrl,
+    recordingSession: params.systemKey ? `${params.systemKey}_recording` : '',
+    recordingUrl: params.pageUrl || params.startUrl,
+    operatorId: 'run_center',
+    maxAttempts: 3,
+    maxRounds: 1
+  };
+}
+
+function requiredFieldsForStage2Step(step) {
+  if (step.id === 1) {
+    return ['systemName', 'systemKeyTemplate', 'homeUrl', 'cdpUrl'];
+  }
+  if (step.id === 5) {
+    return ['targetTemplate', 'homeUrl', 'pageName', 'scenarioKind'];
+  }
+  if (step.id === 13) {
+    return ['runDir', 'cdpUrl'];
+  }
+  if ([6, 7, 10].includes(step.id)) {
+    return ['targetTemplate', 'cdpUrl'];
+  }
+  if ([4, 8].includes(step.id)) {
+    return ['targetTemplate'];
+  }
+  if (step.id === 15) {
+    return ['cdpUrl'];
+  }
+  return [];
+}
+
+function missingFieldsForStage2Step(step) {
+  const parameters = getStage2OnboardingParameters();
+  return requiredFieldsForStage2Step(step).filter((field) => !parameters[field]);
 }
 
 function getFormValue() {
@@ -185,7 +444,161 @@ async function runStage2RunAction(runId, action, body, successMessage) {
   }
 }
 
+async function runStage2OperationStep(stepId) {
+  const step = stage2OnboardingSteps.find((item) => item.id === Number(stepId));
+  if (!step || step.mode !== 'executable') {
+    return;
+  }
+
+  const missingFields = missingFieldsForStage2Step(step);
+  if (missingFields.length) {
+    saveState.textContent = '请先补齐向导参数';
+    state.onboardingStepResults[step.id] = {
+      status: 'blocked',
+      message: `缺少参数：${missingFields.join(', ')}`,
+      updatedAt: new Date().toISOString()
+    };
+    saveStage2OnboardingStepResults();
+    renderStage2Overview();
+    return;
+  }
+
+  const actionKey = `stage2-onboarding-${step.id}`;
+  state.pendingAction = actionKey;
+  state.onboardingStepResults[step.id] = {
+    status: 'running',
+    message: '正在提交到运行中心',
+    updatedAt: new Date().toISOString()
+  };
+  saveStage2OnboardingStepResults();
+  saveState.textContent = '处理中';
+  render();
+
+  try {
+    const payload = await api('/api/stage2/operation/run-step', {
+      method: 'POST',
+      body: JSON.stringify({
+        source: 'run_center_new_system_onboarding',
+        stepId: step.operation,
+        sessionId: getStage2OperationSessionId(),
+        params: getStage2StepParams(step)
+      })
+    });
+    if (payload.overview) {
+      state.stage2Overview = payload.overview;
+      syncSelectedRun();
+    }
+    const result = payload.stepResult || payload.result || {};
+    const commandResult = result.result || result;
+    const session = result.session || null;
+    if (session?.sessionId) {
+      state.onboardingOperationSessionId = session.sessionId;
+    }
+    state.onboardingStepResults[step.id] = {
+      status: commandResult.status || 'submitted',
+      message: commandResult.error || commandResult.stderrPreview || commandResult.stdoutPreview || '已提交运行中心',
+      runId: commandResult.parsedStdout?.run_dir || commandResult.runId || commandResult.run_id || null,
+      artifactHref: result.session?.sessionId
+        ? operationArtifactHref(result.session.sessionId, `command_result_${step.operation}_json`)
+        : (commandResult.artifacts?.result?.href || result.artifactHref || result.artifact_href || null),
+      artifacts: session?.artifacts || result.artifacts || [],
+      updatedAt: commandResult.finishedAt || commandResult.updatedAt || commandResult.updated_at || new Date().toISOString()
+    };
+    saveStage2OnboardingStepResults();
+    saveState.textContent = '已提交步骤';
+    render();
+  } catch (error) {
+    state.onboardingStepResults[step.id] = {
+      status: 'failed',
+      message: error.message,
+      updatedAt: new Date().toISOString()
+    };
+    saveStage2OnboardingStepResults();
+    saveState.textContent = error.message;
+    render();
+  } finally {
+    state.pendingAction = null;
+    render();
+  }
+}
+
+async function runStage2EnvironmentCheck() {
+  const actionKey = 'stage2-onboarding-environment';
+  state.pendingAction = actionKey;
+  state.onboardingStepResults.check_environment = {
+    status: 'running',
+    message: '正在检查 Python、Stage-2 入口和本机 CDP',
+    updatedAt: new Date().toISOString()
+  };
+  saveStage2OnboardingStepResults();
+  saveState.textContent = '检查环境中';
+  render();
+
+  try {
+    const payload = await api('/api/stage2/operation/check-environment', {
+      method: 'POST',
+      body: JSON.stringify({
+        source: 'run_center_new_system_onboarding',
+        sessionId: getStage2OperationSessionId(),
+        params: getStage2OnboardingParameters()
+      })
+    });
+    if (payload.overview) {
+      state.stage2Overview = payload.overview;
+      syncSelectedRun();
+    }
+    const result = payload.result || {};
+    const commandResult = result.result || result;
+    const session = result.session || null;
+    if (session?.sessionId) {
+      state.onboardingOperationSessionId = session.sessionId;
+    }
+    const checkSummary = commandResult.parsedStdout?.checks
+      ? Object.entries(commandResult.parsedStdout.checks)
+        .map(([key, value]) => `${key}:${value.ok ? 'ok' : 'fail'}`)
+        .join(' · ')
+      : commandResult.stderrPreview;
+    state.onboardingStepResults.check_environment = {
+      status: commandResult.status || 'submitted',
+      message: checkSummary || '环境检查已完成',
+      artifactHref: session?.sessionId ? operationArtifactHref(session.sessionId, 'command_result_check_environment_json') : null,
+      updatedAt: commandResult.finishedAt || new Date().toISOString()
+    };
+    saveStage2OnboardingStepResults();
+    saveState.textContent = '环境检查完成';
+    render();
+  } catch (error) {
+    state.onboardingStepResults.check_environment = {
+      status: 'failed',
+      message: error.message,
+      updatedAt: new Date().toISOString()
+    };
+    saveStage2OnboardingStepResults();
+    saveState.textContent = error.message;
+    render();
+  } finally {
+    state.pendingAction = null;
+    render();
+  }
+}
+
+function confirmStage2OnboardingStep(stepId) {
+  const step = stage2OnboardingSteps.find((item) => item.id === Number(stepId));
+  if (!step || step.mode === 'executable') {
+    return;
+  }
+  state.onboardingStepResults[step.id] = {
+    status: 'confirmed',
+    message: step.mode === 'artifact' ? '已查看产物并确认' : '已完成人工确认',
+    updatedAt: new Date().toISOString()
+  };
+  saveStage2OnboardingStepResults();
+  saveState.textContent = '已记录确认';
+  renderStage2Overview();
+}
+
 function render() {
+  renderWorkspaceChrome();
   renderProjectList();
   renderProjectHeader();
   renderPipeline();
@@ -197,6 +610,13 @@ function render() {
   renderStage2Overview();
   renderStage2RunDetail();
   renderTabs();
+}
+
+function renderWorkspaceChrome() {
+  document.body.dataset.workspace = WORKSPACE_VIEW;
+  document.querySelectorAll('[data-workspace-link]').forEach((link) => {
+    link.classList.toggle('active', link.dataset.workspaceLink === WORKSPACE_VIEW);
+  });
 }
 
 function renderProjectList() {
@@ -221,6 +641,35 @@ function renderProjectList() {
 function renderProjectHeader() {
   const project = state.currentProject;
   const runCenter = getProjectRunCenter(project);
+  const eyebrow = document.querySelector('.eyebrow');
+  if (WORKSPACE_VIEW === 'stage2') {
+    if (eyebrow) {
+      eyebrow.textContent = '第二阶段 Python 执行子系统';
+    }
+    pageTitle.textContent = '第二阶段运行中心';
+    pageSubtitle.textContent = '新系统接入、验证矩阵、人工接管和运行产物在这里独立操作。';
+    projectStatus.textContent = state.stage2Overview ? '已接入' : '待读取';
+    projectStatus.className = `status-pill ${state.stage2Overview ? 'success' : 'warning'}`;
+  } else if (eyebrow) {
+    eyebrow.textContent = '第一阶段需求驱动评测';
+  }
+
+  if (WORKSPACE_VIEW === 'stage2') {
+    document.title = '第二阶段运行中心 - aut_agent';
+  } else {
+    document.title = 'aut_agent 软件自动化评测平台';
+  }
+
+  if (WORKSPACE_VIEW === 'stage2') {
+    document.querySelector('#currentPhaseLabel').textContent = runCenter.currentPhaseLabel;
+    document.querySelector('#currentStepLabel').textContent = runCenter.currentStepLabel;
+    document.querySelector('#currentObjectLabel').textContent = runCenter.currentObjectLabel || '未选择项目';
+    document.querySelector('#currentRoundLabel').textContent = runCenter.roundLabel;
+    document.querySelector('#nextActionLabel').textContent = runCenter.nextAction;
+    document.querySelector('#lastUpdatedLabel').textContent = formatDate(project?.updatedAt || runCenter.latestEventAt, true);
+    return;
+  }
+
   pageTitle.textContent = project ? project.name : '自动化测试运行中心';
   pageSubtitle.textContent = project
     ? `${project.sut?.name || '待补充系统'} · ${runCenter.currentPhaseLabel} · ${runCenter.currentStepLabel}`
@@ -332,6 +781,21 @@ function renderEventList() {
 }
 
 function renderStage2Overview() {
+  document.querySelectorAll('[data-stage2-tab]').forEach((button) => {
+    button.classList.toggle('active', button.dataset.stage2Tab === state.activeStage2Tab);
+  });
+  document.querySelectorAll('.stage2-tab-body').forEach((body) => {
+    body.classList.remove('active');
+  });
+  document.querySelector(`#stage2${state.activeStage2Tab[0].toUpperCase()}${state.activeStage2Tab.slice(1)}Tab`)?.classList.add('active');
+
+  renderStage2SummaryTab();
+  renderStage2OnboardingTab();
+  renderStage2MatrixTab();
+  renderStage2HumanTab();
+}
+
+function renderStage2SummaryTab() {
   const overview = state.stage2Overview;
   const summaryNode = document.querySelector('#stage2Summary');
   const cards = document.querySelector('#stage2OverviewCards');
@@ -563,6 +1027,226 @@ function renderStage2Overview() {
       </div>
     </button>
   `).join('');
+}
+
+function renderStage2OnboardingTab() {
+  const container = document.querySelector('#stage2OnboardingTab');
+  const form = state.onboardingForm;
+  const environmentResult = state.onboardingStepResults.check_environment;
+  const operationSessionId = getStage2OperationSessionId() || state.stage2Overview?.operationCenter?.currentSession?.sessionId;
+  const checkingEnvironment = state.pendingAction === 'stage2-onboarding-environment';
+  const phaseCounts = stage2OnboardingSteps.reduce((counts, step) => {
+    const result = state.onboardingStepResults[step.id];
+    if (result?.status === 'confirmed' || result?.status === 'submitted' || result?.status === 'passed' || result?.status === 'completed') {
+      counts[step.phase] += 1;
+    }
+    return counts;
+  }, { map: 0, template: 0, validation: 0 });
+  const phaseMeta = [
+    ['map', '系统地图', '先确认入口结构和页面类型', 3],
+    ['template', '模板收敛', '把低风险页面收敛成可复用模板', 6],
+    ['validation', '验证与汇总', '连机验证后接入统一汇总', 6]
+  ];
+
+  container.innerHTML = `
+    <section class="onboarding-layout">
+      <form class="onboarding-form" id="stage2OnboardingForm">
+        <div class="onboarding-form-head">
+          <div>
+            <p class="section-kicker">新系统接入</p>
+            <h3>三段式向导</h3>
+            <p class="panel-note">先看系统地图，再收敛模板，最后做连机验证和统一汇总。</p>
+          </div>
+          <div class="inline-actions">
+            <button class="ghost-action compact-action" data-onboarding-check-env type="button" ${checkingEnvironment ? 'disabled' : ''}>
+              ${checkingEnvironment ? '检查中...' : '检查环境'}
+            </button>
+            <button class="ghost-action compact-action" data-onboarding-reset type="button">清空状态</button>
+          </div>
+        </div>
+        <div class="onboarding-field-grid">
+          ${renderOnboardingField('systemName', '系统名称', form.systemName, '公交业务系统')}
+          ${renderOnboardingField('systemKeyTemplate', 'system key/template', form.systemKeyTemplate, 'bus_system_map')}
+          ${renderOnboardingField('homeUrl', '首页 URL', form.homeUrl, 'https://example.com/home', 'url')}
+          ${renderOnboardingField('cdpUrl', 'CDP URL', form.cdpUrl, 'http://localhost:9222', 'url')}
+          ${renderOnboardingField('targetTemplate', '目标模板', form.targetTemplate, 'bus_station_query_reset')}
+          ${renderOnboardingField('pageName', '页面名', form.pageName, '班线查询页')}
+          <label>
+            scenario kind
+            <select name="scenarioKind">
+              ${['query', 'detail', 'navigation', 'create', 'edit', 'generic'].map((value) => `
+                <option value="${value}" ${form.scenarioKind === value ? 'selected' : ''}>${value}</option>
+              `).join('')}
+            </select>
+          </label>
+          ${renderOnboardingField('model', 'model', form.model, '可留空使用默认 profile')}
+          ${renderOnboardingField('captureSeconds', 'capture seconds', form.captureSeconds, '20', 'number')}
+          ${renderOnboardingField('runDir', '接管 run dir（可选）', form.runDir, 'artifacts/stage2/runs/<run_dir>')}
+        </div>
+        <div class="onboarding-session-strip">
+          <span>Operation Session</span>
+          <strong>${escapeHtml(operationSessionId || '尚未创建')}</strong>
+          ${environmentResult ? `<em class="${verdictClass(environmentResult.status)}">${escapeHtml(statusLabel(environmentResult.status))}</em>` : ''}
+          ${environmentResult?.artifactHref ? `<a class="inline-link compact-link" href="${escapeHtml(environmentResult.artifactHref)}" target="_blank" rel="noreferrer">环境检查结果</a>` : ''}
+        </div>
+      </form>
+
+      <section class="onboarding-phase-strip" aria-label="接入阶段">
+        ${phaseMeta.map(([key, title, note, total]) => `
+          <article class="onboarding-phase ${key}">
+            <span>${escapeHtml(title)}</span>
+            <strong>${escapeHtml(String(phaseCounts[key]))}/${escapeHtml(String(total))}</strong>
+            <p>${escapeHtml(note)}</p>
+          </article>
+        `).join('')}
+      </section>
+
+      <section class="onboarding-steps">
+        ${phaseMeta.map(([key, title]) => `
+          <div class="onboarding-step-group">
+            <h3>${escapeHtml(title)}</h3>
+            <div class="onboarding-step-list">
+              ${stage2OnboardingSteps.filter((step) => step.phase === key).map(renderOnboardingStepCard).join('')}
+            </div>
+          </div>
+        `).join('')}
+      </section>
+    </section>
+  `;
+}
+
+function renderOnboardingField(name, label, value, placeholder, type = 'text') {
+  return `
+    <label>
+      ${escapeHtml(label)}
+      <input name="${escapeHtml(name)}" type="${escapeHtml(type)}" value="${escapeHtml(value)}" placeholder="${escapeHtml(placeholder)}">
+    </label>
+  `;
+}
+
+function renderOnboardingStepCard(step) {
+  const result = state.onboardingStepResults[step.id] || {};
+  const status = result.status || (step.mode === 'executable' ? 'ready' : 'manual');
+  const missingFields = step.mode === 'executable' ? missingFieldsForStage2Step(step) : [];
+  const running = state.pendingAction === `stage2-onboarding-${step.id}`;
+  const buttonLabel = step.mode === 'executable'
+    ? (running ? '执行中...' : '执行步骤')
+    : (step.mode === 'artifact' ? '标记已查看' : '标记已确认');
+  const modeLabel = {
+    executable: '可执行',
+    manual: '人工确认',
+    artifact: '产物查看'
+  }[step.mode];
+
+  return `
+    <article class="onboarding-step-card ${step.mode} ${status}">
+      <header>
+        <span class="step-number">${escapeHtml(String(step.id).padStart(2, '0'))}</span>
+        <div>
+          <strong>${escapeHtml(step.title)}</strong>
+          <p>${escapeHtml(step.detail)}</p>
+        </div>
+      </header>
+      <div class="tag-row">
+        <span class="tag ${step.mode === 'executable' ? 'passed' : 'manual'}">${escapeHtml(modeLabel)}</span>
+        <span class="tag ${verdictClass(status)}">${escapeHtml(statusLabel(status))}</span>
+        ${missingFields.length ? `<span class="tag warning">缺少 ${escapeHtml(String(missingFields.length))} 项</span>` : ''}
+      </div>
+      ${renderArtifactChips(step.artifacts)}
+      ${result.message ? `<p class="inline-note">${escapeHtml(result.message)}</p>` : ''}
+      ${result.runId ? `<p class="inline-note">Run：${escapeHtml(result.runId)}</p>` : ''}
+      <div class="inline-actions">
+        <button
+          class="ghost-action compact-action"
+          data-onboarding-step="${escapeHtml(String(step.id))}"
+          data-onboarding-action="${step.mode === 'executable' ? 'run' : 'confirm'}"
+          type="button"
+          ${(running || (step.mode === 'executable' && missingFields.length)) ? 'disabled' : ''}
+        >${escapeHtml(buttonLabel)}</button>
+        ${result.artifactHref ? `<a class="inline-link compact-link" href="${escapeHtml(result.artifactHref)}" target="_blank" rel="noreferrer">打开产物</a>` : ''}
+      </div>
+    </article>
+  `;
+}
+
+function renderArtifactChips(artifacts = []) {
+  if (!artifacts.length) {
+    return '';
+  }
+  return `
+    <div class="artifact-chip-row">
+      ${artifacts.map((artifact) => `<span>${escapeHtml(artifact)}</span>`).join('')}
+    </div>
+  `;
+}
+
+function renderStage2MatrixTab() {
+  const container = document.querySelector('#stage2MatrixTab');
+  const matrix = state.stage2Overview?.latestValidationMatrix;
+  if (!matrix) {
+    container.innerHTML = `
+      <div class="stage2-guidance-empty">
+        <strong>验证矩阵尚未生成</strong>
+        <p>新系统模板稳定后，在“新系统接入”的第 15 步运行统一验证汇总。</p>
+      </div>
+    `;
+    return;
+  }
+
+  const facts = [
+    ['目标数', matrix.targetCount],
+    ['已执行', matrix.executedCount],
+    ['通过', matrix.passedCount],
+    ['失败', matrix.failedCount],
+    ['跳过', matrix.skippedCount]
+  ];
+  container.innerHTML = `
+    <section class="stage2-tab-section">
+      <div class="stage2-overview compact-overview">
+        ${facts.map(([label, value]) => `
+          <article class="overview-fact">
+            <span>${escapeHtml(label)}</span>
+            <strong>${escapeHtml(String(value ?? '-'))}</strong>
+          </article>
+        `).join('')}
+      </div>
+      ${renderInlineArtifactLinks(matrix.artifacts || [], '暂无验证矩阵产物链接。')}
+    </section>
+  `;
+}
+
+function renderStage2HumanTab() {
+  const container = document.querySelector('#stage2HumanTab');
+  const overview = state.stage2Overview;
+  const waitingSessions = (overview?.sessionSummaries || []).filter((session) => session.waitingHuman);
+  const waitingRuns = (overview?.runSummaries || []).filter((run) => run.humanTakeover?.status && run.humanTakeover.status !== 'none');
+  if (!overview || (!waitingSessions.length && !waitingRuns.length)) {
+    container.innerHTML = `
+      <div class="stage2-guidance-empty">
+        <strong>当前没有待人工接管项</strong>
+        <p>如果新系统需要登录、切页面或补前置数据，可在向导第 13 步生成处理入口。</p>
+      </div>
+    `;
+    return;
+  }
+
+  container.innerHTML = `
+    <section class="human-tab-grid">
+      ${waitingRuns.map((run) => `
+        <article class="human-task-row">
+          <header>
+            <strong>${escapeHtml(run.templateName || run.runId)}</strong>
+            <span class="tag manual">${escapeHtml(statusLabel(run.humanTakeover.status || 'needs_review'))}</span>
+          </header>
+          <p>${escapeHtml(run.waitingReason || run.humanTakeover.waitingReason || run.latestMessage || '等待人工处理')}</p>
+          <div class="inline-actions">
+            <button class="ghost-action compact-action" data-run-id="${escapeHtml(run.runId)}" type="button">查看 Run</button>
+            ${run.actionCenter?.resumeCommand ? `<button class="ghost-action compact-action" data-copy-command="${escapeHtml(run.actionCenter.resumeCommand)}" type="button">复制恢复命令</button>` : ''}
+          </div>
+        </article>
+      `).join('')}
+    </section>
+  `;
 }
 
 function renderStage2RunDetail() {
@@ -1275,6 +1959,11 @@ function statusLabel(value = '') {
     warning: '注意',
     none: '无',
     unknown: '未知',
+    ready: '待执行',
+    manual: '待确认',
+    submitted: '已提交',
+    confirmed: '已确认',
+    blocked: '待补参数',
     '-': '-'
   };
   return labels[value] || value || '未知';
@@ -1368,6 +2057,12 @@ function stageLabel(value = '') {
     reporting: '报告',
     retry: '重试',
     submit: '提交',
+    ready: '待执行',
+    manual: '待确认',
+    submitted: '已提交',
+    confirmed: '已确认',
+    running: '执行中',
+    blocked: '待补参数',
     '-': '-'
   };
   return labels[value] || value || '-';
@@ -1458,6 +2153,77 @@ document.querySelector('.tabs').addEventListener('click', (event) => {
   }
 });
 
+document.querySelector('#stage2Tabs').addEventListener('click', (event) => {
+  const button = event.target.closest('[data-stage2-tab]');
+  if (!button) {
+    return;
+  }
+  state.activeStage2Tab = button.dataset.stage2Tab;
+  renderStage2Overview();
+});
+
+document.querySelector('#stage2OnboardingTab').addEventListener('input', (event) => {
+  const field = event.target.closest('[name]');
+  if (!field || !(field.name in state.onboardingForm)) {
+    return;
+  }
+  state.onboardingForm[field.name] = field.value;
+  saveStage2OnboardingForm();
+});
+
+document.querySelector('#stage2OnboardingTab').addEventListener('change', (event) => {
+  const field = event.target.closest('[name]');
+  if (!field || !(field.name in state.onboardingForm)) {
+    return;
+  }
+  updateStage2OnboardingField(field.name, field.value);
+});
+
+document.querySelector('#stage2OnboardingTab').addEventListener('click', (event) => {
+  const resetButton = event.target.closest('[data-onboarding-reset]');
+  if (resetButton) {
+    state.onboardingForm = { ...stage2OnboardingDefaults };
+    state.onboardingStepResults = {};
+    state.onboardingOperationSessionId = null;
+    saveStage2OnboardingForm();
+    saveStage2OnboardingStepResults();
+    saveState.textContent = '向导状态已清空';
+    renderStage2Overview();
+    return;
+  }
+
+  const checkEnvironmentButton = event.target.closest('[data-onboarding-check-env]');
+  if (checkEnvironmentButton) {
+    runStage2EnvironmentCheck();
+    return;
+  }
+
+  const stepButton = event.target.closest('[data-onboarding-step][data-onboarding-action]');
+  if (!stepButton) {
+    return;
+  }
+  if (stepButton.dataset.onboardingAction === 'run') {
+    runStage2OperationStep(stepButton.dataset.onboardingStep);
+    return;
+  }
+  confirmStage2OnboardingStep(stepButton.dataset.onboardingStep);
+});
+
+document.querySelector('#stage2HumanTab').addEventListener('click', (event) => {
+  const copyButton = event.target.closest('[data-copy-command]');
+  if (copyButton) {
+    copyText(copyButton.dataset.copyCommand, '恢复命令已复制');
+    return;
+  }
+  const runButton = event.target.closest('[data-run-id]');
+  if (runButton) {
+    state.selectedRunId = runButton.dataset.runId;
+    syncSelectedSession();
+    renderStage2Overview();
+    renderStage2RunDetail();
+  }
+});
+
 stage2RunList.addEventListener('click', (event) => {
   const button = event.target.closest('[data-run-id]');
   if (button) {
@@ -1468,6 +2234,12 @@ stage2RunList.addEventListener('click', (event) => {
 });
 
 stage2SessionList.addEventListener('click', (event) => {
+  const copyButton = event.target.closest('[data-copy-command]');
+  if (copyButton) {
+    copyText(copyButton.dataset.copyCommand, '恢复命令已复制');
+    return;
+  }
+
   const sessionButton = event.target.closest('[data-session-id]');
   if (sessionButton) {
     state.selectedSessionId = sessionButton.dataset.sessionId;
