@@ -11,7 +11,11 @@ if str(ROOT_DIR) not in sys.path:
 
 from prototype.stage2.app.runtime.template_bootstrap import bootstrap_template_bundle  # noqa: E402
 from prototype.stage2.app.runtime.templates import load_template_bundle  # noqa: E402
-from prototype.stage2.main import bootstrap_template, list_templates  # noqa: E402
+from prototype.stage2.main import (  # noqa: E402
+    bootstrap_system_exploration_template,
+    bootstrap_template,
+    list_templates,
+)
 
 
 def test_bootstrap_template_bundle_creates_minimal_scaffold() -> None:
@@ -90,3 +94,22 @@ def test_main_bootstrap_template_and_list_templates_support_scaffolded_template(
         persisted = json.loads(Path(payload["template_path"]).read_text(encoding="utf-8"))
         assert persisted["bootstrap"]["status"] == "draft_needs_discovery_review"
         assert persisted["execution_path"] == "bootstrap_detail"
+
+
+def test_bootstrap_system_exploration_template_creates_navigation_seed(monkeypatch) -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        template_root = Path(tmpdir)
+        import prototype.stage2.main as stage2_main
+
+        monkeypatch.setattr(stage2_main, "TEMPLATE_ROOT", template_root)
+        payload = bootstrap_system_exploration_template(
+            target_name="公交业务系统",
+            start_url="https://example.com/home",
+        )
+
+        assert payload["template"].endswith("_system_map")
+        assert payload["mode"] == "system_map_bootstrap"
+        assert Path(payload["template_path"]).exists()
+        persisted = json.loads(Path(payload["template_path"]).read_text(encoding="utf-8"))
+        assert persisted["feature_point"]["type"] == "导航"
+        assert persisted["page_entry"]["name"] == "公交业务系统系统入口"

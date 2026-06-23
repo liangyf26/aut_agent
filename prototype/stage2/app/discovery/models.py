@@ -25,6 +25,11 @@ class PageEntryRecord:
     parent_page_entry_id: str | None = None
     source_page_entry_id: str | None = None
     source_action_type: str | None = None
+    entry_role: str = "seed_entry"
+    semantic_page_type: str = ""
+    semantic_page_type_confidence: str = "unknown"
+    semantic_subtypes: list[str] = field(default_factory=list)
+    review_reasons: list[str] = field(default_factory=list)
     execution_path: str | None = None
     evidence: dict[str, Any] = field(default_factory=dict)
 
@@ -79,6 +84,9 @@ class DiscoveryResult:
     page_entries: list[PageEntryRecord]
     feature_points: list[FeaturePointRecord]
     screenshot_records: list[ScreenshotRecord]
+    navigation_tree: list[dict[str, Any]] = field(default_factory=list)
+    page_semantic_summary: list[dict[str, Any]] = field(default_factory=list)
+    navigation_nodes: list[dict[str, Any]] = field(default_factory=list)
     review_queue: list[dict[str, Any]] = field(default_factory=list)
     review_hints: dict[str, Any] = field(default_factory=dict)
     stats: dict[str, Any] = field(default_factory=dict)
@@ -92,6 +100,9 @@ class DiscoveryResult:
             "page_entries": [item.to_dict() for item in self.page_entries],
             "feature_points": [item.to_dict() for item in self.feature_points],
             "screenshot_records": [item.to_dict() for item in self.screenshot_records],
+            "navigation_tree": list(self.navigation_tree),
+            "page_semantic_summary": list(self.page_semantic_summary),
+            "navigation_nodes": list(self.navigation_nodes),
             "review_queue": list(self.review_queue),
             "review_hints": dict(self.review_hints),
             "stats": dict(self.stats),
@@ -118,6 +129,15 @@ class DiscoveryResult:
                 ScreenshotRecord(**item)
                 for item in payload.get("screenshot_records", [])
                 if isinstance(item, dict)
+            ],
+            navigation_tree=[
+                item for item in payload.get("navigation_tree", []) if isinstance(item, dict)
+            ],
+            page_semantic_summary=[
+                item for item in payload.get("page_semantic_summary", []) if isinstance(item, dict)
+            ],
+            navigation_nodes=[
+                item for item in payload.get("navigation_nodes", []) if isinstance(item, dict)
             ],
             review_queue=[
                 item for item in payload.get("review_queue", []) if isinstance(item, dict)

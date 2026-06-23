@@ -223,6 +223,9 @@ def _build_page_entry_patch(
             "discovery_title": _text((first_entry.get("evidence") or {}).get("title")),
             "discovery_source": _text(first_entry.get("source")),
             "current_template_url": _text(current_page_entry.get("url")),
+            "semantic_page_type": _text(first_entry.get("semantic_page_type")),
+            "semantic_page_type_confidence": _text(first_entry.get("semantic_page_type_confidence")),
+            "entry_role": _text(first_entry.get("entry_role")),
         },
     }
 
@@ -424,6 +427,17 @@ def _build_review_items(
                 "detail": f"当前值为 {current_page_name or '空'}，建议改为 {suggested_page_name}。",
                 "target_file": "template.json",
                 "status": "needs_review",
+            }
+        )
+    semantic_page_type = _text((page_entry_patch.get("evidence") or {}).get("semantic_page_type"))
+    semantic_confidence = _text((page_entry_patch.get("evidence") or {}).get("semantic_page_type_confidence"))
+    if semantic_page_type:
+        items.append(
+            {
+                "title": "确认页面语义初分",
+                "detail": f"discovery 当前把该页面初分为 {semantic_page_type}（confidence={semantic_confidence or 'unknown'}），请确认模板是否应该收敛在这个页面类型上。",
+                "target_file": "template.json",
+                "status": "needs_review" if semantic_confidence != "high" else "ready",
             }
         )
     current_feature_name = _text((bundle.template.get("feature_point") or {}).get("name"))

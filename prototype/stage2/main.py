@@ -110,6 +110,39 @@ def bootstrap_template(
     }
 
 
+def bootstrap_system_exploration_template(
+    *,
+    target_name: str,
+    start_url: str,
+    template_name: str = "",
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    normalized_target_name = str(target_name or "").strip() or "新系统页面"
+    normalized_start_url = str(start_url or "").strip()
+    if not normalized_start_url:
+        raise ValueError("start_url 不能为空。")
+    resolved_template_name = str(template_name or "").strip() or _default_system_map_template_name(
+        normalized_target_name
+    )
+    payload = bootstrap_template(
+        resolved_template_name,
+        page_url=normalized_start_url,
+        page_name=f"{normalized_target_name}系统入口",
+        feature_name=f"{normalized_target_name}系统地图探索",
+        feature_type="导航",
+        scenario_kind="navigation",
+        overwrite=overwrite,
+    )
+    payload["target_name"] = normalized_target_name
+    payload["mode"] = "system_map_bootstrap"
+    payload["recommended_next_steps"] = [
+        "python -m prototype.stage2.main --routing-summary --template <template_name>",
+        "python -m prototype.stage2.main --explore-system-map --template <template_name> --cdp-url http://localhost:9222",
+        "python -m prototype.stage2.main --template-revision-checklist --template <template_name>",
+    ]
+    return payload
+
+
 def generate_template_revision_checklist(
     template_name: str,
     *,
@@ -154,6 +187,12 @@ def _find_latest_candidate_review_for_template(template_name: str) -> Path | Non
     if not candidates:
         return None
     return sorted(candidates, reverse=True)[0]
+
+
+def _default_system_map_template_name(target_name: str) -> str:
+    normalized = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(target_name or "").strip())
+    normalized = normalized.strip("_")
+    return f"{normalized or 'new_system'}_system_map"
 
 
 def initialize_runs(template_name: str) -> list[dict[str, str]]:
@@ -840,7 +879,13 @@ async def run_live_discovery(
                     "page_entries_path": str(completed_paths["page_entries"]),
                     "feature_points_path": str(completed_paths["feature_points"]),
                     "screenshot_records_path": str(completed_paths["screenshot_records"]),
+                    "navigation_nodes_path": str(completed_paths["navigation_nodes"]),
+                    "navigation_tree_path": str(completed_paths["navigation_tree"]),
+                    "page_semantic_summary_path": str(completed_paths["page_semantic_summary"]),
                     "discovery_result_path": str(completed_paths["discovery_summary"]),
+                    "navigation_node_count": len(completed_result.navigation_nodes),
+                    "page_semantic_count": len(completed_result.page_semantic_summary),
+                    "semantic_page_type_breakdown": completed_result.stats.get("semantic_page_type_breakdown", {}),
                 }
             )
         (output_dir / "routing_summary.json").write_text(
@@ -882,10 +927,51 @@ async def run_live_discovery(
         "page_entry_count": len(result.page_entries),
         "feature_point_count": len(result.feature_points),
         "screenshot_record_count": len(result.screenshot_records),
+        "navigation_node_count": len(result.navigation_nodes),
+        "page_semantic_count": len(result.page_semantic_summary),
+        "semantic_page_type_breakdown": result.stats.get("semantic_page_type_breakdown", {}),
         "page_entries_path": str(paths["page_entries"]),
         "feature_points_path": str(paths["feature_points"]),
         "screenshot_records_path": str(paths["screenshot_records"]),
+        "navigation_nodes_path": str(paths["navigation_nodes"]),
+        "navigation_tree_path": str(paths["navigation_tree"]),
+        "page_semantic_summary_path": str(paths["page_semantic_summary"]),
         "discovery_result_path": str(paths["discovery_summary"]),
+    }
+
+
+async def explore_system_map(
+    *,
+    target_name: str,
+    start_url: str,
+    cdp_url: str,
+    model_name: str | None = None,
+    template_name: str = "",
+    overwrite_template: bool = False,
+) -> dict[str, Any]:
+    bootstrap_payload = bootstrap_system_exploration_template(
+        target_name=target_name,
+        start_url=start_url,
+        template_name=template_name,
+        overwrite=overwrite_template,
+    )
+    discovery_payload = await run_live_discovery(
+        bootstrap_payload["template"],
+        cdp_url=cdp_url,
+        model_name=model_name,
+    )
+    return {
+        "target_name": target_name,
+        "template": bootstrap_payload["template"],
+        "template_dir": bootstrap_payload["template_dir"],
+        "mode": "system_map_exploration",
+        "bootstrap": bootstrap_payload,
+        "discovery": discovery_payload,
+        "recommended_next_steps": [
+            "检查 navigation_tree.json 和 page_semantic_summary.json，确认系统地图和页面类型初分是否合理。",
+            "如需更精细线索，再执行 --capture-human-recording。",
+            "确认首批要验证的页面后，再执行 --template-revision-checklist 或补具体模板。",
+        ],
     }
 
 
@@ -979,6 +1065,11 @@ def main() -> None:
         help="Create a minimal template scaffold so discovery and human recording can start without hand-writing all four template files.",
     )
     parser.add_argument(
+        "--explore-system-map",
+        action="store_true",
+        help="Bootstrap a minimal system-map template, then run live discovery to generate navigation tree and page semantic summary for a new system.",
+    )
+    parser.add_argument(
         "--template-revision-checklist",
         action="store_true",
         help="Build a semi-automatic revision checklist from discovery and human recording artifacts for the given template.",
@@ -997,6 +1088,11 @@ def main() -> None:
         "--page-url",
         default="",
         help="Start URL used by --bootstrap-template.",
+    )
+    parser.add_argument(
+        "--target-name",
+        default="",
+        help="Human-readable system name used by --explore-system-map.",
     )
     parser.add_argument(
         "--page-name",
@@ -1175,6 +1271,25 @@ def main() -> None:
                     feature_type=args.feature_type,
                     scenario_kind=args.scenario_kind,
                     overwrite=args.bootstrap_overwrite,
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+
+    if args.explore_system_map:
+        print(
+            json.dumps(
+                asyncio.run(
+                    explore_system_map(
+                        target_name=args.target_name or args.template or "新系统",
+                        start_url=args.page_url,
+                        cdp_url=args.cdp_url,
+                        model_name=args.model or None,
+                        template_name=args.template,
+                        overwrite_template=args.bootstrap_overwrite,
+                    )
                 ),
                 ensure_ascii=False,
                 indent=2,

@@ -49,6 +49,31 @@ def test_apply_discovery_review_patch_can_ignore_and_rename_records() -> None:
     assert reviewed.stats["review_patch_ignored_count"] == 1
 
 
+def test_apply_discovery_review_patch_rebuilds_semantic_summary() -> None:
+    bundle = load_template_bundle(TEMPLATE_ROOT / "suyuan_online_query_reset")
+    result = DiscoveryPlanner().plan(
+        template_name=bundle.name,
+        template=bundle.template,
+        baseline=bundle.baseline,
+    )
+    page_id = result.page_entries[0].page_entry_id
+    patch = {
+        "status": "reviewed",
+        "page_entry_updates": {
+            page_id: {
+                "semantic_page_type": "查询列表页",
+                "semantic_page_type_confidence": "high",
+            }
+        },
+    }
+
+    reviewed = apply_discovery_review_patch(result, patch)
+
+    assert reviewed.page_entries[0].semantic_page_type == "查询列表页"
+    assert reviewed.page_semantic_summary[0]["semantic_page_type"] == "查询列表页"
+    assert reviewed.stats["semantic_page_type_breakdown"]["查询列表页"] >= 1
+
+
 def test_build_run_contexts_prefers_shared_live_discovery_outputs_when_present(monkeypatch) -> None:
     template_name = "suyuan_online_query_reset"
     bundle = load_template_bundle(TEMPLATE_ROOT / template_name)

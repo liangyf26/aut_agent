@@ -10,6 +10,7 @@ from .models import (
     ScreenshotRecord,
     utc_now_iso,
 )
+from .summary import build_discovery_views
 
 
 class DiscoveryPlanner:
@@ -96,6 +97,32 @@ class DiscoveryPlanner:
             execution_path=execution_path,
         )
 
+        views = build_discovery_views(
+            page_entries=page_entries,
+            feature_points=feature_points,
+            navigation_nodes=[
+                {
+                    "navigation_node_id": f"seed::{page_entry_id}",
+                    "owner_page_entry_id": page_entry_id,
+                    "parent_navigation_node_id": None,
+                    "label": page_entry.get("name", template_name),
+                    "node_kind": "seed_entry",
+                    "menu_path_labels": [page_entry.get("name", template_name)],
+                    "menu_level": 0,
+                    "sibling_order": 0,
+                    "locator": "",
+                    "href": page_entry.get("url", ""),
+                    "visible": True,
+                    "expanded": None,
+                    "target_page_entry_id": page_entry_id,
+                    "status": "mapped_to_page_entry",
+                    "status_reason": "template_seed",
+                    "traversal_method": "template_seed",
+                }
+            ],
+        )
+        page_entries = views["page_entries"]
+
         return DiscoveryResult(
             template_name=template_name,
             generated_at=utc_now_iso(),
@@ -103,6 +130,28 @@ class DiscoveryPlanner:
             page_entries=page_entries,
             feature_points=feature_points,
             screenshot_records=screenshot_records,
+            navigation_tree=views["navigation_tree"],
+            page_semantic_summary=views["page_semantic_summary"],
+            navigation_nodes=[
+                {
+                    "navigation_node_id": f"seed::{page_entry_id}",
+                    "owner_page_entry_id": page_entry_id,
+                    "parent_navigation_node_id": None,
+                    "label": page_entry.get("name", template_name),
+                    "node_kind": "seed_entry",
+                    "menu_path_labels": [page_entry.get("name", template_name)],
+                    "menu_level": 0,
+                    "sibling_order": 0,
+                    "locator": "",
+                    "href": page_entry.get("url", ""),
+                    "visible": True,
+                    "expanded": None,
+                    "target_page_entry_id": page_entry_id,
+                    "status": "mapped_to_page_entry",
+                    "status_reason": "template_seed",
+                    "traversal_method": "template_seed",
+                }
+            ],
             review_queue=[
                 {
                     "record_type": "page_entry",
@@ -113,6 +162,8 @@ class DiscoveryPlanner:
                         "name": page_entry.get("name", template_name),
                         "url": page_entry.get("url", ""),
                         "page_type": "page_entry",
+                        "semantic_page_type": page_entries[0].semantic_page_type,
+                        "semantic_page_type_confidence": page_entries[0].semantic_page_type_confidence,
                         "discovery_depth": 0,
                         "stable_key": page_identity["stable_key"],
                     },
@@ -153,6 +204,7 @@ class DiscoveryPlanner:
                 "page_type_breakdown": {"page_entry": len(page_entries)},
                 "feature_scope_breakdown": {"page_action": len(feature_points)},
                 "action_type_breakdown": {"verified_flow_entry": len(feature_points)},
+                **views["stats"],
             },
             notes=[
                 "当前发现结果来自已验证模板的保守播种，不包含自动页面遍历。",

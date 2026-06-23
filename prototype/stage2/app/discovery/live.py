@@ -18,6 +18,7 @@ from .identity import (
     slug,
 )
 from .models import DiscoveryResult, FeaturePointRecord, PageEntryRecord, ScreenshotRecord, utc_now_iso
+from .summary import build_discovery_views
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,7 @@ async def plan_live_discovery(
         dedupe_key=entry_identity["dedupe_key"],
         dedupe_basis=entry_identity["dedupe_basis"],
         discovery_depth=0,
+        entry_role="seed_entry",
         execution_path=execution_path,
         evidence={
             "title": await page.title(),
@@ -147,6 +149,12 @@ async def plan_live_discovery(
     page_entries = [root_page_entry, *discovered_page_entries]
     linked_feature_points = traversal_artifacts["feature_points"] if config.revisit_page_feature_points else []
     feature_points = [*feature_points, *linked_feature_points]
+    views = build_discovery_views(
+        page_entries=page_entries,
+        feature_points=feature_points,
+        navigation_nodes=traversal_artifacts["navigation_nodes"],
+    )
+    page_entries = views["page_entries"]
     feature_scope_breakdown = Counter(item.feature_scope for item in feature_points)
     action_type_breakdown = Counter(item.action_type for item in feature_points)
     page_type_breakdown = Counter(item.page_type for item in page_entries)
@@ -159,16 +167,28 @@ async def plan_live_discovery(
         page_entries=page_entries,
         feature_points=feature_points,
         screenshot_records=screenshot_records,
+        navigation_tree=views["navigation_tree"],
+        page_semantic_summary=views["page_semantic_summary"],
+        navigation_nodes=traversal_artifacts["navigation_nodes"],
         review_queue=review_queue,
         review_hints={
             "status": "pending_manual_review",
             "entry": {
                 "kind": "manual_review_placeholder",
-                "suggested_outputs": ["page_entries.json", "feature_points.json", "discovery_result.json"],
+                "suggested_outputs": [
+                    "page_entries.json",
+                    "feature_points.json",
+                    "navigation_nodes.json",
+                    "navigation_tree.json",
+                    "page_semantic_summary.json",
+                    "discovery_result.json",
+                ],
                 "review_queue_file": "discovery_review_queue.json",
             },
             "recommended_checks": [
+                "先确认系统地图树中哪些节点只是可见菜单、哪些节点已经成功映射到页面入口。",
                 "确认去重后的页面入口是否仍然保持业务上唯一。",
+                "确认 semantic_page_type 是否符合页面业务语义，尤其是查询列表页、详情展示页和混合工作台页。",
                 "确认 page_action / row_action / modal_action 的分类是否符合页面语义。",
                 "优先人工确认 discovery_depth 较深、来源为 same_origin_link 的入口。",
                 "优先人工确认 modal_action 和 row_action 的候选项。",
@@ -180,6 +200,7 @@ async def plan_live_discovery(
                 "discovery_depth",
                 "source_page_entry_id",
                 "page_type",
+                "semantic_page_type",
                 "feature_scope",
                 "action_type",
             ],
@@ -195,6 +216,7 @@ async def plan_live_discovery(
             "feature_scope_breakdown": dict(feature_scope_breakdown),
             "action_type_breakdown": dict(action_type_breakdown),
             "discovery_depth_limit": config.max_discovery_depth,
+            **views["stats"],
             **traversal_artifacts["stats"],
             **feature_stats,
         },
@@ -203,6 +225,7 @@ async def plan_live_discovery(
             "页面入口优先使用 canonical_url 生成稳定 ID，并保留 dedupe_basis 作为后续人工审核依据。",
             "同 URL 的 hash / volatile query 变体会在 canonical_url 与 generalized_url 层统一，减少重复入口。",
             "同源链接使用独立页面探测，避免扰动当前已登录主页面。",
+            "当前会额外落盘 navigation_nodes.json、navigation_tree.json 与 page_semantic_summary.json，作为新系统第一次接入时的系统地图视图。",
             "功能点已区分 page_action、row_action、modal_action，并补充 action_type 与 discovery_depth。",
             "已遍历的同源页面会追加独立 page_entry，并可按配置补采该页的 feature_points。",
             "当前同源遍历默认只深入 1 层，优先产出稳定入口清单，不扩成通用爬虫。",
@@ -444,6 +467,10 @@ async def _discover_same_origin_targets(
     discovered_keys = {page_entry_key}
     results: list[PageEntryRecord] = []
     discovered_feature_points: list[FeaturePointRecord] = []
+    navigation_nodes = _build_navigation_nodes(
+        owner_page_entry_id=page_entry_id,
+        nav_candidates=nav_candidates,
+    )
     queue: list[dict[str, Any]] = [
         {
             "page_entry_id": page_entry_id,
@@ -544,9 +571,12 @@ async def _discover_same_origin_targets(
                         parent_page_entry_id=current["page_entry_id"],
                         source_page_entry_id=current["page_entry_id"],
                         source_action_type=_infer_navigation_action_type(candidate),
+                        entry_role="linked_entry",
                         execution_path="controlled_navigation",
                         evidence={
                             "from_page_entry_id": current["page_entry_id"],
+                            "entry_trigger_text": text,
+                            "entry_trigger_container": candidate.get("container_type"),
                             "locator": candidate.get("locator"),
                             "locator_anchor": locator_anchor(candidate.get("locator")) or None,
                             "role": candidate.get("role"),
@@ -556,6 +586,12 @@ async def _discover_same_origin_targets(
                             "navigation_depth": current_depth + 1,
                         },
                     )
+                )
+                _mark_navigation_node_mapped(
+                    navigation_nodes=navigation_nodes,
+                    owner_page_entry_id=current["page_entry_id"],
+                    candidate=candidate,
+                    target_page_entry_id=resolved_identity["record_id"],
                 )
                 screenshot_records.append(
                     ScreenshotRecord(
@@ -574,6 +610,12 @@ async def _discover_same_origin_targets(
                 discovered_keys.add(resolved_identity["dedupe_key"])
 
                 scan = await _scan_live_page(probe_page, config=config)
+                navigation_nodes.extend(
+                    _build_navigation_nodes(
+                        owner_page_entry_id=resolved_identity["record_id"],
+                        nav_candidates=scan["nav_candidates"],
+                    )
+                )
                 if config.revisit_page_feature_points:
                     linked_landing_dir = Path(config.screenshot_root) / slug(
                         resolved_identity["record_id"], fallback="page_entry", max_length=96
@@ -641,7 +683,11 @@ async def _discover_same_origin_targets(
         results,
         key=lambda item: (item.discovery_depth, item.stable_key or item.page_entry_id, item.name),
     )
-    return ordered_results, {"stats": dict(stats), "feature_points": discovered_feature_points}
+    return ordered_results, {
+        "stats": dict(stats),
+        "feature_points": discovered_feature_points,
+        "navigation_nodes": navigation_nodes,
+    }
 
 
 async def _build_feature_points(
@@ -795,6 +841,108 @@ def _ordered_nav_candidates(nav_candidates: list[dict[str, Any]]) -> list[dict[s
             locator_anchor(item.get("locator")).lower(),
         ),
     )
+
+
+def _build_navigation_nodes(
+    *,
+    owner_page_entry_id: str,
+    nav_candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    nodes: list[dict[str, Any]] = []
+    for index, candidate in enumerate(_ordered_nav_candidates(nav_candidates), start=1):
+        label = normalize_text(candidate.get("text"))
+        locator = normalize_text(candidate.get("locator"))
+        role = normalize_text(candidate.get("role"))
+        href = normalize_text(candidate.get("href"))
+        node_key = "__".join(
+            part
+            for part in (
+                owner_page_entry_id,
+                label or f"nav_{index}",
+                locator_anchor(locator),
+                href,
+            )
+            if part
+        )
+        menu_path_labels = _infer_menu_path_labels(candidate)
+        nodes.append(
+            {
+                "navigation_node_id": f"nav::{node_key or f'{owner_page_entry_id}__{index}'}",
+                "owner_page_entry_id": owner_page_entry_id,
+                "parent_navigation_node_id": None,
+                "label": label or f"nav_{index}",
+                "node_kind": _infer_navigation_node_kind(candidate),
+                "menu_path_labels": menu_path_labels,
+                "menu_level": max(len(menu_path_labels) - 1, 0),
+                "sibling_order": index - 1,
+                "locator": locator,
+                "href": href,
+                "visible": True,
+                "expanded": None,
+                "target_page_entry_id": None,
+                "status": "candidate" if href else "visible_only",
+                "status_reason": "same_origin_href_candidate" if href else "no_href_visible_navigation",
+                "traversal_method": "dom_scan",
+                "role": role,
+                "container_type": normalize_text(candidate.get("container_type")),
+                "container_label": normalize_text(candidate.get("container_label")),
+                "entry_trigger_text": label,
+                "entry_trigger_container": normalize_text(candidate.get("container_type")),
+            }
+        )
+    return nodes
+
+
+def _mark_navigation_node_mapped(
+    *,
+    navigation_nodes: list[dict[str, Any]],
+    owner_page_entry_id: str,
+    candidate: dict[str, Any],
+    target_page_entry_id: str,
+) -> None:
+    label = normalize_text(candidate.get("text"))
+    locator = normalize_text(candidate.get("locator"))
+    href = normalize_text(candidate.get("href"))
+    for item in navigation_nodes:
+        if str(item.get("owner_page_entry_id") or "") != owner_page_entry_id:
+            continue
+        if normalize_text(item.get("label")) != label:
+            continue
+        if normalize_text(item.get("locator")) != locator:
+            continue
+        if normalize_text(item.get("href")) != href:
+            continue
+        item["target_page_entry_id"] = target_page_entry_id
+        item["status"] = "mapped_to_page_entry"
+        item["status_reason"] = "controlled_same_origin_navigation"
+        item["traversal_method"] = "playwright_probe"
+        return
+
+
+def _infer_navigation_node_kind(candidate: dict[str, Any]) -> str:
+    role = normalize_text(candidate.get("role")).lower()
+    tag = normalize_text(candidate.get("tag")).lower()
+    if role == "tab":
+        return "tab"
+    if role == "menuitem":
+        return "menu_item"
+    if tag == "a":
+        return "link"
+    return "navigation_item"
+
+
+def _infer_menu_path_labels(candidate: dict[str, Any]) -> list[str]:
+    container_label = normalize_text(candidate.get("container_label"))
+    text = normalize_text(candidate.get("text"))
+    context_text = normalize_text(candidate.get("context_text"))
+    path = []
+    if container_label and container_label != text:
+        path.append(container_label)
+    if text:
+        path.append(text)
+    if not path and context_text:
+        path.append(context_text[:40])
+    return path
 
 
 def _group_action_candidates(
@@ -1077,6 +1225,9 @@ def _build_review_queue(
                     "name": page_entry.name,
                     "url": page_entry.url,
                     "page_type": page_entry.page_type,
+                    "semantic_page_type": page_entry.semantic_page_type,
+                    "semantic_page_type_confidence": page_entry.semantic_page_type_confidence,
+                    "review_reasons": list(page_entry.review_reasons),
                     "discovery_depth": page_entry.discovery_depth,
                     "stable_key": page_entry.stable_key,
                 },

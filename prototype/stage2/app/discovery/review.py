@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .models import DiscoveryResult, FeaturePointRecord, PageEntryRecord, ScreenshotRecord
+from .summary import build_discovery_views
 
 REVIEW_PATCH_FILENAME = "discovery_review_patch.json"
 
@@ -101,6 +102,12 @@ def apply_discovery_review_patch(
         queue_item["fields"] = fields_payload
         review_queue.append(queue_item)
 
+    views = build_discovery_views(
+        page_entries=page_entries,
+        feature_points=feature_points,
+        navigation_nodes=[dict(item) for item in result.navigation_nodes],
+    )
+    page_entries = views["page_entries"]
     page_type_breakdown = Counter(item.page_type for item in page_entries)
     feature_scope_breakdown = Counter(item.feature_scope for item in feature_points)
     action_type_breakdown = Counter(item.action_type for item in feature_points)
@@ -117,6 +124,7 @@ def apply_discovery_review_patch(
             "review_patch_applied": True,
             "review_patch_ignored_count": len(ignore_record_ids),
             "review_patch_renamed_count": len(rename_records),
+            **views["stats"],
         }
     )
 
@@ -145,6 +153,9 @@ def apply_discovery_review_patch(
         page_entries=page_entries,
         feature_points=feature_points,
         screenshot_records=screenshot_records,
+        navigation_tree=views["navigation_tree"],
+        page_semantic_summary=views["page_semantic_summary"],
+        navigation_nodes=[dict(item) for item in result.navigation_nodes],
         review_queue=review_queue,
         review_hints=review_hints,
         stats=stats,

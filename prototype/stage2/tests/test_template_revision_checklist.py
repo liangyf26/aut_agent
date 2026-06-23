@@ -41,6 +41,8 @@ def test_build_template_revision_checklist_combines_discovery_and_candidate_revi
                     template_name="demo_query",
                     source="playwright.live_page",
                     confidence="live_page_loaded",
+                    semantic_page_type="查询列表页",
+                    semantic_page_type_confidence="medium",
                     evidence={"title": "查询中心"},
                 )
             ],
@@ -138,10 +140,12 @@ def test_build_template_revision_checklist_combines_discovery_and_candidate_revi
         assert checklist.markdown_path.exists()
         payload = checklist.payload
         assert payload["template_json_patch"]["feature_point"]["name"] == "重置"
+        assert payload["template_json_patch"]["page_entry"]["evidence"]["semantic_page_type"] == "查询列表页"
         assert payload["template_json_patch"]["steps"][0]["action"] == "fill_field_by_locator"
         assert payload["locator_hints_patch"]["recommended_locators"]["重置"] == "button:has-text('重置')"
         assert payload["data_schema_patch"]["field_rules"]["keyword"]["path"] == "candidate_form.keyword"
         assert any(item["title"] == "替换 bootstrap steps" for item in payload["review_items"])
+        assert any(item["title"] == "确认页面语义初分" for item in payload["review_items"])
 
 
 def test_generate_template_revision_checklist_works_with_template_only(monkeypatch) -> None:

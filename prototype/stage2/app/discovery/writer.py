@@ -50,18 +50,51 @@ class DiscoveryArtifactWriter:
             notes=result.notes,
             items=list(result.review_queue),
         )
+        navigation_nodes_payload = self._collection_payload(
+            template_name=result.template_name,
+            generated_at=result.generated_at,
+            strategy=result.strategy,
+            review_hints=result.review_hints,
+            stats=result.stats,
+            notes=result.notes,
+            items=list(result.navigation_nodes),
+        )
+        navigation_tree_payload = self._collection_payload(
+            template_name=result.template_name,
+            generated_at=result.generated_at,
+            strategy=result.strategy,
+            review_hints=result.review_hints,
+            stats=result.stats,
+            notes=result.notes,
+            items=list(result.navigation_tree),
+        )
+        page_semantic_summary_payload = self._collection_payload(
+            template_name=result.template_name,
+            generated_at=result.generated_at,
+            strategy=result.strategy,
+            review_hints=result.review_hints,
+            stats=result.stats,
+            notes=result.notes,
+            items=list(result.page_semantic_summary),
+        )
 
         paths = {
             "page_entries": self.output_dir / "page_entries.json",
             "feature_points": self.output_dir / "feature_points.json",
             "screenshot_records": self.output_dir / "screenshot_records.json",
             "review_queue": self.output_dir / "discovery_review_queue.json",
+            "navigation_nodes": self.output_dir / "navigation_nodes.json",
+            "navigation_tree": self.output_dir / "navigation_tree.json",
+            "page_semantic_summary": self.output_dir / "page_semantic_summary.json",
             "discovery_summary": self.output_dir / "discovery_result.json",
         }
         paths["page_entries"].write_text(self._json(page_entries_payload), encoding="utf-8")
         paths["feature_points"].write_text(self._json(feature_points_payload), encoding="utf-8")
         paths["screenshot_records"].write_text(self._json(screenshot_payload), encoding="utf-8")
         paths["review_queue"].write_text(self._json(review_queue_payload), encoding="utf-8")
+        paths["navigation_nodes"].write_text(self._json(navigation_nodes_payload), encoding="utf-8")
+        paths["navigation_tree"].write_text(self._json(navigation_tree_payload), encoding="utf-8")
+        paths["page_semantic_summary"].write_text(self._json(page_semantic_summary_payload), encoding="utf-8")
         paths["discovery_summary"].write_text(self._json(result.to_dict()), encoding="utf-8")
         return paths
 
@@ -116,5 +149,8 @@ class DiscoveryArtifactWriter:
             "feature_points": root / "feature_points.json",
             "screenshot_records": root / "screenshot_records.json",
             "review_queue": root / "discovery_review_queue.json",
+            "navigation_nodes": root / "navigation_nodes.json",
+            "navigation_tree": root / "navigation_tree.json",
+            "page_semantic_summary": root / "page_semantic_summary.json",
             "discovery_summary": root / "discovery_result.json",
         }
