@@ -135,7 +135,7 @@ _Avoid_: 自动验收结论、业务通过率
 _Avoid_: 仅看浏览器动作、只在最终报告里复盘、无实时状态
 
 **运行中心 (Run Center)**:
-当前 Node.js 主平台首页和后续平台 UI 的操作工作台，聚合当前项目阶段摘要、项目级近期事件、第二阶段运行摘要、orchestration session 摘要、人工录制候选审阅摘要、基线冻结摘要和选中 run 详情，并提供打开关键 artifact 与受控恢复动作入口；当前通过 `GET /api/stage2/overview` 从 `artifacts/stage2/` 聚合读取。
+当前 Node.js 主平台首页和后续平台 UI 的操作工作台，聚合当前项目阶段摘要、项目级近期事件、第二阶段运行摘要、orchestration session 摘要、人工录制候选审阅摘要、基线冻结摘要和选中 run 详情，并提供打开关键 artifact 与受控恢复动作入口；当前通过 `GET /api/stage2/overview` 从 `artifacts/stage2/` 聚合读取，执行 `mark-human-takeover-resolved` 后会立即重算 session 级聚合，避免会话状态滞后到下一次自动刷新。
 _Avoid_: 只看首页表单、只看浏览器窗口、把 run 产物散落在多个入口里
 
 **候选模板审阅包 (Candidate Template Review Package)**:

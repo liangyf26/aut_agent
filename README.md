@@ -49,6 +49,8 @@ python -m prototype.stage2.main --run-sample --cdp-url http://localhost:9222
 python -m prototype.stage2.main --live-discovery --template suyuan_online_apply --model AI-tester --cdp-url http://localhost:9222
 python -m prototype.stage2.main --capture-human-recording --template suyuan_online_apply --cdp-url http://localhost:9222
 python -m prototype.stage2.main --resume-human-takeover <run_dir> --cdp-url http://localhost:9222
+python -m prototype.stage2.main --validate-connected-template <template_name> --cdp-url http://localhost:9222
+python -m prototype.stage2.main --validate-template <template_name>
 python -m prototype.stage2.main --validation-matrix --cdp-url http://localhost:9222
 python -m prototype.stage2.main --platform-daily-report
 .venv\Scripts\python.exe -m pytest prototype/stage2/tests/test_suyuan_shared_actions.py prototype/stage2/tests/test_suyuan_submit_dialog_actions.py prototype/stage2/tests/test_suyuan_registry_contract.py -q
@@ -70,6 +72,10 @@ prototype/stage2/    第二阶段 Python 执行子系统原型
 tools/               原型脚本、探针和实战样本工具
 artifacts/           运行产物、报告、截图和阶段性证据
 ```
+
+## 团队测试手册
+
+- [第二阶段新系统接入测试手册](docs/第二阶段新系统接入测试手册.md)
 
 ## 技术路线
 

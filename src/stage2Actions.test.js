@@ -75,6 +75,57 @@ test('markHumanTakeoverResolved writes resolution payload without claiming autom
   }
 });
 
+test('markHumanTakeoverResolved refreshes session artifacts after resolution', async () => {
+  const tempBase = path.join(repoRoot, 'tmp');
+  await fs.mkdir(tempBase, { recursive: true });
+  const tempRoot = await fs.mkdtemp(path.join(tempBase, 'stage2-actions-'));
+  const runId = '20260623_132500_modelA';
+  const runDir = path.join(repoRoot, 'artifacts', 'stage2', runId);
+  await fs.mkdir(runDir, { recursive: true });
+  await fs.writeFile(path.join(runDir, 'human_takeover.json'), JSON.stringify({
+    source_run_id: runId,
+    source_run_dir: runDir,
+    scheduled_action_ids: ['retry-002'],
+    resume_command: 'python -m prototype.stage2.main --resume-human-takeover ...'
+  }, null, 2), 'utf8');
+
+  try {
+    let capturedRunSummaries = null;
+    const result = await markHumanTakeoverResolved(
+      {
+        runId,
+        operatorId: 'run-center',
+        note: 'manual review completed',
+        readyToResume: false
+      },
+      {
+        loadStage2Overview: async () => ({
+          runSummaries: [
+            {
+              runId,
+              orchestrationStreamId: 'session::A',
+              waitingHuman: false,
+              humanTakeover: { status: 'resolved' }
+            }
+          ]
+        }),
+        syncStage2SessionArtifacts: async (runSummaries) => {
+          capturedRunSummaries = runSummaries;
+          return [];
+        }
+      }
+    );
+
+    assert.equal(result.status, 'resolved');
+    assert.ok(Array.isArray(capturedRunSummaries));
+    assert.equal(capturedRunSummaries.length, 1);
+    assert.equal(capturedRunSummaries[0].runId, runId);
+  } finally {
+    await fs.rm(runDir, { recursive: true, force: true });
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test('resumeHumanTakeover delegates to python entrypoint and returns parsed payload', async () => {
   const tempBase = path.join(repoRoot, 'tmp');
   await fs.mkdir(tempBase, { recursive: true });

@@ -2,6 +2,7 @@ const fs = require('fs/promises');
 const path = require('path');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
+const { loadStage2Overview, syncStage2SessionArtifacts } = require('./stage2Dashboard');
 
 const execFileAsync = promisify(execFile);
 
@@ -92,13 +93,16 @@ function buildResumeHumanTakeoverArgs(runDir, packet, options = {}) {
   return args;
 }
 
-async function markHumanTakeoverResolved({
-  runId,
-  operatorId,
-  note,
-  readyToResume = true,
-  handledActionIds
-}) {
+async function markHumanTakeoverResolved(
+  {
+    runId,
+    operatorId,
+    note,
+    readyToResume = true,
+    handledActionIds
+  },
+  dependencies = {}
+) {
   const runDir = await resolveStage2RunDir(runId);
   const packet = await readJsonIfExists(path.join(runDir, 'human_takeover.json'));
   if (!packet) {
@@ -127,6 +131,10 @@ async function markHumanTakeoverResolved({
 
   const resolutionPath = path.join(runDir, 'human_takeover_resolution.json');
   await fs.writeFile(resolutionPath, JSON.stringify(resolvedPayload, null, 2), 'utf8');
+  const overviewLoader = dependencies.loadStage2Overview || loadStage2Overview;
+  const sessionSync = dependencies.syncStage2SessionArtifacts || syncStage2SessionArtifacts;
+  const overview = await overviewLoader();
+  await sessionSync(overview.runSummaries || []);
 
   return {
     status: 'resolved',
