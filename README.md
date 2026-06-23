@@ -38,6 +38,15 @@ http://localhost:4173
 
 当前首页默认展示“自动化测试运行中心”。项目级运行态和第二阶段聚合视图会在页面空闲时自动刷新。
 
+如果端口 `4173` 已被旧实例占用，优先先访问 `http://localhost:4173` 确认现有服务是否可复用。需要在 Windows 上查出并结束旧进程时，可执行：
+
+```powershell
+netstat -ano | findstr :4173
+taskkill /PID <PID> /F
+```
+
+部分环境下 `Get-NetTCPConnection -LocalPort 4173` 可能因为权限限制返回 `Access is denied`，此时优先使用上面的 `netstat` 命令。
+
 ## 常用命令
 
 ```powershell
@@ -87,6 +96,8 @@ artifacts/           运行产物、报告、截图和阶段性证据
 3. 再跑目标页面 `--live-discovery` 或 `--capture-human-recording` 收集功能点和候选定位线索。
 4. 再用 `--template-revision-checklist` 自动汇总建议回填项，生成按文件分组的修订清单。
 5. 最后由测试人员按清单修订模板，再执行 `--validate-connected-template` 做深入连机验证。
+
+如果通过运行中心首页的新系统接入卡片操作，`system key/template` 建议只填基础 key，例如 `bus` 或 `suyuan`；前端会自动归一化为 `<system_key>_system_map`。完成“先探索系统地图”后，卡片会直接暴露 `navigation_tree.json`、`page_semantic_summary.json`、`page_entries.json` 三个核心 artifact 链接；“步骤结果”链接主要用于查看该步命令返回 JSON 以便排错。
 
 ## 技术路线
 
