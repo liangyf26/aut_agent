@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const fs = require('fs/promises');
 const path = require('path');
+const { listV3Runs } = require('./stage2V3RunCenter');
 
 const STAGE2_DIR = path.join(__dirname, '..', 'artifacts', 'stage2');
 const SESSIONS_DIR = path.join(STAGE2_DIR, 'sessions');
@@ -1850,6 +1851,7 @@ async function loadStage2Overview() {
     latestModelComparison,
     humanLoopSummary,
     operationCenter,
+    v3RunCenter,
     runDirectories
   ] = await Promise.all([
     readJsonIfExists(path.join(STAGE2_DIR, 'latest_platform_daily_report.json')),
@@ -1858,6 +1860,7 @@ async function loadStage2Overview() {
     readJsonIfExists(path.join(STAGE2_DIR, 'latest_model_comparison.json')),
     readLatestHumanLoopSummary(),
     readOperationCenterOverview(),
+    listV3Runs(),
     listRunDirectories()
   ]);
 
@@ -1875,7 +1878,9 @@ async function loadStage2Overview() {
       runningCount: runSummaries.filter((item) => item.overallStatus === 'running').length,
       waitingHumanCount: runSummaries.filter((item) => item.waitingReason || item.humanTakeover.status !== 'none').length,
       failedCount: runSummaries.filter((item) => item.overallStatus === 'failed').length,
-      scheduledNextRoundCount: runSummaries.filter((item) => item.nextRound.shouldStart).length
+      scheduledNextRoundCount: runSummaries.filter((item) => item.nextRound.shouldStart).length,
+      v3RunCount: v3RunCenter.runs.length,
+      v3WaitingHumanCount: v3RunCenter.runs.filter((item) => item.status === 'waiting_human').length
     },
     latestValidationMatrix: latestValidationMatrix ? {
       status: latestValidationMatrix.summary?.status || 'unknown',
@@ -1900,6 +1905,7 @@ async function loadStage2Overview() {
       items: latestModelComparison.items || []
     } : null,
     latestBaselineFreezeManifest: await summarizeBaselineFreezeManifest(latestBaselineFreezeManifest),
+    v3RunCenter,
     humanLoopSummary,
     operationCenter,
     sessionSummaries,

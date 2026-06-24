@@ -1,5 +1,6 @@
 const STAGE2_ONBOARDING_FORM_KEY = 'stage2_new_system_onboarding_form';
 const STAGE2_ONBOARDING_RESULTS_KEY = 'stage2_new_system_onboarding_results';
+const STAGE2_LOCAL_RUNS_KEY = 'stage2_v3_local_runs';
 const WORKSPACE_VIEW = window.location.pathname.replace(/\/+$/, '') === '/stage2' ? 'stage2' : 'stage1';
 
 const stage2OnboardingDefaults = {
@@ -151,10 +152,15 @@ const state = {
   projects: [],
   currentProject: null,
   activeTab: 'analysis',
-  activeStage2Tab: 'onboarding',
+  activeStage2Tab: 'overview',
   showProjectForm: false,
   pendingAction: null,
   stage2Overview: null,
+  stage2Runs: [],
+  stage2RunDetails: {},
+  stage2LocalRuns: loadStage2LocalRuns(),
+  stage2RunsApiAvailable: null,
+  stage2LastError: '',
   selectedRunId: null,
   selectedSessionId: null,
   onboardingOperationSessionId: null,
@@ -175,6 +181,7 @@ const saveState = document.querySelector('#saveState');
 const toggleProjectFormButton = document.querySelector('#toggleProjectFormButton');
 const stage2SessionList = document.querySelector('#stage2SessionList');
 const stage2RunList = document.querySelector('#stage2RunList');
+const stage2RunForm = document.querySelector('#stage2RunForm');
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -212,6 +219,19 @@ function loadStage2OnboardingStepResults() {
 
 function saveStage2OnboardingStepResults() {
   localStorage.setItem(STAGE2_ONBOARDING_RESULTS_KEY, JSON.stringify(state.onboardingStepResults));
+}
+
+function loadStage2LocalRuns() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(STAGE2_LOCAL_RUNS_KEY) || '[]');
+    return Array.isArray(saved) ? saved : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveStage2LocalRuns() {
+  localStorage.setItem(STAGE2_LOCAL_RUNS_KEY, JSON.stringify(state.stage2LocalRuns.slice(0, 8)));
 }
 
 function updateStage2OnboardingField(name, value) {
@@ -324,13 +344,17 @@ function fillForm(project) {
 }
 
 async function loadDashboardData() {
-  const [projectsPayload, stage2Payload] = await Promise.all([
+  const [projectsPayload, stage2Payload, stage2RunsPayload] = await Promise.all([
     api('/api/projects'),
-    api('/api/stage2/overview').catch(() => ({ overview: null }))
+    api('/api/stage2/overview').catch(() => ({ overview: null })),
+    api('/api/stage2/v3/runs').catch((error) => ({ error }))
   ]);
 
   state.projects = projectsPayload.projects;
   state.stage2Overview = stage2Payload.overview;
+  state.stage2RunsApiAvailable = !stage2RunsPayload.error;
+  state.stage2LastError = stage2RunsPayload.error ? stage2RunsPayload.error.message : '';
+  state.stage2Runs = normalizeStage2Runs(stage2RunsPayload, state.stage2Overview);
 
   if (state.currentProject?.id) {
     state.currentProject = state.projects.find((item) => item.id === state.currentProject.id) || null;
@@ -343,6 +367,7 @@ async function loadDashboardData() {
   fillForm(state.currentProject);
   syncSelectedSession();
   syncSelectedRun();
+  await loadSelectedStage2RunDetail();
   render();
 }
 
@@ -367,14 +392,14 @@ function syncSelectedSession() {
 }
 
 function syncSelectedRun() {
-  const runs = state.stage2Overview?.runSummaries || [];
+  const runs = getStage2Runs();
   if (runs.length === 0) {
     state.selectedRunId = null;
     return;
   }
 
-  if (!runs.some((item) => item.runId === state.selectedRunId)) {
-    state.selectedRunId = runs[0].runId;
+  if (!runs.some((item) => getRunId(item) === state.selectedRunId)) {
+    state.selectedRunId = getRunId(runs[0]);
   }
 
   syncSelectedSession();
@@ -444,6 +469,138 @@ async function runStage2RunAction(runId, action, body, successMessage) {
     syncSelectedRun();
     saveState.textContent = successMessage;
     render();
+  } catch (error) {
+    saveState.textContent = error.message;
+    render();
+  } finally {
+    state.pendingAction = null;
+    render();
+  }
+}
+
+async function createStage2Run(event) {
+  event.preventDefault();
+  const data = new FormData(stage2RunForm);
+  const payload = {
+    systemName: data.get('systemName')?.trim() || '',
+    system_name: data.get('systemName')?.trim() || '',
+    entryUrl: data.get('entryUrl')?.trim() || '',
+    entry_url: data.get('entryUrl')?.trim() || '',
+    cdpUrl: data.get('cdpUrl')?.trim() || '',
+    cdp_url: data.get('cdpUrl')?.trim() || '',
+    accountNotes: data.get('accountNotes')?.trim() || '',
+    account_notes: data.get('accountNotes')?.trim() || '',
+    scope: data.get('scope')?.trim() || '',
+    maxPages: Number(data.get('maxPages')) || 30,
+    max_pages: Number(data.get('maxPages')) || 30,
+    maxRounds: Number(data.get('maxRounds')) || 2,
+    max_rounds: Number(data.get('maxRounds')) || 2
+  };
+  if (!payload.systemName || !payload.entryUrl) {
+    saveState.textContent = '请填写系统名称和首页 URL';
+    return;
+  }
+
+  state.pendingAction = 'create-stage2-run';
+  saveState.textContent = '正在创建 run';
+  render();
+
+  try {
+    const result = await api('/api/stage2/v3/runs', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+    const run = normalizeStage2Run(result.run || result);
+    state.selectedRunId = getRunId(run);
+    delete state.stage2RunDetails[state.selectedRunId];
+    saveState.textContent = '已创建 run';
+    await loadDashboardData();
+  } catch (error) {
+    const localRun = normalizeStage2Run({
+      ...payload,
+      runId: `draft_${Date.now()}`,
+      status: 'draft',
+      latestMessage: `v3 创建接口暂不可用：${error.message}`,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      counts: { pages: 0, features: 0, cases: 0, executed: 0, passed: 0, failed: 0, skipped: 0, humanTasks: 0 }
+    }, 'local');
+    state.stage2LocalRuns.unshift(localRun);
+    saveStage2LocalRuns();
+    state.stage2Runs = normalizeStage2Runs({}, state.stage2Overview);
+    state.selectedRunId = getRunId(localRun);
+    saveState.textContent = '后端接口未就绪，已创建本地草稿';
+    render();
+  } finally {
+    state.pendingAction = null;
+    render();
+  }
+}
+
+async function selectStage2Run(runId) {
+  state.selectedRunId = runId;
+  syncSelectedSession();
+  await loadSelectedStage2RunDetail();
+  renderStage2Overview();
+}
+
+async function runStage2V3Action(runId, action) {
+  if (!runId || runId.startsWith('draft_')) {
+    saveState.textContent = '本地草稿需要等待后端 v3 API 接入后才能执行';
+    return;
+  }
+  const successText = {
+    start: '已触发自动评测',
+    pause: '已请求暂停',
+    resume: '已请求继续',
+    stop: '已请求停止',
+    'analyze-round': '已触发 AI 复盘',
+    'continue-next-round': '已请求进入下一轮',
+    'generate-report': '已请求生成报告'
+  }[action] || '已提交操作';
+  state.pendingAction = `stage2-${action}`;
+  saveState.textContent = '处理中';
+  render();
+  try {
+    const result = await api(`/api/stage2/v3/runs/${encodeURIComponent(runId)}/${action}`, {
+      method: 'POST',
+      body: JSON.stringify({ operatorId: 'run_center', source: 'stage2_v3_cockpit' })
+    });
+    delete state.stage2RunDetails[runId];
+    if (result.overview) {
+      state.stage2Overview = result.overview;
+    }
+    saveState.textContent = successText;
+    await loadDashboardData();
+  } catch (error) {
+    saveState.textContent = error.message;
+    render();
+  } finally {
+    state.pendingAction = null;
+    render();
+  }
+}
+
+async function completeStage2HumanTask(taskId) {
+  const runId = state.selectedRunId;
+  if (!runId || !taskId) {
+    return;
+  }
+  state.pendingAction = `stage2-human-${taskId}`;
+  saveState.textContent = '正在提交人工处理结果';
+  render();
+  try {
+    await api(`/api/stage2/v3/runs/${encodeURIComponent(runId)}/save-human-task`, {
+      method: 'POST',
+      body: JSON.stringify({
+        taskId,
+        operatorId: 'run_center',
+        result: { status: 'completed', note: 'Completed from v3 run cockpit.' }
+      })
+    });
+    saveState.textContent = '已记录人工处理结果';
+    delete state.stage2RunDetails[runId];
+    await loadDashboardData();
   } catch (error) {
     saveState.textContent = error.message;
     render();
@@ -790,6 +947,212 @@ function renderEventList() {
   `).join('');
 }
 
+function getRunId(run) {
+  return run?.run_id || run?.runId || run?.id || run?.manifest?.run_id || '';
+}
+
+function getRunStatus(run) {
+  return run?.status || run?.overallStatus || run?.manifest?.status || run?.current_status?.status || 'unknown';
+}
+
+function normalizeStage2Runs(payload = {}, overview = null) {
+  const v3Items = payload.runs || payload.items || payload.data || payload.overview?.runs || [];
+  const normalized = Array.isArray(v3Items) ? v3Items.map((run) => normalizeStage2Run(run, 'v3')) : [];
+  const overviewRuns = (overview?.runSummaries || []).map((run) => normalizeStage2Run(run, 'overview'));
+  const localRuns = state.stage2LocalRuns.map((run) => normalizeStage2Run(run, 'local'));
+  const deduped = new Map();
+
+  [...localRuns, ...normalized, ...overviewRuns].forEach((run) => {
+    const id = getRunId(run);
+    if (!id || deduped.has(id)) {
+      return;
+    }
+    deduped.set(id, run);
+  });
+
+  return Array.from(deduped.values()).sort((left, right) => {
+    const leftTime = new Date(left.updatedAt || left.createdAt || left.started_at || 0).getTime();
+    const rightTime = new Date(right.updatedAt || right.createdAt || right.started_at || 0).getTime();
+    return rightTime - leftTime;
+  });
+}
+
+function normalizeStage2Run(run = {}, source = 'v3') {
+  const manifest = run.run_manifest || run.manifest || {};
+  const stats = run.stats || run.summary || {};
+  const runId = getRunId(run) || `stage2_${Date.now()}`;
+  return {
+    ...run,
+    runId,
+    source,
+    systemName: run.systemName || run.system_name || manifest.system_name || run.templateName || '未命名系统',
+    entryUrl: run.entryUrl || run.entry_url || manifest.entry_url || run.homeUrl || '',
+    status: getRunStatus(run),
+    currentPhase: run.currentPhase || run.current_phase || run.currentStatus?.phase || run.current_status?.phase || run.status || '',
+    currentPhaseLabel: run.currentPhaseLabel || run.current_phase_label || stageLabel(run.currentPhase || run.current_phase || run.status || ''),
+    currentStepLabel: run.currentStepLabel || run.current_step_label || run.current_status?.current_step || '',
+    currentTargetLabel: run.currentTargetLabel || run.current_target_label || run.current_status?.current_target || '',
+    nextAction: run.nextAction || run.next_action || run.current_status?.next_action || '',
+    latestMessage: run.latestMessage || run.message || run.current_status?.message || '',
+    createdAt: run.createdAt || run.created_at || manifest.created_at || run.started_at || '',
+    updatedAt: run.updatedAt || run.updated_at || manifest.updated_at || run.finished_at || run.started_at || '',
+    counts: {
+      pages: Number(stats.pageEntries ?? stats.pages ?? run.pageCount ?? run.page_count ?? toArrayItems(run.pageEntries || run.page_entries).length ?? 0),
+      features: Number(stats.featurePoints ?? stats.features ?? run.featureCount ?? run.feature_count ?? toArrayItems(run.featurePoints || run.feature_points).length ?? 0),
+      cases: Number(stats.testCases ?? stats.cases ?? run.caseCount ?? run.case_count ?? toArrayItems(run.generatedTestCases || run.generated_test_cases).length ?? 0),
+      executed: Number(stats.executed ?? stats.executedCount ?? stats.executionCount ?? run.executedCount ?? 0),
+      passed: Number(stats.passed ?? stats.passedCount ?? stats.verificationSuccesses ?? run.passedCount ?? 0),
+      failed: Number(stats.failed ?? stats.failedCount ?? run.failedCount ?? 0),
+      skipped: Number(stats.skipped ?? stats.skippedCount ?? run.skippedCount ?? 0),
+      humanTasks: Number(stats.humanTasks ?? stats.pendingHumanTasks ?? run.pendingHumanTaskCount ?? 0)
+    }
+  };
+}
+
+function getStage2Runs() {
+  return state.stage2Runs || [];
+}
+
+function getSelectedStage2Run() {
+  const detail = state.stage2RunDetails[state.selectedRunId];
+  const run = getStage2Runs().find((item) => getRunId(item) === state.selectedRunId);
+  if (!detail) {
+    return run;
+  }
+  const detailRun = detail.run || detail;
+  const linkArtifacts = detailRun.artifacts || run?.artifacts || {};
+  const payloadArtifacts = detail.artifacts || {};
+  return normalizeStage2Run({
+    ...run,
+    ...detailRun,
+    artifacts: { ...linkArtifacts, ...payloadArtifacts },
+    artifactLinks: linkArtifacts
+  }, run?.source || 'detail');
+}
+
+async function loadSelectedStage2RunDetail() {
+  if (!state.selectedRunId || state.stage2RunDetails[state.selectedRunId]) {
+    return;
+  }
+  if (state.selectedRunId.startsWith('draft_')) {
+    return;
+  }
+  try {
+    const payload = await api(`/api/stage2/v3/runs/${encodeURIComponent(state.selectedRunId)}`);
+    state.stage2RunDetails[state.selectedRunId] = payload;
+  } catch {
+    state.stage2RunDetails[state.selectedRunId] = null;
+  }
+}
+
+function toArrayItems(value) {
+  if (Array.isArray(value)) {
+    return value;
+  }
+  if (Array.isArray(value?.items)) {
+    return value.items;
+  }
+  if (Array.isArray(value?.results)) {
+    return value.results;
+  }
+  return [];
+}
+
+function getRunArtifact(run, ...keys) {
+  for (const key of keys) {
+    if (run?.[key]) {
+      return run[key];
+    }
+    if (run?.artifacts?.[key]) {
+      return run.artifacts[key];
+    }
+  }
+  return null;
+}
+
+function getRunPages(run) {
+  return toArrayItems(getRunArtifact(run, 'pageEntries', 'page_entries', 'pages'));
+}
+
+function getRunFeatures(run) {
+  return toArrayItems(getRunArtifact(run, 'featurePoints', 'feature_points', 'features'));
+}
+
+function getRunCases(run) {
+  return toArrayItems(getRunArtifact(run, 'generatedTestCases', 'generated_test_cases', 'testCases', 'cases'));
+}
+
+function getRunExecutions(run) {
+  return toArrayItems(getRunArtifact(run, 'executionResults', 'execution_results', 'executions', 'results'));
+}
+
+function getRunHumanTasks(run) {
+  const direct = toArrayItems(getRunArtifact(run, 'humanTasks', 'human_tasks'));
+  if (direct.length) {
+    return direct;
+  }
+  const pending = run?.actionCenter?.controlLoop?.pendingHumanActions || run?.actionCenter?.pendingHumanActions || [];
+  return pending.map((item, index) => ({
+    task_id: item.actionId || `pending_${index + 1}`,
+    task_type: item.type || item.stage || 'review_next_round_plan',
+    title: item.title || item.reason || '待人工处理',
+    reason: item.reason || item.expectedOutcome || '',
+    status: item.status || 'pending'
+  }));
+}
+
+function getRunRoundAnalysis(run) {
+  return getRunArtifact(run, 'roundAnalysis', 'round_analysis') || run?.aiReview || run?.analysis || {};
+}
+
+function getRunNextRoundPlan(run) {
+  return getRunArtifact(run, 'nextRoundPlan', 'next_round_plan') || run?.nextRound || run?.next_round || {};
+}
+
+function getRunReportLinks(run) {
+  const artifacts = getRunArtifacts(run);
+  return artifacts.filter((item) => /report/i.test(item.key || item.label || item.fileName || ''));
+}
+
+function getRunArtifacts(run) {
+  const artifacts = [];
+  const pushArtifact = (item, fallbackKey = '') => {
+    if (!item) {
+      return;
+    }
+    if (typeof item === 'string') {
+      artifacts.push({ key: fallbackKey || item, label: fallbackKey || item, fileName: item, href: item });
+      return;
+    }
+    artifacts.push({
+      key: item.key || fallbackKey || item.label || item.fileName || item.path || item.href,
+      label: item.label || fallbackKey || item.fileName || item.path || item.href || 'artifact',
+      fileName: item.fileName || item.path || item.href || '',
+      description: item.description || item.kind || '',
+      href: item.href || item.url || item.path || '#'
+    });
+  };
+
+  if (Array.isArray(run?.artifacts)) {
+    run.artifacts.forEach((item) => pushArtifact(item));
+  }
+  Object.entries(run?.artifactLinks || {}).forEach(([key, value]) => pushArtifact(value, key));
+  if (!run?.artifactLinks && run?.artifacts && !Array.isArray(run.artifacts)) {
+    Object.entries(run.artifacts)
+      .filter(([, value]) => value?.href)
+      .forEach(([key, value]) => pushArtifact(value, key));
+  }
+  Object.entries(run?.artifact_paths || run?.artifactPaths || {}).forEach(([key, value]) => pushArtifact(value, key));
+  (run?.actionCenter?.artifactGroups || []).forEach((group) => {
+    (group.items || []).forEach((item) => pushArtifact(item, group.label));
+  });
+  return artifacts;
+}
+
+function stage2TabId(tab) {
+  return `stage2${tab[0].toUpperCase()}${tab.slice(1)}Tab`;
+}
+
 function renderStage2Overview() {
   document.querySelectorAll('[data-stage2-tab]').forEach((button) => {
     button.classList.toggle('active', button.dataset.stage2Tab === state.activeStage2Tab);
@@ -797,12 +1160,499 @@ function renderStage2Overview() {
   document.querySelectorAll('.stage2-tab-body').forEach((body) => {
     body.classList.remove('active');
   });
-  document.querySelector(`#stage2${state.activeStage2Tab[0].toUpperCase()}${state.activeStage2Tab.slice(1)}Tab`)?.classList.add('active');
+  document.querySelector(`#${stage2TabId(state.activeStage2Tab)}`)?.classList.add('active');
 
-  renderStage2SummaryTab();
-  renderStage2OnboardingTab();
-  renderStage2MatrixTab();
-  renderStage2HumanTab();
+  renderStage2V3Shell();
+  renderStage2V3OverviewTab();
+  renderStage2V3CollectionTab('pages');
+  renderStage2V3CollectionTab('features');
+  renderStage2V3CollectionTab('cases');
+  renderStage2V3CollectionTab('execution');
+  renderStage2V3AiTab();
+  renderStage2V3HumanTab();
+  renderStage2V3ReportTab();
+  renderStage2V3ArtifactsTab();
+}
+
+function renderStage2V3Shell() {
+  const runs = getStage2Runs();
+  const run = getSelectedStage2Run();
+  const summaryNode = document.querySelector('#stage2Summary');
+  const runTitle = document.querySelector('#stage2RunTitle');
+  const runSubtitle = document.querySelector('#stage2RunSubtitle');
+  const runEyebrow = document.querySelector('#stage2RunEyebrow');
+  const actions = document.querySelector('#stage2RunActions');
+  const metrics = document.querySelector('#stage2MetricCards');
+  const monitor = document.querySelector('#stage2MonitorStrip');
+  const timeline = document.querySelector('#stage2Timeline');
+
+  if (summaryNode) {
+    const apiState = state.stage2RunsApiAvailable === false ? 'v3 API 未就绪，当前显示兼容数据和本地草稿。' : 'v3 API 已连接，按 run 汇总第二阶段产物。';
+    summaryNode.textContent = runs.length ? `${runs.length} 个 run 可查询。${apiState}` : `暂无 run。${apiState}`;
+  }
+
+  if (!run) {
+    runEyebrow.textContent = '等待创建';
+    runTitle.textContent = '从一个 run 开始';
+    runSubtitle.textContent = '填写左侧最少信息后创建 run，运行中心会承接发现、执行、AI 复盘、人工处理和报告查看。';
+    actions.innerHTML = '<span class="status-pill warning">尚未选择</span>';
+    metrics.innerHTML = renderStage2MetricCards(null);
+    monitor.innerHTML = renderStage2Monitor(null);
+    timeline.innerHTML = renderStage2Timeline(null);
+  } else {
+    runEyebrow.textContent = `${run.source === 'local' ? '本地草稿' : '当前 run'} · ${escapeHtml(getRunId(run))}`;
+    runTitle.textContent = run.systemName || getRunId(run);
+    runSubtitle.textContent = [run.entryUrl, run.currentPhaseLabel, run.latestMessage].filter(Boolean).join(' · ') || '等待运行中心写入状态。';
+    actions.innerHTML = renderStage2RunActions(run);
+    metrics.innerHTML = renderStage2MetricCards(run);
+    monitor.innerHTML = renderStage2Monitor(run);
+    timeline.innerHTML = renderStage2Timeline(run);
+  }
+
+  if (!stage2RunList) {
+    return;
+  }
+  if (!runs.length) {
+    stage2RunList.innerHTML = `
+      <div class="stage2-empty">
+        <strong>还没有 run</strong>
+        <p>创建 run 后，页面入口、功能点、执行结果和报告都会归档到同一个运行对象下。</p>
+      </div>
+    `;
+    return;
+  }
+
+  stage2RunList.innerHTML = runs.map((item) => {
+    const id = getRunId(item);
+    return `
+      <button class="stage2-run-card ${id === state.selectedRunId ? 'active' : ''}" data-run-id="${escapeHtml(id)}" type="button">
+        <span class="tag ${verdictClass(getRunStatus(item))}">${escapeHtml(statusLabel(getRunStatus(item)))}</span>
+        <strong>${escapeHtml(item.systemName || id)}</strong>
+        <small>${escapeHtml(id)}</small>
+        <p>${escapeHtml(item.latestMessage || item.currentPhaseLabel || item.entryUrl || '暂无运行摘要')}</p>
+        <div class="stage2-run-card-stats">
+          <span>${escapeHtml(String(item.counts?.pages || 0))} 入口</span>
+          <span>${escapeHtml(String(item.counts?.features || 0))} 功能点</span>
+          <span>${escapeHtml(String(item.counts?.executed || 0))} 已执行</span>
+        </div>
+      </button>
+    `;
+  }).join('');
+}
+
+function renderStage2RunActions(run) {
+  const id = getRunId(run);
+  const disabled = state.pendingAction || run.source === 'local' ? 'disabled' : '';
+  const localNote = run.source === 'local'
+    ? '<span class="status-pill warning">等待后端接入</span>'
+    : '';
+  return `
+    ${localNote}
+    <button class="ghost-action compact-action" data-stage2-run-action="start" data-run-id="${escapeHtml(id)}" type="button" ${disabled}>开始自动评测</button>
+    <button class="ghost-action compact-action" data-stage2-run-action="pause" data-run-id="${escapeHtml(id)}" type="button" ${disabled}>暂停</button>
+    <button class="ghost-action compact-action" data-stage2-run-action="resume" data-run-id="${escapeHtml(id)}" type="button" ${disabled}>继续</button>
+    <button class="ghost-action compact-action" data-stage2-run-action="analyze-round" data-run-id="${escapeHtml(id)}" type="button" ${disabled}>AI 复盘</button>
+    <button class="ghost-action compact-action" data-stage2-run-action="continue-next-round" data-run-id="${escapeHtml(id)}" type="button" ${disabled}>进入下一轮</button>
+    <button class="ghost-action compact-action" data-stage2-run-action="generate-report" data-run-id="${escapeHtml(id)}" type="button" ${disabled}>生成报告</button>
+    <button class="ghost-action compact-action danger-action" data-stage2-run-action="stop" data-run-id="${escapeHtml(id)}" type="button" ${disabled}>停止</button>
+  `;
+}
+
+function renderStage2MetricCards(run) {
+  const counts = run?.counts || {};
+  const executionTotal = Number(counts.executed || 0);
+  const passRate = executionTotal ? `${Math.round((Number(counts.passed || 0) / executionTotal) * 100)}%` : '-';
+  const items = [
+    ['页面入口', counts.pages || 0, '自动发现范围'],
+    ['功能点', counts.features || 0, '可测交互目标'],
+    ['执行用例', counts.cases || 0, '按类型生成'],
+    ['已执行', executionTotal || 0, `${counts.failed || 0} 失败 / ${counts.skipped || 0} 跳过`],
+    ['通过率', passRate, '基础路径状态'],
+    ['人工任务', counts.humanTasks || getRunHumanTasks(run || {}).length || 0, '通过界面处理']
+  ];
+  return items.map(([label, value, note]) => `
+    <article class="stage2-meter">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(String(value))}</strong>
+      <small>${escapeHtml(note)}</small>
+    </article>
+  `).join('');
+}
+
+function renderStage2Monitor(run) {
+  const nextPlan = getRunNextRoundPlan(run || {});
+  const fields = [
+    ['当前阶段', run?.currentPhaseLabel || stageLabel(run?.currentPhase || '-')],
+    ['当前步骤', run?.currentStepLabel || '-'],
+    ['当前对象', run?.currentTargetLabel || '-'],
+    ['下一步动作', run?.nextAction || nextPlan.next_round_goal || nextPlan.nextRoundGoal || '-'],
+    ['阻塞原因', run?.blockedReason || run?.waitingReason || nextPlan.decision || '-']
+  ];
+  return fields.map(([label, value]) => `
+    <article class="stage2-monitor-item">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(String(value || '-'))}</strong>
+    </article>
+  `).join('');
+}
+
+function renderStage2Timeline(run) {
+  const phases = getStage2Timeline(run);
+  if (!phases.length) {
+    return `
+      <div class="stage2-empty">
+        <strong>等待第一条运行事件</strong>
+        <p>v3 要求持续落盘进度事件。后端接入后，这里会显示 preflight、discovery、执行、AI 复盘和报告阶段。</p>
+      </div>
+    `;
+  }
+  return `
+    <div class="stage2-timeline-line">
+      ${phases.map((phase) => `
+        <article class="stage2-timeline-step ${phase.current ? 'current' : ''} ${phase.status || ''}">
+          <span>${escapeHtml(phase.label)}</span>
+          <strong>${escapeHtml(statusLabel(phase.status || 'pending'))}</strong>
+          <small>${escapeHtml(phase.message || phase.time || '')}</small>
+        </article>
+      `).join('')}
+    </div>
+  `;
+}
+
+function getStage2Timeline(run) {
+  if (!run) {
+    return [];
+  }
+  const explicit = run.phaseTimeline || run.phase_timeline || run.timeline || [];
+  if (explicit.length) {
+    return explicit.map((item) => ({
+      label: item.label || stageLabel(item.phase || item.key || ''),
+      status: item.status || 'pending',
+      message: item.message || item.nextAction || item.next_action || '',
+      time: item.updatedAt || item.updated_at || item.timestamp || '',
+      current: item.key === run.currentPhase || item.phase === run.currentPhase
+    }));
+  }
+  const phaseOrder = [
+    ['preflight', '预检'],
+    ['discovery', '自动发现'],
+    ['feature_analysis', '功能点识别'],
+    ['case_generation', '用例生成'],
+    ['execution', '安全执行'],
+    ['ai_analysis', 'AI 复盘'],
+    ['reporting', '报告']
+  ];
+  const current = run.currentPhase || run.status || '';
+  return phaseOrder.map(([key, label]) => ({
+    label,
+    status: key === current ? 'running' : (run.status === 'completed' ? 'completed' : 'pending'),
+    message: key === current ? run.latestMessage || run.nextAction || '' : '',
+    current: key === current
+  }));
+}
+
+function renderStage2V3OverviewTab() {
+  const container = document.querySelector('#stage2OverviewTab');
+  const run = getSelectedStage2Run();
+  if (!container) {
+    return;
+  }
+  if (!run) {
+    container.innerHTML = renderStage2Empty('运行中心等待 run', '左侧创建 run 后，运行中心会把发现、执行、AI 复盘、人工介入和报告入口串成一条主流程。');
+    return;
+  }
+  const analysis = getRunRoundAnalysis(run);
+  const nextPlan = getRunNextRoundPlan(run);
+  container.innerHTML = `
+    <section class="stage2-overview-grid">
+      <article class="stage2-work-card">
+        <header>
+          <strong>自动化闭环</strong>
+          <span class="tag ${verdictClass(getRunStatus(run))}">${escapeHtml(statusLabel(getRunStatus(run)))}</span>
+        </header>
+        <p>${escapeHtml(run.latestMessage || '等待 run 状态写入。')}</p>
+        <div class="detail-list">
+          ${[
+            ['Run ID', getRunId(run)],
+            ['系统', run.systemName],
+            ['入口', run.entryUrl || '-'],
+            ['创建时间', formatDate(run.createdAt)],
+            ['更新时间', formatDate(run.updatedAt)]
+          ].map(([label, value]) => `
+            <div class="detail-item"><span>${escapeHtml(label)}</span><strong>${escapeHtml(String(value || '-'))}</strong></div>
+          `).join('')}
+        </div>
+      </article>
+      <article class="stage2-work-card">
+        <header>
+          <strong>AI 复盘摘要</strong>
+          <span class="tag">${escapeHtml(String(analysis.confidence ?? analysis.ai_confidence ?? '-'))}</span>
+        </header>
+        <p>${escapeHtml(analysis.summary || analysis.coverage_summary?.summary || analysis.failure_summary?.summary || '暂无 AI 复盘产物。')}</p>
+        <div class="tag-row">
+          <span class="tag">${escapeHtml(String((analysis.human_tasks || analysis.humanTasks || []).length || getRunHumanTasks(run).length))} 个人工项</span>
+          <span class="tag">${escapeHtml(String((analysis.improvement_candidates || analysis.improvementCandidates || []).length || 0))} 个改进候选</span>
+        </div>
+      </article>
+      <article class="stage2-work-card">
+        <header>
+          <strong>下一轮计划</strong>
+          <span class="tag ${nextPlan.requires_human_approval || nextPlan.requiresHumanApproval ? 'manual' : 'passed'}">${escapeHtml(nextPlan.decision || statusLabel(nextPlan.status || '-'))}</span>
+        </header>
+        <p>${escapeHtml(nextPlan.next_round_goal || nextPlan.nextRoundGoal || nextPlan.reason || '暂无下一轮计划。')}</p>
+        <div class="tag-row">
+          <span class="tag">${escapeHtml(nextPlan.should_continue || nextPlan.shouldContinue ? '建议继续' : '未建议继续')}</span>
+          <span class="tag">${escapeHtml(nextPlan.risk_level || nextPlan.riskLevel || '风险未知')}</span>
+        </div>
+      </article>
+    </section>
+  `;
+}
+
+function renderStage2V3CollectionTab(kind) {
+  const container = document.querySelector(`#${stage2TabId(kind)}`);
+  const run = getSelectedStage2Run();
+  if (!container) {
+    return;
+  }
+  const config = {
+    pages: {
+      title: '页面入口',
+      empty: '尚未发现页面入口。启动 discovery 后会显示导航树、可达状态和截图证据。',
+      rows: getRunPages(run || {}),
+      columns: [
+        ['名称', (item) => item.name || item.title || item.page_name || item.pageEntryId || item.page_entry_id],
+        ['类型', (item) => item.page_type || item.pageType || item.type || '-'],
+        ['状态', (item) => statusLabel(item.status || 'unknown')],
+        ['URL', (item) => item.url || item.entry_url || '-']
+      ]
+    },
+    features: {
+      title: '功能点',
+      empty: '尚未识别功能点。功能点应来自默认可见和轻量交互后显式出现的交互目标。',
+      rows: getRunFeatures(run || {}),
+      columns: [
+        ['名称', (item) => item.name || item.title || item.feature_point_id || item.featurePointId],
+        ['类型', (item) => item.feature_type || item.featureType || item.type || '-'],
+        ['风险', (item) => item.risk_level || item.riskLevel || '-'],
+        ['置信度', (item) => item.confidence ?? '-'],
+        ['审核', (item) => statusLabel(item.review_status || item.reviewStatus || '-')]
+      ]
+    },
+    cases: {
+      title: '执行型测试用例',
+      empty: '尚未生成执行型测试用例。v3 用例应从功能点类型生成，不要求用户填写模板文件。',
+      rows: getRunCases(run || {}),
+      columns: [
+        ['标题', (item) => item.title || item.name || item.test_case_id || item.testCaseId],
+        ['模板', (item) => item.type_template || item.typeTemplate || item.kind || '-'],
+        ['风险策略', (item) => item.risk_policy || item.riskPolicy || '-'],
+        ['需人工确认', (item) => item.requires_human_confirmation || item.requiresHumanConfirmation ? '是' : '否']
+      ]
+    },
+    execution: {
+      title: '执行结果',
+      empty: '尚未执行安全用例。执行结果应包含动作日志、页面反馈、截图引用和未执行原因。',
+      rows: getRunExecutions(run || {}),
+      columns: [
+        ['用例', (item) => item.title || item.test_case_id || item.testCaseId],
+        ['状态', (item) => statusLabel(item.status || 'unknown')],
+        ['判定', (item) => item.verdict || '-'],
+        ['失败原因', (item) => item.failure_reason || item.failureReason || '-'],
+        ['人工确认', (item) => item.manual_confirmation_required || item.manualConfirmationRequired ? '需要' : '否']
+      ]
+    }
+  }[kind];
+  container.innerHTML = renderStage2Table(config.title, config.rows, config.columns, config.empty);
+}
+
+function renderStage2V3AiTab() {
+  const container = document.querySelector('#stage2AiTab');
+  const run = getSelectedStage2Run();
+  if (!container) {
+    return;
+  }
+  if (!run) {
+    container.innerHTML = renderStage2Empty('等待 AI 复盘', '每轮自动执行结束后，AI 应分析失败、证据质量和下一轮策略。');
+    return;
+  }
+  const analysis = getRunRoundAnalysis(run);
+  const nextPlan = getRunNextRoundPlan(run);
+  container.innerHTML = `
+    <section class="stage2-ai-grid">
+      <article class="stage2-work-card">
+        <header><strong>本轮分析</strong><span class="tag">${escapeHtml(String(analysis.round_id || analysis.roundId || '-'))}</span></header>
+        ${renderStage2KeyValueList([
+          ['覆盖摘要', analysis.coverage_summary?.summary || analysis.coverageSummary?.summary || analysis.summary || '-'],
+          ['失败摘要', analysis.failure_summary?.summary || analysis.failureSummary?.summary || '-'],
+          ['证据质量', analysis.evidence_quality?.summary || analysis.evidenceQuality?.summary || '-'],
+          ['AI 置信度', analysis.confidence ?? analysis.ai_confidence ?? '-']
+        ])}
+      </article>
+      <article class="stage2-work-card">
+        <header><strong>下一轮计划</strong><span class="tag">${escapeHtml(nextPlan.decision || '-')}</span></header>
+        ${renderStage2KeyValueList([
+          ['是否继续', nextPlan.should_continue || nextPlan.shouldContinue ? '是' : '否'],
+          ['下一轮目标', nextPlan.next_round_goal || nextPlan.nextRoundGoal || '-'],
+          ['风险等级', nextPlan.risk_level || nextPlan.riskLevel || '-'],
+          ['需要人工批准', nextPlan.requires_human_approval || nextPlan.requiresHumanApproval ? '是' : '否']
+        ])}
+      </article>
+      <article class="stage2-work-card stage2-work-card-wide">
+        <header><strong>改进与沉淀候选</strong><span class="tag">${escapeHtml(String((analysis.improvement_candidates || analysis.improvementCandidates || []).length || 0))}</span></header>
+        ${renderStage2CompactList(analysis.improvement_candidates || analysis.improvementCandidates || [], '暂无改进候选。')}
+      </article>
+    </section>
+  `;
+}
+
+function renderStage2V3HumanTab() {
+  const container = document.querySelector('#stage2HumanTab');
+  const run = getSelectedStage2Run();
+  if (!container) {
+    return;
+  }
+  const tasks = getRunHumanTasks(run || {});
+  if (!tasks.length) {
+    container.innerHTML = renderStage2Empty('当前没有待人工处理任务', '当系统需要选择优先页面、审核功能点、录制路径、更正测试数据或批准下一轮时，任务会出现在这里。');
+    return;
+  }
+  container.innerHTML = `
+    <section class="stage2-human-grid">
+      ${tasks.map((task) => `
+        <article class="stage2-task-card">
+          <header>
+            <strong>${escapeHtml(task.title || task.task_id || '待人工处理')}</strong>
+            <span class="tag ${task.status === 'pending' ? 'manual' : 'passed'}">${escapeHtml(statusLabel(task.status || 'pending'))}</span>
+          </header>
+          <p>${escapeHtml(task.reason || task.task_type || '请在界面中完成处理，系统会生成结构化结果。')}</p>
+          <div class="tag-row">
+            <span class="tag">${escapeHtml(task.task_type || task.type || 'human_task')}</span>
+            <span class="tag">${escapeHtml(task.task_id || task.actionId || '-')}</span>
+          </div>
+          <div class="inline-actions">
+            <button class="ghost-action compact-action" data-stage2-human-task="${escapeHtml(task.task_id || task.actionId || '')}" type="button" ${state.pendingAction ? 'disabled' : ''}>标记完成</button>
+          </div>
+        </article>
+      `).join('')}
+    </section>
+  `;
+}
+
+function renderStage2V3ReportTab() {
+  const container = document.querySelector('#stage2ReportTab');
+  const run = getSelectedStage2Run();
+  if (!container) {
+    return;
+  }
+  const links = getRunReportLinks(run || {});
+  const report = run?.report || run?.runReport || getRunArtifact(run || {}, 'run_report', 'runReport') || {};
+  container.innerHTML = `
+    <section class="stage2-report-layout">
+      <article class="stage2-work-card">
+        <header><strong>总体测试报告</strong><span class="tag">${escapeHtml(links.length ? '可打开' : '待生成')}</span></header>
+        <p>${escapeHtml(report.summary || report.overview || '报告应直接说明页面入口、功能点、执行结果、失败原因、人工确认项和证据索引。')}</p>
+        <div class="inline-actions">
+          <button class="ghost-action compact-action" data-stage2-run-action="generate-report" data-run-id="${escapeHtml(getRunId(run || {}))}" type="button" ${!run || state.pendingAction ? 'disabled' : ''}>生成报告</button>
+        </div>
+      </article>
+      <article class="stage2-work-card stage2-work-card-wide">
+        <header><strong>报告链接</strong><span class="tag">${escapeHtml(String(links.length))}</span></header>
+        ${renderStage2ArtifactLinks(links, '暂无报告 artifact。')}
+      </article>
+    </section>
+  `;
+}
+
+function renderStage2V3ArtifactsTab() {
+  const container = document.querySelector('#stage2ArtifactsTab');
+  const run = getSelectedStage2Run();
+  if (!container) {
+    return;
+  }
+  const artifacts = getRunArtifacts(run || {});
+  container.innerHTML = `
+    <section class="stage2-work-card">
+      <header><strong>稳定产物入口</strong><span class="tag">${escapeHtml(String(artifacts.length))}</span></header>
+      ${renderStage2ArtifactLinks(artifacts, '暂无 artifact 链接。后端应按白名单 key 暴露 run_manifest、page_entries、feature_points、execution_results、round_analysis、next_round_plan 和 report。')}
+    </section>
+  `;
+}
+
+function renderStage2Table(title, rows, columns, emptyText) {
+  if (!rows.length) {
+    return renderStage2Empty(title, emptyText);
+  }
+  return `
+    <section class="stage2-table-card">
+      <div class="stage2-section-head">
+        <h3>${escapeHtml(title)}</h3>
+        <span class="tag">${escapeHtml(String(rows.length))}</span>
+      </div>
+      <div class="stage2-table-wrap">
+        <table class="stage2-data-table">
+          <thead><tr>${columns.map(([label]) => `<th>${escapeHtml(label)}</th>`).join('')}</tr></thead>
+          <tbody>
+            ${rows.map((row) => `
+              <tr>${columns.map(([, getter]) => `<td>${escapeHtml(String(getter(row) ?? '-'))}</td>`).join('')}</tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function renderStage2KeyValueList(items) {
+  return `
+    <div class="detail-list">
+      ${items.map(([label, value]) => `
+        <div class="detail-item"><span>${escapeHtml(label)}</span><strong>${escapeHtml(String(value || '-'))}</strong></div>
+      `).join('')}
+    </div>
+  `;
+}
+
+function renderStage2CompactList(items, emptyText) {
+  if (!items.length) {
+    return `<div class="stage2-empty"><p>${escapeHtml(emptyText)}</p></div>`;
+  }
+  return `
+    <div class="stage2-compact-list">
+      ${items.slice(0, 8).map((item) => `
+        <article>
+          <strong>${escapeHtml(item.title || item.name || item.candidate_id || item.id || '候选项')}</strong>
+          <p>${escapeHtml(item.reason || item.summary || item.description || '')}</p>
+        </article>
+      `).join('')}
+    </div>
+  `;
+}
+
+function renderStage2ArtifactLinks(artifacts, emptyText) {
+  if (!artifacts.length) {
+    return renderStage2Empty('Artifacts', emptyText);
+  }
+  return `
+    <div class="stage2-artifact-grid">
+      ${artifacts.map((artifact) => `
+        <a class="artifact-action" href="${escapeHtml(artifact.href || '#')}" target="_blank" rel="noreferrer">
+          <span>${escapeHtml(artifact.label || artifact.key || 'artifact')}</span>
+          <small>${escapeHtml(artifact.description || artifact.fileName || '')}</small>
+          <strong>${escapeHtml(artifact.key || artifact.fileName || '')}</strong>
+        </a>
+      `).join('')}
+    </div>
+  `;
+}
+
+function renderStage2Empty(title, message) {
+  return `
+    <div class="stage2-empty">
+      <strong>${escapeHtml(title)}</strong>
+      <p>${escapeHtml(message)}</p>
+    </div>
+  `;
 }
 
 function renderStage2SummaryTab() {
@@ -2146,7 +2996,15 @@ function stageLabel(value = '') {
     retry: '重试',
     submit: '提交',
     ready: '待执行',
+    draft: '草稿',
     manual: '待确认',
+    draft: '草稿',
+    waiting_human: '待人工处理',
+    planned: '已计划',
+    feature_analysis: '功能点识别',
+    case_generation: '用例生成',
+    execution: '安全执行',
+    ai_analysis: 'AI 复盘',
     submitted: '已提交',
     confirmed: '已确认',
     running: '执行中',
@@ -2204,6 +3062,35 @@ async function copyText(value, successMessage) {
 
 projectForm.addEventListener('submit', saveProject);
 
+stage2RunForm?.addEventListener('submit', createStage2Run);
+
+document.querySelector('#stage2Cockpit')?.addEventListener('click', (event) => {
+  const refreshButton = event.target.closest('[data-stage2-action="refresh-runs"]');
+  if (refreshButton) {
+    loadDashboardData().catch((error) => {
+      saveState.textContent = error.message;
+    });
+    return;
+  }
+
+  const runActionButton = event.target.closest('[data-stage2-run-action][data-run-id]');
+  if (runActionButton) {
+    runStage2V3Action(runActionButton.dataset.runId, runActionButton.dataset.stage2RunAction);
+    return;
+  }
+
+  const humanTaskButton = event.target.closest('[data-stage2-human-task]');
+  if (humanTaskButton) {
+    completeStage2HumanTask(humanTaskButton.dataset.stage2HumanTask);
+    return;
+  }
+
+  const copyButton = event.target.closest('[data-copy-command]');
+  if (copyButton) {
+    copyText(copyButton.dataset.copyCommand, '命令已复制');
+  }
+});
+
 document.querySelector('#newProjectButton').addEventListener('click', () => {
   state.currentProject = null;
   state.showProjectForm = true;
@@ -2241,7 +3128,7 @@ document.querySelector('.tabs').addEventListener('click', (event) => {
   }
 });
 
-document.querySelector('#stage2Tabs').addEventListener('click', (event) => {
+document.querySelector('#stage2Tabs')?.addEventListener('click', (event) => {
   const button = event.target.closest('[data-stage2-tab]');
   if (!button) {
     return;
@@ -2250,7 +3137,7 @@ document.querySelector('#stage2Tabs').addEventListener('click', (event) => {
   renderStage2Overview();
 });
 
-document.querySelector('#stage2OnboardingTab').addEventListener('input', (event) => {
+document.querySelector('#stage2OnboardingTab')?.addEventListener('input', (event) => {
   const field = event.target.closest('[name]');
   if (!field || !(field.name in state.onboardingForm)) {
     return;
@@ -2259,7 +3146,7 @@ document.querySelector('#stage2OnboardingTab').addEventListener('input', (event)
   saveStage2OnboardingForm();
 });
 
-document.querySelector('#stage2OnboardingTab').addEventListener('change', (event) => {
+document.querySelector('#stage2OnboardingTab')?.addEventListener('change', (event) => {
   const field = event.target.closest('[name]');
   if (!field || !(field.name in state.onboardingForm)) {
     return;
@@ -2267,7 +3154,7 @@ document.querySelector('#stage2OnboardingTab').addEventListener('change', (event
   updateStage2OnboardingField(field.name, field.value);
 });
 
-document.querySelector('#stage2OnboardingTab').addEventListener('click', (event) => {
+document.querySelector('#stage2OnboardingTab')?.addEventListener('click', (event) => {
   const resetButton = event.target.closest('[data-onboarding-reset]');
   if (resetButton) {
     state.onboardingForm = { ...stage2OnboardingDefaults };
@@ -2297,7 +3184,7 @@ document.querySelector('#stage2OnboardingTab').addEventListener('click', (event)
   confirmStage2OnboardingStep(stepButton.dataset.onboardingStep);
 });
 
-document.querySelector('#stage2HumanTab').addEventListener('click', (event) => {
+document.querySelector('#stage2HumanTab')?.addEventListener('click', (event) => {
   const copyButton = event.target.closest('[data-copy-command]');
   if (copyButton) {
     copyText(copyButton.dataset.copyCommand, '恢复命令已复制');
@@ -2312,16 +3199,16 @@ document.querySelector('#stage2HumanTab').addEventListener('click', (event) => {
   }
 });
 
-stage2RunList.addEventListener('click', (event) => {
+stage2RunList?.addEventListener('click', (event) => {
   const button = event.target.closest('[data-run-id]');
   if (button) {
-    state.selectedRunId = button.dataset.runId;
-    renderStage2Overview();
-    renderStage2RunDetail();
+    selectStage2Run(button.dataset.runId).catch((error) => {
+      saveState.textContent = error.message;
+    });
   }
 });
 
-stage2SessionList.addEventListener('click', (event) => {
+stage2SessionList?.addEventListener('click', (event) => {
   const copyButton = event.target.closest('[data-copy-command]');
   if (copyButton) {
     copyText(copyButton.dataset.copyCommand, '恢复命令已复制');
@@ -2344,7 +3231,7 @@ stage2SessionList.addEventListener('click', (event) => {
   }
 });
 
-document.querySelector('#stage2RunDetail').addEventListener('click', (event) => {
+document.querySelector('#stage2RunDetail')?.addEventListener('click', (event) => {
   const copyButton = event.target.closest('[data-copy-command]');
   if (copyButton) {
     copyText(copyButton.dataset.copyCommand, '恢复命令已复制');

@@ -772,6 +772,283 @@ textarea:focus {
   display: block;
 }
 
+.stage2-cockpit {
+  display: grid;
+  grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.stage2-command-rail,
+.stage2-control-deck,
+.stage2-work-card,
+.stage2-table-card,
+.stage2-task-card {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.stage2-command-rail {
+  display: grid;
+  gap: 18px;
+  padding: 18px;
+  position: sticky;
+  top: 18px;
+}
+
+.stage2-rail-head,
+.stage2-run-form,
+.stage2-run-picker,
+.stage2-control-deck,
+.stage2-work-card,
+.stage2-table-card,
+.stage2-task-card {
+  display: grid;
+  gap: 12px;
+}
+
+.stage2-run-form label {
+  display: grid;
+  gap: 6px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.stage2-run-form input,
+.stage2-run-form textarea {
+  width: 100%;
+  min-width: 0;
+}
+
+.stage2-form-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.stage2-run-list {
+  display: grid;
+  gap: 10px;
+  max-height: 420px;
+  overflow: auto;
+}
+
+.stage2-run-card {
+  display: grid;
+  gap: 7px;
+  width: 100%;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f8fafc;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.stage2-run-card.active {
+  border-color: var(--accent);
+  background: #f1fbf8;
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.stage2-run-card strong,
+.stage2-run-card small,
+.stage2-run-card p {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.stage2-run-card p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.stage2-run-card-stats,
+.stage2-run-actions,
+.stage2-section-head,
+.stage2-table-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.stage2-run-card-stats {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.stage2-control-deck {
+  padding: 18px;
+}
+
+.stage2-run-head {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.stage2-run-head h2 {
+  margin: 0;
+  font-size: 28px;
+  line-height: 1.15;
+}
+
+.stage2-meter-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.stage2-meter,
+.stage2-monitor-item {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.stage2-meter span,
+.stage2-monitor-item span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.stage2-meter strong,
+.stage2-monitor-item strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 18px;
+  line-height: 1.25;
+}
+
+.stage2-meter small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.stage2-monitor-strip,
+.stage2-timeline-line {
+  display: grid;
+  gap: 10px;
+}
+
+.stage2-monitor-strip {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.stage2-timeline-line {
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+}
+
+.stage2-timeline-step {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.stage2-timeline-step.current {
+  border-color: var(--accent);
+  background: #f1fbf8;
+}
+
+.stage2-timeline-step span,
+.stage2-timeline-step small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.stage2-timeline-step span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.stage2-timeline-step strong {
+  display: block;
+  margin: 4px 0;
+}
+
+.stage2-overview-grid,
+.stage2-ai-grid,
+.stage2-report-layout,
+.stage2-human-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.stage2-overview-grid,
+.stage2-ai-grid,
+.stage2-report-layout {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.stage2-work-card,
+.stage2-table-card,
+.stage2-task-card {
+  padding: 14px;
+}
+
+.stage2-work-card header,
+.stage2-task-card header {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.stage2-work-card-wide {
+  grid-column: 1 / -1;
+}
+
+.stage2-table-scroll {
+  overflow-x: auto;
+}
+
+.stage2-data-table {
+  width: 100%;
+  min-width: 640px;
+  border-collapse: collapse;
+}
+
+.stage2-data-table th,
+.stage2-data-table td {
+  padding: 10px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+
+.stage2-data-table td {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.stage2-empty {
+  padding: 18px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 8px;
+  color: var(--muted);
+}
+
+.stage2-empty strong {
+  display: block;
+  color: var(--text);
+}
+
 .onboarding-layout {
   display: grid;
   gap: 14px;
@@ -1527,6 +1804,11 @@ textarea:focus {
 }
 
 @media (max-width: 1320px) {
+  .stage2-meter-grid,
+  .stage2-timeline-line {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
   .stage2-overview,
   .onboarding-field-grid,
   .onboarding-step-list,
@@ -1558,8 +1840,13 @@ textarea:focus {
 
   .hero-grid,
   .operator-grid,
-  .detail-grid {
+  .detail-grid,
+  .stage2-cockpit {
     grid-template-columns: 1fr;
+  }
+
+  .stage2-command-rail {
+    position: static;
   }
 
   .stage-track {
@@ -1594,12 +1881,35 @@ textarea:focus {
   .hero-meta-grid,
   .metric-strip,
   .stage2-overview,
+  .stage2-meter-grid,
+  .stage2-monitor-strip,
+  .stage2-timeline-line,
+  .stage2-overview-grid,
+  .stage2-ai-grid,
+  .stage2-report-layout,
   .onboarding-field-grid,
   .onboarding-phase-strip,
   .onboarding-step-list,
   .stage-track,
   .two-cols {
     grid-template-columns: 1fr;
+  }
+
+  .stage2-run-head {
+    display: grid;
+  }
+
+  .stage2-form-row {
+    grid-template-columns: 1fr;
+  }
+
+  .stage2-control-deck,
+  .stage2-command-rail {
+    padding: 14px;
+  }
+
+  .stage2-data-table {
+    min-width: 520px;
   }
 
   .onboarding-form-head,

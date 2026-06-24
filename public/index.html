@@ -221,26 +221,94 @@
           </article>
 
           <article class="panel stage2-panel">
-            <div class="panel-heading">
-              <div>
-                <h2>第二阶段运行中心</h2>
-                <p class="panel-note" id="stage2Summary">读取真实 run 产物、编排会话、验证矩阵和模型对比摘要。</p>
-              </div>
+            <div class="stage2-cockpit" id="stage2Cockpit">
+              <aside class="stage2-command-rail">
+                <div class="stage2-rail-head">
+                  <p class="section-kicker">Run cockpit</p>
+                  <h2>第二阶段运行中心</h2>
+                  <p class="panel-note" id="stage2Summary">从这里创建、监控和复盘每一次自动评测 run。</p>
+                </div>
+
+                <form class="stage2-run-form" id="stage2RunForm">
+                  <label>
+                    系统名称
+                    <input name="systemName" placeholder="追本溯源管理系统">
+                  </label>
+                  <label>
+                    首页 URL
+                    <input name="entryUrl" type="url" placeholder="https://test.example.com/home">
+                  </label>
+                  <label>
+                    CDP URL
+                    <input name="cdpUrl" type="url" value="http://localhost:9222" placeholder="http://localhost:9222">
+                  </label>
+                  <label>
+                    测试账号与环境
+                    <textarea name="accountNotes" rows="3" placeholder="账号、角色、权限范围、登录接管说明"></textarea>
+                  </label>
+                  <label>
+                    探索范围
+                    <textarea name="scope" rows="3" placeholder="优先页面、排除页面、禁止动作、前置数据限制"></textarea>
+                  </label>
+                  <div class="stage2-form-row">
+                    <label>
+                      最大页面
+                      <input name="maxPages" type="number" min="1" max="100" value="30">
+                    </label>
+                    <label>
+                      最大轮次
+                      <input name="maxRounds" type="number" min="1" max="10" value="2">
+                    </label>
+                  </div>
+                  <button class="primary-action" data-stage2-action="create-run" type="submit">创建 run</button>
+                </form>
+
+                <section class="stage2-run-picker">
+                  <div class="stage2-section-head">
+                    <h3>Run 列表</h3>
+                    <button class="ghost-action compact-action" data-stage2-action="refresh-runs" type="button">刷新</button>
+                  </div>
+                  <div class="stage2-run-list" id="stage2RunList"></div>
+                </section>
+              </aside>
+
+              <section class="stage2-control-deck">
+                <header class="stage2-run-head">
+                  <div>
+                    <p class="section-kicker" id="stage2RunEyebrow">当前 run</p>
+                    <h2 id="stage2RunTitle">尚未选择 run</h2>
+                    <p class="panel-note" id="stage2RunSubtitle">创建或选择 run 后，这里会显示发现、执行、AI 复盘和报告状态。</p>
+                  </div>
+                  <div class="stage2-run-actions" id="stage2RunActions"></div>
+                </header>
+
+                <section class="stage2-meter-grid" id="stage2MetricCards"></section>
+                <section class="stage2-monitor-strip" id="stage2MonitorStrip"></section>
+                <section class="stage2-timeline" id="stage2Timeline"></section>
+
+                <div class="stage2-tabs" id="stage2Tabs" role="tablist" aria-label="第二阶段运行中心">
+                  <button data-stage2-tab="overview" type="button">总览</button>
+                  <button data-stage2-tab="pages" type="button">页面入口</button>
+                  <button data-stage2-tab="features" type="button">功能点</button>
+                  <button data-stage2-tab="cases" type="button">用例</button>
+                  <button data-stage2-tab="execution" type="button">执行结果</button>
+                  <button data-stage2-tab="ai" type="button">AI 复盘</button>
+                  <button data-stage2-tab="human" type="button">人工处理</button>
+                  <button data-stage2-tab="report" type="button">报告</button>
+                  <button data-stage2-tab="artifacts" type="button">Artifacts</button>
+                </div>
+
+                <div class="stage2-tab-body" id="stage2OverviewTab"></div>
+                <div class="stage2-tab-body" id="stage2PagesTab"></div>
+                <div class="stage2-tab-body" id="stage2FeaturesTab"></div>
+                <div class="stage2-tab-body" id="stage2CasesTab"></div>
+                <div class="stage2-tab-body" id="stage2ExecutionTab"></div>
+                <div class="stage2-tab-body" id="stage2AiTab"></div>
+                <div class="stage2-tab-body" id="stage2HumanTab"></div>
+                <div class="stage2-tab-body" id="stage2ReportTab"></div>
+                <div class="stage2-tab-body" id="stage2ArtifactsTab"></div>
+              </section>
             </div>
-            <div class="stage2-tabs" id="stage2Tabs" role="tablist" aria-label="第二阶段运行中心">
-              <button data-stage2-tab="summary" type="button">运行摘要</button>
-              <button data-stage2-tab="onboarding" type="button">新系统接入</button>
-              <button data-stage2-tab="matrix" type="button">验证矩阵</button>
-              <button data-stage2-tab="human" type="button">人工接管</button>
-            </div>
-            <div class="stage2-tab-body" id="stage2SummaryTab">
-              <div class="stage2-overview" id="stage2OverviewCards"></div>
-              <div class="session-list" id="stage2SessionList"></div>
-              <div class="run-list" id="stage2RunList"></div>
-            </div>
-            <div class="stage2-tab-body" id="stage2OnboardingTab"></div>
-            <div class="stage2-tab-body" id="stage2MatrixTab"></div>
-            <div class="stage2-tab-body" id="stage2HumanTab"></div>
           </article>
         </section>
 

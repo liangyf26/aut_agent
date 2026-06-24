@@ -19,6 +19,18 @@ const {
   runOperationStep
 } = require('./stage2OperationCenter');
 const {
+  analyzeV3Run,
+  continueNextRound,
+  createV3Run,
+  generateV3Report,
+  getV3Run,
+  listV3Runs,
+  resolveV3RunArtifact,
+  saveHumanTaskResult,
+  setV3RunLifecycleStatus,
+  startV3Run
+} = require('./stage2V3RunCenter');
+const {
   createProject,
   updateProject,
   hydrateProject,
@@ -63,6 +75,10 @@ function sendError(res, statusCode, message) {
 
 function sendOperationError(res, error) {
   sendError(res, error.statusCode || 500, error.message || 'Stage-2 operation failed.');
+}
+
+function sendStage2V3Error(res, error) {
+  sendError(res, error.statusCode || 500, error.message || 'Stage-2 v3 run operation failed.');
 }
 
 async function readJson(req) {
@@ -162,6 +178,86 @@ async function handleApi(req, res, pathname) {
       sendJson(res, 200, { result, overview });
     } catch (error) {
       sendOperationError(res, error);
+    }
+    return true;
+  }
+
+  if (req.method === 'GET' && pathname === '/api/stage2/v3/runs') {
+    try {
+      sendJson(res, 200, await listV3Runs());
+    } catch (error) {
+      sendStage2V3Error(res, error);
+    }
+    return true;
+  }
+
+  if (req.method === 'POST' && pathname === '/api/stage2/v3/runs') {
+    try {
+      const body = await readJson(req);
+      sendJson(res, 201, await createV3Run(body));
+    } catch (error) {
+      sendStage2V3Error(res, error);
+    }
+    return true;
+  }
+
+  const stage2V3ArtifactParams = routeMatch(pathname, '/api/stage2/v3/runs/:runId/artifacts/:artifactKey');
+  if (stage2V3ArtifactParams && req.method === 'GET') {
+    try {
+      const artifact = await resolveV3RunArtifact(
+        stage2V3ArtifactParams.runId,
+        stage2V3ArtifactParams.artifactKey
+      );
+      if (!artifact) {
+        sendError(res, 404, 'Stage-2 v3 artifact not found.');
+        return true;
+      }
+      const content = await fs.readFile(artifact.path);
+      res.writeHead(200, {
+        'Content-Type': mimeTypes[path.extname(artifact.path).toLowerCase()] || 'application/octet-stream',
+        'Cache-Control': 'no-store',
+        'Content-Disposition': `inline; filename="${encodeURIComponent(artifact.fileName)}"`
+      });
+      res.end(content);
+    } catch (error) {
+      sendStage2V3Error(res, error);
+    }
+    return true;
+  }
+
+  const stage2V3RunParams = routeMatch(pathname, '/api/stage2/v3/runs/:runId');
+  if (stage2V3RunParams && req.method === 'GET') {
+    try {
+      sendJson(res, 200, await getV3Run(stage2V3RunParams.runId));
+    } catch (error) {
+      sendStage2V3Error(res, error);
+    }
+    return true;
+  }
+
+  const stage2V3RunActionParams = routeMatch(pathname, '/api/stage2/v3/runs/:runId/:action');
+  if (stage2V3RunActionParams && req.method === 'POST') {
+    try {
+      const body = await readJson(req);
+      const { runId, action } = stage2V3RunActionParams;
+      const handlers = {
+        start: () => startV3Run(runId, body),
+        pause: () => setV3RunLifecycleStatus(runId, 'pause', body),
+        resume: () => setV3RunLifecycleStatus(runId, 'resume', body),
+        stop: () => setV3RunLifecycleStatus(runId, 'stop', body),
+        'save-human-task': () => saveHumanTaskResult(runId, body),
+        'analyze-round': () => analyzeV3Run(runId),
+        'continue-next-round': () => continueNextRound(runId, body),
+        'generate-report': () => generateV3Report(runId)
+      };
+      const handler = handlers[action];
+      if (!handler) {
+        sendError(res, 404, 'Unknown stage-2 v3 run action.');
+        return true;
+      }
+      sendJson(res, 200, await handler());
+    } catch (error) {
+      sendStage2V3Error(res, error);
     }
     return true;
   }

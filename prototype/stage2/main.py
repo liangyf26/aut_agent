@@ -14,24 +14,10 @@ if str(ROOT_DIR) not in sys.path:
 
 from prototype.stage2.app.runtime.templates import load_template_bundle
 from prototype.stage2.app.runtime.template_bootstrap import bootstrap_template_bundle
-from prototype.stage2.app.runtime.template_revision_checklist import build_template_revision_checklist
 from prototype.stage2.app.reporting import (
     build_platform_daily_report,
     render_platform_daily_report_markdown,
 )
-from prototype.stage2.app.verification.template_runtime import TemplateRuntimeData
-from prototype.stage2.app.verification.validation_matrix import (
-    VALIDATION_MODE_CONNECTED,
-    VALIDATION_MODE_LOCAL,
-    VALIDATION_STATUS_FAILED,
-    VALIDATION_STATUS_SKIPPED,
-    ValidationMatrixResult,
-    ValidationMatrixTarget,
-    build_default_g4_validation_targets,
-    build_validation_matrix_payload,
-    render_validation_matrix_markdown,
-)
-
 TEMPLATE_ROOT = ROOT_DIR / "prototype" / "stage2" / "templates"
 HUMAN_LOOP_ROOT = ROOT_DIR / "artifacts" / "stage2" / "human_loop"
 DEFAULT_CDP_URL = "http://localhost:9222"
@@ -41,6 +27,42 @@ DEFAULT_G4_VALIDATION_GOAL = (
 
 if sys.stdout.encoding != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
+
+
+def _load_template_runtime_data_class():
+    from prototype.stage2.app.verification.template_runtime import TemplateRuntimeData
+
+    return TemplateRuntimeData
+
+
+def _ensure_validation_matrix_symbols() -> None:
+    if "ValidationMatrixResult" in globals():
+        return
+    from prototype.stage2.app.verification.validation_matrix import (
+        VALIDATION_MODE_CONNECTED as _VALIDATION_MODE_CONNECTED,
+        VALIDATION_MODE_LOCAL as _VALIDATION_MODE_LOCAL,
+        VALIDATION_STATUS_FAILED as _VALIDATION_STATUS_FAILED,
+        VALIDATION_STATUS_SKIPPED as _VALIDATION_STATUS_SKIPPED,
+        ValidationMatrixResult as _ValidationMatrixResult,
+        ValidationMatrixTarget as _ValidationMatrixTarget,
+        build_default_g4_validation_targets as _build_default_g4_validation_targets,
+        build_validation_matrix_payload as _build_validation_matrix_payload,
+        render_validation_matrix_markdown as _render_validation_matrix_markdown,
+    )
+
+    globals().update(
+        {
+            "VALIDATION_MODE_CONNECTED": _VALIDATION_MODE_CONNECTED,
+            "VALIDATION_MODE_LOCAL": _VALIDATION_MODE_LOCAL,
+            "VALIDATION_STATUS_FAILED": _VALIDATION_STATUS_FAILED,
+            "VALIDATION_STATUS_SKIPPED": _VALIDATION_STATUS_SKIPPED,
+            "ValidationMatrixResult": _ValidationMatrixResult,
+            "ValidationMatrixTarget": _ValidationMatrixTarget,
+            "build_default_g4_validation_targets": _build_default_g4_validation_targets,
+            "build_validation_matrix_payload": _build_validation_matrix_payload,
+            "render_validation_matrix_markdown": _render_validation_matrix_markdown,
+        }
+    )
 
 
 def list_templates() -> list[dict[str, str]]:
@@ -158,6 +180,8 @@ def generate_template_revision_checklist(
     candidate_review_path: str = "",
     output_dir: str = "",
 ) -> dict[str, Any]:
+    from prototype.stage2.app.runtime.template_revision_checklist import build_template_revision_checklist
+
     template_dir = TEMPLATE_ROOT / template_name
     resolved_discovery_dir = Path(discovery_dir) if discovery_dir else ROOT_DIR / "artifacts" / "stage2" / f"live_discovery_{template_name}"
     resolved_candidate_review_path = (
@@ -568,6 +592,8 @@ async def run_local_template_validation(template_name: str) -> dict[str, Any]:
     from prototype.stage2.app.runtime.artifacts import ArtifactWriter
     from prototype.stage2.app.verification import execute_generic_template_with_shared_result
 
+    TemplateRuntimeData = _load_template_runtime_data_class()
+    _ensure_validation_matrix_symbols()
     bundle = load_template_bundle(TEMPLATE_ROOT / template_name)
     artifact_root = ROOT_DIR / "artifacts" / "stage2" / "template_validation"
     artifact_root.mkdir(parents=True, exist_ok=True)
@@ -616,6 +642,8 @@ async def run_connected_template_validation(
     from prototype.stage2.app.runtime.artifacts import ArtifactWriter
     from prototype.stage2.app.verification import execute_generic_template_with_shared_result
 
+    TemplateRuntimeData = _load_template_runtime_data_class()
+    _ensure_validation_matrix_symbols()
     bundle = load_template_bundle(TEMPLATE_ROOT / template_name)
     artifact_root = ROOT_DIR / "artifacts" / "stage2" / "template_validation"
     artifact_root.mkdir(parents=True, exist_ok=True)
@@ -667,6 +695,7 @@ def _coerce_validation_matrix_result(
     target: ValidationMatrixTarget,
     payload: dict[str, Any],
 ) -> ValidationMatrixResult:
+    _ensure_validation_matrix_symbols()
     status = str(payload.get("status") or "").strip().lower()
     if status not in {"passed", "failed", "skipped"}:
         status = "passed" if payload.get("success") else "failed"
@@ -692,6 +721,7 @@ def _failed_validation_matrix_result(
     reason: str,
     payload: dict[str, Any] | None = None,
 ) -> ValidationMatrixResult:
+    _ensure_validation_matrix_symbols()
     return ValidationMatrixResult(
         target=target,
         status=VALIDATION_STATUS_FAILED,
@@ -703,6 +733,7 @@ def _failed_validation_matrix_result(
 
 
 def _skipped_validation_matrix_result(target: ValidationMatrixTarget, *, reason: str) -> ValidationMatrixResult:
+    _ensure_validation_matrix_symbols()
     return ValidationMatrixResult(
         target=target,
         status=VALIDATION_STATUS_SKIPPED,
@@ -720,6 +751,7 @@ async def run_g4_validation_matrix(
     local_runner: Any = None,
     connected_runner: Any = None,
 ) -> dict[str, Any]:
+    _ensure_validation_matrix_symbols()
     selected_targets = list(targets or build_default_g4_validation_targets())
     local_runner = local_runner or run_local_template_validation
     connected_runner = connected_runner or run_connected_template_validation
@@ -1094,6 +1126,57 @@ async def run_stage2_sample_entrypoint(
     )
 
 
+async def run_v3_assessment_entrypoint(
+    *,
+    target_name: str,
+    start_url: str,
+    cdp_url: str,
+    model_name: str | None,
+    run_id: str,
+    artifact_root: str,
+    use_live_discovery: bool,
+    max_pages: int,
+    max_features_per_page: int,
+    template_name: str,
+) -> dict[str, Any]:
+    from prototype.stage2.app.v3_orchestrator import V3RunConfig, run_v3_assessment
+
+    artifact_root_path = (
+        Path(artifact_root)
+        if artifact_root
+        else ROOT_DIR / "artifacts" / "stage2" / "v3_runs"
+    )
+    config = V3RunConfig(
+        target_name=target_name or "第二阶段 v3 演示系统",
+        start_url=start_url,
+        cdp_url=cdp_url,
+        model_name=model_name,
+        run_id=run_id,
+        artifact_root=artifact_root_path,
+        use_live_discovery=bool(use_live_discovery and start_url),
+        max_pages=max_pages,
+        max_features_per_page=max_features_per_page,
+        metadata={
+            "entrypoint": "prototype.stage2.main --run-v3",
+            "template_name": template_name,
+        },
+    )
+
+    async def discovery_provider() -> dict[str, Any]:
+        return await explore_system_map(
+            target_name=config.target_name,
+            start_url=config.start_url,
+            cdp_url=config.cdp_url,
+            model_name=config.model_name,
+            template_name=template_name,
+        )
+
+    return await run_v3_assessment(
+        config,
+        discovery_provider=discovery_provider if config.use_live_discovery else None,
+    )
+
+
 async def resume_human_takeover_entrypoint(
     *,
     run_dir: str,
@@ -1257,6 +1340,38 @@ def main() -> None:
         "--run-sample",
         action="store_true",
         help="Run the full stage-2 sample pipeline for the current template via the unified platform entrypoint.",
+    )
+    parser.add_argument(
+        "--run-v3",
+        action="store_true",
+        help="Run the stage-2 v3 run-centered minimum loop and write v3 contract artifacts.",
+    )
+    parser.add_argument(
+        "--v3-run-id",
+        default="",
+        help="Optional explicit run id for --run-v3.",
+    )
+    parser.add_argument(
+        "--v3-artifact-root",
+        default="",
+        help="Optional artifact root for --run-v3. Defaults to artifacts/stage2/v3_runs.",
+    )
+    parser.add_argument(
+        "--v3-use-live-discovery",
+        action="store_true",
+        help="For --run-v3, call the existing system-map/live-discovery flow before generating cases.",
+    )
+    parser.add_argument(
+        "--v3-max-pages",
+        type=int,
+        default=5,
+        help="Maximum page entries retained in a v3 run.",
+    )
+    parser.add_argument(
+        "--v3-max-features-per-page",
+        type=int,
+        default=6,
+        help="Maximum feature points retained per page in a v3 run.",
     )
     parser.add_argument(
         "--max-attempts",
@@ -1448,6 +1563,31 @@ def main() -> None:
                         cdp_url=args.cdp_url,
                         max_attempts=args.max_attempts,
                         max_rounds=args.max_rounds,
+                    )
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+
+    if args.run_v3:
+        print(
+            json.dumps(
+                asyncio.run(
+                    run_v3_assessment_entrypoint(
+                        target_name=args.target_name or args.template or "第二阶段 v3 演示系统",
+                        start_url=args.page_url,
+                        cdp_url=args.cdp_url,
+                        model_name=args.model or None,
+                        run_id=args.v3_run_id,
+                        artifact_root=args.v3_artifact_root,
+                        use_live_discovery=args.v3_use_live_discovery,
+                        max_pages=args.v3_max_pages,
+                        max_features_per_page=args.v3_max_features_per_page,
+                        template_name=args.template
+                        if args.template != "suyuan_online_apply"
+                        else "",
                     )
                 ),
                 ensure_ascii=False,
