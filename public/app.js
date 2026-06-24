@@ -160,6 +160,7 @@ const state = {
   stage2RunDetails: {},
   stage2LocalRuns: loadStage2LocalRuns(),
   stage2ActionLog: [],
+  stage2BrowserPreflight: { status: 'unknown', ok: false, message: '浏览器连接状态待检查。' },
   stage2RunsApiAvailable: null,
   stage2LastError: '',
   selectedRunId: null,
@@ -170,6 +171,7 @@ const state = {
 };
 
 const AUTO_REFRESH_MS = 15000;
+let stage2BrowserPreflightTimer = null;
 const fields = ['name', 'client', 'vendor', 'sutName', 'sutBaseUrl', 'accountNotes', 'scope', 'documentText'];
 
 const projectForm = document.querySelector('#projectForm');
@@ -516,12 +518,13 @@ function getStage2ExecutionMode(run) {
     || run?.input_config?.execution_mode
     || run?.manifest?.execution_mode
     || run?.run_manifest?.execution_mode
-    || 'contract_placeholder';
+    || 'contract_only';
 }
 
 function executionModeLabel(mode) {
   const labels = {
     real_browser: '真实浏览器',
+    contract_only: '契约占位',
     contract_placeholder: '契约占位'
   };
   return labels[mode] || mode || '契约占位';
@@ -529,7 +532,8 @@ function executionModeLabel(mode) {
 
 function isStage2RealExecutionAvailable(run) {
   return Boolean(
-    run?.realExecutionAvailable
+    state.stage2BrowserPreflight?.ok
+    || run?.realExecutionAvailable
     || run?.real_execution_available
     || run?.capabilities?.realBrowserExecution
     || run?.capabilities?.real_browser_execution
@@ -538,6 +542,90 @@ function isStage2RealExecutionAvailable(run) {
     || run?.preflight?.cdp_available === true
     || run?.preflightResult?.cdpAvailable === true
   );
+}
+
+function getStage2FormCdpUrl() {
+  const value = stage2RunForm?.elements?.cdpUrl?.value?.trim();
+  return value || 'http://localhost:9222';
+}
+
+function browserPreflightTone() {
+  if (state.stage2BrowserPreflight?.ok) {
+    return 'success';
+  }
+  if (state.stage2BrowserPreflight?.status === 'checking') {
+    return 'manual';
+  }
+  if (state.stage2BrowserPreflight?.status === 'unknown') {
+    return 'warning';
+  }
+  return 'failed';
+}
+
+function browserPreflightOptionSuffix() {
+  const preflight = state.stage2BrowserPreflight || {};
+  if (preflight.ok) {
+    return '（已连接）';
+  }
+  if (preflight.status === 'checking') {
+    return '（检查中）';
+  }
+  if (preflight.status === 'unknown') {
+    return '（待检查）';
+  }
+  return '（不可达）';
+}
+
+function browserPreflightMessage() {
+  const preflight = state.stage2BrowserPreflight || {};
+  if (preflight.ok) {
+    const targetText = Number.isInteger(preflight.targetCount)
+      ? `，可见 ${preflight.targetCount} 个页面 target`
+      : '';
+    return `${preflight.message || '真实浏览器已连接'}${targetText}`;
+  }
+  return preflight.message || '浏览器连接状态待检查。';
+}
+
+async function refreshStage2BrowserPreflight({ silent = false } = {}) {
+  const cdpUrl = getStage2FormCdpUrl();
+  state.stage2BrowserPreflight = {
+    status: 'checking',
+    ok: false,
+    cdpUrl,
+    message: `正在检查 CDP：${cdpUrl}`
+  };
+  renderStage2BrowserPreflight();
+  renderStage2Overview();
+  try {
+    const result = await api(`/api/stage2/v3/browser-preflight?cdpUrl=${encodeURIComponent(cdpUrl)}`);
+    state.stage2BrowserPreflight = result;
+    if (!silent) {
+      pushStage2ActionLog(result.ok ? `真实浏览器预检通过：${result.message}` : `真实浏览器预检失败：${result.message}`, result.ok ? 'success' : 'error');
+    }
+  } catch (error) {
+    state.stage2BrowserPreflight = {
+      status: 'failed',
+      ok: false,
+      cdpUrl,
+      message: `真实浏览器预检失败：${error.message}`
+    };
+    if (!silent) {
+      pushStage2ActionLog(state.stage2BrowserPreflight.message, 'error');
+    }
+  } finally {
+    renderStage2BrowserPreflight();
+    renderStage2Overview();
+  }
+}
+
+function renderStage2BrowserPreflight() {
+  const node = document.querySelector('#stage2BrowserPreflight');
+  if (!node) {
+    return;
+  }
+  node.className = `stage2-browser-preflight ${browserPreflightTone()}`;
+  node.textContent = browserPreflightMessage();
 }
 
 async function createStage2Run(event) {
@@ -1283,6 +1371,7 @@ function renderStage2Overview() {
   renderStage2V3ReportTab();
   renderStage2V3ArtifactsTab();
   renderStage2ActionFeedback();
+  renderStage2BrowserPreflight();
 }
 
 function renderStage2V3Shell() {
@@ -1362,6 +1451,8 @@ function renderStage2RunActions(run) {
   const runKind = getStage2RunKind(run);
   const executionMode = getStage2ExecutionMode(run);
   const realAvailable = isStage2RealExecutionAvailable(run);
+  const realBrowserSuffix = browserPreflightOptionSuffix();
+  const realBrowserMessage = browserPreflightMessage();
   const disabled = state.pendingAction || !actionable ? 'disabled' : '';
   const disabledReason = state.pendingAction
     ? '正在处理上一项操作，请等待反馈区显示完成或失败。'
@@ -1372,7 +1463,7 @@ function renderStage2RunActions(run) {
       执行模式
       <select id="stage2ExecutionMode" ${state.pendingAction || !actionable ? 'disabled' : ''}>
         <option value="contract_only" ${executionMode !== 'real_browser' ? 'selected' : ''}>契约占位</option>
-        <option value="real_browser" ${executionMode === 'real_browser' ? 'selected' : ''}>真实浏览器${realAvailable ? '' : '（未就绪）'}</option>
+        <option value="real_browser" ${executionMode === 'real_browser' ? 'selected' : ''}>真实浏览器${escapeHtml(realBrowserSuffix)}</option>
       </select>
     </label>
     <button class="ghost-action compact-action primary-compact-action" data-stage2-run-action="start" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '按所选执行模式启动。' : disabledReason)}" ${disabled}>开始自动评测</button>
@@ -1382,7 +1473,7 @@ function renderStage2RunActions(run) {
     <button class="ghost-action compact-action" data-stage2-run-action="continue-next-round" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '按下一轮计划继续。' : disabledReason)}" ${disabled}>进入下一轮</button>
     <button class="ghost-action compact-action" data-stage2-run-action="generate-report" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '生成或刷新报告。' : disabledReason)}" ${disabled}>生成报告</button>
     <button class="ghost-action compact-action danger-action" data-stage2-run-action="stop" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '停止当前 run。' : disabledReason)}" ${disabled}>停止</button>
-    <span class="stage2-action-reason">${escapeHtml(realAvailable ? '真实浏览器预检可用。' : '真实浏览器执行未就绪时，选择该模式会直接报错并说明缺口。')}</span>
+    <span class="stage2-action-reason">${escapeHtml(realAvailable ? realBrowserMessage : `${realBrowserMessage}。选择该模式会先做真实预检，失败会直接显示原因。`)}</span>
   `;
 }
 
@@ -3226,6 +3317,24 @@ async function copyText(value, successMessage) {
 projectForm.addEventListener('submit', saveProject);
 
 stage2RunForm?.addEventListener('submit', createStage2Run);
+stage2RunForm?.elements?.cdpUrl?.addEventListener('input', () => {
+  clearTimeout(stage2BrowserPreflightTimer);
+  state.stage2BrowserPreflight = {
+    status: 'unknown',
+    ok: false,
+    cdpUrl: getStage2FormCdpUrl(),
+    message: 'CDP URL 已变更，等待重新检查。'
+  };
+  renderStage2BrowserPreflight();
+  renderStage2Overview();
+  stage2BrowserPreflightTimer = setTimeout(() => {
+    refreshStage2BrowserPreflight({ silent: true }).catch(() => {});
+  }, 600);
+});
+stage2RunForm?.elements?.cdpUrl?.addEventListener('blur', () => {
+  clearTimeout(stage2BrowserPreflightTimer);
+  refreshStage2BrowserPreflight({ silent: true }).catch(() => {});
+});
 
 document.querySelector('#stage2Cockpit')?.addEventListener('click', (event) => {
   const refreshButton = event.target.closest('[data-stage2-action="refresh-runs"]');
@@ -3446,7 +3555,9 @@ function autoRefreshDashboard() {
   });
 }
 
-loadDashboardData().catch((error) => {
+loadDashboardData().then(() => {
+  refreshStage2BrowserPreflight({ silent: true }).catch(() => {});
+}).catch((error) => {
   saveState.textContent = error.message;
 });
 

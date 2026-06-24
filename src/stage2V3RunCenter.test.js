@@ -1,11 +1,13 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs/promises');
+const http = require('http');
 const os = require('os');
 const path = require('path');
 
 const {
   analyzeV3Run,
+  checkBrowserPreflight,
   continueNextRound,
   createV3Run,
   generateV3Report,
@@ -27,6 +29,34 @@ async function withTempRunsDir(callback) {
 
 async function readJson(filePath) {
   return JSON.parse(await fs.readFile(filePath, 'utf8'));
+}
+
+async function withFakeCdpServer(callback) {
+  const server = http.createServer((req, res) => {
+    if (req.url === '/json/version') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        Browser: 'Chrome/149.0.7827.156',
+        'Protocol-Version': '1.3',
+        webSocketDebuggerUrl: 'ws://localhost:9222/devtools/browser/fake'
+      }));
+      return;
+    }
+    if (req.url === '/json/list') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify([{ type: 'page', url: 'https://example.com' }]));
+      return;
+    }
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const { port } = server.address();
+    return await callback(`http://127.0.0.1:${port}`);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 }
 
 function argValue(args, name) {
@@ -118,6 +148,123 @@ async function writeFakePythonV3Artifacts(artifactRoot, runId, overrides = {}) {
   return pythonRunDir;
 }
 
+async function writeFakePythonV1Artifacts(artifactRoot, runId) {
+  const pythonRunDir = path.join(artifactRoot, runId);
+  await fs.mkdir(pythonRunDir, { recursive: true });
+  const page = {
+    page_entry_id: 'page_001',
+    name: '真实首页',
+    url: 'https://example.com/home',
+    menu_path: ['真实首页'],
+    page_type: 'landing',
+    discovery_depth: 0,
+    status: 'reachable',
+    source: 'real_browser_cdp',
+    screenshot_refs: ['screenshots/home_visible.png']
+  };
+  const feature = {
+    feature_point_id: 'feature_001',
+    page_entry_id: 'page_001',
+    name: '页面可见性验证',
+    feature_type: 'view',
+    risk_level: 'low',
+    auto_verifiable: true,
+    verification_strategy: 'page_visible',
+    locator_candidates: [],
+    source: 'real_browser_page_visible',
+    confidence: 0.95,
+    review_status: 'auto_included'
+  };
+  const testCase = {
+    test_case_id: 'case_001',
+    feature_point_id: 'feature_001',
+    title: '首页真实浏览器可见性验证',
+    type_template: 'page_visible',
+    preconditions: [],
+    steps: [{ action: 'goto', target: 'https://example.com/home' }],
+    expected_feedback: ['页面可见'],
+    risk_policy: 'safe_auto',
+    assertions: ['page_visible'],
+    requires_human_confirmation: false
+  };
+  const result = {
+    test_case_id: 'case_001',
+    status: 'real_passed',
+    verdict: '真实浏览器低风险页面可见性验证通过。',
+    started_at: '2026-06-24T00:00:00.000Z',
+    finished_at: '2026-06-24T00:00:01.000Z',
+    actions: [{ action: 'goto', ok: true }],
+    page_feedback: ['页面可见'],
+    screenshot_refs: ['screenshots/home_visible.png'],
+    network_refs: [],
+    failure_reason: null,
+    manual_confirmation_required: false,
+    execution_mode: 'real_browser'
+  };
+
+  await fs.writeFile(path.join(pythonRunDir, 'page_entries.json'), JSON.stringify({
+    schema_version: 'stage2_v3_run.v1',
+    page_entries: [page],
+    items: [page]
+  }, null, 2));
+  await fs.writeFile(path.join(pythonRunDir, 'feature_points.json'), JSON.stringify({
+    schema_version: 'stage2_v3_run.v1',
+    feature_points: [feature],
+    items: [feature]
+  }, null, 2));
+  await fs.writeFile(path.join(pythonRunDir, 'generated_test_cases.json'), JSON.stringify({
+    schema_version: 'stage2_v3_run.v1',
+    test_cases: [testCase],
+    items: [testCase]
+  }, null, 2));
+  await fs.writeFile(path.join(pythonRunDir, 'execution_results.json'), JSON.stringify({
+    schema_version: 'stage2_v3_run.v1',
+    results: [result],
+    items: [result]
+  }, null, 2));
+  await fs.writeFile(path.join(pythonRunDir, 'next_round_plan.json'), JSON.stringify({
+    schema_version: 'stage2_next_round_plan.v3',
+    current_round_id: 'round_001',
+    should_continue: false,
+    decision: 'stop_goal_completed',
+    next_round_goal: '本轮已完成。',
+    target_page_entry_ids: [],
+    target_feature_point_ids: [],
+    planned_improvements: [],
+    risk_level: 'low',
+    requires_human_approval: false
+  }, null, 2));
+  await fs.writeFile(path.join(pythonRunDir, 'human_tasks.json'), JSON.stringify({
+    schema_version: 'stage2_human_tasks.v3',
+    items: []
+  }, null, 2));
+  return pythonRunDir;
+}
+
+test('stage2 v3 browser preflight checks the live CDP endpoint', async () => {
+  await withFakeCdpServer(async (cdpUrl) => {
+    const preflight = await checkBrowserPreflight(cdpUrl);
+
+    assert.equal(preflight.ok, true);
+    assert.equal(preflight.status, 'connected');
+    assert.equal(preflight.browser, 'Chrome/149.0.7827.156');
+    assert.equal(preflight.targetCount, 1);
+    assert.match(preflight.message, /Chrome\/149/);
+  });
+});
+
+test('stage2 v3 browser preflight returns visible unavailable state', async () => {
+  await withFakeCdpServer(async (cdpUrl) => {
+    const preflight = await checkBrowserPreflight(`${cdpUrl}/bad-path`);
+
+    assert.equal(preflight.ok, true);
+    assert.equal(preflight.status, 'connected');
+  });
+  const failed = await checkBrowserPreflight('http://127.0.0.1:1', { timeoutMs: 800 });
+  assert.equal(failed.ok, false);
+  assert.match(failed.message, /CDP/);
+});
+
 test('stage2 v3 run center creates a draft run and starts a stable artifact contract', async () => {
   await withTempRunsDir(async (runsDir) => {
     const created = await createV3Run({
@@ -190,6 +337,50 @@ test('stage2 v3 run center starts real_browser mode through Python v3 bridge', a
     assert.equal(executionResults.items[0].status, 'passed');
     assert.equal(executionResults.items[0].execution_mode, 'real_browser');
     assert.equal(preflight.checks.python_orchestrator.ok, true);
+  });
+});
+
+test('stage2 v3 run center imports Python v1-shaped real browser artifacts', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '真实执行兼容系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+
+    const started = await startV3Run(created.run.runId, {
+      executionMode: 'real_browser'
+    }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV1Artifacts(artifactRoot, runId);
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    assert.equal(started.run.status, 'completed');
+    assert.equal(started.run.summary.pageEntries, 1);
+    assert.equal(started.run.summary.featurePoints, 1);
+    assert.equal(started.run.summary.generatedTestCases, 1);
+    assert.equal(started.run.summary.execution.passed, 1);
+    assert.equal(started.run.summary.execution.by_status.real_passed, 1);
+    assert.equal(started.run.summary.nextDecision, 'stop_goal_completed');
+
+    const runDir = path.join(runsDir, created.run.runId);
+    const pageEntries = await readJson(path.join(runDir, 'page_entries.json'));
+    const featurePoints = await readJson(path.join(runDir, 'feature_points.json'));
+    const generatedTestCases = await readJson(path.join(runDir, 'generated_test_cases.json'));
+    const roundAnalysis = await readJson(path.join(runDir, 'round_analysis.json'));
+    assert.equal(pageEntries.schema_version, 'stage2_page_entries.v3');
+    assert.equal(pageEntries.items.length, 1);
+    assert.equal(featurePoints.items.length, 1);
+    assert.equal(generatedTestCases.items.length, 1);
+    assert.equal(roundAnalysis.coverage_summary.page_entries, 1);
+    assert.equal(roundAnalysis.failure_summary.total_clusters, 0);
   });
 });
 

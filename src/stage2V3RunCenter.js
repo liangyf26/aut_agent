@@ -217,6 +217,66 @@ async function copyTextFileIfExists(sourcePath, targetPath) {
   return true;
 }
 
+async function checkBrowserPreflight(cdpUrl = DEFAULT_CDP_URL, options = {}) {
+  const normalizedCdpUrl = normalizeCdpUrl(cdpUrl);
+  const timeoutMs = normalizeInteger(options.timeoutMs || options.timeout_ms, 3000, 500, 30000);
+  const checkedAt = nowIso();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const buildUrl = (relativePath) => {
+    const base = new URL(normalizedCdpUrl);
+    return new URL(relativePath, `${base.origin}/`).toString();
+  };
+  try {
+    const versionResponse = await fetch(buildUrl('/json/version'), {
+      signal: controller.signal,
+      cache: 'no-store'
+    });
+    if (!versionResponse.ok) {
+      throw new Error(`CDP /json/version 返回 HTTP ${versionResponse.status}`);
+    }
+    const version = await versionResponse.json();
+    let targetCount = null;
+    try {
+      const listResponse = await fetch(buildUrl('/json/list'), {
+        signal: controller.signal,
+        cache: 'no-store'
+      });
+      if (listResponse.ok) {
+        const targets = await listResponse.json();
+        targetCount = Array.isArray(targets) ? targets.length : null;
+      }
+    } catch {
+      targetCount = null;
+    }
+    return {
+      ok: true,
+      status: 'connected',
+      cdpUrl: normalizedCdpUrl,
+      browser: version.Browser || '',
+      protocolVersion: version['Protocol-Version'] || '',
+      webSocketDebuggerUrl: version.webSocketDebuggerUrl || '',
+      targetCount,
+      checkedAt,
+      message: version.Browser
+        ? `已连接 ${version.Browser}`
+        : '已连接 Chrome DevTools Protocol。'
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: error.name === 'AbortError' ? 'timeout' : 'unreachable',
+      cdpUrl: normalizedCdpUrl,
+      checkedAt,
+      message: error.name === 'AbortError'
+        ? `CDP 预检超时：${normalizedCdpUrl}`
+        : `CDP 不可用：${error.message}`
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function appendEvent(runDir, event) {
   await fs.mkdir(runDir, { recursive: true });
   await fs.appendFile(
@@ -591,7 +651,7 @@ function makeScreenshotsIndex() {
 function groupFailures(executionResults) {
   const groups = new Map();
   for (const result of executionResults.items || []) {
-    if (result.status === 'passed') {
+    if (['passed', 'real_passed'].includes(result.status)) {
       continue;
     }
     const key = result.failure_reason || result.status || 'unknown';
@@ -947,7 +1007,7 @@ function normalizePythonPageEntries(payload, inputConfig) {
   if (payload?.schema_version === 'stage2_page_entries.v3' && Array.isArray(payload.items)) {
     return payload;
   }
-  const pages = payload?.pages || [];
+  const pages = payload?.pages || payload?.page_entries || payload?.items || [];
   return {
     schema_version: 'stage2_page_entries.v3',
     items: pages.map((page, index) => ({
@@ -969,7 +1029,7 @@ function normalizePythonFeaturePoints(payload) {
   if (payload?.schema_version === 'stage2_feature_points.v3' && Array.isArray(payload.items)) {
     return payload;
   }
-  const features = payload?.features || [];
+  const features = payload?.features || payload?.feature_points || payload?.items || [];
   return {
     schema_version: 'stage2_feature_points.v3',
     items: features.map((feature, index) => {
@@ -995,7 +1055,7 @@ function normalizePythonTestCases(payload) {
   if (payload?.schema_version === 'stage2_generated_test_cases.v3' && Array.isArray(payload.items)) {
     return payload;
   }
-  const cases = payload?.cases || [];
+  const cases = payload?.cases || payload?.test_cases || payload?.items || [];
   return {
     schema_version: 'stage2_generated_test_cases.v3',
     items: cases.map((testCase, index) => ({
@@ -1016,7 +1076,7 @@ function normalizePythonTestCases(payload) {
 function normalizePythonExecutionResults(payload) {
   const results = payload?.schema_version === 'stage2_execution_results.v3' && Array.isArray(payload.items)
     ? payload.items
-    : payload?.results || [];
+    : payload?.results || payload?.items || [];
   return {
     schema_version: 'stage2_execution_results.v3',
     items: results.map((result) => {
@@ -1633,6 +1693,7 @@ module.exports = {
   ARTIFACTS,
   Stage2V3InputError,
   analyzeV3Run,
+  checkBrowserPreflight,
   continueNextRound,
   createV3Run,
   generateV3Report,

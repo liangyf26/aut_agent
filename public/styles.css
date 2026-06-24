@@ -905,6 +905,41 @@ textarea:focus {
   font-size: 12px;
 }
 
+.stage2-browser-preflight {
+  margin: -4px 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  color: var(--muted);
+  background: #f8fafc;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.stage2-browser-preflight.success {
+  border-color: #a7f3d0;
+  color: #047857;
+  background: #ecfdf5;
+}
+
+.stage2-browser-preflight.failed {
+  border-color: #fecaca;
+  color: #b91c1c;
+  background: #fff1f2;
+}
+
+.stage2-browser-preflight.manual {
+  border-color: #bfdbfe;
+  color: #1d4ed8;
+  background: #eff6ff;
+}
+
+.stage2-browser-preflight.warning {
+  border-color: #fde68a;
+  color: #92400e;
+  background: #fffbeb;
+}
+
 .stage2-action-reason {
   flex-basis: 100%;
   color: var(--muted);

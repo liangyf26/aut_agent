@@ -20,6 +20,7 @@ const {
 } = require('./stage2OperationCenter');
 const {
   analyzeV3Run,
+  checkBrowserPreflight,
   continueNextRound,
   createV3Run,
   generateV3Report,
@@ -185,6 +186,16 @@ async function handleApi(req, res, pathname) {
   if (req.method === 'GET' && pathname === '/api/stage2/v3/runs') {
     try {
       sendJson(res, 200, await listV3Runs());
+    } catch (error) {
+      sendStage2V3Error(res, error);
+    }
+    return true;
+  }
+
+  if (req.method === 'GET' && pathname === '/api/stage2/v3/browser-preflight') {
+    try {
+      const query = new URL(req.url, `http://${req.headers.host}`).searchParams;
+      sendJson(res, 200, await checkBrowserPreflight(query.get('cdpUrl') || query.get('cdp_url')));
     } catch (error) {
       sendStage2V3Error(res, error);
     }
