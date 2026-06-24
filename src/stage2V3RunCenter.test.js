@@ -381,6 +381,13 @@ test('stage2 v3 run center imports Python v1-shaped real browser artifacts', asy
     assert.equal(generatedTestCases.items.length, 1);
     assert.equal(roundAnalysis.coverage_summary.page_entries, 1);
     assert.equal(roundAnalysis.failure_summary.total_clusters, 0);
+
+    const continued = await continueNextRound(created.run.runId, {}, { runsDir });
+    assert.equal(continued.run.status, 'completed');
+    assert.equal(continued.run.currentRoundId, 'round_001');
+    assert.equal(continued.run.rounds.length, 1);
+    const currentStatus = await readJson(path.join(runDir, 'current_status.json'));
+    assert.equal(currentStatus.message, '当前目标已完成，无需进入下一轮；可生成报告或创建新的更大范围 run。');
   });
 });
 

@@ -1562,6 +1562,11 @@ async function continueNextRound(runId, body = {}, options = {}) {
   const { runDir, manifest } = await readManifest(runId, options);
   const nextRoundPlan = await readJsonRequired(path.join(runDir, ARTIFACTS.next_round_plan), 'next_round_plan 缺失。');
   const approved = body.approved === true || body.decision === 'approve';
+  const stopDecision = [
+    'stop_goal_completed',
+    'stop_no_improvement',
+    'stop_budget_exhausted'
+  ].includes(nextRoundPlan.decision);
   if (nextRoundPlan.requires_human_approval && !approved) {
     const saved = await updateRunStatus(
       runDir,
@@ -1570,6 +1575,18 @@ async function continueNextRound(runId, body = {}, options = {}) {
       'next_round_blocked',
       '下一轮计划需要人工批准后才能继续。',
       { decision: nextRoundPlan.decision }
+    );
+    return { run: buildPublicRun(runDir, saved, await loadRunArtifacts(runDir)), nextRoundPlan };
+  }
+  if (stopDecision) {
+    const restoredRoundId = nextRoundPlan.current_round_id || manifest.current_round_id;
+    const saved = await updateRunStatus(
+      runDir,
+      { ...manifest, current_round_id: restoredRoundId },
+      'completed',
+      'next_round_not_required',
+      '当前目标已完成，无需进入下一轮；可生成报告或创建新的更大范围 run。',
+      { decision: nextRoundPlan.decision, next_round_required: false }
     );
     return { run: buildPublicRun(runDir, saved, await loadRunArtifacts(runDir)), nextRoundPlan };
   }

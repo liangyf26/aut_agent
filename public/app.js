@@ -521,6 +521,21 @@ function getStage2ExecutionMode(run) {
     || 'contract_only';
 }
 
+function getStage2NextDecision(run) {
+  const nextRoundPlan = getRunArtifact(run, 'next_round_plan', 'nextRoundPlan') || {};
+  return run?.nextDecision
+    || run?.next_decision
+    || run?.summary?.nextDecision
+    || run?.summary?.next_decision
+    || nextRoundPlan.decision
+    || '';
+}
+
+function isStage2NextRoundAllowed(run) {
+  const decision = getStage2NextDecision(run);
+  return !['stop_goal_completed', 'stop_no_improvement', 'stop_budget_exhausted'].includes(decision);
+}
+
 function executionModeLabel(mode) {
   const labels = {
     real_browser: '真实浏览器',
@@ -1189,6 +1204,8 @@ function normalizeStage2Run(run = {}, source = 'v3') {
     currentStepLabel: run.currentStepLabel || run.current_step_label || run.current_status?.current_step || '',
     currentTargetLabel: run.currentTargetLabel || run.current_target_label || run.current_status?.current_target || '',
     nextAction: run.nextAction || run.next_action || run.current_status?.next_action || '',
+    nextDecision: stats.nextDecision || stats.next_decision || run.nextDecision || run.next_decision || run.next_round_plan?.decision || '',
+    shouldContinue: stats.shouldContinue ?? stats.should_continue ?? run.shouldContinue ?? run.should_continue ?? run.next_round_plan?.should_continue,
     latestMessage: run.latestMessage || run.message || run.current_status?.message || '',
     executionMode: getStage2ExecutionMode(run),
     realExecutionAvailable: Boolean(run.realExecutionAvailable || run.real_execution_available || run.capabilities?.realBrowserExecution || run.capabilities?.real_browser_execution || run.preflight?.cdp_available),
@@ -1453,10 +1470,17 @@ function renderStage2RunActions(run) {
   const realAvailable = isStage2RealExecutionAvailable(run);
   const realBrowserSuffix = browserPreflightOptionSuffix();
   const realBrowserMessage = browserPreflightMessage();
+  const nextRoundAllowed = actionable && isStage2NextRoundAllowed(run);
   const disabled = state.pendingAction || !actionable ? 'disabled' : '';
+  const continueDisabled = state.pendingAction || !nextRoundAllowed ? 'disabled' : '';
   const disabledReason = state.pendingAction
     ? '正在处理上一项操作，请等待反馈区显示完成或失败。'
     : runKind.reason;
+  const continueReason = state.pendingAction
+    ? '正在处理上一项操作，请等待反馈区显示完成或失败。'
+    : nextRoundAllowed
+      ? '按下一轮计划继续。'
+      : '当前目标已完成或没有可继续计划；请生成报告，或创建新的更大范围 run。';
   return `
     <span class="status-pill ${escapeHtml(runKind.tone === 'passed' ? 'success' : runKind.tone)}">${escapeHtml(runKind.label)}</span>
     <label class="stage2-mode-select">
@@ -1470,7 +1494,7 @@ function renderStage2RunActions(run) {
     <button class="ghost-action compact-action" data-stage2-run-action="pause" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '请求暂停当前 run。' : disabledReason)}" ${disabled}>暂停</button>
     <button class="ghost-action compact-action" data-stage2-run-action="resume" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '请求继续当前 run。' : disabledReason)}" ${disabled}>继续</button>
     <button class="ghost-action compact-action" data-stage2-run-action="analyze-round" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '触发 AI 复盘。' : disabledReason)}" ${disabled}>AI 复盘</button>
-    <button class="ghost-action compact-action" data-stage2-run-action="continue-next-round" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '按下一轮计划继续。' : disabledReason)}" ${disabled}>进入下一轮</button>
+    <button class="ghost-action compact-action" data-stage2-run-action="continue-next-round" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(continueReason)}" ${continueDisabled}>进入下一轮</button>
     <button class="ghost-action compact-action" data-stage2-run-action="generate-report" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '生成或刷新报告。' : disabledReason)}" ${disabled}>生成报告</button>
     <button class="ghost-action compact-action danger-action" data-stage2-run-action="stop" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '停止当前 run。' : disabledReason)}" ${disabled}>停止</button>
     <span class="stage2-action-reason">${escapeHtml(realAvailable ? realBrowserMessage : `${realBrowserMessage}。选择该模式会先做真实预检，失败会直接显示原因。`)}</span>
