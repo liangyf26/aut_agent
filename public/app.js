@@ -494,6 +494,52 @@ function isStage2V3ActionableRun(run) {
   return Boolean(runId && runId.startsWith('stage2_v3_') && run?.source !== 'local' && run?.source !== 'overview');
 }
 
+function getStage2RunKind(run) {
+  if (!run) {
+    return { label: '未选择', tone: 'manual', reason: '创建或选择 run 后才能操作。' };
+  }
+  if (run.source === 'local' || getRunId(run).startsWith('draft_')) {
+    return { label: '本地草稿', tone: 'warning', reason: '这是前端保存的草稿，后端没有正式 run，不能启动或复盘。' };
+  }
+  if (isStage2V3ActionableRun(run)) {
+    return { label: '可操作 v3 run', tone: 'passed', reason: '该 run 可由运行中心提交启动、暂停、复盘和人工任务。' };
+  }
+  return { label: '只读历史 run', tone: 'manual', reason: '这是历史产物汇总，只能查看报告和 artifacts，不能由 v3 API 继续执行。' };
+}
+
+function getStage2ExecutionMode(run) {
+  return run?.executionMode
+    || run?.execution_mode
+    || run?.inputConfig?.executionMode
+    || run?.inputConfig?.execution_mode
+    || run?.input_config?.executionMode
+    || run?.input_config?.execution_mode
+    || run?.manifest?.execution_mode
+    || run?.run_manifest?.execution_mode
+    || 'contract_placeholder';
+}
+
+function executionModeLabel(mode) {
+  const labels = {
+    real_browser: '真实浏览器',
+    contract_placeholder: '契约占位'
+  };
+  return labels[mode] || mode || '契约占位';
+}
+
+function isStage2RealExecutionAvailable(run) {
+  return Boolean(
+    run?.realExecutionAvailable
+    || run?.real_execution_available
+    || run?.capabilities?.realBrowserExecution
+    || run?.capabilities?.real_browser_execution
+    || run?.executor?.realBrowser === true
+    || run?.executor?.real_browser === true
+    || run?.preflight?.cdp_available === true
+    || run?.preflightResult?.cdpAvailable === true
+  );
+}
+
 async function createStage2Run(event) {
   event.preventDefault();
   const data = new FormData(stage2RunForm);
@@ -504,6 +550,8 @@ async function createStage2Run(event) {
     entry_url: data.get('entryUrl')?.trim() || '',
     cdpUrl: data.get('cdpUrl')?.trim() || '',
     cdp_url: data.get('cdpUrl')?.trim() || '',
+    executionMode: data.get('executionMode') || 'contract_only',
+    execution_mode: data.get('executionMode') || 'contract_only',
     accountNotes: data.get('accountNotes')?.trim() || '',
     account_notes: data.get('accountNotes')?.trim() || '',
     scope: data.get('scope')?.trim() || '',
@@ -513,12 +561,13 @@ async function createStage2Run(event) {
     max_rounds: Number(data.get('maxRounds')) || 2
   };
   if (!payload.systemName || !payload.entryUrl) {
-    saveState.textContent = '请填写系统名称和首页 URL';
+    pushStage2ActionLog('创建 run 失败：请填写系统名称和首页 URL。', 'error');
+    renderStage2Overview();
     return;
   }
 
   state.pendingAction = 'create-stage2-run';
-  pushStage2ActionLog('正在创建 v3 run...');
+  pushStage2ActionLog(`正在创建 v3 run，执行模式：${executionModeLabel(payload.executionMode)}。`);
   render();
 
   try {
@@ -583,12 +632,16 @@ async function runStage2V3Action(runId, action) {
   }
   const run = getSelectedStage2Run() || getStage2Runs().find((item) => getRunId(item) === runId);
   if (run && !isStage2V3ActionableRun(run)) {
-    pushStage2ActionLog('当前 run 是只读历史产物，只能查看报告和 artifacts，不能从 v3 运行中心执行。', 'warning');
+    pushStage2ActionLog(`${getStage2RunKind(run).label}不能执行：${getStage2RunKind(run).reason}`, 'warning');
     renderStage2Overview();
     return;
   }
+  const modeSelect = document.querySelector('#stage2ExecutionMode');
+  const executionMode = action === 'start'
+    ? (modeSelect?.value || getStage2ExecutionMode(run))
+    : getStage2ExecutionMode(run);
   const successText = {
-    start: '已触发自动评测',
+    start: executionMode === 'real_browser' ? '已触发真实浏览器自动评测' : '已触发契约占位闭环',
     pause: '已请求暂停',
     resume: '已请求继续',
     stop: '已请求停止',
@@ -602,13 +655,24 @@ async function runStage2V3Action(runId, action) {
   try {
     const result = await api(`/api/stage2/v3/runs/${encodeURIComponent(runId)}/${action}`, {
       method: 'POST',
-      body: JSON.stringify({ operatorId: 'run_center', source: 'stage2_v3_cockpit' })
+      body: JSON.stringify({
+        operatorId: 'run_center',
+        source: 'stage2_v3_cockpit',
+        executionMode,
+        execution_mode: executionMode
+      })
     });
     delete state.stage2RunDetails[runId];
     if (result.overview) {
       state.stage2Overview = result.overview;
     }
-    pushStage2ActionLog(successText, 'success');
+    const returnedRun = normalizeStage2Run(result.run || result, 'v3');
+    const returnedStatus = statusLabel(returnedRun.status);
+    const returnedMessage = returnedRun.latestMessage ? `：${returnedRun.latestMessage}` : '';
+    const tone = ['failed', 'error'].includes(returnedRun.status)
+      ? 'error'
+      : returnedRun.status === 'waiting_human' ? 'warning' : 'success';
+    pushStage2ActionLog(`${successText}，当前状态：${returnedStatus}${returnedMessage}`, tone);
     await loadDashboardData();
   } catch (error) {
     pushStage2ActionLog(`操作失败：${error.message}`, 'error');
@@ -622,6 +686,12 @@ async function runStage2V3Action(runId, action) {
 async function completeStage2HumanTask(taskId) {
   const runId = state.selectedRunId;
   if (!runId || !taskId) {
+    return;
+  }
+  const run = getSelectedStage2Run() || getStage2Runs().find((item) => getRunId(item) === runId);
+  if (run && !isStage2V3ActionableRun(run)) {
+    pushStage2ActionLog(`人工任务不能提交：${getStage2RunKind(run).reason}`, 'warning');
+    renderStage2Overview();
     return;
   }
   state.pendingAction = `stage2-human-${taskId}`;
@@ -1032,6 +1102,8 @@ function normalizeStage2Run(run = {}, source = 'v3') {
     currentTargetLabel: run.currentTargetLabel || run.current_target_label || run.current_status?.current_target || '',
     nextAction: run.nextAction || run.next_action || run.current_status?.next_action || '',
     latestMessage: run.latestMessage || run.message || run.current_status?.message || '',
+    executionMode: getStage2ExecutionMode(run),
+    realExecutionAvailable: Boolean(run.realExecutionAvailable || run.real_execution_available || run.capabilities?.realBrowserExecution || run.capabilities?.real_browser_execution || run.preflight?.cdp_available),
     createdAt: run.createdAt || run.created_at || manifest.created_at || run.started_at || '',
     updatedAt: run.updatedAt || run.updated_at || manifest.updated_at || run.finished_at || run.started_at || '',
     counts: {
@@ -1239,7 +1311,8 @@ function renderStage2V3Shell() {
     monitor.innerHTML = renderStage2Monitor(null);
     timeline.innerHTML = renderStage2Timeline(null);
   } else {
-    runEyebrow.textContent = `${run.source === 'local' ? '本地草稿' : '当前 run'} · ${escapeHtml(getRunId(run))}`;
+    const runKind = getStage2RunKind(run);
+    runEyebrow.textContent = `${runKind.label} · ${executionModeLabel(getStage2ExecutionMode(run))} · ${getRunId(run)}`;
     runTitle.textContent = run.systemName || getRunId(run);
     runSubtitle.textContent = [run.entryUrl, run.currentPhaseLabel, run.latestMessage].filter(Boolean).join(' · ') || '等待运行中心写入状态。';
     actions.innerHTML = renderStage2RunActions(run);
@@ -1263,16 +1336,16 @@ function renderStage2V3Shell() {
 
   stage2RunList.innerHTML = runs.map((item) => {
     const id = getRunId(item);
-    const modeLabel = isStage2V3ActionableRun(item)
-      ? '可操作'
-      : (item.source === 'local' ? '本地草稿' : '只读');
+    const runKind = getStage2RunKind(item);
+    const executionMode = getStage2ExecutionMode(item);
     return `
       <button class="stage2-run-card ${id === state.selectedRunId ? 'active' : ''}" data-run-id="${escapeHtml(id)}" type="button">
         <span class="tag ${verdictClass(getRunStatus(item))}">${escapeHtml(statusLabel(getRunStatus(item)))}</span>
-        <span class="tag ${isStage2V3ActionableRun(item) ? 'passed' : 'manual'}">${escapeHtml(modeLabel)}</span>
+        <span class="tag ${escapeHtml(runKind.tone)}">${escapeHtml(runKind.label)}</span>
+        <span class="tag ${executionMode === 'real_browser' ? 'manual' : 'warning'}">${escapeHtml(executionModeLabel(executionMode))}</span>
         <strong>${escapeHtml(item.systemName || id)}</strong>
         <small>${escapeHtml(id)}</small>
-        <p>${escapeHtml(item.latestMessage || item.currentPhaseLabel || item.entryUrl || '暂无运行摘要')}</p>
+        <p>${escapeHtml(item.latestMessage || item.currentPhaseLabel || item.entryUrl || runKind.reason || '暂无运行摘要')}</p>
         <div class="stage2-run-card-stats">
           <span>${escapeHtml(String(item.counts?.pages || 0))} 入口</span>
           <span>${escapeHtml(String(item.counts?.features || 0))} 功能点</span>
@@ -1286,19 +1359,30 @@ function renderStage2V3Shell() {
 function renderStage2RunActions(run) {
   const id = getRunId(run);
   const actionable = isStage2V3ActionableRun(run);
+  const runKind = getStage2RunKind(run);
+  const executionMode = getStage2ExecutionMode(run);
+  const realAvailable = isStage2RealExecutionAvailable(run);
   const disabled = state.pendingAction || !actionable ? 'disabled' : '';
-  const localNote = !actionable
-    ? `<span class="status-pill warning">${run.source === 'local' ? '本地草稿，不能执行' : '只读历史 run，不能执行'}</span>`
-    : '<span class="status-pill success">可操作 v3 run</span>';
+  const disabledReason = state.pendingAction
+    ? '正在处理上一项操作，请等待反馈区显示完成或失败。'
+    : runKind.reason;
   return `
-    ${localNote}
-    <button class="ghost-action compact-action" data-stage2-run-action="start" data-run-id="${escapeHtml(id)}" type="button" ${disabled}>开始自动评测</button>
-    <button class="ghost-action compact-action" data-stage2-run-action="pause" data-run-id="${escapeHtml(id)}" type="button" ${disabled}>暂停</button>
-    <button class="ghost-action compact-action" data-stage2-run-action="resume" data-run-id="${escapeHtml(id)}" type="button" ${disabled}>继续</button>
-    <button class="ghost-action compact-action" data-stage2-run-action="analyze-round" data-run-id="${escapeHtml(id)}" type="button" ${disabled}>AI 复盘</button>
-    <button class="ghost-action compact-action" data-stage2-run-action="continue-next-round" data-run-id="${escapeHtml(id)}" type="button" ${disabled}>进入下一轮</button>
-    <button class="ghost-action compact-action" data-stage2-run-action="generate-report" data-run-id="${escapeHtml(id)}" type="button" ${disabled}>生成报告</button>
-    <button class="ghost-action compact-action danger-action" data-stage2-run-action="stop" data-run-id="${escapeHtml(id)}" type="button" ${disabled}>停止</button>
+    <span class="status-pill ${escapeHtml(runKind.tone === 'passed' ? 'success' : runKind.tone)}">${escapeHtml(runKind.label)}</span>
+    <label class="stage2-mode-select">
+      执行模式
+      <select id="stage2ExecutionMode" ${state.pendingAction || !actionable ? 'disabled' : ''}>
+        <option value="contract_only" ${executionMode !== 'real_browser' ? 'selected' : ''}>契约占位</option>
+        <option value="real_browser" ${executionMode === 'real_browser' ? 'selected' : ''}>真实浏览器${realAvailable ? '' : '（未就绪）'}</option>
+      </select>
+    </label>
+    <button class="ghost-action compact-action primary-compact-action" data-stage2-run-action="start" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '按所选执行模式启动。' : disabledReason)}" ${disabled}>开始自动评测</button>
+    <button class="ghost-action compact-action" data-stage2-run-action="pause" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '请求暂停当前 run。' : disabledReason)}" ${disabled}>暂停</button>
+    <button class="ghost-action compact-action" data-stage2-run-action="resume" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '请求继续当前 run。' : disabledReason)}" ${disabled}>继续</button>
+    <button class="ghost-action compact-action" data-stage2-run-action="analyze-round" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '触发 AI 复盘。' : disabledReason)}" ${disabled}>AI 复盘</button>
+    <button class="ghost-action compact-action" data-stage2-run-action="continue-next-round" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '按下一轮计划继续。' : disabledReason)}" ${disabled}>进入下一轮</button>
+    <button class="ghost-action compact-action" data-stage2-run-action="generate-report" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '生成或刷新报告。' : disabledReason)}" ${disabled}>生成报告</button>
+    <button class="ghost-action compact-action danger-action" data-stage2-run-action="stop" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '停止当前 run。' : disabledReason)}" ${disabled}>停止</button>
+    <span class="stage2-action-reason">${escapeHtml(realAvailable ? '真实浏览器预检可用。' : '真实浏览器执行未就绪时，选择该模式会直接报错并说明缺口。')}</span>
   `;
 }
 
@@ -1308,8 +1392,9 @@ function renderStage2ActionFeedback() {
     return;
   }
   const selected = getSelectedStage2Run();
+  const selectedKind = getStage2RunKind(selected);
   const selectedMode = selected
-    ? (isStage2V3ActionableRun(selected) ? '当前选择的是可操作 v3 run。' : '当前选择的是只读/本地 run，仅支持查看。')
+    ? `${selectedKind.label} · ${executionModeLabel(getStage2ExecutionMode(selected))}。${selectedKind.reason}`
     : '创建或选择 run 后，这里会显示操作反馈。';
   const logs = state.stage2ActionLog.length
     ? state.stage2ActionLog.map((item) => `
@@ -1320,9 +1405,12 @@ function renderStage2ActionFeedback() {
     `).join('')
     : `<li><span>-</span><strong>${escapeHtml(selectedMode)}</strong></li>`;
   container.innerHTML = `
-    <div class="stage2-feedback-head">
-      <strong>操作反馈</strong>
-      <span class="tag ${selected && isStage2V3ActionableRun(selected) ? 'passed' : 'manual'}">${escapeHtml(selectedMode)}</span>
+    <div class="stage2-feedback-head ${state.pendingAction ? 'is-pending' : ''}">
+      <div>
+        <strong>${escapeHtml(state.pendingAction ? '正在处理' : '操作反馈')}</strong>
+        <p>${escapeHtml(selectedMode)}</p>
+      </div>
+      <span class="tag ${selected ? escapeHtml(selectedKind.tone) : 'manual'}">${escapeHtml(state.pendingAction ? '进行中' : '可追溯')}</span>
     </div>
     <ul>${logs}</ul>
   `;
@@ -1433,6 +1521,8 @@ function renderStage2V3OverviewTab() {
   }
   const analysis = getRunRoundAnalysis(run);
   const nextPlan = getRunNextRoundPlan(run);
+  const runKind = getStage2RunKind(run);
+  const executionMode = getStage2ExecutionMode(run);
   container.innerHTML = `
     <section class="stage2-overview-grid">
       <article class="stage2-work-card">
@@ -1444,6 +1534,8 @@ function renderStage2V3OverviewTab() {
         <div class="detail-list">
           ${[
             ['Run ID', getRunId(run)],
+            ['Run 类型', runKind.label],
+            ['执行模式', executionModeLabel(executionMode)],
             ['系统', run.systemName],
             ['入口', run.entryUrl || '-'],
             ['创建时间', formatDate(run.createdAt)],
@@ -1617,13 +1709,14 @@ function renderStage2V3ReportTab() {
   }
   const links = getRunReportLinks(run || {});
   const report = run?.report || run?.runReport || getRunArtifact(run || {}, 'run_report', 'runReport') || {};
+  const actionable = run && isStage2V3ActionableRun(run);
   container.innerHTML = `
     <section class="stage2-report-layout">
       <article class="stage2-work-card">
         <header><strong>总体测试报告</strong><span class="tag">${escapeHtml(links.length ? '可打开' : '待生成')}</span></header>
         <p>${escapeHtml(report.summary || report.overview || '报告应直接说明页面入口、功能点、执行结果、失败原因、人工确认项和证据索引。')}</p>
         <div class="inline-actions">
-          <button class="ghost-action compact-action" data-stage2-run-action="generate-report" data-run-id="${escapeHtml(getRunId(run || {}))}" type="button" ${!run || state.pendingAction ? 'disabled' : ''}>生成报告</button>
+          <button class="ghost-action compact-action" data-stage2-run-action="generate-report" data-run-id="${escapeHtml(getRunId(run || {}))}" type="button" title="${escapeHtml(actionable ? '生成或刷新报告。' : getStage2RunKind(run).reason)}" ${!actionable || state.pendingAction ? 'disabled' : ''}>生成报告</button>
         </div>
       </article>
       <article class="stage2-work-card stage2-work-card-wide">

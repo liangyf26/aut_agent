@@ -818,6 +818,7 @@ textarea:focus {
 }
 
 .stage2-run-form input,
+.stage2-run-form select,
 .stage2-run-form textarea {
   width: 100%;
   min-width: 0;
@@ -878,6 +879,40 @@ textarea:focus {
   align-items: center;
 }
 
+.stage2-run-actions {
+  justify-content: flex-end;
+}
+
+.stage2-mode-select {
+  display: inline-grid;
+  grid-template-columns: auto minmax(132px, 170px);
+  gap: 7px;
+  align-items: center;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f8fafc;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.stage2-mode-select select {
+  min-height: 26px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.stage2-action-reason {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  text-align: right;
+}
+
 .stage2-run-card-stats {
   color: var(--muted);
   font-size: 12px;
@@ -898,6 +933,18 @@ textarea:focus {
   gap: 8px;
   align-items: center;
   justify-content: space-between;
+}
+
+.stage2-feedback-head.is-pending {
+  padding-left: 10px;
+  border-left: 4px solid var(--accent);
+}
+
+.stage2-feedback-head p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .stage2-action-feedback ul {
@@ -938,6 +985,19 @@ textarea:focus {
 
 .stage2-action-feedback li.error strong {
   color: #b42318;
+}
+
+.ghost-action:disabled,
+.primary-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.56;
+}
+
+.primary-compact-action {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-weight: 800;
 }
 
 .stage2-control-deck {
@@ -1954,6 +2014,26 @@ textarea:focus {
 
   .stage2-run-head {
     display: grid;
+  }
+
+  .stage2-run-actions {
+    justify-content: stretch;
+  }
+
+  .stage2-mode-select,
+  .stage2-run-actions .ghost-action,
+  .stage2-action-reason {
+    width: 100%;
+    text-align: left;
+  }
+
+  .stage2-mode-select {
+    grid-template-columns: 1fr;
+  }
+
+  .stage2-action-feedback li {
+    grid-template-columns: 1fr;
+    gap: 2px;
   }
 
   .stage2-form-row {

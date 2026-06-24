@@ -243,6 +243,13 @@
                     <input name="cdpUrl" type="url" value="http://localhost:9222" placeholder="http://localhost:9222">
                   </label>
                   <label>
+                    执行模式
+                    <select name="executionMode">
+                      <option value="contract_only">契约占位：生成 v3 产物与预检闭环</option>
+                      <option value="real_browser">真实浏览器：连接 CDP/Playwright 后执行</option>
+                    </select>
+                  </label>
+                  <label>
                     测试账号与环境
                     <textarea name="accountNotes" rows="3" placeholder="账号、角色、权限范围、登录接管说明"></textarea>
                   </label>
@@ -261,6 +268,7 @@
                     </label>
                   </div>
                   <button class="primary-action" data-stage2-action="create-run" type="submit">创建 run</button>
+                  <p class="inline-note">真实浏览器模式需要后端执行器、Python、Playwright 和 CDP 预检均可用；不可用时运行中心会直接显示错误。</p>
                 </form>
 
                 <section class="stage2-run-picker">

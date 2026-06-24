@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 V3_SCHEMA_VERSION = "stage2_v3_run.v1"
 DiscoveryProvider = Callable[[], Awaitable[dict[str, Any]]]
+RealBrowserProvider = Callable[["V3RunConfig", Path], Awaitable[dict[str, Any]]]
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,8 @@ class V3RunConfig:
     artifact_root: Path = Path("artifacts/stage2/v3_runs")
     run_id: str = ""
     cdp_url: str = ""
+    execution_mode: str = "contract_only"
+    reuse_run_dir: bool = False
     model_name: str | None = None
     use_live_discovery: bool = False
     max_pages: int = 5
@@ -31,6 +34,7 @@ async def run_v3_assessment(
     config: V3RunConfig,
     *,
     discovery_provider: DiscoveryProvider | None = None,
+    real_browser_provider: RealBrowserProvider | None = None,
 ) -> dict[str, Any]:
     """Run the v3 minimum closed loop and persist all contract artifacts."""
 
@@ -38,7 +42,39 @@ async def run_v3_assessment(
     writer.update_state("initializing", "running", "v3 run initialized")
 
     discovery_payload: dict[str, Any] = {}
-    if config.use_live_discovery and discovery_provider is not None:
+    real_browser_payload: dict[str, Any] = {}
+    execution_mode = _normalize_execution_mode(config.execution_mode)
+    if execution_mode == "real_browser":
+        writer.update_state("preflight", "running", "checking Playwright/CDP real browser executor")
+        if real_browser_provider is None:
+            from prototype.stage2.app.v3_real_browser import collect_real_browser_artifacts
+
+            real_browser_provider = collect_real_browser_artifacts
+        real_browser_payload = await real_browser_provider(config, writer.run_dir)
+        writer.write_json(
+            "preflight_result.json",
+            real_browser_payload.get("preflight_result", _build_real_browser_preflight(real_browser_payload)),
+        )
+        writer.write_json(
+            "screenshots_index.json",
+            real_browser_payload.get(
+                "screenshots_index",
+                {
+                    "schema_version": V3_SCHEMA_VERSION,
+                    "screenshots": [],
+                    "items": [],
+                    "notes": ["真实浏览器执行未产生截图。"],
+                },
+            ),
+        )
+        writer.write_json("source_real_browser.json", real_browser_payload)
+        if real_browser_payload.get("status") != "completed":
+            writer.update_state(
+                "preflight",
+                "waiting_human",
+                _text(real_browser_payload.get("message")) or "real browser executor unavailable",
+            )
+    elif config.use_live_discovery and discovery_provider is not None:
         writer.update_state("discovery", "running", "running live discovery provider")
         try:
             discovery_payload = await discovery_provider()
@@ -51,22 +87,40 @@ async def run_v3_assessment(
             }
             writer.write_json("source_discovery.json", discovery_payload)
 
-    pages = _build_pages(config, discovery_payload)
-    writer.write_json("pages.json", {"schema_version": V3_SCHEMA_VERSION, "pages": pages})
+    pages = _build_pages(config, discovery_payload, real_browser_payload=real_browser_payload)
+    writer.write_json("pages.json", {"schema_version": V3_SCHEMA_VERSION, "pages": pages, "items": pages})
+    writer.write_json("page_entries.json", {"schema_version": V3_SCHEMA_VERSION, "page_entries": pages, "items": pages})
     writer.update_state("feature_identification", "running", f"identified {len(pages)} page entries")
 
-    features = _build_features(config, discovery_payload, pages)
-    writer.write_json("features.json", {"schema_version": V3_SCHEMA_VERSION, "features": features})
+    features = _build_features(
+        config,
+        discovery_payload,
+        pages,
+        real_browser_payload=real_browser_payload,
+    )
+    writer.write_json("features.json", {"schema_version": V3_SCHEMA_VERSION, "features": features, "items": features})
+    writer.write_json(
+        "feature_points.json",
+        {"schema_version": V3_SCHEMA_VERSION, "feature_points": features, "items": features},
+    )
     writer.update_state("case_generation", "running", f"identified {len(features)} feature points")
 
     cases = _build_cases(features, risk_whitelist=set(config.risk_whitelist))
-    writer.write_json("cases.json", {"schema_version": V3_SCHEMA_VERSION, "cases": cases})
+    writer.write_json("cases.json", {"schema_version": V3_SCHEMA_VERSION, "cases": cases, "items": cases})
+    writer.write_json(
+        "generated_test_cases.json",
+        {"schema_version": V3_SCHEMA_VERSION, "test_cases": cases, "items": cases},
+    )
     writer.update_state("safe_execution", "running", f"generated {len(cases)} executable cases")
 
-    execution_results = _execute_cases(cases, config=config)
+    execution_results = _execute_cases(
+        cases,
+        config=config,
+        real_browser_payload=real_browser_payload,
+    )
     writer.write_json(
         "execution_results.json",
-        {"schema_version": V3_SCHEMA_VERSION, "results": execution_results},
+        {"schema_version": V3_SCHEMA_VERSION, "results": execution_results, "items": execution_results},
     )
 
     round_analysis = _build_round_analysis(
@@ -76,6 +130,7 @@ async def run_v3_assessment(
         features=features,
         cases=cases,
         execution_results=execution_results,
+        real_browser_payload=real_browser_payload,
     )
     writer.write_json("round_analysis.json", round_analysis)
     writer.update_state("ai_review", "running", "round analysis generated")
@@ -145,11 +200,19 @@ async def run_v3_assessment(
             "feature_count": len(features),
             "case_count": len(cases),
             "executed_count": sum(
-                1 for item in execution_results if item["status"] == "passed_safe_placeholder"
+                1
+                for item in execution_results
+                if item["status"] in {"passed_safe_placeholder", "real_passed"}
             ),
             "blocked_count": sum(1 for item in execution_results if item["status"].startswith("blocked")),
+            "failed_or_skipped_count": sum(
+                1
+                for item in execution_results
+                if item["status"].startswith(("failed", "skipped"))
+            ),
             "open_human_task_count": human_tasks["open_task_count"],
             "next_round_status": next_round_plan["status"],
+            "execution_mode": execution_mode,
         },
         "report_path": str(report_path),
     }
@@ -159,7 +222,11 @@ class V3RunArtifactWriter:
     def __init__(self, config: V3RunConfig) -> None:
         self.started_at = _now()
         self.run_id = config.run_id.strip() or _default_run_id(config.target_name)
-        self.run_dir = _unique_run_dir(config.artifact_root, self.run_id)
+        self.run_dir = (
+            config.artifact_root / _slug(self.run_id)
+            if config.reuse_run_dir
+            else _unique_run_dir(config.artifact_root, self.run_id)
+        )
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self._config = config
         self._state: dict[str, Any] = {
@@ -168,6 +235,7 @@ class V3RunArtifactWriter:
             "target_name": config.target_name,
             "start_url": config.start_url,
             "cdp_url": config.cdp_url,
+            "execution_mode": _normalize_execution_mode(config.execution_mode),
             "model_name": config.model_name,
             "use_live_discovery": config.use_live_discovery,
             "started_at": self.started_at,
@@ -178,10 +246,15 @@ class V3RunArtifactWriter:
             "metadata": dict(config.metadata),
             "artifact_contract": [
                 "run_state.json",
+                "preflight_result.json",
                 "pages.json",
+                "page_entries.json",
                 "features.json",
+                "feature_points.json",
                 "cases.json",
+                "generated_test_cases.json",
                 "execution_results.json",
+                "screenshots_index.json",
                 "round_analysis.json",
                 "next_round_plan.json",
                 "human_tasks.json",
@@ -213,7 +286,20 @@ class V3RunArtifactWriter:
         self.write_json("run_state.json", self._state)
 
 
-def _build_pages(config: V3RunConfig, discovery_payload: dict[str, Any]) -> list[dict[str, Any]]:
+def _build_pages(
+    config: V3RunConfig,
+    discovery_payload: dict[str, Any],
+    *,
+    real_browser_payload: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    if real_browser_payload:
+        real_pages = real_browser_payload.get("pages")
+        if isinstance(real_pages, list):
+            return [item for item in real_pages if isinstance(item, dict)][
+                : max(0, config.max_pages)
+            ]
+        if _normalize_execution_mode(config.execution_mode) == "real_browser":
+            return []
     discovered = _load_discovery_list(discovery_payload, "page_entries", "page_entries_path")
     pages: list[dict[str, Any]] = []
     for index, item in enumerate(discovered[: max(1, config.max_pages)], start=1):
@@ -243,7 +329,18 @@ def _build_features(
     config: V3RunConfig,
     discovery_payload: dict[str, Any],
     pages: list[dict[str, Any]],
+    *,
+    real_browser_payload: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    if real_browser_payload:
+        real_features = real_browser_payload.get("features")
+        if isinstance(real_features, list):
+            return _limit_features_per_page(
+                [item for item in real_features if isinstance(item, dict)],
+                config.max_features_per_page,
+            )
+        if _normalize_execution_mode(config.execution_mode) == "real_browser":
+            return []
     discovered = _load_discovery_list(discovery_payload, "feature_points", "feature_points_path")
     page_ids = {page["page_id"] for page in pages}
     features: list[dict[str, Any]] = []
@@ -297,7 +394,14 @@ def _build_cases(features: list[dict[str, Any]], *, risk_whitelist: set[str]) ->
     return cases
 
 
-def _execute_cases(cases: list[dict[str, Any]], *, config: V3RunConfig) -> list[dict[str, Any]]:
+def _execute_cases(
+    cases: list[dict[str, Any]],
+    *,
+    config: V3RunConfig,
+    real_browser_payload: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    if _normalize_execution_mode(config.execution_mode) == "real_browser":
+        return _execute_real_browser_cases(cases, real_browser_payload or {})
     results = []
     for case in cases:
         if not case["auto_allowed"]:
@@ -329,6 +433,85 @@ def _execute_cases(cases: list[dict[str, Any]], *, config: V3RunConfig) -> list[
     return results
 
 
+def _execute_real_browser_cases(
+    cases: list[dict[str, Any]],
+    real_browser_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    started_at = _now()
+    if real_browser_payload.get("status") != "completed":
+        status = _real_browser_failure_status(real_browser_payload)
+        return [
+            {
+                "case_id": "preflight_real_browser",
+                "feature_id": "",
+                "status": status,
+                "execution_mode": "real_browser",
+                "started_at": started_at,
+                "finished_at": _now(),
+                "evidence": [],
+                "message": _text(real_browser_payload.get("message"))
+                or "真实浏览器执行器不可用，未执行任何用例。",
+                "failure_reason": real_browser_payload.get("failure_reason")
+                or real_browser_payload.get("executor_status")
+                or "executor_unavailable",
+            }
+        ]
+
+    screenshot_refs = [
+        item.get("screenshot_id")
+        for item in real_browser_payload.get("screenshots_index", {}).get("screenshots", [])
+        if isinstance(item, dict) and item.get("screenshot_id")
+    ]
+    observed_feature_ids = {
+        str(item.get("feature_id"))
+        for item in real_browser_payload.get("features", [])
+        if isinstance(item, dict) and item.get("feature_id")
+    }
+    results: list[dict[str, Any]] = []
+    for case in cases:
+        if not case["auto_allowed"]:
+            results.append(
+                {
+                    "case_id": case["case_id"],
+                    "feature_id": case["feature_id"],
+                    "status": "blocked_by_policy",
+                    "execution_mode": "real_browser",
+                    "started_at": started_at,
+                    "finished_at": _now(),
+                    "evidence": [],
+                    "message": "真实浏览器模式未执行高风险或需要业务数据的动作，已转成人工任务。",
+                }
+            )
+            continue
+        if case["feature_id"] not in observed_feature_ids:
+            results.append(
+                {
+                    "case_id": case["case_id"],
+                    "feature_id": case["feature_id"],
+                    "status": "skipped_not_observed",
+                    "execution_mode": "real_browser",
+                    "started_at": started_at,
+                    "finished_at": _now(),
+                    "evidence": screenshot_refs,
+                    "message": "真实浏览器扫描未重新定位到该功能点，未执行点击。",
+                }
+            )
+            continue
+        results.append(
+            {
+                "case_id": case["case_id"],
+                "feature_id": case["feature_id"],
+                "status": "real_passed",
+                "execution_mode": "real_browser",
+                "started_at": started_at,
+                "finished_at": _now(),
+                "evidence": screenshot_refs,
+                "message": "已通过真实浏览器完成低风险导航/可见元素扫描和截图证据采集，未执行提交、删除、审批等副作用动作。",
+            }
+        )
+    return results
+
+
 def _build_round_analysis(
     *,
     config: V3RunConfig,
@@ -337,11 +520,32 @@ def _build_round_analysis(
     features: list[dict[str, Any]],
     cases: list[dict[str, Any]],
     execution_results: list[dict[str, Any]],
+    real_browser_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    execution_mode = _normalize_execution_mode(config.execution_mode)
     blocked = [item for item in execution_results if item["status"].startswith("blocked")]
-    passed = [item for item in execution_results if item["status"] == "passed_safe_placeholder"]
+    passed = [
+        item
+        for item in execution_results
+        if item["status"] in {"passed_safe_placeholder", "real_passed"}
+    ]
+    failed_or_skipped = [
+        item
+        for item in execution_results
+        if item["status"].startswith(("real_failed", "failed", "skipped", "login_required"))
+    ]
     source_status = _text(discovery_payload.get("status")) if discovery_payload else "demo_safe"
     failure_clusters = []
+    if execution_mode == "real_browser" and real_browser_payload and real_browser_payload.get("status") != "completed":
+        failure_clusters.append(
+            {
+                "cluster_id": _text(real_browser_payload.get("failure_reason")) or "real_browser_unavailable",
+                "title": _text(real_browser_payload.get("message")) or "真实浏览器执行器不可用",
+                "severity": "high",
+                "case_ids": [item["case_id"] for item in failed_or_skipped],
+                "suggestion": "在运行中心检查 CDP 地址、浏览器登录状态和 Playwright 环境后重试。",
+            }
+        )
     if blocked:
         failure_clusters.append(
             {
@@ -352,7 +556,7 @@ def _build_round_analysis(
                 "suggestion": "在运行中心用界面确认白名单、补充测试数据或录制人工样本。",
             }
         )
-    if not config.use_live_discovery:
+    if execution_mode != "real_browser" and not config.use_live_discovery:
         failure_clusters.append(
             {
                 "cluster_id": "demo_discovery_only",
@@ -383,8 +587,10 @@ def _build_round_analysis(
             "case_count": len(cases),
             "passed_count": len(passed),
             "blocked_count": len(blocked),
+            "failed_or_skipped_count": len(failed_or_skipped),
+            "execution_mode": execution_mode,
         },
-        "quality_judgement": _quality_judgement(pages, features, blocked),
+        "quality_judgement": _quality_judgement(pages, features, blocked + failed_or_skipped),
         "failure_clusters": failure_clusters,
         "asset_learning": [
             {
@@ -410,7 +616,26 @@ def _build_human_tasks(
     round_analysis: dict[str, Any],
 ) -> dict[str, Any]:
     tasks: list[dict[str, Any]] = []
-    if not config.use_live_discovery:
+    execution_mode = _normalize_execution_mode(config.execution_mode)
+    executor_blockers = [
+        item
+        for item in execution_results
+        if item["status"] in {"skipped_no_executor", "login_required", "real_failed"}
+        or item["status"].startswith("failed")
+    ]
+    if executor_blockers:
+        tasks.append(
+            {
+                "task_id": "human_task_fix_real_browser_executor",
+                "type": "executor_recovery",
+                "status": "open",
+                "title": "修复真实浏览器执行条件",
+                "ui_action": "在运行中心检查 CDP 地址、登录状态和 Playwright 环境后重新开始自动评测。",
+                "case_ids": [item["case_id"] for item in executor_blockers],
+                "blocks_next_round": True,
+            }
+        )
+    if execution_mode != "real_browser" and not config.use_live_discovery:
         tasks.append(
             {
                 "task_id": "human_task_connect_browser",
@@ -773,6 +998,37 @@ def _safe_execution_message(config: V3RunConfig) -> str:
     if config.use_live_discovery:
         return "已按 v3 最小闭环完成低风险安全占位执行；真实 Playwright 断言将在后续迭代接入。"
     return "已在 demo/safe 模式完成低风险占位执行，用于验证 v3 产物链路。"
+
+
+def _normalize_execution_mode(value: str) -> str:
+    mode = _text(value) or "contract_only"
+    if mode in {"contract_placeholder", "placeholder", "safe_placeholder"}:
+        return "contract_only"
+    if mode not in {"contract_only", "real_browser"}:
+        return "contract_only"
+    return mode
+
+
+def _real_browser_failure_status(real_browser_payload: dict[str, Any]) -> str:
+    reason = _text(real_browser_payload.get("failure_reason"))
+    if reason == "login_required":
+        return "login_required"
+    if reason in {"playwright_missing", "cdp_required", "cdp_connect_failed"}:
+        return "skipped_no_executor"
+    return "real_failed"
+
+
+def _build_real_browser_preflight(real_browser_payload: dict[str, Any]) -> dict[str, Any]:
+    status = _text(real_browser_payload.get("status")) or "failed"
+    return {
+        "schema_version": V3_SCHEMA_VERSION,
+        "execution_mode": "real_browser",
+        "status": status,
+        "ok": status == "completed",
+        "failure_reason": _text(real_browser_payload.get("failure_reason")) or None,
+        "message": _text(real_browser_payload.get("message")) or "真实浏览器预检未返回详细信息。",
+        "created_at": _now(),
+    }
 
 
 def _infer_page_type(name: str, url: str) -> str:

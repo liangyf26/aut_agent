@@ -1,12 +1,17 @@
 const crypto = require('crypto');
+const { execFile } = require('child_process');
 const fs = require('fs/promises');
 const path = require('path');
+const { promisify } = require('util');
 
 const ROOT_DIR = path.join(__dirname, '..');
 const DEFAULT_STAGE2_RUNS_DIR = path.join(ROOT_DIR, 'artifacts', 'stage2', 'runs');
 const DEFAULT_CDP_URL = 'http://localhost:9222/';
 const SAFE_ID_PATTERN = /^[A-Za-z0-9_-]{1,120}$/;
 const LOCAL_CDP_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
+const DEFAULT_PYTHON_COMMAND = process.env.STAGE2_PYTHON || process.env.PYTHON || 'python';
+const DEFAULT_PYTHON_TIMEOUT_MS = 10 * 60 * 1000;
+const execFileAsync = promisify(execFile);
 
 const ARTIFACTS = {
   run_manifest: 'run_manifest.json',
@@ -29,6 +34,7 @@ const ARTIFACTS = {
   next_round_plan: 'next_round_plan.json',
   human_tasks: 'human_tasks.json',
   promotion_candidates: 'promotion_candidates.json',
+  python_execution: 'python_execution.json',
   run_report_json: path.join('reports', 'run_report.json'),
   run_report_md: path.join('reports', 'run_report.md')
 };
@@ -160,6 +166,17 @@ function normalizeInteger(value, fallback, min, max) {
   return number;
 }
 
+function normalizeExecutionMode(value) {
+  const mode = normalizeText(value, 'real_browser');
+  if (['contract_placeholder', 'placeholder', 'safe_placeholder'].includes(mode)) {
+    return 'contract_only';
+  }
+  if (!['real_browser', 'contract_only'].includes(mode)) {
+    throw new Stage2V3InputError('executionMode 仅支持 real_browser 或 contract_only。');
+  }
+  return mode;
+}
+
 async function pathExists(targetPath) {
   try {
     await fs.access(targetPath);
@@ -189,6 +206,15 @@ async function readJsonRequired(filePath, message) {
 async function writeJson(filePath, payload) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   await fs.writeFile(filePath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+}
+
+async function copyTextFileIfExists(sourcePath, targetPath) {
+  if (!(await pathExists(sourcePath))) {
+    return false;
+  }
+  await fs.mkdir(path.dirname(targetPath), { recursive: true });
+  await fs.copyFile(sourcePath, targetPath);
+  return true;
 }
 
 async function appendEvent(runDir, event) {
@@ -266,11 +292,18 @@ function summarizeExecution(items = []) {
     const status = item.status || 'unknown';
     byStatus[status] = (byStatus[status] || 0) + 1;
   }
+  const passed = (byStatus.passed || 0) + (byStatus.real_passed || 0);
+  const failed = (byStatus.failed || 0)
+    + (byStatus.real_failed || 0)
+    + (byStatus.login_required || 0);
+  const skipped = (byStatus.skipped || 0)
+    + (byStatus.skipped_no_executor || 0)
+    + (byStatus.skipped_not_observed || 0);
   return {
     total: items.length,
-    passed: byStatus.passed || 0,
-    failed: byStatus.failed || 0,
-    skipped: byStatus.skipped || 0,
+    passed,
+    failed,
+    skipped,
     needs_review: byStatus.needs_review || 0,
     by_status: byStatus
   };
@@ -278,11 +311,13 @@ function summarizeExecution(items = []) {
 
 function buildPublicRun(runDir, manifest, artifacts = {}) {
   const executionItems = artifacts.execution_results?.items || [];
+  const executionMode = artifacts.current_status?.execution_mode || manifest.execution_mode || null;
   return {
     runId: manifest.run_id,
     systemName: manifest.system_name,
     entryUrl: manifest.entry_url,
     status: manifest.status,
+    executionMode,
     currentRoundId: manifest.current_round_id,
     createdAt: manifest.created_at,
     updatedAt: manifest.updated_at,
@@ -295,7 +330,8 @@ function buildPublicRun(runDir, manifest, artifacts = {}) {
       generatedTestCases: summarizeItems(artifacts.generated_test_cases?.items),
       execution: summarizeExecution(executionItems),
       pendingHumanTasks: (artifacts.human_tasks?.items || []).filter((item) => item.status === 'pending').length,
-      nextDecision: artifacts.next_round_plan?.decision || null
+      nextDecision: artifacts.next_round_plan?.decision || null,
+      executionMode
     },
     artifacts: artifactRefs(manifest.run_id)
   };
@@ -379,17 +415,21 @@ async function getV3Run(runId, options = {}) {
   return { run: buildPublicRun(runDir, manifest, artifacts), artifacts };
 }
 
-function makePreflightResult(manifest, inputConfig) {
+function makePreflightResult(manifest, inputConfig, executionMode = 'contract_only') {
+  const isContractOnly = executionMode === 'contract_only';
   return {
     schema_version: 'stage2_preflight_result.v3',
     run_id: manifest.run_id,
-    status: 'needs_executor',
+    execution_mode: executionMode,
+    status: isContractOnly ? 'contract_only' : 'pending_real_browser',
     checks: {
       input_config: { ok: true },
       cdp_url: { ok: true, url: inputConfig.cdp_url },
       python_orchestrator: {
-        ok: false,
-        reason: 'Node v3 API 已建立 run 契约；真实 Python v3 orchestrator 仍需接入。'
+        ok: !isContractOnly,
+        reason: isContractOnly
+          ? '本次按 contract_only 模式只生成 v3 产物契约，不执行真实浏览器。'
+          : '准备调用 Python v3 orchestrator 执行真实浏览器链路。'
       }
     },
     created_at: nowIso()
@@ -520,7 +560,7 @@ function makeGeneratedTestCases(featurePoints) {
   };
 }
 
-function makeExecutionResults(testCases) {
+function makeExecutionResults(testCases, reason = 'contract_only_mode') {
   return {
     schema_version: 'stage2_execution_results.v3',
     items: testCases.items.map((testCase) => ({
@@ -528,13 +568,13 @@ function makeExecutionResults(testCases) {
       status: testCase.requires_human_confirmation ? 'needs_review' : 'skipped',
       verdict: testCase.requires_human_confirmation
         ? '需要人工确认后才能执行。'
-        : '已生成执行型测试用例，等待 Python v3 执行器接入后自动执行。',
+        : '已生成执行型测试用例，但本轮未执行真实浏览器动作。',
       actions: [],
       page_feedback: [],
       screenshot_refs: [],
       failure_reason: testCase.requires_human_confirmation
         ? 'manual_review_required'
-        : 'python_v3_executor_not_connected',
+        : reason,
       manual_confirmation_required: Boolean(testCase.requires_human_confirmation)
     }))
   };
@@ -588,13 +628,19 @@ function buildHumanTasks(featurePoints, executionResults, nextRoundPlan = null) 
     });
   }
 
-  const skipped = (executionResults.items || []).filter((item) => item.failure_reason === 'python_v3_executor_not_connected');
+  const skipped = (executionResults.items || []).filter((item) => [
+    'contract_only_mode',
+    'python_v3_executor_not_connected',
+    'python_v3_orchestrator_failed',
+    'python_executor_unavailable',
+    'python_returned_safe_placeholder'
+  ].includes(item.failure_reason));
   if (skipped.length) {
     tasks.push({
       task_id: 'task_connect_executor_or_confirm_plan',
       task_type: 'review_next_round_plan',
-      title: '确认下一轮执行计划',
-      reason: '后端已生成 v3 run 产物契约，但真实浏览器执行需由 Python v3 orchestrator 接入。',
+      title: '处理真实浏览器执行阻塞',
+      reason: '本轮没有获得真实浏览器执行证据，请检查执行模式、Python v3 orchestrator、CDP 地址或人工确认下一步。',
       input_refs: ['generated_test_cases', 'execution_results', 'next_round_plan'],
       ui_schema: {
         kind: 'decision',
@@ -628,7 +674,14 @@ function makeRoundAnalysis({ manifest, pageEntries, featurePoints, testCases, ex
   const executionSummary = summarizeExecution(executionResults.items || []);
   const failureClusters = groupFailures(executionResults);
   const humanTaskReasons = failureClusters
-    .filter((cluster) => ['manual_review_required', 'python_v3_executor_not_connected'].includes(cluster.reason))
+    .filter((cluster) => [
+      'manual_review_required',
+      'contract_only_mode',
+      'python_v3_executor_not_connected',
+      'python_v3_orchestrator_failed',
+      'python_executor_unavailable',
+      'python_returned_safe_placeholder'
+    ].includes(cluster.reason))
     .map((cluster) => cluster.reason);
 
   const analysis = {
@@ -656,7 +709,7 @@ function makeRoundAnalysis({ manifest, pageEntries, featurePoints, testCases, ex
       {
         candidate_id: 'improve_connect_python_v3_orchestrator',
         scope: 'runtime',
-        title: '接入 Python v3 orchestrator 后替换占位执行结果',
+        title: '确保真实浏览器执行链路产出可复核证据',
         confidence: 0.95,
         evidence_refs: ['execution_results']
       }
@@ -670,7 +723,7 @@ function makeRoundAnalysis({ manifest, pageEntries, featurePoints, testCases, ex
     should_continue: false,
     decision: failureClusters.length ? 'wait_human_review' : 'stop_goal_completed',
     next_round_goal: failureClusters.length
-      ? '接入真实执行器或由人工确认计划后，执行低风险用例并补齐截图证据。'
+      ? '处理执行阻塞后，重新执行低风险用例并补齐截图证据。'
       : '本 run 已完成当前范围。',
     target_page_entry_ids: (pageEntries.items || []).map((item) => item.page_entry_id),
     target_feature_point_ids: (featurePoints.items || [])
@@ -711,10 +764,353 @@ function makePromotionCandidates() {
   };
 }
 
+function parseJsonFromProcessOutput(stdout) {
+  const text = String(stdout || '').trim();
+  if (!text) {
+    return null;
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start !== -1 && end > start) {
+      try {
+        return JSON.parse(text.slice(start, end + 1));
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
+async function resolvePythonCommand(options = {}) {
+  if (options.pythonRunner) {
+    return options.pythonCommand || DEFAULT_PYTHON_COMMAND;
+  }
+  const bundledPython = process.env.USERPROFILE
+    ? path.join(process.env.USERPROFILE, '.cache', 'codex-runtimes', 'codex-primary-runtime', 'dependencies', 'python', 'python.exe')
+    : null;
+  const candidates = [
+    options.pythonCommand,
+    process.env.STAGE2_PYTHON,
+    process.env.PYTHON,
+    bundledPython,
+    DEFAULT_PYTHON_COMMAND
+  ].filter(Boolean);
+  const seen = new Set();
+  const errors = [];
+  for (const command of candidates) {
+    if (seen.has(command)) {
+      continue;
+    }
+    seen.add(command);
+    try {
+      if (path.isAbsolute(command) && !(await pathExists(command))) {
+        errors.push(`${command}: 不存在`);
+        continue;
+      }
+      const result = await execFileAsync(command, [
+        '-c',
+        'import sys,json; print(json.dumps({"major":sys.version_info[0],"minor":sys.version_info[1]}))'
+      ], { cwd: ROOT_DIR, timeout: 8000, windowsHide: true });
+      const version = JSON.parse(String(result.stdout || '').trim());
+      if (version.major > 3 || (version.major === 3 && version.minor >= 10)) {
+        return command;
+      }
+      errors.push(`${command}: Python ${version.major}.${version.minor} 低于 3.10`);
+    } catch (error) {
+      errors.push(`${command}: ${error.message}`);
+    }
+  }
+  throw new Stage2V3InputError(`找不到可运行第二阶段 v3 的 Python 3.10+：${errors.join('；')}`, 500);
+}
+
+async function runPythonV3Orchestrator({ runId, runsDir, runDir, inputConfig, body, roundId }, options = {}) {
+  const executionMode = normalizeExecutionMode(body.executionMode || body.execution_mode || 'real_browser');
+  const artifactRoot = runsDir;
+  const command = await resolvePythonCommand(options);
+  const args = [
+    '-m',
+    'prototype.stage2.main',
+    '--run-v3',
+    '--v3-run-id',
+    runId,
+    '--v3-artifact-root',
+    artifactRoot,
+    '--v3-execution-mode',
+    executionMode,
+    '--v3-reuse-run-dir',
+    '--target-name',
+    inputConfig.system_name,
+    '--page-url',
+    inputConfig.entry_url,
+    '--cdp-url',
+    inputConfig.cdp_url,
+    '--v3-max-pages',
+    String(normalizeInteger(body.maxPages || body.max_pages, inputConfig.max_pages, 1, 200)),
+    '--v3-max-features-per-page',
+    String(normalizeInteger(
+      body.maxFeaturesPerPage || body.max_features_per_page,
+      inputConfig.max_features_per_page,
+      1,
+      200
+    ))
+  ];
+  if (body.useLiveDiscovery !== false && body.use_live_discovery !== false) {
+    args.push('--v3-use-live-discovery');
+  }
+  if (body.model) {
+    args.push('--model', String(body.model));
+  }
+
+  await fs.mkdir(artifactRoot, { recursive: true });
+  const timeoutMs = normalizeInteger(
+    body.timeoutMs || body.timeout_ms,
+    options.pythonTimeoutMs || DEFAULT_PYTHON_TIMEOUT_MS,
+    1000,
+    60 * 60 * 1000
+  );
+  const startedAt = nowIso();
+  let result;
+  try {
+    if (options.pythonRunner) {
+      result = await options.pythonRunner({ command, args, cwd: ROOT_DIR, artifactRoot, runsDir, runDir, timeoutMs });
+    } else {
+      result = await execFileAsync(command, args, {
+        cwd: ROOT_DIR,
+        timeout: timeoutMs,
+        windowsHide: true,
+        maxBuffer: 20 * 1024 * 1024
+      });
+    }
+  } catch (error) {
+    const stderr = String(error.stderr || error.message || '');
+    const failureReason = error.code === 'ENOENT' ? 'python_executor_unavailable' : 'python_v3_orchestrator_failed';
+    return {
+      ok: false,
+      failureReason,
+      command,
+      args,
+      artifactRoot,
+      startedAt,
+      finishedAt: nowIso(),
+      exitCode: typeof error.code === 'number' ? error.code : null,
+      stdout: String(error.stdout || ''),
+      stderr,
+      error: error.message || stderr || failureReason
+    };
+  }
+
+  const stdout = String(result?.stdout || '');
+  const stderr = String(result?.stderr || '');
+  const parsed = parseJsonFromProcessOutput(stdout);
+  return {
+    ok: true,
+    command,
+    args,
+    artifactRoot,
+    startedAt,
+    finishedAt: nowIso(),
+    exitCode: 0,
+    stdout,
+    stderr,
+    result: parsed
+  };
+}
+
+async function findPythonRunDir(processResult) {
+  const explicit = processResult.result?.run_dir;
+  if (explicit && await pathExists(explicit)) {
+    return explicit;
+  }
+  const artifactPaths = processResult.result?.artifact_paths || {};
+  for (const value of Object.values(artifactPaths)) {
+    if (value) {
+      const dir = path.dirname(value);
+      if (await pathExists(dir)) {
+        return dir;
+      }
+    }
+  }
+  const dirents = await fs.readdir(processResult.artifactRoot, { withFileTypes: true }).catch(() => []);
+  const directories = dirents.filter((item) => item.isDirectory()).map((item) => path.join(processResult.artifactRoot, item.name));
+  return directories[0] || null;
+}
+
+async function readPythonJson(pyRunDir, fileName) {
+  return pyRunDir ? readJsonIfExists(path.join(pyRunDir, fileName)) : null;
+}
+
+function normalizePythonPageEntries(payload, inputConfig) {
+  if (payload?.schema_version === 'stage2_page_entries.v3' && Array.isArray(payload.items)) {
+    return payload;
+  }
+  const pages = payload?.pages || [];
+  return {
+    schema_version: 'stage2_page_entries.v3',
+    items: pages.map((page, index) => ({
+      page_entry_id: page.page_entry_id || page.page_id || `page_${String(index + 1).padStart(3, '0')}`,
+      name: page.name || page.title || `${inputConfig.system_name}页面${index + 1}`,
+      url: page.url || inputConfig.entry_url,
+      menu_path: page.menu_path || [inputConfig.system_name],
+      page_type: page.page_type || page.semantic_page_type || 'unknown',
+      discovery_depth: Number.isInteger(page.discovery_depth) ? page.discovery_depth : index === 0 ? 0 : 1,
+      status: page.status || 'reachable',
+      source: page.source || 'python_v3_orchestrator',
+      evidence: page.evidence || {},
+      screenshot_refs: page.screenshot_refs || page.screenshots || []
+    }))
+  };
+}
+
+function normalizePythonFeaturePoints(payload) {
+  if (payload?.schema_version === 'stage2_feature_points.v3' && Array.isArray(payload.items)) {
+    return payload;
+  }
+  const features = payload?.features || [];
+  return {
+    schema_version: 'stage2_feature_points.v3',
+    items: features.map((feature, index) => {
+      const risk = feature.risk_level || 'low';
+      return {
+        feature_point_id: feature.feature_point_id || feature.feature_id || `feature_${String(index + 1).padStart(3, '0')}`,
+        page_entry_id: feature.page_entry_id || feature.page_id || 'page_home',
+        name: feature.name || feature.title || `功能点${index + 1}`,
+        feature_type: feature.feature_type || feature.type || 'unknown',
+        risk_level: risk,
+        auto_verifiable: feature.auto_verifiable !== false && risk === 'low',
+        verification_strategy: feature.verification_strategy || `${feature.feature_type || 'unknown'}_minimal_path`,
+        locator_candidates: feature.locator_candidates || [],
+        source: feature.source || 'python_v3_orchestrator',
+        confidence: typeof feature.confidence === 'number' ? feature.confidence : 0.7,
+        review_status: feature.review_status || (risk === 'low' ? 'auto_included' : 'pending')
+      };
+    })
+  };
+}
+
+function normalizePythonTestCases(payload) {
+  if (payload?.schema_version === 'stage2_generated_test_cases.v3' && Array.isArray(payload.items)) {
+    return payload;
+  }
+  const cases = payload?.cases || [];
+  return {
+    schema_version: 'stage2_generated_test_cases.v3',
+    items: cases.map((testCase, index) => ({
+      test_case_id: testCase.test_case_id || testCase.case_id || `case_${String(index + 1).padStart(3, '0')}`,
+      feature_point_id: testCase.feature_point_id || testCase.feature_id || '',
+      title: testCase.title || testCase.name || `执行型用例${index + 1}`,
+      type_template: testCase.type_template || testCase.case_type || 'unknown',
+      preconditions: testCase.preconditions || [],
+      steps: testCase.steps || [],
+      expected_feedback: testCase.expected_feedback || [testCase.expected_result].filter(Boolean),
+      risk_policy: testCase.risk_policy || (testCase.auto_allowed === false ? 'manual_review_required' : 'safe_auto'),
+      assertions: testCase.assertions || [],
+      requires_human_confirmation: Boolean(testCase.requires_human_confirmation || testCase.auto_allowed === false)
+    }))
+  };
+}
+
+function normalizePythonExecutionResults(payload) {
+  const results = payload?.schema_version === 'stage2_execution_results.v3' && Array.isArray(payload.items)
+    ? payload.items
+    : payload?.results || [];
+  return {
+    schema_version: 'stage2_execution_results.v3',
+    items: results.map((result) => {
+      let status = result.status || 'unknown';
+      let failureReason = result.failure_reason || null;
+      let manualConfirmationRequired = Boolean(result.manual_confirmation_required);
+      if (status === 'passed_safe_placeholder') {
+        status = 'skipped';
+        failureReason = 'python_returned_safe_placeholder';
+        manualConfirmationRequired = true;
+      } else if (status === 'blocked_by_policy') {
+        failureReason = failureReason || 'blocked_by_policy';
+        manualConfirmationRequired = true;
+      }
+      return {
+        test_case_id: result.test_case_id || result.case_id || '',
+        status,
+        verdict: result.verdict || result.message || '',
+        started_at: result.started_at || null,
+        finished_at: result.finished_at || null,
+        actions: result.actions || [],
+        page_feedback: result.page_feedback || [],
+        screenshot_refs: result.screenshot_refs || result.evidence || [],
+        network_refs: result.network_refs || [],
+        failure_reason: failureReason,
+        manual_confirmation_required: manualConfirmationRequired,
+        execution_mode: result.execution_mode || 'real_browser'
+      };
+    })
+  };
+}
+
+function normalizePythonHumanTasks(payload) {
+  if (payload?.schema_version === 'stage2_human_tasks.v3' && Array.isArray(payload.items)) {
+    return payload;
+  }
+  const tasks = payload?.tasks || [];
+  return {
+    schema_version: 'stage2_human_tasks.v3',
+    items: tasks.map((task) => ({
+      task_id: task.task_id,
+      task_type: task.task_type || task.type || 'review_next_round_plan',
+      title: task.title || '人工处理任务',
+      reason: task.reason || task.ui_action || '需要在运行中心处理后继续。',
+      input_refs: task.input_refs || [],
+      ui_schema: task.ui_schema || { kind: 'decision', actions: ['approve', 'pause', 'stop'] },
+      status: task.status === 'open' ? 'pending' : task.status || 'pending',
+      result_artifact: task.result_artifact || null
+    }))
+  };
+}
+
+function normalizePythonNextRoundPlan(payload, executionResults, roundId) {
+  const hasBlockingEvidenceGap = (executionResults.items || []).some((item) => [
+    'contract_only_mode',
+    'python_returned_safe_placeholder',
+    'python_v3_orchestrator_failed',
+    'python_executor_unavailable',
+    'cdp_connect_failed',
+    'playwright_missing',
+    'login_required'
+  ].includes(item.failure_reason) || [
+    'skipped_no_executor',
+    'skipped_not_observed',
+    'login_required',
+    'real_failed',
+    'failed'
+  ].includes(item.status));
+  if (payload?.schema_version === 'stage2_next_round_plan.v3' && !hasBlockingEvidenceGap) {
+    return payload;
+  }
+  return {
+    schema_version: 'stage2_next_round_plan.v3',
+    current_round_id: roundId,
+    should_continue: Boolean(payload?.should_continue || payload?.should_start_next_round) && !hasBlockingEvidenceGap,
+    decision: hasBlockingEvidenceGap
+      ? 'wait_human_review'
+      : payload?.decision || (payload?.status === 'blocked_waiting_human' ? 'wait_human_review' : payload?.should_start_next_round ? 'auto_continue' : 'stop_goal_completed'),
+    next_round_goal: hasBlockingEvidenceGap
+      ? '补齐真实浏览器执行证据后重新执行低风险用例。'
+      : payload?.next_round_goal || payload?.primary_reason || '继续下一轮自动评测。',
+    target_page_entry_ids: payload?.target_page_entry_ids || [],
+    target_feature_point_ids: payload?.target_feature_point_ids || [],
+    planned_improvements: payload?.planned_improvements || payload?.recommended_actions || [],
+    risk_level: payload?.risk_level || 'low',
+    requires_human_approval: Boolean(hasBlockingEvidenceGap || payload?.requires_human_approval || payload?.status === 'blocked_waiting_human')
+  };
+}
+
 async function updateRunStatus(runDir, manifest, status, phase, message, extra = {}) {
   const updated = {
     ...manifest,
     status,
+    execution_mode: extra.execution_mode || manifest.execution_mode || null,
     updated_at: nowIso()
   };
   const saved = await saveManifest(runDir, updated);
@@ -723,45 +1119,16 @@ async function updateRunStatus(runDir, manifest, status, phase, message, extra =
   return saved;
 }
 
-async function startV3Run(runId, body = {}, options = {}) {
-  const { runDir, manifest } = await readManifest(runId, options);
-  const inputConfig = await readJsonRequired(path.join(runDir, ARTIFACTS.input_config), 'input_config 缺失。');
-  const roundId = body.roundId || body.round_id || manifest.current_round_id || 'round_001';
-  const startedAt = nowIso();
-  const nextRound = {
-    round_id: roundId,
-    goal: normalizeText(body.goal || body.roundGoal, '首轮 v3 自动发现与低风险用例生成'),
-    started_at: startedAt,
-    finished_at: null,
-    input_artifacts: ['input_config'],
-    output_artifacts: [],
-    status: 'running'
-  };
-  let runningManifest = {
-    ...manifest,
-    status: 'running',
-    started_at: manifest.started_at || startedAt,
-    updated_at: startedAt,
-    current_round_id: roundId,
-    rounds: [...(manifest.rounds || []).filter((item) => item.round_id !== roundId), nextRound]
-  };
-  runningManifest = await saveManifest(runDir, runningManifest);
-  await writeJson(path.join(runDir, ARTIFACTS.current_status), buildCurrentStatus(
-    runningManifest,
-    'running_contract_pipeline',
-    '正在生成 v3 run 稳定产物契约。'
-  ));
-  await appendEvent(runDir, { type: 'run_started', run_id: runId, round_id: roundId });
-
-  const preflightResult = makePreflightResult(runningManifest, inputConfig);
-  const { systemMap, navigationTree, pageEntries } = makeDiscoveryArtifacts(runningManifest, inputConfig);
+async function persistContractOnlyArtifacts(runDir, manifest, inputConfig, executionMode = 'contract_only') {
+  const preflightResult = makePreflightResult(manifest, inputConfig, executionMode);
+  const { systemMap, navigationTree, pageEntries } = makeDiscoveryArtifacts(manifest, inputConfig);
   const featurePoints = makeFeatureArtifacts(inputConfig);
   const discoveryReview = makeDiscoveryReview(featurePoints);
   const testCases = makeGeneratedTestCases(featurePoints);
-  const executionResults = makeExecutionResults(testCases);
+  const executionResults = makeExecutionResults(testCases, 'contract_only_mode');
   const screenshotsIndex = makeScreenshotsIndex();
   const analysisPack = makeRoundAnalysis({
-    manifest: runningManifest,
+    manifest,
     pageEntries,
     featurePoints,
     testCases,
@@ -779,6 +1146,198 @@ async function startV3Run(runId, body = {}, options = {}) {
   await writeJson(path.join(runDir, ARTIFACTS.execution_results), executionResults);
   await writeJson(path.join(runDir, ARTIFACTS.screenshots_index), screenshotsIndex);
   await persistAnalysisPack(runDir, analysisPack);
+  return analysisPack;
+}
+
+async function persistRealBrowserFailure(runDir, manifest, inputConfig, processResult, roundId) {
+  const preflightResult = {
+    schema_version: 'stage2_preflight_result.v3',
+    run_id: manifest.run_id,
+    execution_mode: 'real_browser',
+    status: 'failed',
+    checks: {
+      input_config: { ok: true },
+      cdp_url: { ok: true, url: inputConfig.cdp_url },
+      python_orchestrator: {
+        ok: false,
+        reason: processResult.error || processResult.stderr || processResult.failureReason,
+        failure_reason: processResult.failureReason
+      }
+    },
+    command: { executable: processResult.command, args: processResult.args },
+    started_at: processResult.startedAt,
+    finished_at: processResult.finishedAt
+  };
+  const { systemMap, navigationTree, pageEntries } = makeDiscoveryArtifacts(manifest, inputConfig);
+  const featurePoints = makeFeatureArtifacts(inputConfig);
+  const discoveryReview = makeDiscoveryReview(featurePoints);
+  const testCases = makeGeneratedTestCases(featurePoints);
+  const executionResults = {
+    schema_version: 'stage2_execution_results.v3',
+    items: testCases.items.map((testCase) => ({
+      test_case_id: testCase.test_case_id,
+      status: 'failed',
+      verdict: `真实浏览器执行未完成：${processResult.error || processResult.failureReason}`,
+      started_at: processResult.startedAt,
+      finished_at: processResult.finishedAt,
+      actions: [],
+      page_feedback: [],
+      screenshot_refs: [],
+      network_refs: [],
+      failure_reason: processResult.failureReason,
+      manual_confirmation_required: true,
+      execution_mode: 'real_browser'
+    }))
+  };
+  const screenshotsIndex = makeScreenshotsIndex();
+  const analysisPack = makeRoundAnalysis({
+    manifest,
+    pageEntries,
+    featurePoints,
+    testCases,
+    executionResults,
+    screenshotsIndex
+  });
+  analysisPack.nextRoundPlan.current_round_id = roundId;
+  analysisPack.nextRoundPlan.decision = 'wait_human_review';
+  analysisPack.nextRoundPlan.requires_human_approval = true;
+  analysisPack.nextRoundPlan.next_round_goal = '修复真实浏览器执行环境后重新启动本轮低风险执行。';
+
+  await writeJson(path.join(runDir, ARTIFACTS.python_execution), processResult);
+  await writeJson(path.join(runDir, ARTIFACTS.preflight_result), preflightResult);
+  await writeJson(path.join(runDir, ARTIFACTS.system_map), systemMap);
+  await writeJson(path.join(runDir, ARTIFACTS.navigation_tree), navigationTree);
+  await writeJson(path.join(runDir, ARTIFACTS.page_entries), pageEntries);
+  await writeJson(path.join(runDir, ARTIFACTS.feature_points), featurePoints);
+  await writeJson(path.join(runDir, ARTIFACTS.discovery_review), discoveryReview);
+  await writeJson(path.join(runDir, ARTIFACTS.generated_test_cases), testCases);
+  await writeJson(path.join(runDir, ARTIFACTS.execution_results), executionResults);
+  await writeJson(path.join(runDir, ARTIFACTS.screenshots_index), screenshotsIndex);
+  await persistAnalysisPack(runDir, analysisPack);
+  return analysisPack;
+}
+
+async function persistRealBrowserArtifacts(runDir, manifest, inputConfig, processResult, roundId) {
+  const pyRunDir = await findPythonRunDir(processResult);
+  const pageEntries = normalizePythonPageEntries(
+    await readPythonJson(pyRunDir, 'page_entries.json') || await readPythonJson(pyRunDir, 'pages.json'),
+    inputConfig
+  );
+  const featurePoints = normalizePythonFeaturePoints(
+    await readPythonJson(pyRunDir, 'feature_points.json') || await readPythonJson(pyRunDir, 'features.json')
+  );
+  const testCases = normalizePythonTestCases(
+    await readPythonJson(pyRunDir, 'generated_test_cases.json') || await readPythonJson(pyRunDir, 'cases.json')
+  );
+  const executionResults = normalizePythonExecutionResults(await readPythonJson(pyRunDir, 'execution_results.json'));
+  const screenshotsIndex = await readPythonJson(pyRunDir, 'screenshots_index.json') || {
+    schema_version: 'stage2_screenshots_index.v3',
+    items: [],
+    notes: ['Python v3 本轮未返回截图索引。']
+  };
+  const discoveryReview = makeDiscoveryReview(featurePoints);
+  const { systemMap, navigationTree } = makeDiscoveryArtifacts(manifest, inputConfig);
+  const pythonNextRoundPlan = await readPythonJson(pyRunDir, 'next_round_plan.json');
+  const analysisPack = makeRoundAnalysis({
+    manifest,
+    pageEntries,
+    featurePoints,
+    testCases,
+    executionResults,
+    screenshotsIndex
+  });
+  analysisPack.nextRoundPlan = normalizePythonNextRoundPlan(pythonNextRoundPlan, executionResults, roundId);
+  analysisPack.humanTasks = normalizePythonHumanTasks(await readPythonJson(pyRunDir, 'human_tasks.json'));
+  if (analysisPack.nextRoundPlan.requires_human_approval) {
+    const existingTaskIds = new Set(analysisPack.humanTasks.items.map((item) => item.task_id));
+    if (!existingTaskIds.has('task_connect_executor_or_confirm_plan')) {
+      analysisPack.humanTasks.items.push(...buildHumanTasks(featurePoints, executionResults, analysisPack.nextRoundPlan).items);
+    }
+  }
+
+  await writeJson(path.join(runDir, ARTIFACTS.python_execution), { ...processResult, pythonRunDir: pyRunDir });
+  await writeJson(path.join(runDir, ARTIFACTS.preflight_result), {
+    schema_version: 'stage2_preflight_result.v3',
+    run_id: manifest.run_id,
+    execution_mode: 'real_browser',
+    status: 'completed',
+    checks: {
+      input_config: { ok: true },
+      cdp_url: { ok: true, url: inputConfig.cdp_url },
+      python_orchestrator: { ok: true, run_dir: pyRunDir }
+    },
+    command: { executable: processResult.command, args: processResult.args },
+    started_at: processResult.startedAt,
+    finished_at: processResult.finishedAt
+  });
+  await writeJson(path.join(runDir, ARTIFACTS.system_map), systemMap);
+  await writeJson(path.join(runDir, ARTIFACTS.navigation_tree), navigationTree);
+  await writeJson(path.join(runDir, ARTIFACTS.page_entries), pageEntries);
+  await writeJson(path.join(runDir, ARTIFACTS.feature_points), featurePoints);
+  await writeJson(path.join(runDir, ARTIFACTS.discovery_review), discoveryReview);
+  await writeJson(path.join(runDir, ARTIFACTS.generated_test_cases), testCases);
+  await writeJson(path.join(runDir, ARTIFACTS.execution_results), executionResults);
+  await writeJson(path.join(runDir, ARTIFACTS.screenshots_index), screenshotsIndex);
+  await copyTextFileIfExists(path.join(pyRunDir || '', 'report.md'), path.join(runDir, ARTIFACTS.run_report_md));
+  await persistAnalysisPack(runDir, analysisPack);
+  return analysisPack;
+}
+
+async function startV3Run(runId, body = {}, options = {}) {
+  const { runDir, manifest } = await readManifest(runId, options);
+  const inputConfig = await readJsonRequired(path.join(runDir, ARTIFACTS.input_config), 'input_config 缺失。');
+  const executionMode = normalizeExecutionMode(body.executionMode || body.execution_mode || options.executionMode);
+  const roundId = body.roundId || body.round_id || manifest.current_round_id || 'round_001';
+  const startedAt = nowIso();
+  const nextRound = {
+    round_id: roundId,
+    goal: normalizeText(body.goal || body.roundGoal, '首轮 v3 自动发现与低风险用例生成'),
+    started_at: startedAt,
+    finished_at: null,
+    input_artifacts: ['input_config'],
+    output_artifacts: [],
+    status: 'running'
+  };
+  let runningManifest = {
+    ...manifest,
+    status: 'running',
+    execution_mode: executionMode,
+    started_at: manifest.started_at || startedAt,
+    updated_at: startedAt,
+    current_round_id: roundId,
+    rounds: [...(manifest.rounds || []).filter((item) => item.round_id !== roundId), nextRound]
+  };
+  runningManifest = await saveManifest(runDir, runningManifest);
+  await writeJson(path.join(runDir, ARTIFACTS.current_status), buildCurrentStatus(
+    runningManifest,
+    executionMode === 'real_browser' ? 'real_browser_execution' : 'running_contract_pipeline',
+    executionMode === 'real_browser'
+      ? '正在调用 Python v3 orchestrator 执行真实浏览器链路。'
+      : '正在生成 v3 run 稳定产物契约，本轮不会执行真实浏览器。',
+    { execution_mode: executionMode }
+  ));
+  await appendEvent(runDir, { type: 'run_started', run_id: runId, round_id: roundId, execution_mode: executionMode });
+
+  let analysisPack;
+  let executionFailed = false;
+  if (executionMode === 'contract_only') {
+    analysisPack = await persistContractOnlyArtifacts(runDir, runningManifest, inputConfig, executionMode);
+  } else {
+    const processResult = await runPythonV3Orchestrator({
+      runId,
+      runsDir: getRunsDir(options),
+      runDir,
+      inputConfig,
+      body,
+      roundId
+    }, options);
+    if (processResult.ok) {
+      analysisPack = await persistRealBrowserArtifacts(runDir, runningManifest, inputConfig, processResult, roundId);
+    } else {
+      executionFailed = true;
+      analysisPack = await persistRealBrowserFailure(runDir, runningManifest, inputConfig, processResult, roundId);
+    }
+  }
 
   const completedRound = {
     ...nextRound,
@@ -796,12 +1355,18 @@ async function startV3Run(runId, body = {}, options = {}) {
       'next_round_plan',
       'human_tasks'
     ],
-    status: analysisPack.nextRoundPlan.requires_human_approval ? 'waiting_human' : 'completed'
+    status: executionFailed
+      ? 'failed'
+      : analysisPack.nextRoundPlan.requires_human_approval ? 'waiting_human' : 'completed'
   };
-  const finalStatus = analysisPack.nextRoundPlan.requires_human_approval ? 'waiting_human' : 'completed';
-  const finalMessage = analysisPack.nextRoundPlan.requires_human_approval
-    ? '首轮产物已生成，等待运行中心人工确认下一步。'
-    : '首轮产物已生成。';
+  const finalStatus = executionFailed
+    ? 'failed'
+    : analysisPack.nextRoundPlan.requires_human_approval ? 'waiting_human' : 'completed';
+  const finalMessage = executionFailed
+    ? '真实浏览器执行失败，已写入可读错误和阻塞产物。'
+    : analysisPack.nextRoundPlan.requires_human_approval
+      ? '首轮产物已生成，等待运行中心人工确认下一步。'
+      : '首轮真实浏览器执行产物已生成。';
   const finalManifest = await updateRunStatus(
     runDir,
     {
@@ -809,9 +1374,9 @@ async function startV3Run(runId, body = {}, options = {}) {
       rounds: [...(runningManifest.rounds || []).filter((item) => item.round_id !== roundId), completedRound]
     },
     finalStatus,
-    'round_analysis',
+    executionFailed ? 'real_browser_execution_failed' : 'round_analysis',
     finalMessage,
-    { decision: analysisPack.nextRoundPlan.decision }
+    { decision: analysisPack.nextRoundPlan.decision, execution_mode: executionMode }
   );
 
   return { run: buildPublicRun(runDir, finalManifest, await loadRunArtifacts(runDir)) };
@@ -1016,7 +1581,7 @@ function makeReport({ manifest, pageEntries, featurePoints, testCases, execution
     '',
     '## 说明',
     '',
-    '本报告由 Node.js v3 Run API 基于稳定 artifact 契约生成。当前后端不会替代 Python v3 执行器执行真实浏览器动作；真实执行证据接入后会补齐截图、动作日志和页面反馈。',
+    '本报告由 Node.js v3 Run API 基于稳定 artifact 契约生成。`real_browser` 模式会调用 Python v3 orchestrator 获取真实浏览器证据；`contract_only` 或执行失败时，报告会明确标注未获得真实执行证据。',
     '',
     '## 人工确认项',
     '',

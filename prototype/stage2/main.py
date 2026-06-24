@@ -1135,6 +1135,8 @@ async def run_v3_assessment_entrypoint(
     run_id: str,
     artifact_root: str,
     use_live_discovery: bool,
+    execution_mode: str,
+    reuse_run_dir: bool,
     max_pages: int,
     max_features_per_page: int,
     template_name: str,
@@ -1150,6 +1152,8 @@ async def run_v3_assessment_entrypoint(
         target_name=target_name or "第二阶段 v3 演示系统",
         start_url=start_url,
         cdp_url=cdp_url,
+        execution_mode=execution_mode,
+        reuse_run_dir=reuse_run_dir,
         model_name=model_name,
         run_id=run_id,
         artifact_root=artifact_root_path,
@@ -1360,6 +1364,17 @@ def main() -> None:
         "--v3-use-live-discovery",
         action="store_true",
         help="For --run-v3, call the existing system-map/live-discovery flow before generating cases.",
+    )
+    parser.add_argument(
+        "--v3-execution-mode",
+        choices=("contract_only", "real_browser"),
+        default="contract_only",
+        help="For --run-v3, choose contract_only or real_browser execution.",
+    )
+    parser.add_argument(
+        "--v3-reuse-run-dir",
+        action="store_true",
+        help="For --run-v3, write into an existing run directory instead of creating a suffixed directory.",
     )
     parser.add_argument(
         "--v3-max-pages",
@@ -1583,6 +1598,8 @@ def main() -> None:
                         run_id=args.v3_run_id,
                         artifact_root=args.v3_artifact_root,
                         use_live_discovery=args.v3_use_live_discovery,
+                        execution_mode=args.v3_execution_mode,
+                        reuse_run_dir=args.v3_reuse_run_dir,
                         max_pages=args.v3_max_pages,
                         max_features_per_page=args.v3_max_features_per_page,
                         template_name=args.template
