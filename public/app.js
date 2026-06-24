@@ -159,6 +159,7 @@ const state = {
   stage2Runs: [],
   stage2RunDetails: {},
   stage2LocalRuns: loadStage2LocalRuns(),
+  stage2ActionLog: [],
   stage2RunsApiAvailable: null,
   stage2LastError: '',
   selectedRunId: null,
@@ -478,6 +479,21 @@ async function runStage2RunAction(runId, action, body, successMessage) {
   }
 }
 
+function pushStage2ActionLog(message, tone = 'info') {
+  const entry = {
+    at: new Date().toISOString(),
+    message,
+    tone
+  };
+  state.stage2ActionLog = [entry, ...state.stage2ActionLog].slice(0, 6);
+  saveState.textContent = message;
+}
+
+function isStage2V3ActionableRun(run) {
+  const runId = getRunId(run);
+  return Boolean(runId && runId.startsWith('stage2_v3_') && run?.source !== 'local' && run?.source !== 'overview');
+}
+
 async function createStage2Run(event) {
   event.preventDefault();
   const data = new FormData(stage2RunForm);
@@ -502,7 +518,7 @@ async function createStage2Run(event) {
   }
 
   state.pendingAction = 'create-stage2-run';
-  saveState.textContent = '正在创建 run';
+  pushStage2ActionLog('正在创建 v3 run...');
   render();
 
   try {
@@ -513,7 +529,7 @@ async function createStage2Run(event) {
     const run = normalizeStage2Run(result.run || result);
     state.selectedRunId = getRunId(run);
     delete state.stage2RunDetails[state.selectedRunId];
-    saveState.textContent = '已创建 run';
+    pushStage2ActionLog(`已创建 v3 run：${state.selectedRunId}`, 'success');
     await loadDashboardData();
   } catch (error) {
     const localRun = normalizeStage2Run({
@@ -529,11 +545,26 @@ async function createStage2Run(event) {
     saveStage2LocalRuns();
     state.stage2Runs = normalizeStage2Runs({}, state.stage2Overview);
     state.selectedRunId = getRunId(localRun);
-    saveState.textContent = '后端接口未就绪，已创建本地草稿';
+    pushStage2ActionLog(`创建 v3 run 失败，已保存本地草稿：${error.message}`, 'warning');
     render();
   } finally {
     state.pendingAction = null;
     render();
+  }
+}
+
+async function refreshStage2Runs() {
+  state.pendingAction = 'stage2-refresh-runs';
+  pushStage2ActionLog('正在刷新 v3 run 列表...');
+  renderStage2Overview();
+  try {
+    await loadDashboardData();
+    pushStage2ActionLog(`已刷新 run 列表：${getStage2Runs().length} 个 run`, 'success');
+  } catch (error) {
+    pushStage2ActionLog(`刷新 run 列表失败：${error.message}`, 'error');
+  } finally {
+    state.pendingAction = null;
+    renderStage2Overview();
   }
 }
 
@@ -546,7 +577,14 @@ async function selectStage2Run(runId) {
 
 async function runStage2V3Action(runId, action) {
   if (!runId || runId.startsWith('draft_')) {
-    saveState.textContent = '本地草稿需要等待后端 v3 API 接入后才能执行';
+    pushStage2ActionLog('本地草稿不能执行，请先确认后端 v3 API 可用并创建正式 run。', 'warning');
+    renderStage2Overview();
+    return;
+  }
+  const run = getSelectedStage2Run() || getStage2Runs().find((item) => getRunId(item) === runId);
+  if (run && !isStage2V3ActionableRun(run)) {
+    pushStage2ActionLog('当前 run 是只读历史产物，只能查看报告和 artifacts，不能从 v3 运行中心执行。', 'warning');
+    renderStage2Overview();
     return;
   }
   const successText = {
@@ -559,7 +597,7 @@ async function runStage2V3Action(runId, action) {
     'generate-report': '已请求生成报告'
   }[action] || '已提交操作';
   state.pendingAction = `stage2-${action}`;
-  saveState.textContent = '处理中';
+  pushStage2ActionLog(`正在执行操作：${successText}...`);
   render();
   try {
     const result = await api(`/api/stage2/v3/runs/${encodeURIComponent(runId)}/${action}`, {
@@ -570,10 +608,10 @@ async function runStage2V3Action(runId, action) {
     if (result.overview) {
       state.stage2Overview = result.overview;
     }
-    saveState.textContent = successText;
+    pushStage2ActionLog(successText, 'success');
     await loadDashboardData();
   } catch (error) {
-    saveState.textContent = error.message;
+    pushStage2ActionLog(`操作失败：${error.message}`, 'error');
     render();
   } finally {
     state.pendingAction = null;
@@ -587,7 +625,7 @@ async function completeStage2HumanTask(taskId) {
     return;
   }
   state.pendingAction = `stage2-human-${taskId}`;
-  saveState.textContent = '正在提交人工处理结果';
+  pushStage2ActionLog(`正在提交人工处理结果：${taskId}...`);
   render();
   try {
     await api(`/api/stage2/v3/runs/${encodeURIComponent(runId)}/save-human-task`, {
@@ -598,11 +636,11 @@ async function completeStage2HumanTask(taskId) {
         result: { status: 'completed', note: 'Completed from v3 run cockpit.' }
       })
     });
-    saveState.textContent = '已记录人工处理结果';
+    pushStage2ActionLog(`已记录人工处理结果：${taskId}`, 'success');
     delete state.stage2RunDetails[runId];
     await loadDashboardData();
   } catch (error) {
-    saveState.textContent = error.message;
+    pushStage2ActionLog(`人工处理结果提交失败：${error.message}`, 'error');
     render();
   } finally {
     state.pendingAction = null;
@@ -1172,6 +1210,7 @@ function renderStage2Overview() {
   renderStage2V3HumanTab();
   renderStage2V3ReportTab();
   renderStage2V3ArtifactsTab();
+  renderStage2ActionFeedback();
 }
 
 function renderStage2V3Shell() {
@@ -1224,9 +1263,13 @@ function renderStage2V3Shell() {
 
   stage2RunList.innerHTML = runs.map((item) => {
     const id = getRunId(item);
+    const modeLabel = isStage2V3ActionableRun(item)
+      ? '可操作'
+      : (item.source === 'local' ? '本地草稿' : '只读');
     return `
       <button class="stage2-run-card ${id === state.selectedRunId ? 'active' : ''}" data-run-id="${escapeHtml(id)}" type="button">
         <span class="tag ${verdictClass(getRunStatus(item))}">${escapeHtml(statusLabel(getRunStatus(item)))}</span>
+        <span class="tag ${isStage2V3ActionableRun(item) ? 'passed' : 'manual'}">${escapeHtml(modeLabel)}</span>
         <strong>${escapeHtml(item.systemName || id)}</strong>
         <small>${escapeHtml(id)}</small>
         <p>${escapeHtml(item.latestMessage || item.currentPhaseLabel || item.entryUrl || '暂无运行摘要')}</p>
@@ -1242,10 +1285,11 @@ function renderStage2V3Shell() {
 
 function renderStage2RunActions(run) {
   const id = getRunId(run);
-  const disabled = state.pendingAction || run.source === 'local' ? 'disabled' : '';
-  const localNote = run.source === 'local'
-    ? '<span class="status-pill warning">等待后端接入</span>'
-    : '';
+  const actionable = isStage2V3ActionableRun(run);
+  const disabled = state.pendingAction || !actionable ? 'disabled' : '';
+  const localNote = !actionable
+    ? `<span class="status-pill warning">${run.source === 'local' ? '本地草稿，不能执行' : '只读历史 run，不能执行'}</span>`
+    : '<span class="status-pill success">可操作 v3 run</span>';
   return `
     ${localNote}
     <button class="ghost-action compact-action" data-stage2-run-action="start" data-run-id="${escapeHtml(id)}" type="button" ${disabled}>开始自动评测</button>
@@ -1255,6 +1299,32 @@ function renderStage2RunActions(run) {
     <button class="ghost-action compact-action" data-stage2-run-action="continue-next-round" data-run-id="${escapeHtml(id)}" type="button" ${disabled}>进入下一轮</button>
     <button class="ghost-action compact-action" data-stage2-run-action="generate-report" data-run-id="${escapeHtml(id)}" type="button" ${disabled}>生成报告</button>
     <button class="ghost-action compact-action danger-action" data-stage2-run-action="stop" data-run-id="${escapeHtml(id)}" type="button" ${disabled}>停止</button>
+  `;
+}
+
+function renderStage2ActionFeedback() {
+  const container = document.querySelector('#stage2ActionFeedback');
+  if (!container) {
+    return;
+  }
+  const selected = getSelectedStage2Run();
+  const selectedMode = selected
+    ? (isStage2V3ActionableRun(selected) ? '当前选择的是可操作 v3 run。' : '当前选择的是只读/本地 run，仅支持查看。')
+    : '创建或选择 run 后，这里会显示操作反馈。';
+  const logs = state.stage2ActionLog.length
+    ? state.stage2ActionLog.map((item) => `
+      <li class="${escapeHtml(item.tone)}">
+        <span>${escapeHtml(formatDate(item.at))}</span>
+        <strong>${escapeHtml(item.message)}</strong>
+      </li>
+    `).join('')
+    : `<li><span>-</span><strong>${escapeHtml(selectedMode)}</strong></li>`;
+  container.innerHTML = `
+    <div class="stage2-feedback-head">
+      <strong>操作反馈</strong>
+      <span class="tag ${selected && isStage2V3ActionableRun(selected) ? 'passed' : 'manual'}">${escapeHtml(selectedMode)}</span>
+    </div>
+    <ul>${logs}</ul>
   `;
 }
 
@@ -3067,9 +3137,7 @@ stage2RunForm?.addEventListener('submit', createStage2Run);
 document.querySelector('#stage2Cockpit')?.addEventListener('click', (event) => {
   const refreshButton = event.target.closest('[data-stage2-action="refresh-runs"]');
   if (refreshButton) {
-    loadDashboardData().catch((error) => {
-      saveState.textContent = error.message;
-    });
+    refreshStage2Runs();
     return;
   }
 
