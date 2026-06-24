@@ -7,6 +7,16 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
 
+from prototype.stage2.app.runtime.policy_gate import (
+    POLICY_ALLOWED,
+    RISK_FORBIDDEN_MUTATION,
+    RISK_RISKY_SUBMIT,
+    RISK_SAFE_INTERACT,
+    RISK_SAFE_READ,
+    SAFETY_POLICY_LOW_RISK_ONLY,
+    evaluate_action_policy,
+)
+
 
 V3_SCHEMA_VERSION = "stage2_v3_run.v1"
 DiscoveryProvider = Callable[[], Awaitable[dict[str, Any]]]
@@ -27,6 +37,8 @@ class V3RunConfig:
     max_pages: int = 5
     max_features_per_page: int = 6
     risk_whitelist: tuple[str, ...] = ()
+    safety_policy: str = SAFETY_POLICY_LOW_RISK_ONLY
+    allowed_side_effect_actions: tuple[str, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -105,7 +117,7 @@ async def run_v3_assessment(
     )
     writer.update_state("case_generation", "running", f"identified {len(features)} feature points")
 
-    cases = _build_cases(features, risk_whitelist=set(config.risk_whitelist))
+    cases = _build_cases(features, config=config)
     writer.write_json("cases.json", {"schema_version": V3_SCHEMA_VERSION, "cases": cases, "items": cases})
     writer.write_json(
         "generated_test_cases.json",
@@ -202,7 +214,13 @@ async def run_v3_assessment(
             "executed_count": sum(
                 1
                 for item in execution_results
-                if item["status"] in {"passed_safe_placeholder", "real_passed"}
+                if item["status"]
+                in {
+                    "passed_safe_placeholder",
+                    "real_passed",
+                    "authorized_by_policy_placeholder",
+                    "real_authorized_side_effect_pending_executor",
+                }
             ),
             "blocked_count": sum(1 for item in execution_results if item["status"].startswith("blocked")),
             "failed_or_skipped_count": sum(
@@ -236,6 +254,8 @@ class V3RunArtifactWriter:
             "start_url": config.start_url,
             "cdp_url": config.cdp_url,
             "execution_mode": _normalize_execution_mode(config.execution_mode),
+            "safety_policy": _normalize_safety_policy(config.safety_policy),
+            "allowed_side_effect_actions": list(config.allowed_side_effect_actions),
             "model_name": config.model_name,
             "use_live_discovery": config.use_live_discovery,
             "started_at": self.started_at,
@@ -371,12 +391,48 @@ def _build_features(
     return _demo_features(pages, config.max_features_per_page)
 
 
-def _build_cases(features: list[dict[str, Any]], *, risk_whitelist: set[str]) -> list[dict[str, Any]]:
+def _build_cases(features: list[dict[str, Any]], *, config: V3RunConfig) -> list[dict[str, Any]]:
     cases = []
+    legacy_risk_whitelist = set(config.risk_whitelist)
     for index, feature in enumerate(features, start=1):
         feature_type = _text(feature.get("feature_type")) or "navigation"
         risk_level = _text(feature.get("risk_level")) or _risk_level(feature_type)
-        auto_allowed = risk_level == "low" or feature_type in risk_whitelist
+        policy_risk_level = _policy_risk_level(feature_type, risk_level)
+        policy_payload = _build_policy_payload(config)
+        policy_decision = evaluate_action_policy(
+            {
+                "action_id": f"case_{index:03d}",
+                "action_name": _text(feature.get("name")) or f"功能点 {index}",
+                "action_type": feature_type,
+                "template_name": _text(config.metadata.get("template_name")),
+                "project_name": config.target_name,
+            },
+            policy_risk_level,
+            payload=policy_payload,
+        ).to_dict()
+        auto_allowed = policy_decision.get("status") == POLICY_ALLOWED
+        if (
+            feature_type in legacy_risk_whitelist
+            and policy_risk_level != RISK_FORBIDDEN_MUTATION
+            and not auto_allowed
+        ):
+            legacy_decision = evaluate_action_policy(
+                {
+                    "action_id": f"case_{index:03d}",
+                    "action_name": _text(feature.get("name")) or f"功能点 {index}",
+                    "action_type": feature_type,
+                    "template_name": _text(config.metadata.get("template_name")),
+                    "project_name": config.target_name,
+                },
+                RISK_RISKY_SUBMIT,
+                payload={
+                    "safety_policy": _normalize_safety_policy(config.safety_policy),
+                    "allowlist": [{"action_type": feature_type, "risk_level": RISK_RISKY_SUBMIT}],
+                },
+            ).to_dict()
+            if legacy_decision.get("status") == POLICY_ALLOWED:
+                policy_decision = legacy_decision
+                auto_allowed = True
         cases.append(
             {
                 "case_id": f"case_{index:03d}",
@@ -385,7 +441,10 @@ def _build_cases(features: list[dict[str, Any]], *, risk_whitelist: set[str]) ->
                 "name": f"{feature['name']}基础路径验证",
                 "case_type": feature_type,
                 "risk_level": risk_level,
+                "policy_risk_level": policy_risk_level,
                 "auto_allowed": auto_allowed,
+                "policy_decision": policy_decision,
+                "policy_evidence": _build_policy_evidence(config, policy_decision),
                 "steps": _case_steps(feature_type),
                 "expected_result": _expected_result(feature_type),
                 "data_requirements": _data_requirements(feature_type),
@@ -414,7 +473,25 @@ def _execute_cases(
                     "started_at": _now(),
                     "finished_at": _now(),
                     "evidence": [],
+                    "policy_decision": case.get("policy_decision", {}),
+                    "policy_evidence": case.get("policy_evidence", {}),
                     "message": "高风险或需要业务数据的动作未自动执行，已转成人工任务。",
+                }
+            )
+            continue
+        if _is_side_effect_case(case):
+            results.append(
+                {
+                    "case_id": case["case_id"],
+                    "feature_id": case["feature_id"],
+                    "status": "authorized_by_policy_placeholder",
+                    "execution_mode": "safe_placeholder",
+                    "started_at": _now(),
+                    "finished_at": _now(),
+                    "evidence": [],
+                    "policy_decision": case.get("policy_decision", {}),
+                    "policy_evidence": case.get("policy_evidence", {}),
+                    "message": "测试环境全权限模式已授权该副作用动作；当前 contract_only 模式仅落盘策略证据，真实执行由浏览器执行器消费。",
                 }
             )
             continue
@@ -427,6 +504,8 @@ def _execute_cases(
                 "started_at": _now(),
                 "finished_at": _now(),
                 "evidence": [],
+                "policy_decision": case.get("policy_decision", {}),
+                "policy_evidence": case.get("policy_evidence", {}),
                 "message": _safe_execution_message(config),
             }
         )
@@ -467,6 +546,12 @@ def _execute_real_browser_cases(
         for item in real_browser_payload.get("features", [])
         if isinstance(item, dict) and item.get("feature_id")
     }
+    side_effect_results = [
+        item
+        for item in real_browser_payload.get("side_effect_results", [])
+        if isinstance(item, dict)
+    ]
+    used_side_effect_result_indexes: set[int] = set()
     results: list[dict[str, Any]] = []
     for case in cases:
         if not case["auto_allowed"]:
@@ -479,7 +564,45 @@ def _execute_real_browser_cases(
                     "started_at": started_at,
                     "finished_at": _now(),
                     "evidence": [],
+                    "policy_decision": case.get("policy_decision", {}),
+                    "policy_evidence": case.get("policy_evidence", {}),
                     "message": "真实浏览器模式未执行高风险或需要业务数据的动作，已转成人工任务。",
+                }
+            )
+            continue
+        if _is_side_effect_case(case):
+            side_effect_match = _take_side_effect_result_for_case(
+                case,
+                side_effect_results,
+                used_side_effect_result_indexes,
+            )
+            if side_effect_match:
+                results.append(
+                    {
+                        **side_effect_match,
+                        "case_id": case["case_id"],
+                        "feature_id": case["feature_id"],
+                        "execution_mode": "real_browser",
+                        "policy_decision": side_effect_match.get("policy_decision")
+                        or case.get("policy_decision", {}),
+                        "policy_evidence": case.get("policy_evidence", {}),
+                        "message": side_effect_match.get("message")
+                        or "测试环境全权限模式已执行白名单副作用动作，并记录前后证据。",
+                    }
+                )
+                continue
+            results.append(
+                {
+                    "case_id": case["case_id"],
+                    "feature_id": case["feature_id"],
+                    "status": "skipped_not_observed",
+                    "execution_mode": "real_browser",
+                    "started_at": started_at,
+                    "finished_at": _now(),
+                    "evidence": screenshot_refs,
+                    "policy_decision": case.get("policy_decision", {}),
+                    "policy_evidence": case.get("policy_evidence", {}),
+                    "message": "该副作用动作已授权，但当前页面未产生匹配的可审计执行结果。",
                 }
             )
             continue
@@ -501,15 +624,39 @@ def _execute_real_browser_cases(
             {
                 "case_id": case["case_id"],
                 "feature_id": case["feature_id"],
-                "status": "real_passed",
+                "status": "real_authorized_side_effect_pending_executor"
+                if _is_side_effect_case(case)
+                else "real_passed",
                 "execution_mode": "real_browser",
                 "started_at": started_at,
                 "finished_at": _now(),
                 "evidence": screenshot_refs,
-                "message": "已通过真实浏览器完成低风险导航/可见元素扫描和截图证据采集，未执行提交、删除、审批等副作用动作。",
+                "policy_decision": case.get("policy_decision", {}),
+                "policy_evidence": case.get("policy_evidence", {}),
+                "message": (
+                    "测试环境全权限模式已授权该副作用动作；当前真实浏览器扫描已确认入口可见，等待动作执行器执行。"
+                    if _is_side_effect_case(case)
+                    else "已通过真实浏览器完成低风险导航/可见元素扫描和截图证据采集，未执行提交、删除、审批等副作用动作。"
+                ),
             }
         )
     return results
+
+
+def _take_side_effect_result_for_case(
+    case: dict[str, Any],
+    side_effect_results: list[dict[str, Any]],
+    used_indexes: set[int],
+) -> dict[str, Any] | None:
+    case_type = _text(case.get("case_type"))
+    for index, result in enumerate(side_effect_results):
+        if index in used_indexes:
+            continue
+        if _text(result.get("action_type")) != case_type:
+            continue
+        used_indexes.add(index)
+        return result
+    return None
 
 
 def _build_round_analysis(
@@ -527,12 +674,19 @@ def _build_round_analysis(
     passed = [
         item
         for item in execution_results
-        if item["status"] in {"passed_safe_placeholder", "real_passed"}
+        if item["status"]
+        in {
+            "passed_safe_placeholder",
+            "real_passed",
+            "side_effect_executed",
+            "authorized_by_policy_placeholder",
+            "real_authorized_side_effect_pending_executor",
+        }
     ]
     failed_or_skipped = [
         item
         for item in execution_results
-        if item["status"].startswith(("real_failed", "failed", "skipped", "login_required"))
+        if item["status"].startswith(("real_failed", "failed", "skipped", "login_required", "side_effect_failed"))
     ]
     source_status = _text(discovery_payload.get("status")) if discovery_payload else "demo_safe"
     failure_clusters = []
@@ -599,10 +753,7 @@ def _build_round_analysis(
                 "description": "本轮功能点已被归一为导航、查询、详情、新增/编辑/提交等类型，可供运行中心继续审核。",
             }
         ],
-        "limitations": [
-            "当前 v3 最小闭环不执行真实提交、删除、导出等高风险动作。",
-            "safe_placeholder 表示链路和产物契约已跑通，不等价于真实业务断言通过。",
-        ],
+        "limitations": _policy_limitations(config),
     }
 
 
@@ -738,7 +889,11 @@ def _render_report(
     human_tasks: dict[str, Any],
     next_round_plan: dict[str, Any],
 ) -> str:
-    passed = sum(1 for item in execution_results if item["status"] == "passed_safe_placeholder")
+    passed = sum(
+        1
+        for item in execution_results
+        if item["status"] in {"passed_safe_placeholder", "real_passed", "side_effect_executed"}
+    )
     blocked = sum(1 for item in execution_results if item["status"].startswith("blocked"))
     lines = [
         f"# 第二阶段 v3 运行报告 - {config.target_name}",
@@ -746,6 +901,8 @@ def _render_report(
         f"- Run ID: `{run_id}`",
         f"- Run Dir: `{run_dir}`",
         f"- Start URL: `{config.start_url or 'demo/safe mode'}`",
+        f"- Safety Policy: `{_normalize_safety_policy(config.safety_policy)}`",
+        f"- Allowed Side Effects: `{', '.join(config.allowed_side_effect_actions) or 'none'}`",
         f"- Generated At: `{_now()}`",
         "",
         "## 总览",
@@ -790,11 +947,23 @@ def _render_report(
             "- `human_tasks.json`",
             "- `report.md`",
             "",
-            "> 注：`passed_safe_placeholder` 仅表示低风险最小执行占位已完成；真实业务正确性仍需后续接入 Playwright 确定性验证或人工确认。",
+            "> 注：`side_effect_executed` 表示测试环境全权限模式下的白名单副作用动作已被真实浏览器执行并采集证据；业务正确性仍以报告证据和人工复核为准。",
             "",
         ]
     )
     return "\n".join(lines)
+
+
+def _policy_limitations(config: V3RunConfig) -> list[str]:
+    if _normalize_safety_policy(config.safety_policy) == "test_env_full_access":
+        return [
+            "测试环境全权限模式仅执行当前页面可见、allowlist 内且受次数上限控制的副作用动作。",
+            "副作用动作只证明可操作性与页面反馈，不等价于完整业务验收结论。",
+        ]
+    return [
+        "当前安全策略为 low_risk_only，不执行真实提交、删除、审批等副作用动作。",
+        "safe_placeholder 表示链路和产物契约已跑通，不等价于真实业务断言通过。",
+    ]
 
 
 def _demo_pages(config: V3RunConfig) -> list[dict[str, Any]]:
@@ -918,7 +1087,11 @@ def _normalize_feature_type(value: str) -> str:
         "新建": "create",
         "编辑": "edit",
         "删除": "delete",
+        "移除": "remove",
         "提交": "submit",
+        "保存": "save",
+        "审批": "approve",
+        "审核": "approve",
         "导出": "export",
         "重置": "reset",
     }
@@ -928,11 +1101,57 @@ def _normalize_feature_type(value: str) -> str:
 def _risk_level(feature_type: str) -> str:
     if feature_type in {"navigation", "view", "query", "detail", "reset"}:
         return "low"
-    if feature_type in {"create", "edit", "submit", "export"}:
+    if feature_type in {"create", "edit", "submit", "save", "export"}:
         return "medium"
-    if feature_type in {"delete", "remove"}:
+    if feature_type in {"delete", "remove", "approve"}:
         return "high"
     return "medium"
+
+
+def _policy_risk_level(feature_type: str, risk_level: str) -> str:
+    if feature_type in {"navigation", "view", "detail"}:
+        return RISK_SAFE_READ
+    if feature_type in {"query", "reset", "export"}:
+        return RISK_SAFE_INTERACT
+    if feature_type in {"delete", "remove", "approve"} or risk_level == "high":
+        return RISK_FORBIDDEN_MUTATION
+    if feature_type in {"create", "edit", "submit", "save"} or risk_level == "medium":
+        return RISK_RISKY_SUBMIT
+    return RISK_RISKY_SUBMIT
+
+
+def _is_side_effect_case(case: dict[str, Any]) -> bool:
+    return _text(case.get("policy_risk_level")) in {
+        RISK_RISKY_SUBMIT,
+        RISK_FORBIDDEN_MUTATION,
+    }
+
+
+def _build_policy_payload(config: V3RunConfig) -> dict[str, Any]:
+    safety_policy = _normalize_safety_policy(config.safety_policy)
+    return {
+        "safety_policy": safety_policy,
+        "allowed_side_effect_actions": list(config.allowed_side_effect_actions),
+    }
+
+
+def _build_policy_evidence(
+    config: V3RunConfig,
+    policy_decision: dict[str, Any],
+) -> dict[str, Any]:
+    safety_policy = _normalize_safety_policy(config.safety_policy)
+    evidence = {
+        "safety_policy": safety_policy,
+        "allowed_side_effect_actions": list(config.allowed_side_effect_actions),
+        "policy_status": policy_decision.get("status"),
+        "policy_reason_code": policy_decision.get("reason_code"),
+    }
+    if safety_policy == "test_env_full_access":
+        evidence["test_environment_authorization"] = True
+        evidence["authorization_note"] = (
+            "测试环境全权限模式：允许对 allowlist 内的副作用动作执行自动化验证。"
+        )
+    return evidence
 
 
 def _case_steps(feature_type: str) -> list[dict[str, Any]]:
@@ -960,6 +1179,31 @@ def _case_steps(feature_type: str) -> list[dict[str, Any]]:
             {"action": "fill_required_fields", "target": "ui_provided_test_data"},
             {"action": "dry_run_or_stop_before_submit", "target": "submit_button"},
         ],
+        "edit": [
+            {"action": "open_edit_form", "target": "first_edit_button"},
+            {"action": "change_low_risk_field", "target": "ui_provided_test_data"},
+            {"action": "submit_form", "target": "save_button"},
+        ],
+        "submit": [
+            {"action": "fill_required_fields", "target": "ui_provided_test_data"},
+            {"action": "submit_form", "target": "submit_button"},
+        ],
+        "save": [
+            {"action": "fill_required_fields", "target": "ui_provided_test_data"},
+            {"action": "save_form", "target": "save_button"},
+        ],
+        "delete": [
+            {"action": "open_delete_confirm", "target": "first_delete_button"},
+            {"action": "confirm_delete", "target": "confirm_button"},
+        ],
+        "remove": [
+            {"action": "open_remove_confirm", "target": "first_remove_button"},
+            {"action": "confirm_remove", "target": "confirm_button"},
+        ],
+        "approve": [
+            {"action": "open_approval", "target": "approve_button"},
+            {"action": "confirm_approval", "target": "confirm_button"},
+        ],
     }
     return steps_by_type.get(feature_type, [{"action": "inspect", "target": "feature"}])
 
@@ -971,12 +1215,14 @@ def _expected_result(feature_type: str) -> str:
         return "查询动作有明确反馈：列表刷新、空状态、提示或接口响应。"
     if feature_type == "reset":
         return "筛选条件恢复默认状态。"
+    if feature_type in {"create", "edit", "submit", "save", "delete", "remove", "approve"}:
+        return "在授权策略允许时执行真实副作用动作，并记录执行前后证据。"
     return "动作需要人工确认风险和测试数据后再执行。"
 
 
 def _data_requirements(feature_type: str) -> list[str]:
-    if feature_type in {"create", "edit", "submit"}:
-        return ["测试数据模板", "提交风险白名单", "回滚或清理策略"]
+    if feature_type in {"create", "edit", "submit", "save", "delete", "remove", "approve"}:
+        return ["测试数据模板", "副作用动作 allowlist", "回滚或清理策略"]
     if feature_type == "query":
         return ["可选筛选条件"]
     return []
@@ -1007,6 +1253,13 @@ def _normalize_execution_mode(value: str) -> str:
     if mode not in {"contract_only", "real_browser"}:
         return "contract_only"
     return mode
+
+
+def _normalize_safety_policy(value: str) -> str:
+    normalized = (_text(value) or SAFETY_POLICY_LOW_RISK_ONLY).lower().replace("-", "_").replace(" ", "_")
+    if normalized in {"test_env_full_access", "full_access", "test_full_access"}:
+        return "test_env_full_access"
+    return SAFETY_POLICY_LOW_RISK_ONLY
 
 
 def _real_browser_failure_status(real_browser_payload: dict[str, Any]) -> str:

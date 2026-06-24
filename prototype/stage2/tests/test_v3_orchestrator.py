@@ -126,5 +126,87 @@ def test_v3_run_can_consume_existing_discovery_paths() -> None:
         assert next_round_plan["status"] == "ready"
 
 
+def test_v3_test_env_full_access_allows_side_effect_cases_without_human_review() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        source_dir = root / "source"
+        source_dir.mkdir()
+        page_entries_path = source_dir / "page_entries.json"
+        feature_points_path = source_dir / "feature_points.json"
+        page_entries_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "page_entry_id": "page_records",
+                        "name": "记录管理",
+                        "url": "https://example.test/records",
+                    }
+                ],
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        feature_points_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "feature_point_id": "feature_submit",
+                        "page_entry_id": "page_records",
+                        "name": "提交记录",
+                        "feature_type": "提交",
+                    },
+                    {
+                        "feature_point_id": "feature_delete",
+                        "page_entry_id": "page_records",
+                        "name": "删除记录",
+                        "feature_type": "删除",
+                    },
+                ],
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_discovery_provider() -> dict[str, str]:
+            return {
+                "status": "completed",
+                "page_entries_path": str(page_entries_path),
+                "feature_points_path": str(feature_points_path),
+            }
+
+        result = asyncio.run(
+            run_v3_assessment(
+                V3RunConfig(
+                    target_name="测试环境系统",
+                    start_url="https://example.test/records",
+                    artifact_root=root / "runs",
+                    run_id="full_access_contract",
+                    use_live_discovery=True,
+                    safety_policy="test_env_full_access",
+                    allowed_side_effect_actions=("submit", "delete"),
+                ),
+                discovery_provider=fake_discovery_provider,
+            )
+        )
+
+        run_dir = Path(result["run_dir"])
+        cases = _read_json(run_dir / "cases.json")["cases"]
+        execution_results = _read_json(run_dir / "execution_results.json")["results"]
+        human_tasks = _read_json(run_dir / "human_tasks.json")
+        next_round_plan = _read_json(run_dir / "next_round_plan.json")
+
+        assert [case["case_type"] for case in cases] == ["submit", "delete"]
+        assert all(case["auto_allowed"] is True for case in cases)
+        assert {case["policy_evidence"]["safety_policy"] for case in cases} == {
+            "test_env_full_access"
+        }
+        assert all(
+            result["status"] == "authorized_by_policy_placeholder"
+            for result in execution_results
+        )
+        assert human_tasks["open_task_count"] == 0
+        assert next_round_plan["status"] == "ready"
+
+
 def _read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))

@@ -298,6 +298,21 @@ test('stage2 v3 run center creates a draft run and starts a stable artifact cont
   });
 });
 
+test('stage2 v3 run center requires explicit confirmation for full access mode', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    await assert.rejects(
+      () => createV3Run({
+        systemName: '全权限未确认系统',
+        entryUrl: 'https://example.com/home',
+        cdpUrl: 'http://localhost:9222',
+        safetyPolicy: 'test_env_full_access',
+        allowedSideEffects: ['submit', 'delete']
+      }, { runsDir }),
+      /测试环境全权限模式必须先/
+    );
+  });
+});
+
 test('stage2 v3 run center starts real_browser mode through Python v3 bridge', async () => {
   await withTempRunsDir(async (runsDir) => {
     const created = await createV3Run({
@@ -330,6 +345,7 @@ test('stage2 v3 run center starts real_browser mode through Python v3 bridge', a
     assert.equal(argValue(received.args, '--v3-artifact-root'), received.artifactRoot);
     assert.equal(argValue(received.args, '--page-url'), 'https://example.com/home');
     assert.equal(argValue(received.args, '--cdp-url'), 'http://localhost:9222/');
+    assert.equal(argValue(received.args, '--v3-safety-policy'), 'low_risk_only');
 
     const runDir = path.join(runsDir, created.run.runId);
     const executionResults = await readJson(path.join(runDir, 'execution_results.json'));
@@ -337,6 +353,64 @@ test('stage2 v3 run center starts real_browser mode through Python v3 bridge', a
     assert.equal(executionResults.items[0].status, 'passed');
     assert.equal(executionResults.items[0].execution_mode, 'real_browser');
     assert.equal(preflight.checks.python_orchestrator.ok, true);
+  });
+});
+
+test('stage2 v3 run center persists and forwards test environment full access policy', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '全权限测试系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      safetyPolicy: 'test_env_full_access',
+      fullAccessConfirmed: true,
+      allowedSideEffects: ['submit', 'delete', 'approve']
+    }, { runsDir });
+    let received = null;
+    await startV3Run(created.run.runId, {
+      executionMode: 'real_browser'
+    }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        received = { args };
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          executionItems: [{
+            test_case_id: 'case_nav',
+            status: 'side_effect_executed',
+            verdict: '已执行提交动作。',
+            started_at: '2026-06-24T00:00:00.000Z',
+            finished_at: '2026-06-24T00:00:01.000Z',
+            action_type: 'submit',
+            control_label: '提交',
+            policy_decision: { decision: 'allowed', reason_code: 'test_env_full_access_allowlisted' },
+            before_screenshot_ref: 'side_effect_001_before',
+            after_screenshot_ref: 'side_effect_001_after',
+            failure_reason: null,
+            execution_mode: 'real_browser'
+          }]
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    const runDir = path.join(runsDir, created.run.runId);
+    const manifest = await readJson(path.join(runDir, 'run_manifest.json'));
+    const inputConfig = await readJson(path.join(runDir, 'input_config.json'));
+    const executionResults = await readJson(path.join(runDir, 'execution_results.json'));
+    assert.equal(manifest.safety_policy, 'test_env_full_access');
+    assert.equal(inputConfig.full_access_confirmed, true);
+    assert.deepEqual(inputConfig.allowed_side_effect_actions, ['submit', 'delete', 'approve']);
+    assert.equal(argValue(received.args, '--v3-safety-policy'), 'test_env_full_access');
+    assert.deepEqual(
+      received.args.filter((item, index) => received.args[index - 1] === '--v3-allow-side-effect-action'),
+      ['submit', 'delete', 'approve']
+    );
+    assert.equal(executionResults.items[0].status, 'side_effect_executed');
+    assert.deepEqual(executionResults.items[0].screenshot_refs, ['side_effect_001_before', 'side_effect_001_after']);
   });
 });
 

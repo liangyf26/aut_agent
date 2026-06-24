@@ -251,6 +251,23 @@
                     </select>
                   </label>
                   <label>
+                    执行安全策略
+                    <select name="safetyPolicy">
+                      <option value="low_risk_only">低风险只读：禁止提交、删除、审批</option>
+                      <option value="test_env_full_access">测试环境全权限：允许副作用动作</option>
+                    </select>
+                  </label>
+                  <section class="stage2-safety-confirmation" id="stage2SafetyConfirmation" hidden>
+                    <div>
+                      <strong>测试环境全权限</strong>
+                      <p>将允许自动执行提交、保存、删除、审批等会改变测试数据或推进流程的副作用动作。</p>
+                    </div>
+                    <label class="stage2-checkbox-row">
+                      <input name="safetyPolicyConfirmed" type="checkbox" value="yes">
+                      <span>我确认这是可执行副作用动作的测试环境</span>
+                    </label>
+                  </section>
+                  <label>
                     测试账号与环境
                     <textarea name="accountNotes" rows="3" placeholder="账号、角色、权限范围、登录接管说明"></textarea>
                   </label>

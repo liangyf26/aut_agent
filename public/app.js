@@ -172,6 +172,7 @@ const state = {
 
 const AUTO_REFRESH_MS = 15000;
 let stage2BrowserPreflightTimer = null;
+const STAGE2_FULL_ACCESS_ALLOWLIST = ['create', 'edit', 'submit', 'delete', 'approve', 'save', 'remove'];
 const fields = ['name', 'client', 'vendor', 'sutName', 'sutBaseUrl', 'accountNotes', 'scope', 'documentText'];
 
 const projectForm = document.querySelector('#projectForm');
@@ -545,6 +546,68 @@ function executionModeLabel(mode) {
   return labels[mode] || mode || '契约占位';
 }
 
+function normalizeStage2SafetyPolicy(policy) {
+  if (['test_env_full_access', 'full_access', 'testing_full_access'].includes(policy)) {
+    return 'test_env_full_access';
+  }
+  return 'low_risk_only';
+}
+
+function safetyPolicyLabel(policy) {
+  const normalized = normalizeStage2SafetyPolicy(policy);
+  return normalized === 'test_env_full_access' ? '测试环境全权限' : '低风险只读';
+}
+
+function safetyPolicyTone(policy) {
+  return normalizeStage2SafetyPolicy(policy) === 'test_env_full_access' ? 'warning' : 'passed';
+}
+
+function safetyPolicyDescription(policy) {
+  return normalizeStage2SafetyPolicy(policy) === 'test_env_full_access'
+    ? '允许提交、保存、删除、审批等副作用动作'
+    : '仅执行导航、查询、查看和非破坏性动作';
+}
+
+function parseStage2Allowlist(value) {
+  if (Array.isArray(value)) {
+    return value.filter(Boolean).map(String);
+  }
+  if (typeof value === 'string') {
+    return value.split(',').map((item) => item.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function getStage2AllowedSideEffects(run = {}) {
+  return parseStage2Allowlist(
+    run.allowedSideEffects
+    || run.allowedSideEffectActions
+    || run.allowed_side_effects
+    || run.allowed_side_effect_actions
+    || run.sideEffectAllowlist
+    || run.side_effect_allowlist
+    || run.inputConfig?.allowedSideEffects
+    || run.inputConfig?.allowed_side_effects
+    || run.input_config?.allowedSideEffects
+    || run.input_config?.allowed_side_effects
+    || run.manifest?.allowed_side_effects
+    || run.run_manifest?.allowed_side_effects
+  );
+}
+
+function getStage2SafetyPolicy(run = {}) {
+  return normalizeStage2SafetyPolicy(
+    run.safetyPolicy
+    || run.safety_policy
+    || run.inputConfig?.safetyPolicy
+    || run.inputConfig?.safety_policy
+    || run.input_config?.safetyPolicy
+    || run.input_config?.safety_policy
+    || run.manifest?.safety_policy
+    || run.run_manifest?.safety_policy
+  );
+}
+
 function isStage2RealExecutionAvailable(run) {
   return Boolean(
     state.stage2BrowserPreflight?.ok
@@ -643,9 +706,26 @@ function renderStage2BrowserPreflight() {
   node.textContent = browserPreflightMessage();
 }
 
+function renderStage2SafetyConfirmation() {
+  const panel = document.querySelector('#stage2SafetyConfirmation');
+  const policySelect = stage2RunForm?.elements?.safetyPolicy;
+  const confirmInput = stage2RunForm?.elements?.safetyPolicyConfirmed;
+  if (!panel || !policySelect) {
+    return;
+  }
+  const isFullAccess = normalizeStage2SafetyPolicy(policySelect.value) === 'test_env_full_access';
+  panel.hidden = !isFullAccess;
+  panel.classList.toggle('is-active', isFullAccess);
+  if (!isFullAccess && confirmInput) {
+    confirmInput.checked = false;
+  }
+}
+
 async function createStage2Run(event) {
   event.preventDefault();
   const data = new FormData(stage2RunForm);
+  const safetyPolicy = normalizeStage2SafetyPolicy(data.get('safetyPolicy') || 'low_risk_only');
+  const allowedSideEffects = safetyPolicy === 'test_env_full_access' ? [...STAGE2_FULL_ACCESS_ALLOWLIST] : [];
   const payload = {
     systemName: data.get('systemName')?.trim() || '',
     system_name: data.get('systemName')?.trim() || '',
@@ -655,6 +735,14 @@ async function createStage2Run(event) {
     cdp_url: data.get('cdpUrl')?.trim() || '',
     executionMode: data.get('executionMode') || 'contract_only',
     execution_mode: data.get('executionMode') || 'contract_only',
+    safetyPolicy,
+    safety_policy: safetyPolicy,
+    allowedSideEffects,
+    allowed_side_effects: allowedSideEffects,
+    sideEffectAllowlist: allowedSideEffects,
+    side_effect_allowlist: allowedSideEffects,
+    safetyPolicyConfirmed: safetyPolicy === 'test_env_full_access' && data.get('safetyPolicyConfirmed') === 'yes',
+    safety_policy_confirmed: safetyPolicy === 'test_env_full_access' && data.get('safetyPolicyConfirmed') === 'yes',
     accountNotes: data.get('accountNotes')?.trim() || '',
     account_notes: data.get('accountNotes')?.trim() || '',
     scope: data.get('scope')?.trim() || '',
@@ -668,9 +756,15 @@ async function createStage2Run(event) {
     renderStage2Overview();
     return;
   }
+  if (safetyPolicy === 'test_env_full_access' && data.get('safetyPolicyConfirmed') !== 'yes') {
+    pushStage2ActionLog('创建 run 失败：测试环境全权限需要先勾选确认，明确允许提交、保存、删除、审批等副作用动作。', 'error');
+    renderStage2SafetyConfirmation();
+    renderStage2Overview();
+    return;
+  }
 
   state.pendingAction = 'create-stage2-run';
-  pushStage2ActionLog(`正在创建 v3 run，执行模式：${executionModeLabel(payload.executionMode)}。`);
+  pushStage2ActionLog(`正在创建 v3 run，执行模式：${executionModeLabel(payload.executionMode)}，安全策略：${safetyPolicyLabel(payload.safetyPolicy)}。`);
   render();
 
   try {
@@ -743,6 +837,8 @@ async function runStage2V3Action(runId, action) {
   const executionMode = action === 'start'
     ? (modeSelect?.value || getStage2ExecutionMode(run))
     : getStage2ExecutionMode(run);
+  const safetyPolicy = getStage2SafetyPolicy(run);
+  const allowedSideEffects = getStage2AllowedSideEffects(run);
   const successText = {
     start: executionMode === 'real_browser' ? '已触发真实浏览器自动评测' : '已触发契约占位闭环',
     pause: '已请求暂停',
@@ -762,7 +858,13 @@ async function runStage2V3Action(runId, action) {
         operatorId: 'run_center',
         source: 'stage2_v3_cockpit',
         executionMode,
-        execution_mode: executionMode
+        execution_mode: executionMode,
+        safetyPolicy,
+        safety_policy: safetyPolicy,
+        allowedSideEffects,
+        allowed_side_effects: allowedSideEffects,
+        sideEffectAllowlist: allowedSideEffects,
+        side_effect_allowlist: allowedSideEffects
       })
     });
     delete state.stage2RunDetails[runId];
@@ -1208,6 +1310,8 @@ function normalizeStage2Run(run = {}, source = 'v3') {
     shouldContinue: stats.shouldContinue ?? stats.should_continue ?? run.shouldContinue ?? run.should_continue ?? run.next_round_plan?.should_continue,
     latestMessage: run.latestMessage || run.message || run.current_status?.message || '',
     executionMode: getStage2ExecutionMode(run),
+    safetyPolicy: getStage2SafetyPolicy(run),
+    allowedSideEffects: getStage2AllowedSideEffects(run),
     realExecutionAvailable: Boolean(run.realExecutionAvailable || run.real_execution_available || run.capabilities?.realBrowserExecution || run.capabilities?.real_browser_execution || run.preflight?.cdp_available),
     createdAt: run.createdAt || run.created_at || manifest.created_at || run.started_at || '',
     updatedAt: run.updatedAt || run.updated_at || manifest.updated_at || run.finished_at || run.started_at || '',
@@ -1389,6 +1493,7 @@ function renderStage2Overview() {
   renderStage2V3ArtifactsTab();
   renderStage2ActionFeedback();
   renderStage2BrowserPreflight();
+  renderStage2SafetyConfirmation();
 }
 
 function renderStage2V3Shell() {
@@ -1418,7 +1523,7 @@ function renderStage2V3Shell() {
     timeline.innerHTML = renderStage2Timeline(null);
   } else {
     const runKind = getStage2RunKind(run);
-    runEyebrow.textContent = `${runKind.label} · ${executionModeLabel(getStage2ExecutionMode(run))} · ${getRunId(run)}`;
+    runEyebrow.textContent = `${runKind.label} · ${executionModeLabel(getStage2ExecutionMode(run))} · ${safetyPolicyLabel(getStage2SafetyPolicy(run))} · ${getRunId(run)}`;
     runTitle.textContent = run.systemName || getRunId(run);
     runSubtitle.textContent = [run.entryUrl, run.currentPhaseLabel, run.latestMessage].filter(Boolean).join(' · ') || '等待运行中心写入状态。';
     actions.innerHTML = renderStage2RunActions(run);
@@ -1444,11 +1549,13 @@ function renderStage2V3Shell() {
     const id = getRunId(item);
     const runKind = getStage2RunKind(item);
     const executionMode = getStage2ExecutionMode(item);
+    const safetyPolicy = getStage2SafetyPolicy(item);
     return `
       <button class="stage2-run-card ${id === state.selectedRunId ? 'active' : ''}" data-run-id="${escapeHtml(id)}" type="button">
         <span class="tag ${verdictClass(getRunStatus(item))}">${escapeHtml(statusLabel(getRunStatus(item)))}</span>
         <span class="tag ${escapeHtml(runKind.tone)}">${escapeHtml(runKind.label)}</span>
         <span class="tag ${executionMode === 'real_browser' ? 'manual' : 'warning'}">${escapeHtml(executionModeLabel(executionMode))}</span>
+        <span class="tag ${escapeHtml(safetyPolicyTone(safetyPolicy))}">${escapeHtml(safetyPolicyLabel(safetyPolicy))}</span>
         <strong>${escapeHtml(item.systemName || id)}</strong>
         <small>${escapeHtml(id)}</small>
         <p>${escapeHtml(item.latestMessage || item.currentPhaseLabel || item.entryUrl || runKind.reason || '暂无运行摘要')}</p>
@@ -1467,6 +1574,7 @@ function renderStage2RunActions(run) {
   const actionable = isStage2V3ActionableRun(run);
   const runKind = getStage2RunKind(run);
   const executionMode = getStage2ExecutionMode(run);
+  const safetyPolicy = getStage2SafetyPolicy(run);
   const realAvailable = isStage2RealExecutionAvailable(run);
   const realBrowserSuffix = browserPreflightOptionSuffix();
   const realBrowserMessage = browserPreflightMessage();
@@ -1483,6 +1591,7 @@ function renderStage2RunActions(run) {
       : '当前目标已完成或没有可继续计划；请生成报告，或创建新的更大范围 run。';
   return `
     <span class="status-pill ${escapeHtml(runKind.tone === 'passed' ? 'success' : runKind.tone)}">${escapeHtml(runKind.label)}</span>
+    <span class="status-pill ${escapeHtml(safetyPolicyTone(safetyPolicy))}">${escapeHtml(safetyPolicyLabel(safetyPolicy))}</span>
     <label class="stage2-mode-select">
       执行模式
       <select id="stage2ExecutionMode" ${state.pendingAction || !actionable ? 'disabled' : ''}>
@@ -1509,7 +1618,7 @@ function renderStage2ActionFeedback() {
   const selected = getSelectedStage2Run();
   const selectedKind = getStage2RunKind(selected);
   const selectedMode = selected
-    ? `${selectedKind.label} · ${executionModeLabel(getStage2ExecutionMode(selected))}。${selectedKind.reason}`
+    ? `${selectedKind.label} · ${executionModeLabel(getStage2ExecutionMode(selected))} · ${safetyPolicyLabel(getStage2SafetyPolicy(selected))}。${selectedKind.reason}`
     : '创建或选择 run 后，这里会显示操作反馈。';
   const logs = state.stage2ActionLog.length
     ? state.stage2ActionLog.map((item) => `
@@ -1638,6 +1747,8 @@ function renderStage2V3OverviewTab() {
   const nextPlan = getRunNextRoundPlan(run);
   const runKind = getStage2RunKind(run);
   const executionMode = getStage2ExecutionMode(run);
+  const safetyPolicy = getStage2SafetyPolicy(run);
+  const allowedSideEffects = getStage2AllowedSideEffects(run);
   container.innerHTML = `
     <section class="stage2-overview-grid">
       <article class="stage2-work-card">
@@ -1651,6 +1762,8 @@ function renderStage2V3OverviewTab() {
             ['Run ID', getRunId(run)],
             ['Run 类型', runKind.label],
             ['执行模式', executionModeLabel(executionMode)],
+            ['安全策略', safetyPolicyLabel(safetyPolicy)],
+            ['副作用白名单', allowedSideEffects.length ? allowedSideEffects.join(', ') : '无'],
             ['系统', run.systemName],
             ['入口', run.entryUrl || '-'],
             ['创建时间', formatDate(run.createdAt)],
@@ -3358,6 +3471,13 @@ stage2RunForm?.elements?.cdpUrl?.addEventListener('input', () => {
 stage2RunForm?.elements?.cdpUrl?.addEventListener('blur', () => {
   clearTimeout(stage2BrowserPreflightTimer);
   refreshStage2BrowserPreflight({ silent: true }).catch(() => {});
+});
+stage2RunForm?.elements?.safetyPolicy?.addEventListener('change', () => {
+  renderStage2SafetyConfirmation();
+  renderStage2Overview();
+});
+stage2RunForm?.elements?.safetyPolicyConfirmed?.addEventListener('change', () => {
+  renderStage2SafetyConfirmation();
 });
 
 document.querySelector('#stage2Cockpit')?.addEventListener('click', (event) => {

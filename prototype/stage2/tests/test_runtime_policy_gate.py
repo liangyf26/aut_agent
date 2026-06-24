@@ -15,6 +15,7 @@ from prototype.stage2.app.runtime import (
     RISK_RISKY_SUBMIT,
     RISK_SAFE_INTERACT,
     RISK_SAFE_READ,
+    SAFETY_POLICY_TEST_ENV_FULL_ACCESS,
     build_policy_gate_config,
     evaluate_action_policy,
 )
@@ -99,7 +100,7 @@ def test_risky_submit_can_fall_back_to_manual_review_mode() -> None:
     assert decision.requires_allowlist is True
 
 
-def test_forbidden_mutation_stays_blocked_even_with_allowlist_entry() -> None:
+def test_forbidden_mutation_stays_blocked_by_default_even_with_allowlist_entry() -> None:
     payload = {
         "policy": {
             "allowlist": [
@@ -122,6 +123,39 @@ def test_forbidden_mutation_stays_blocked_even_with_allowlist_entry() -> None:
     assert decision.reason_code == "forbidden_mutation_blocked"
     assert decision.matched_allowlist is True
     assert decision.requires_allowlist is True
+    assert decision.extra["safety_policy"] == "low_risk_only"
+
+
+def test_forbidden_mutation_can_be_allowed_in_test_env_full_access() -> None:
+    payload = {
+        "policy": {
+            "safety_policy": SAFETY_POLICY_TEST_ENV_FULL_ACCESS,
+            "allowed_side_effect_actions": ["delete"],
+        }
+    }
+
+    decision = evaluate_action_policy(
+        {"action_id": "delete_record", "action_type": "delete"},
+        RISK_FORBIDDEN_MUTATION,
+        payload=payload,
+    )
+
+    assert decision.status == POLICY_ALLOWED
+    assert decision.reason_code == "forbidden_mutation_test_env_allowed"
+    assert decision.matched_allowlist is True
+    assert decision.requires_allowlist is True
+    assert decision.extra["test_environment_authorization"] is True
+
+
+def test_side_effect_allowlist_does_not_open_risky_submit_without_test_env_policy() -> None:
+    decision = evaluate_action_policy(
+        {"action_id": "submit_form", "action_type": "submit"},
+        RISK_RISKY_SUBMIT,
+        payload={"policy": {"allowed_side_effect_actions": ["submit"]}},
+    )
+
+    assert decision.status == POLICY_BLOCKED
+    assert decision.reason_code == "risky_submit_unlisted_blocked"
 
 
 def test_policy_gate_config_collects_allow_rules_from_config_and_payload() -> None:

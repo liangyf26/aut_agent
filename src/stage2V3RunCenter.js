@@ -11,6 +11,9 @@ const SAFE_ID_PATTERN = /^[A-Za-z0-9_-]{1,120}$/;
 const LOCAL_CDP_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
 const DEFAULT_PYTHON_COMMAND = process.env.STAGE2_PYTHON || process.env.PYTHON || 'python';
 const DEFAULT_PYTHON_TIMEOUT_MS = 10 * 60 * 1000;
+const SAFETY_POLICY_LOW_RISK_ONLY = 'low_risk_only';
+const SAFETY_POLICY_TEST_ENV_FULL_ACCESS = 'test_env_full_access';
+const DEFAULT_FULL_ACCESS_ACTIONS = ['create', 'edit', 'submit', 'delete', 'approve', 'save', 'remove'];
 const execFileAsync = promisify(execFile);
 
 const ARTIFACTS = {
@@ -138,6 +141,22 @@ function normalizeCdpUrl(value) {
 function normalizeInputConfig(body = {}) {
   const systemName = normalizeText(body.systemName || body.system_name || body.targetName, '未命名系统');
   const entryUrl = normalizeHttpUrl(body.entryUrl || body.entry_url || body.homeUrl || body.pageUrl, 'entryUrl');
+  const safetyPolicy = normalizeSafetyPolicy(body.safetyPolicy || body.safety_policy);
+  const allowedSideEffectActions = normalizeAllowedSideEffectActions(
+    body.allowedSideEffectActions
+      || body.allowed_side_effect_actions
+      || body.allowedSideEffects
+      || body.allowed_side_effects
+      || body.sideEffectAllowlist
+      || body.side_effect_allowlist
+  );
+  const fullAccessConfirmed = body.fullAccessConfirmed === true
+    || body.full_access_confirmed === true
+    || body.safetyPolicyConfirmed === true
+    || body.safety_policy_confirmed === true;
+  if (safetyPolicy === SAFETY_POLICY_TEST_ENV_FULL_ACCESS && !fullAccessConfirmed) {
+    throw new Stage2V3InputError('测试环境全权限模式必须先在运行中心明确确认，不能静默启用副作用动作。');
+  }
 
   return {
     schema_version: 'stage2_input_config.v3',
@@ -147,12 +166,54 @@ function normalizeInputConfig(body = {}) {
     test_account_note: normalizeOptionalText(body.testAccountNote || body.test_account_note || body.accountNotes),
     login_mode: normalizeText(body.loginMode || body.login_mode, 'human_takeover_or_existing_session'),
     scope: normalizeOptionalText(body.scope || body.scopeText || body.explorationScope),
-    safety_policy: normalizeText(body.safetyPolicy || body.safety_policy, 'low_risk_only'),
+    safety_policy: safetyPolicy,
+    full_access_confirmed: safetyPolicy === SAFETY_POLICY_TEST_ENV_FULL_ACCESS && fullAccessConfirmed,
+    allowed_side_effect_actions: safetyPolicy === SAFETY_POLICY_TEST_ENV_FULL_ACCESS
+      ? (allowedSideEffectActions.length ? allowedSideEffectActions : DEFAULT_FULL_ACCESS_ACTIONS)
+      : [],
     max_pages: normalizeInteger(body.maxPages || body.max_pages, 30, 1, 200),
     max_features_per_page: normalizeInteger(body.maxFeaturesPerPage || body.max_features_per_page, 30, 1, 200),
     auto_continue: body.autoContinue === true || body.auto_continue === true,
     created_from: normalizeText(body.createdFrom || body.created_from, 'run_center_v3')
   };
+}
+
+function normalizeSafetyPolicy(value) {
+  const policy = normalizeText(value, SAFETY_POLICY_LOW_RISK_ONLY).toLowerCase().replace(/-/g, '_');
+  if (['test_env_full_access', 'full_access', 'testing_full_access', 'test_full_access'].includes(policy)) {
+    return SAFETY_POLICY_TEST_ENV_FULL_ACCESS;
+  }
+  return SAFETY_POLICY_LOW_RISK_ONLY;
+}
+
+function normalizeAllowedSideEffectActions(value) {
+  const rawItems = Array.isArray(value)
+    ? value
+    : typeof value === 'string'
+      ? value.split(/[,\s;]+/)
+      : [];
+  const aliases = new Map([
+    ['approval', 'approve'],
+    ['audit', 'approve'],
+    ['confirm', 'submit'],
+    ['new', 'create'],
+    ['add', 'create'],
+    ['update', 'edit'],
+    ['remove', 'delete']
+  ]);
+  const allowed = new Set(['create', 'edit', 'submit', 'delete', 'approve', 'save', 'remove', '*']);
+  const normalized = [];
+  const seen = new Set();
+  for (const item of rawItems) {
+    const token = normalizeText(item, '').toLowerCase().replace(/-/g, '_');
+    const canonical = aliases.get(token) || token;
+    if (!canonical || !allowed.has(canonical) || seen.has(canonical)) {
+      continue;
+    }
+    seen.add(canonical);
+    normalized.push(canonical);
+  }
+  return normalized;
 }
 
 function normalizeInteger(value, fallback, min, max) {
@@ -293,6 +354,9 @@ function buildManifest({ runId, inputConfig, status, createdAt, updatedAt, round
     system_name: inputConfig.system_name,
     entry_url: inputConfig.entry_url,
     cdp_url: inputConfig.cdp_url,
+    safety_policy: inputConfig.safety_policy,
+    full_access_confirmed: inputConfig.full_access_confirmed,
+    allowed_side_effect_actions: inputConfig.allowed_side_effect_actions,
     status,
     created_at: createdAt,
     updated_at: updatedAt,
@@ -352,10 +416,13 @@ function summarizeExecution(items = []) {
     const status = item.status || 'unknown';
     byStatus[status] = (byStatus[status] || 0) + 1;
   }
-  const passed = (byStatus.passed || 0) + (byStatus.real_passed || 0);
+  const passed = (byStatus.passed || 0)
+    + (byStatus.real_passed || 0)
+    + (byStatus.side_effect_executed || 0);
   const failed = (byStatus.failed || 0)
     + (byStatus.real_failed || 0)
-    + (byStatus.login_required || 0);
+    + (byStatus.login_required || 0)
+    + (byStatus.side_effect_failed || 0);
   const skipped = (byStatus.skipped || 0)
     + (byStatus.skipped_no_executor || 0)
     + (byStatus.skipped_not_observed || 0);
@@ -378,6 +445,11 @@ function buildPublicRun(runDir, manifest, artifacts = {}) {
     entryUrl: manifest.entry_url,
     status: manifest.status,
     executionMode,
+    safetyPolicy: manifest.safety_policy || artifacts.input_config?.safety_policy || SAFETY_POLICY_LOW_RISK_ONLY,
+    allowedSideEffectActions: manifest.allowed_side_effect_actions
+      || artifacts.input_config?.allowed_side_effect_actions
+      || [],
+    fullAccessConfirmed: Boolean(manifest.full_access_confirmed || artifacts.input_config?.full_access_confirmed),
     currentRoundId: manifest.current_round_id,
     createdAt: manifest.created_at,
     updatedAt: manifest.updated_at,
@@ -391,7 +463,8 @@ function buildPublicRun(runDir, manifest, artifacts = {}) {
       execution: summarizeExecution(executionItems),
       pendingHumanTasks: (artifacts.human_tasks?.items || []).filter((item) => item.status === 'pending').length,
       nextDecision: artifacts.next_round_plan?.decision || null,
-      executionMode
+      executionMode,
+      safetyPolicy: manifest.safety_policy || artifacts.input_config?.safety_policy || SAFETY_POLICY_LOW_RISK_ONLY
     },
     artifacts: artifactRefs(manifest.run_id)
   };
@@ -651,7 +724,7 @@ function makeScreenshotsIndex() {
 function groupFailures(executionResults) {
   const groups = new Map();
   for (const result of executionResults.items || []) {
-    if (['passed', 'real_passed'].includes(result.status)) {
+    if (['passed', 'real_passed', 'side_effect_executed'].includes(result.status)) {
       continue;
     }
     const key = result.failure_reason || result.status || 'unknown';
@@ -916,8 +989,13 @@ async function runPythonV3Orchestrator({ runId, runsDir, runDir, inputConfig, bo
       inputConfig.max_features_per_page,
       1,
       200
-    ))
+    )),
+    '--v3-safety-policy',
+    inputConfig.safety_policy || SAFETY_POLICY_LOW_RISK_ONLY
   ];
+  for (const action of inputConfig.allowed_side_effect_actions || []) {
+    args.push('--v3-allow-side-effect-action', action);
+  }
   if (body.useLiveDiscovery !== false && body.use_live_discovery !== false) {
     args.push('--v3-use-live-discovery');
   }
@@ -1090,6 +1168,8 @@ function normalizePythonExecutionResults(payload) {
       } else if (status === 'blocked_by_policy') {
         failureReason = failureReason || 'blocked_by_policy';
         manualConfirmationRequired = true;
+      } else if (status === 'side_effect_failed') {
+        failureReason = failureReason || 'side_effect_failed';
       }
       return {
         test_case_id: result.test_case_id || result.case_id || '',
@@ -1097,13 +1177,30 @@ function normalizePythonExecutionResults(payload) {
         verdict: result.verdict || result.message || '',
         started_at: result.started_at || null,
         finished_at: result.finished_at || null,
-        actions: result.actions || [],
-        page_feedback: result.page_feedback || [],
-        screenshot_refs: result.screenshot_refs || result.evidence || [],
+        actions: result.actions || (result.action_type ? [{
+          action: result.action_type,
+          target: result.control_label || '',
+          policy_decision: result.policy_decision || null
+        }] : []),
+        page_feedback: result.page_feedback || [result.visible_feedback].filter(Boolean),
+        screenshot_refs: result.screenshot_refs || result.evidence || [
+          result.before_screenshot_ref,
+          result.after_screenshot_ref
+        ].filter(Boolean),
         network_refs: result.network_refs || [],
         failure_reason: failureReason,
         manual_confirmation_required: manualConfirmationRequired,
-        execution_mode: result.execution_mode || 'real_browser'
+        execution_mode: result.execution_mode || 'real_browser',
+        side_effect: result.action_type ? {
+          action_type: result.action_type,
+          control_label: result.control_label || '',
+          policy_decision: result.policy_decision || null,
+          before_screenshot_ref: result.before_screenshot_ref || null,
+          after_screenshot_ref: result.after_screenshot_ref || null,
+          url_before: result.url_before || null,
+          url_after: result.url_after || null,
+          dialog_events: result.dialog_events || []
+        } : null
       };
     })
   };
@@ -1137,13 +1234,15 @@ function normalizePythonNextRoundPlan(payload, executionResults, roundId) {
     'python_executor_unavailable',
     'cdp_connect_failed',
     'playwright_missing',
-    'login_required'
+    'login_required',
+    'side_effect_failed'
   ].includes(item.failure_reason) || [
     'skipped_no_executor',
     'skipped_not_observed',
     'login_required',
     'real_failed',
-    'failed'
+    'failed',
+    'side_effect_failed'
   ].includes(item.status));
   if (payload?.schema_version === 'stage2_next_round_plan.v3' && !hasBlockingEvidenceGap) {
     return payload;
@@ -1627,6 +1726,8 @@ function makeReport({ manifest, pageEntries, featurePoints, testCases, execution
     generated_at: nowIso(),
     summary: {
       status: manifest.status,
+      safety_policy: manifest.safety_policy || SAFETY_POLICY_LOW_RISK_ONLY,
+      allowed_side_effect_actions: manifest.allowed_side_effect_actions || [],
       page_entries: summarizeItems(pageEntries.items),
       feature_points: summarizeItems(featurePoints.items),
       generated_test_cases: summarizeItems(testCases.items),
@@ -1635,7 +1736,15 @@ function makeReport({ manifest, pageEntries, featurePoints, testCases, execution
       next_decision: nextRoundPlan.decision
     },
     sections: [
-      { title: '运行概况', facts: [{ label: 'run_id', value: manifest.run_id }, { label: 'status', value: manifest.status }] },
+      {
+        title: '运行概况',
+        facts: [
+          { label: 'run_id', value: manifest.run_id },
+          { label: 'status', value: manifest.status },
+          { label: 'safety_policy', value: manifest.safety_policy || SAFETY_POLICY_LOW_RISK_ONLY },
+          { label: 'allowed_side_effect_actions', value: (manifest.allowed_side_effect_actions || []).join(', ') || 'none' }
+        ]
+      },
       { title: '页面入口发现', items: pageEntries.items || [] },
       { title: '功能点识别', items: featurePoints.items || [] },
       { title: '执行型测试用例', items: testCases.items || [] },
@@ -1650,6 +1759,8 @@ function makeReport({ manifest, pageEntries, featurePoints, testCases, execution
     '',
     `- Run ID: ${manifest.run_id}`,
     `- 状态: ${manifest.status}`,
+    `- 安全策略: ${manifest.safety_policy || SAFETY_POLICY_LOW_RISK_ONLY}`,
+    `- 副作用白名单: ${(manifest.allowed_side_effect_actions || []).join(', ') || '无'}`,
     `- 页面入口: ${reportJson.summary.page_entries}`,
     `- 功能点: ${reportJson.summary.feature_points}`,
     `- 执行型测试用例: ${reportJson.summary.generated_test_cases}`,

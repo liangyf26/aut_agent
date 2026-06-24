@@ -1136,6 +1136,8 @@ async def run_v3_assessment_entrypoint(
     artifact_root: str,
     use_live_discovery: bool,
     execution_mode: str,
+    safety_policy: str,
+    allowed_side_effect_actions: list[str] | None,
     reuse_run_dir: bool,
     max_pages: int,
     max_features_per_page: int,
@@ -1153,6 +1155,8 @@ async def run_v3_assessment_entrypoint(
         start_url=start_url,
         cdp_url=cdp_url,
         execution_mode=execution_mode,
+        safety_policy=safety_policy,
+        allowed_side_effect_actions=tuple(allowed_side_effect_actions or ()),
         reuse_run_dir=reuse_run_dir,
         model_name=model_name,
         run_id=run_id,
@@ -1163,6 +1167,8 @@ async def run_v3_assessment_entrypoint(
         metadata={
             "entrypoint": "prototype.stage2.main --run-v3",
             "template_name": template_name,
+            "safety_policy": safety_policy,
+            "allowed_side_effect_actions": list(allowed_side_effect_actions or ()),
         },
     )
 
@@ -1370,6 +1376,21 @@ def main() -> None:
         choices=("contract_only", "real_browser"),
         default="contract_only",
         help="For --run-v3, choose contract_only or real_browser execution.",
+    )
+    parser.add_argument(
+        "--v3-safety-policy",
+        choices=("low_risk_only", "test_env_full_access"),
+        default="low_risk_only",
+        help="For --run-v3, choose low_risk_only or test_env_full_access.",
+    )
+    parser.add_argument(
+        "--v3-allow-side-effect-action",
+        action="append",
+        default=[],
+        help=(
+            "For --run-v3, allow a side-effect action type or id in test_env_full_access. "
+            "May be repeated, e.g. --v3-allow-side-effect-action submit --v3-allow-side-effect-action delete."
+        ),
     )
     parser.add_argument(
         "--v3-reuse-run-dir",
@@ -1599,6 +1620,8 @@ def main() -> None:
                         artifact_root=args.v3_artifact_root,
                         use_live_discovery=args.v3_use_live_discovery,
                         execution_mode=args.v3_execution_mode,
+                        safety_policy=args.v3_safety_policy,
+                        allowed_side_effect_actions=args.v3_allow_side_effect_action,
                         reuse_run_dir=args.v3_reuse_run_dir,
                         max_pages=args.v3_max_pages,
                         max_features_per_page=args.v3_max_features_per_page,

@@ -9,6 +9,9 @@ POLICY_ALLOWED = "allowed"
 POLICY_BLOCKED = "blocked"
 POLICY_NEEDS_REVIEW = "needs_review"
 
+SAFETY_POLICY_LOW_RISK_ONLY = "low_risk_only"
+SAFETY_POLICY_TEST_ENV_FULL_ACCESS = "test_env_full_access"
+
 RISK_SAFE_READ = "safe_read"
 RISK_SAFE_INTERACT = "safe_interact"
 RISK_RISKY_SUBMIT = "risky_submit"
@@ -317,22 +320,32 @@ class PolicyAllowRule:
 class PolicyGateConfig:
     risky_submit_default_decision: str = POLICY_BLOCKED
     unknown_risk_default_decision: str = POLICY_NEEDS_REVIEW
+    safety_policy: str = SAFETY_POLICY_LOW_RISK_ONLY
+    allowed_side_effect_actions: list[str] = field(default_factory=list)
     allow_rules: list[PolicyAllowRule] = field(default_factory=list)
     sources_checked: list[str] = field(default_factory=list)
 
     @classmethod
     def from_sources(cls, *, config: Any = None, payload: Any = None) -> "PolicyGateConfig":
         risky_submit_default = POLICY_BLOCKED
+        safety_policy = SAFETY_POLICY_LOW_RISK_ONLY
+        allowed_side_effect_actions: list[str] = []
         allow_rules: list[PolicyAllowRule] = []
         sources_checked: list[str] = []
         for label, source in (("config", config), ("payload", payload)):
             for source_name, mapping in _iter_policy_mappings(source, label):
                 sources_checked.append(source_name)
                 risky_submit_default = _pick_risky_submit_default(mapping, risky_submit_default)
+                safety_policy = _pick_safety_policy(mapping, safety_policy)
+                allowed_side_effect_actions.extend(
+                    _extract_allowed_side_effect_actions(mapping)
+                )
                 allow_rules.extend(_extract_allow_rules(mapping, source_name))
         return cls(
             risky_submit_default_decision=risky_submit_default,
             unknown_risk_default_decision=POLICY_NEEDS_REVIEW,
+            safety_policy=safety_policy,
+            allowed_side_effect_actions=_dedupe_preserve_order(allowed_side_effect_actions),
             allow_rules=allow_rules,
             sources_checked=sources_checked,
         )
@@ -398,6 +411,10 @@ def evaluate_action_policy(
     )
     gate_config = build_policy_gate_config(config=config, payload=payload)
     matched_rule = _find_matching_rule(policy_action, gate_config.allow_rules)
+    matched_side_effect_action = _matches_allowed_side_effect_action(
+        policy_action,
+        gate_config.allowed_side_effect_actions,
+    )
     matched_rule_id = matched_rule.rule_id if matched_rule else None
     matched_source = matched_rule.source if matched_rule else None
     notes = [note for note in (_text(matched_rule.note) if matched_rule else None,) if note]
@@ -429,20 +446,70 @@ def evaluate_action_policy(
     if policy_action.risk_level == RISK_FORBIDDEN_MUTATION:
         if matched_rule and matched_rule.note and matched_rule.note not in notes:
             notes.append(matched_rule.note)
+        if _is_test_env_full_access(gate_config) and (matched_rule or matched_side_effect_action):
+            notes.append("测试环境全权限模式已开启，且该副作用动作在本轮 allowlist 内。")
+            return _decision_from_action(
+                policy_action,
+                status=POLICY_ALLOWED,
+                reason_code="forbidden_mutation_test_env_allowed",
+                reason=(
+                    "forbidden_mutation action is allowed only because "
+                    "test_env_full_access is enabled and the action is allowlisted."
+                ),
+                policy_source=matched_source or "allowed_side_effect_actions",
+                matched_rule_id=matched_rule_id,
+                matched_allowlist=True,
+                requires_allowlist=True,
+                notes=notes,
+                extra={
+                    "safety_policy": gate_config.safety_policy,
+                    "allowed_side_effect_actions": gate_config.allowed_side_effect_actions,
+                    "sources_checked": gate_config.sources_checked,
+                    "test_environment_authorization": True,
+                },
+            )
         return _decision_from_action(
             policy_action,
             status=POLICY_BLOCKED,
             reason_code="forbidden_mutation_blocked",
-            reason="forbidden_mutation actions stay blocked even when a whitelist entry exists.",
+            reason=(
+                "forbidden_mutation actions stay blocked unless test_env_full_access "
+                "is enabled and the action is allowlisted."
+            ),
             policy_source=matched_source or "policy",
             matched_rule_id=matched_rule_id,
             matched_allowlist=matched_rule is not None,
             requires_allowlist=True,
             notes=notes,
-            extra={"sources_checked": gate_config.sources_checked},
+            extra={
+                "safety_policy": gate_config.safety_policy,
+                "allowed_side_effect_actions": gate_config.allowed_side_effect_actions,
+                "sources_checked": gate_config.sources_checked,
+            },
         )
 
     if policy_action.risk_level == RISK_RISKY_SUBMIT:
+        if _is_test_env_full_access(gate_config) and matched_side_effect_action and not matched_rule:
+            notes.append("测试环境全权限模式已开启，且该副作用动作在本轮 allowlist 内。")
+            return _decision_from_action(
+                policy_action,
+                status=POLICY_ALLOWED,
+                reason_code="risky_submit_test_env_allowed",
+                reason=(
+                    "risky_submit action is allowed because test_env_full_access is "
+                    "enabled and the action is allowlisted."
+                ),
+                policy_source="allowed_side_effect_actions",
+                matched_allowlist=True,
+                requires_allowlist=True,
+                notes=notes,
+                extra={
+                    "safety_policy": gate_config.safety_policy,
+                    "allowed_side_effect_actions": gate_config.allowed_side_effect_actions,
+                    "sources_checked": gate_config.sources_checked,
+                    "test_environment_authorization": True,
+                },
+            )
         if matched_rule:
             reason = "risky_submit action was explicitly resolved by project policy allowlist."
             if matched_rule.decision == POLICY_NEEDS_REVIEW:
@@ -459,7 +526,15 @@ def evaluate_action_policy(
                 matched_allowlist=True,
                 requires_allowlist=True,
                 notes=notes,
-                extra={"sources_checked": gate_config.sources_checked},
+                extra={
+                    "safety_policy": gate_config.safety_policy,
+                    "allowed_side_effect_actions": gate_config.allowed_side_effect_actions,
+                    "sources_checked": gate_config.sources_checked,
+                    "test_environment_authorization": (
+                        gate_config.safety_policy == SAFETY_POLICY_TEST_ENV_FULL_ACCESS
+                        and matched_rule.decision == POLICY_ALLOWED
+                    ),
+                },
             )
         default_decision = gate_config.risky_submit_default_decision
         if default_decision == POLICY_NEEDS_REVIEW:
@@ -556,6 +631,57 @@ def _pick_risky_submit_default(mapping: Mapping[str, Any], current: str) -> str:
     return current
 
 
+def _pick_safety_policy(mapping: Mapping[str, Any], current: str) -> str:
+    raw_value = mapping.get("safety_policy") or mapping.get("v3_safety_policy")
+    normalized = (_normalize_token(raw_value) or current).replace("-", "_").replace(" ", "_")
+    if normalized in {"test_env_full_access", "full_access", "test_full_access"}:
+        return SAFETY_POLICY_TEST_ENV_FULL_ACCESS
+    return SAFETY_POLICY_LOW_RISK_ONLY
+
+
+def _extract_allowed_side_effect_actions(mapping: Mapping[str, Any]) -> list[str]:
+    actions: list[str] = []
+    for key in (
+        "allowed_side_effect_actions",
+        "side_effect_action_allowlist",
+        "side_effect_action_whitelist",
+    ):
+        actions.extend(_string_list(mapping.get(key)))
+    return actions
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    results: list[str] = []
+    for value in values:
+        normalized = _normalize_token(value)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        results.append(value)
+    return results
+
+
+def _is_test_env_full_access(gate_config: PolicyGateConfig) -> bool:
+    return gate_config.safety_policy == SAFETY_POLICY_TEST_ENV_FULL_ACCESS
+
+
+def _matches_allowed_side_effect_action(
+    action: PolicyAction,
+    allowed_actions: list[str],
+) -> bool:
+    tokens = {
+        token
+        for token in (
+            _normalize_token(action.action_id),
+            _normalize_token(action.action_name),
+            _normalize_token(action.action_type),
+        )
+        if token
+    }
+    return any(_normalize_token(item) in tokens for item in allowed_actions)
+
+
 def _extract_allow_rules(mapping: Mapping[str, Any], source_name: str) -> list[PolicyAllowRule]:
     rules: list[PolicyAllowRule] = []
     for key in _ALLOWLIST_KEYS:
@@ -610,6 +736,8 @@ __all__ = [
     "POLICY_ALLOWED",
     "POLICY_BLOCKED",
     "POLICY_NEEDS_REVIEW",
+    "SAFETY_POLICY_LOW_RISK_ONLY",
+    "SAFETY_POLICY_TEST_ENV_FULL_ACCESS",
     "RISK_SAFE_READ",
     "RISK_SAFE_INTERACT",
     "RISK_RISKY_SUBMIT",
