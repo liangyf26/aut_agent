@@ -1384,6 +1384,7 @@ function normalizeStage2Runs(payload = {}, overview = null) {
 function normalizeStage2Run(run = {}, source = 'v3') {
   const manifest = run.run_manifest || run.manifest || {};
   const stats = run.stats || run.summary || {};
+  const executionStats = stats.execution || run.executionSummary || run.execution_summary || {};
   const runId = getRunId(run) || `stage2_${Date.now()}`;
   const targetTracking = normalizeStage2TargetTracking(run.targetTracking || run.target_tracking);
   return {
@@ -1411,6 +1412,7 @@ function normalizeStage2Run(run = {}, source = 'v3') {
     missedTargets: run.missedTargets || run.missed_targets || targetTracking.items.filter((item) => item.status === 'missed').map((item) => item.target).filter(Boolean),
     foundTargets: run.foundTargets || run.found_targets || targetTracking.items.filter((item) => item.status === 'found').map((item) => item.target).filter(Boolean),
     countExplanation: stats.countExplanation || stats.count_explanation || run.countExplanation || run.count_explanation || {},
+    executionSummary: executionStats,
     realExecutionAvailable: Boolean(run.realExecutionAvailable || run.real_execution_available || run.capabilities?.realBrowserExecution || run.capabilities?.real_browser_execution || run.preflight?.cdp_available),
     createdAt: run.createdAt || run.created_at || manifest.created_at || run.started_at || '',
     updatedAt: run.updatedAt || run.updated_at || manifest.updated_at || run.finished_at || run.started_at || '',
@@ -1422,10 +1424,11 @@ function normalizeStage2Run(run = {}, source = 'v3') {
       pages: Number(stats.pageEntries ?? stats.pages ?? run.pageCount ?? run.page_count ?? toArrayItems(run.pageEntries || run.page_entries).length ?? 0),
       features: Number(stats.featurePoints ?? stats.features ?? run.featureCount ?? run.feature_count ?? toArrayItems(run.featurePoints || run.feature_points).length ?? 0),
       cases: Number(stats.testCases ?? stats.cases ?? run.caseCount ?? run.case_count ?? toArrayItems(run.generatedTestCases || run.generated_test_cases).length ?? 0),
-      executed: Number(stats.executed ?? stats.executedCount ?? stats.executionCount ?? run.executedCount ?? 0),
-      passed: Number(stats.passed ?? stats.passedCount ?? stats.verificationSuccesses ?? run.passedCount ?? 0),
-      failed: Number(stats.failed ?? stats.failedCount ?? run.failedCount ?? 0),
-      skipped: Number(stats.skipped ?? stats.skippedCount ?? run.skippedCount ?? 0),
+      executed: Number(executionStats.total ?? stats.executed ?? stats.executedCount ?? stats.executionCount ?? run.executedCount ?? 0),
+      passed: Number(executionStats.passed ?? stats.passed ?? stats.passedCount ?? stats.verificationSuccesses ?? run.passedCount ?? 0),
+      failed: Number(executionStats.failed ?? stats.failed ?? stats.failedCount ?? run.failedCount ?? 0),
+      skipped: Number(executionStats.skipped ?? stats.skipped ?? stats.skippedCount ?? run.skippedCount ?? 0),
+      blocked: Number(executionStats.blocked ?? stats.blocked ?? stats.blockedCount ?? run.blockedCount ?? 0),
       humanTasks: Number(stats.humanTasks ?? stats.pendingHumanTasks ?? run.pendingHumanTaskCount ?? 0),
       targetFound: Number(stats.targetTracking?.found ?? stats.target_found ?? targetTracking.found ?? 0),
       targetMissed: Number(stats.targetTracking?.missed ?? stats.target_missed ?? targetTracking.missed ?? 0),
@@ -1976,7 +1979,7 @@ function renderStage2V3CollectionTab(kind) {
       columns: [
         ['标题', (item) => item.title || item.name || item.test_case_id || item.testCaseId],
         ['模板', (item) => item.type_template || item.typeTemplate || item.kind || '-'],
-        ['风险策略', (item) => item.risk_policy || item.riskPolicy || '-'],
+        ['风险策略', (item) => formatStage2RiskPolicy(item.risk_policy || item.riskPolicy)],
         ['需人工确认', (item) => item.requires_human_confirmation || item.requiresHumanConfirmation ? '是' : '否']
       ]
     },
@@ -1993,7 +1996,55 @@ function renderStage2V3CollectionTab(kind) {
       ]
     }
   }[kind];
-  container.innerHTML = renderStage2Table(config.title, config.rows, config.columns, config.empty);
+  container.innerHTML = kind === 'execution'
+    ? `${renderStage2ExecutionSummary(run)}${renderStage2Table(config.title, config.rows, config.columns, config.empty)}`
+    : renderStage2Table(config.title, config.rows, config.columns, config.empty);
+}
+
+function formatStage2RiskPolicy(policy) {
+  if (!policy) {
+    return '-';
+  }
+  if (typeof policy === 'string') {
+    return policy;
+  }
+  return [policy.decision || policy.status, policy.risk_level || policy.riskLevel]
+    .filter(Boolean)
+    .join(' / ') || '-';
+}
+
+function renderStage2ExecutionSummary(run) {
+  const summary = run?.executionSummary || {};
+  const recentEvidence = Array.isArray(summary.recentEvidence) ? summary.recentEvidence : [];
+  const counts = run?.counts || {};
+  const countLine = [
+    `用例 ${counts.cases || 0}`,
+    `执行 ${counts.executed || 0}`,
+    `通过 ${counts.passed || 0}`,
+    `失败 ${counts.failed || 0}`,
+    `跳过 ${counts.skipped || 0}`,
+    `阻断 ${counts.blocked || 0}`
+  ].join(' · ');
+  return `
+    <section class="stage2-work-card">
+      <header><strong>执行摘要</strong><span class="tag">${escapeHtml(countLine)}</span></header>
+      ${recentEvidence.length
+        ? `<div class="stage2-compact-list">
+            ${recentEvidence.map((item) => `
+              <article>
+                <strong>${escapeHtml(item.testCaseId || item.caseId || '-')}</strong>
+                <p>${escapeHtml([
+                  item.verdict || item.status || '-',
+                  (item.pageFeedback || item.page_feedback || []).join('、'),
+                  item.failureReason || item.failure_reason || ''
+                ].filter(Boolean).join(' · '))}</p>
+                <span class="tag">${escapeHtml((item.screenshotRefs || item.screenshot_refs || []).length ? '有截图证据' : '无截图')}</span>
+              </article>
+            `).join('')}
+          </div>`
+        : '<div class="stage2-empty"><p>暂无最近执行证据。</p></div>'}
+    </section>
+  `;
 }
 
 function renderStage2V3AiTab() {
