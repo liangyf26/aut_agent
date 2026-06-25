@@ -256,6 +256,25 @@ async function readJsonIfExists(filePath) {
   }
 }
 
+async function readProgressEventsIfExists(filePath, limit = 20) {
+  try {
+    const raw = await fs.readFile(filePath, 'utf8');
+    return raw
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return { type: 'unparseable_progress_event', raw: line };
+        }
+      })
+      .slice(-limit);
+  } catch {
+    return [];
+  }
+}
+
 async function readJsonRequired(filePath, message) {
   const value = await readJsonIfExists(filePath);
   if (!value) {
@@ -439,6 +458,12 @@ function summarizeExecution(items = []) {
 function buildPublicRun(runDir, manifest, artifacts = {}) {
   const executionItems = artifacts.execution_results?.items || [];
   const executionMode = artifacts.current_status?.execution_mode || manifest.execution_mode || null;
+  const currentStatus = artifacts.current_status || buildCurrentStatus(
+    manifest,
+    manifest.status || 'unknown',
+    'run 状态摘要不可用。'
+  );
+  const recentEvents = Array.isArray(artifacts.progress_events) ? artifacts.progress_events : [];
   return {
     runId: manifest.run_id,
     systemName: manifest.system_name,
@@ -455,6 +480,10 @@ function buildPublicRun(runDir, manifest, artifacts = {}) {
     updatedAt: manifest.updated_at,
     startedAt: manifest.started_at,
     finishedAt: manifest.finished_at,
+    currentStatus,
+    latestMessage: currentStatus.message || null,
+    recentEvents,
+    operability: makeRunOperability(manifest, artifacts, currentStatus),
     rounds: manifest.rounds || [],
     summary: {
       pageEntries: summarizeItems(artifacts.page_entries?.items),
@@ -474,6 +503,7 @@ async function loadRunArtifacts(runDir) {
   const keys = [
     'input_config',
     'current_status',
+    'preflight_result',
     'page_entries',
     'feature_points',
     'generated_test_cases',
@@ -487,7 +517,130 @@ async function loadRunArtifacts(runDir) {
     key,
     await readJsonIfExists(artifactPath(runDir, key))
   ]));
-  return Object.fromEntries(entries);
+  return {
+    ...Object.fromEntries(entries),
+    progress_events: await readProgressEventsIfExists(path.join(runDir, ARTIFACTS.progress_events))
+  };
+}
+
+function actionName(action) {
+  const aliases = {
+    'continue-next-round': 'continue_next_round',
+    'generate-report': 'generate_report',
+    'analyze-round': 'analyze_round',
+    'save-human-task': 'save_human_task'
+  };
+  return aliases[action] || String(action || '').replace(/-/g, '_');
+}
+
+function operationStatusForRun(run) {
+  if (!run) {
+    return 'failed';
+  }
+  if (run.status === 'failed') {
+    return 'failed';
+  }
+  if (['waiting_human'].includes(run.status)) {
+    return 'blocked';
+  }
+  if (['running'].includes(run.status)) {
+    return 'running';
+  }
+  if (['planned'].includes(run.status)) {
+    return 'queued';
+  }
+  return 'succeeded';
+}
+
+function nextActionForRun(run) {
+  if (!run) {
+    return '检查运行中心错误并重试。';
+  }
+  const pendingTasks = run.summary?.pendingHumanTasks || 0;
+  if (run.status === 'draft') {
+    return '启动自动评测。';
+  }
+  if (run.status === 'waiting_human') {
+    return pendingTasks > 0
+      ? '请在运行中心完成人工确认或审核任务后继续。'
+      : '请确认下一轮计划后继续。';
+  }
+  if (run.status === 'failed') {
+    return '查看错误详情和执行证据，修复后重试。';
+  }
+  if (run.status === 'running') {
+    return '等待执行器推进，或刷新查看最新进度。';
+  }
+  if (run.status === 'paused') {
+    return '可以继续、停止或查看当前证据。';
+  }
+  if (run.status === 'planned') {
+    return '等待执行器推进下一轮。';
+  }
+  if (run.status === 'completed') {
+    return '生成报告，或创建新的更大范围 run。';
+  }
+  if (run.status === 'stopped') {
+    return 'run 已停止，可查看报告或创建新 run。';
+  }
+  return '查看运行中心建议的下一步动作。';
+}
+
+function makeOperationFeedback(action, run, overrides = {}) {
+  const status = overrides.status || operationStatusForRun(run);
+  const message = overrides.message || run?.latestMessage || '操作已提交。';
+  return {
+    schema_version: 'stage2_v3_operation_feedback.v1',
+    action: actionName(action),
+    status,
+    tone: overrides.tone || (
+      status === 'failed' ? 'error' : status === 'blocked' ? 'warning' : status === 'running' ? 'info' : 'success'
+    ),
+    message,
+    nextAction: overrides.nextAction || nextActionForRun(run),
+    error: overrides.error || (status === 'failed'
+      ? {
+          code: run?.currentStatus?.phase || run?.status || 'failed',
+          message
+        }
+      : null)
+  };
+}
+
+function makeRunOperability(manifest, artifacts = {}, currentStatus = null) {
+  const failureReason = artifacts.preflight_result?.checks?.python_orchestrator?.failure_reason
+    || artifacts.execution_results?.items?.find((item) => item.failure_reason)?.failure_reason
+    || null;
+  if (failureReason === 'python_executor_unavailable') {
+    return {
+      kind: 'executor_unavailable',
+      actionable: false,
+      reason: 'Python 执行器不可用，真实浏览器 run 不能继续执行。',
+      blocker: failureReason
+    };
+  }
+  if (manifest.status === 'stopped') {
+    return {
+      kind: 'read_only_v3_run',
+      actionable: false,
+      reason: 'run 已停止，仅可查看产物和报告。',
+      blocker: 'stopped'
+    };
+  }
+  if (manifest.status === 'completed' && currentStatus?.phase === 'next_round_not_required') {
+    return {
+      kind: 'read_only_v3_run',
+      actionable: false,
+      reason: 'run 当前目标已完成，无需继续操作。',
+      blocker: 'goal_completed'
+    };
+  }
+  return {
+    kind: 'actionable_v3_run',
+    actionable: true,
+    reason: '可通过运行中心提交启动、暂停、复盘、人工任务或报告动作。',
+    blocker: null
+  };
 }
 
 async function createV3Run(body = {}, options = {}) {
@@ -519,7 +672,14 @@ async function createV3Run(body = {}, options = {}) {
   });
   await appendEvent(runDir, { type: 'run_created', run_id: runId, status: 'draft' });
 
-  return { run: buildPublicRun(runDir, savedManifest, await loadRunArtifacts(runDir)) };
+  const run = buildPublicRun(runDir, savedManifest, await loadRunArtifacts(runDir));
+  return {
+    run,
+    operation: makeOperationFeedback('create_run', run, {
+      status: 'succeeded',
+      message: 'v3 run 草稿已创建，等待启动。'
+    })
+  };
 }
 
 async function listV3Runs(options = {}) {
@@ -1640,7 +1800,8 @@ async function startV3Run(runId, body = {}, options = {}) {
     { decision: analysisPack.nextRoundPlan.decision, execution_mode: executionMode }
   );
 
-  return { run: buildPublicRun(runDir, finalManifest, await loadRunArtifacts(runDir)) };
+  const run = buildPublicRun(runDir, finalManifest, await loadRunArtifacts(runDir));
+  return { run, operation: makeOperationFeedback('start', run) };
 }
 
 async function persistAnalysisPack(runDir, analysisPack) {
@@ -1681,7 +1842,8 @@ async function setV3RunLifecycleStatus(runId, action, body = {}, options = {}) {
     normalizeText(body.note, messageByAction[action]),
     { operator_id: normalizeOptionalText(body.operatorId || body.operator_id) }
   );
-  return { run: buildPublicRun(runDir, saved, await loadRunArtifacts(runDir)) };
+  const run = buildPublicRun(runDir, saved, await loadRunArtifacts(runDir));
+  return { run, operation: makeOperationFeedback(action, run) };
 }
 
 async function analyzeV3Run(runId, options = {}) {
@@ -1711,8 +1873,10 @@ async function analyzeV3Run(runId, options = {}) {
     '规则复盘产物已生成；当前未接入可追踪 AI 模型调用。',
     { decision: analysisPack.nextRoundPlan.decision }
   );
+  const run = buildPublicRun(runDir, saved, await loadRunArtifacts(runDir));
   return {
-    run: buildPublicRun(runDir, saved, await loadRunArtifacts(runDir)),
+    run,
+    operation: makeOperationFeedback('analyze_round', run),
     roundAnalysis: analysisPack.analysis,
     nextRoundPlan: analysisPack.nextRoundPlan,
     humanTasks: analysisPack.humanTasks
@@ -1758,7 +1922,8 @@ async function saveHumanTaskResult(runId, body = {}, options = {}) {
     pending ? '人工任务结果已保存，仍有待处理任务。' : '人工任务已处理完毕，可继续下一轮。',
     { pending_human_tasks: pending }
   );
-  return { run: buildPublicRun(runDir, saved, await loadRunArtifacts(runDir)), humanTasks: nextHumanTasks };
+  const run = buildPublicRun(runDir, saved, await loadRunArtifacts(runDir));
+  return { run, operation: makeOperationFeedback('save_human_task', run), humanTasks: nextHumanTasks };
 }
 
 async function continueNextRound(runId, body = {}, options = {}) {
@@ -1779,7 +1944,8 @@ async function continueNextRound(runId, body = {}, options = {}) {
       '下一轮计划需要人工批准后才能继续。',
       { decision: nextRoundPlan.decision }
     );
-    return { run: buildPublicRun(runDir, saved, await loadRunArtifacts(runDir)), nextRoundPlan };
+    const run = buildPublicRun(runDir, saved, await loadRunArtifacts(runDir));
+    return { run, operation: makeOperationFeedback('continue_next_round', run), nextRoundPlan };
   }
   if (stopDecision) {
     const restoredRoundId = nextRoundPlan.current_round_id || manifest.current_round_id;
@@ -1791,7 +1957,8 @@ async function continueNextRound(runId, body = {}, options = {}) {
       '当前目标已完成，无需进入下一轮；可生成报告或创建新的更大范围 run。',
       { decision: nextRoundPlan.decision, next_round_required: false }
     );
-    return { run: buildPublicRun(runDir, saved, await loadRunArtifacts(runDir)), nextRoundPlan };
+    const run = buildPublicRun(runDir, saved, await loadRunArtifacts(runDir));
+    return { run, operation: makeOperationFeedback('continue_next_round', run), nextRoundPlan };
   }
 
   const currentRounds = manifest.rounds || [];
@@ -1818,7 +1985,8 @@ async function continueNextRound(runId, body = {}, options = {}) {
     '下一轮已创建，等待执行器推进。',
     { next_round_id: roundId }
   );
-  return { run: buildPublicRun(runDir, saved, await loadRunArtifacts(runDir)), nextRoundPlan };
+  const run = buildPublicRun(runDir, saved, await loadRunArtifacts(runDir));
+  return { run, operation: makeOperationFeedback('continue_next_round', run), nextRoundPlan };
 }
 
 function makeReport({ manifest, pageEntries, featurePoints, testCases, executionResults, roundAnalysis, nextRoundPlan, humanTasks }) {
@@ -1905,7 +2073,8 @@ async function generateV3Report(runId, options = {}) {
   await writeJson(path.join(runDir, ARTIFACTS.run_report_json), reportJson);
   await fs.writeFile(path.join(runDir, ARTIFACTS.run_report_md), `${md}\n`, 'utf8');
   const saved = await updateRunStatus(runDir, manifest, manifest.status, 'reporting', 'run 报告已生成。');
-  return { run: buildPublicRun(runDir, saved, await loadRunArtifacts(runDir)), report: reportJson };
+  const run = buildPublicRun(runDir, saved, await loadRunArtifacts(runDir));
+  return { run, operation: makeOperationFeedback('generate_report', run), report: reportJson };
 }
 
 async function resolveV3RunArtifact(runId, artifactKey, options = {}) {
