@@ -15,6 +15,7 @@ const {
   listV3Runs,
   resolveV3RunArtifact,
   saveHumanTaskResult,
+  setV3RunLifecycleStatus,
   startV3Run
 } = require('./stage2V3RunCenter');
 
@@ -298,6 +299,55 @@ test('stage2 v3 run center creates a draft run and starts a stable artifact cont
   });
 });
 
+test('stage2 v3 run center returns visible operation feedback and persisted status context', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '操作反馈样例系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+
+    assert.equal(created.operation.action, 'create_run');
+    assert.equal(created.operation.status, 'succeeded');
+    assert.match(created.operation.message, /已创建|草稿/);
+    assert.equal(created.operation.error, null);
+    assert.equal(created.run.currentStatus.phase, 'draft');
+    assert.match(created.run.currentStatus.message, /等待启动/);
+    assert.ok(created.run.recentEvents.some((event) => event.type === 'run_created'));
+
+    const started = await startV3Run(created.run.runId, { executionMode: 'contract_only' }, { runsDir });
+    assert.equal(started.operation.action, 'start');
+    assert.equal(started.operation.status, 'blocked');
+    assert.match(started.operation.nextAction, /人工确认|审核|继续/);
+    assert.equal(started.run.status, 'waiting_human');
+    assert.equal(started.run.currentStatus.phase, 'round_analysis');
+    assert.ok(started.run.recentEvents.some((event) => event.type === 'status_changed'));
+
+    const paused = await setV3RunLifecycleStatus(created.run.runId, 'pause', {}, { runsDir });
+    assert.equal(paused.operation.action, 'pause');
+    assert.equal(paused.operation.status, 'succeeded');
+    assert.equal(paused.run.status, 'paused');
+    assert.equal(paused.run.currentStatus.phase, 'pause');
+
+    const resumed = await setV3RunLifecycleStatus(created.run.runId, 'resume', {}, { runsDir });
+    assert.equal(resumed.operation.action, 'resume');
+    assert.equal(resumed.operation.status, 'running');
+    assert.equal(resumed.run.status, 'running');
+    assert.equal(resumed.operation.error, null);
+
+    const blocked = await continueNextRound(created.run.runId, {}, { runsDir });
+    assert.equal(blocked.operation.action, 'continue_next_round');
+    assert.equal(blocked.operation.status, 'blocked');
+    assert.match(blocked.operation.message, /人工批准|人工确认/);
+    assert.equal(blocked.run.status, 'waiting_human');
+
+    const listed = await listV3Runs({ runsDir });
+    const listedRun = listed.runs.find((run) => run.runId === created.run.runId);
+    assert.equal(listedRun.currentStatus.phase, 'next_round_blocked');
+    assert.ok(listedRun.recentEvents.length >= 3);
+  });
+});
+
 test('stage2 v3 run center requires explicit confirmation for full access mode', async () => {
   await withTempRunsDir(async (runsDir) => {
     await assert.rejects(
@@ -556,11 +606,18 @@ test('stage2 v3 run center records missing Python executor without silent succes
     });
 
     assert.equal(started.run.status, 'failed');
+    assert.equal(started.operation.status, 'failed');
+    assert.equal(started.operation.error.code, 'real_browser_execution_failed');
+    assert.equal(started.run.operability.kind, 'executor_unavailable');
+    assert.equal(started.run.operability.actionable, false);
     const runDir = path.join(runsDir, created.run.runId);
     const preflight = await readJson(path.join(runDir, 'preflight_result.json'));
     const executionResults = await readJson(path.join(runDir, 'execution_results.json'));
     assert.equal(preflight.checks.python_orchestrator.failure_reason, 'python_executor_unavailable');
     assert.ok(executionResults.items.every((item) => item.failure_reason === 'python_executor_unavailable'));
+
+    const list = await listV3Runs({ runsDir });
+    assert.equal(list.runs[0].operability.kind, 'executor_unavailable');
   });
 });
 

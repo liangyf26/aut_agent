@@ -492,8 +492,20 @@ function pushStage2ActionLog(message, tone = 'info') {
   saveState.textContent = message;
 }
 
+function pushStage2OperationFeedback(operation, fallbackMessage = '操作已提交。') {
+  if (!operation) {
+    pushStage2ActionLog(fallbackMessage);
+    return;
+  }
+  const nextAction = operation.nextAction ? ` 下一步：${operation.nextAction}` : '';
+  pushStage2ActionLog(`${operation.message || fallbackMessage}${nextAction}`, operation.tone || 'info');
+}
+
 function isStage2V3ActionableRun(run) {
   const runId = getRunId(run);
+  if (run?.operability && runId?.startsWith('stage2_v3_')) {
+    return run.operability.actionable !== false;
+  }
   return Boolean(runId && runId.startsWith('stage2_v3_') && run?.source !== 'local' && run?.source !== 'overview');
 }
 
@@ -503,6 +515,20 @@ function getStage2RunKind(run) {
   }
   if (run.source === 'local' || getRunId(run).startsWith('draft_')) {
     return { label: '本地草稿', tone: 'warning', reason: '这是前端保存的草稿，后端没有正式 run，不能启动或复盘。' };
+  }
+  if (run.operability?.kind === 'executor_unavailable') {
+    return {
+      label: '执行器不可用 v3 run',
+      tone: 'failed',
+      reason: run.operability.reason || 'Python 执行器不可用，真实浏览器 run 不能继续执行。'
+    };
+  }
+  if (run.operability?.kind === 'read_only_v3_run') {
+    return {
+      label: '只读 v3 run',
+      tone: 'manual',
+      reason: run.operability.reason || '该 run 当前只能查看产物和报告。'
+    };
   }
   if (isStage2V3ActionableRun(run)) {
     return { label: '可操作 v3 run', tone: 'passed', reason: '该 run 可由运行中心提交启动、暂停、复盘和人工任务。' };
@@ -775,7 +801,7 @@ async function createStage2Run(event) {
     const run = normalizeStage2Run(result.run || result);
     state.selectedRunId = getRunId(run);
     delete state.stage2RunDetails[state.selectedRunId];
-    pushStage2ActionLog(`已创建 v3 run：${state.selectedRunId}`, 'success');
+    pushStage2OperationFeedback(result.operation, `已创建 v3 run：${state.selectedRunId}`);
     await loadDashboardData();
   } catch (error) {
     const localRun = normalizeStage2Run({
@@ -873,11 +899,10 @@ async function runStage2V3Action(runId, action) {
     }
     const returnedRun = normalizeStage2Run(result.run || result, 'v3');
     const returnedStatus = statusLabel(returnedRun.status);
-    const returnedMessage = returnedRun.latestMessage ? `：${returnedRun.latestMessage}` : '';
-    const tone = ['failed', 'error'].includes(returnedRun.status)
-      ? 'error'
-      : returnedRun.status === 'waiting_human' ? 'warning' : 'success';
-    pushStage2ActionLog(`${successText}，当前状态：${returnedStatus}${returnedMessage}`, tone);
+    pushStage2OperationFeedback(
+      result.operation,
+      `${successText}，当前状态：${returnedStatus}${returnedRun.latestMessage ? `：${returnedRun.latestMessage}` : ''}`
+    );
     await loadDashboardData();
   } catch (error) {
     pushStage2ActionLog(`操作失败：${error.message}`, 'error');
