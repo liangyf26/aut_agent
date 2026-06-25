@@ -328,7 +328,7 @@ async def _page_state_cdp(session: RawCdpSession) -> dict[str, Any]:
               return {
                 url: location.href,
                 title: document.title,
-                visible_text_sample: text.replace(/\s+/g, ' ').slice(0, 600),
+                visible_text_sample: text.replace(/\\s+/g, ' ').slice(0, 600),
                 dialog_events: dialogLog.slice(-10)
               };
             })()""",

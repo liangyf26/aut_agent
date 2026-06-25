@@ -741,6 +741,59 @@ function groupFailures(executionResults) {
   }));
 }
 
+function extractScopeTargets(inputConfig = {}) {
+  const scope = normalizeOptionalText(
+    inputConfig.scope
+      || inputConfig.scopeText
+      || inputConfig.explorationScope
+      || inputConfig.exploration_scope
+  );
+  if (!scope) {
+    return [];
+  }
+  const quoted = [...scope.matchAll(/[“"']([^”"']{2,80})[”"']/g)]
+    .map((match) => normalizeOptionalText(match[1]))
+    .filter(Boolean);
+  if (!quoted.length && !/[页面入口]/.test(scope)) {
+    return [];
+  }
+  const cleaned = scope
+    .replace(/[“"'][^”"']{2,80}[”"']/g, ' ')
+    .replace(/优先|完成|页面|入口|覆盖|测试|请|先|进行|的|和|、|，|。/g, ' ')
+    .split(/\s+/)
+    .map((item) => normalizeOptionalText(item))
+    .filter((item) => item && item.length >= 2);
+  return [...new Set([...quoted, ...cleaned])].slice(0, 5);
+}
+
+function itemMatchesScopeTarget(item, target) {
+  const haystack = [
+    item.name,
+    item.title,
+    item.url,
+    item.menu_path,
+    item.feature_type,
+    item.page_type,
+    item.source
+  ]
+    .flat()
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  return haystack.includes(String(target || '').toLowerCase());
+}
+
+function findMissingScopeTargets(inputConfig, pageEntries, featurePoints) {
+  const targets = extractScopeTargets(inputConfig);
+  if (!targets.length) {
+    return [];
+  }
+  const pages = pageEntries.items || [];
+  const features = featurePoints.items || [];
+  return targets.filter((target) => !pages.some((item) => itemMatchesScopeTarget(item, target))
+    && !features.some((item) => itemMatchesScopeTarget(item, target)));
+}
+
 function buildHumanTasks(featurePoints, executionResults, nextRoundPlan = null) {
   const tasks = [];
   const reviewFeatures = (featurePoints.items || []).filter((item) => item.review_status === 'pending');
@@ -803,9 +856,28 @@ function buildHumanTasks(featurePoints, executionResults, nextRoundPlan = null) 
   };
 }
 
-function makeRoundAnalysis({ manifest, pageEntries, featurePoints, testCases, executionResults, screenshotsIndex }) {
+function makeRoundAnalysis({
+  manifest,
+  inputConfig = {},
+  pageEntries,
+  featurePoints,
+  testCases,
+  executionResults,
+  screenshotsIndex
+}) {
   const executionSummary = summarizeExecution(executionResults.items || []);
   const failureClusters = groupFailures(executionResults);
+  const missingScopeTargets = findMissingScopeTargets(inputConfig, pageEntries, featurePoints);
+  if (missingScopeTargets.length) {
+    failureClusters.push({
+      cluster_id: `cluster_${String(failureClusters.length + 1).padStart(3, '0')}`,
+      reason: 'scope_target_not_found',
+      test_case_ids: [],
+      count: missingScopeTargets.length,
+      target_texts: missingScopeTargets,
+      suggestion: `本轮未发现用户指定目标：${missingScopeTargets.join('、')}。请扩大探索或先在浏览器展开/进入目标菜单后继续。`
+    });
+  }
   const humanTaskReasons = failureClusters
     .filter((cluster) => [
       'manual_review_required',
@@ -813,7 +885,8 @@ function makeRoundAnalysis({ manifest, pageEntries, featurePoints, testCases, ex
       'python_v3_executor_not_connected',
       'python_v3_orchestrator_failed',
       'python_executor_unavailable',
-      'python_returned_safe_placeholder'
+      'python_returned_safe_placeholder',
+      'scope_target_not_found'
     ].includes(cluster.reason))
     .map((cluster) => cluster.reason);
 
@@ -847,15 +920,31 @@ function makeRoundAnalysis({ manifest, pageEntries, featurePoints, testCases, ex
         evidence_refs: ['execution_results']
       }
     ],
+    analysis_mode: 'deterministic_rule_review',
+    ai_provider_status: 'not_connected',
+    scope_targets: extractScopeTargets(inputConfig),
+    missing_scope_targets: missingScopeTargets,
     confidence: 0.72
   };
+
+  if (missingScopeTargets.length) {
+    analysis.improvement_candidates.unshift({
+      candidate_id: 'improve_scope_target_discovery',
+      scope: 'discovery',
+      title: `补齐目标页面发现：${missingScopeTargets.join('、')}`,
+      confidence: 0.98,
+      evidence_refs: ['input_config', 'page_entries', 'feature_points']
+    });
+  }
 
   const nextRoundPlan = {
     schema_version: 'stage2_next_round_plan.v3',
     current_round_id: analysis.round_id,
-    should_continue: false,
-    decision: failureClusters.length ? 'wait_human_review' : 'stop_goal_completed',
-    next_round_goal: failureClusters.length
+    should_continue: missingScopeTargets.length > 0,
+    decision: missingScopeTargets.length ? 'auto_continue' : failureClusters.length ? 'wait_human_review' : 'stop_goal_completed',
+    next_round_goal: missingScopeTargets.length
+      ? `继续寻找用户指定目标页面：${missingScopeTargets.join('、')}。`
+      : failureClusters.length
       ? '处理执行阻塞后，重新执行低风险用例并补齐截图证据。'
       : '本 run 已完成当前范围。',
     target_page_entry_ids: (pageEntries.items || []).map((item) => item.page_entry_id),
@@ -864,7 +953,7 @@ function makeRoundAnalysis({ manifest, pageEntries, featurePoints, testCases, ex
       .map((item) => item.feature_point_id),
     planned_improvements: analysis.improvement_candidates,
     risk_level: 'low',
-    requires_human_approval: failureClusters.length > 0
+    requires_human_approval: failureClusters.length > 0 && missingScopeTargets.length === 0
   };
 
   return {
@@ -993,6 +1082,9 @@ async function runPythonV3Orchestrator({ runId, runsDir, runDir, inputConfig, bo
     '--v3-safety-policy',
     inputConfig.safety_policy || SAFETY_POLICY_LOW_RISK_ONLY
   ];
+  if (inputConfig.scope) {
+    args.push('--v3-scope', inputConfig.scope);
+  }
   for (const action of inputConfig.allowed_side_effect_actions || []) {
     args.push('--v3-allow-side-effect-action', action);
   }
@@ -1288,6 +1380,7 @@ async function persistContractOnlyArtifacts(runDir, manifest, inputConfig, execu
   const screenshotsIndex = makeScreenshotsIndex();
   const analysisPack = makeRoundAnalysis({
     manifest,
+    inputConfig,
     pageEntries,
     featurePoints,
     testCases,
@@ -1351,6 +1444,7 @@ async function persistRealBrowserFailure(runDir, manifest, inputConfig, processR
   const screenshotsIndex = makeScreenshotsIndex();
   const analysisPack = makeRoundAnalysis({
     manifest,
+    inputConfig,
     pageEntries,
     featurePoints,
     testCases,
@@ -1399,13 +1493,21 @@ async function persistRealBrowserArtifacts(runDir, manifest, inputConfig, proces
   const pythonNextRoundPlan = await readPythonJson(pyRunDir, 'next_round_plan.json');
   const analysisPack = makeRoundAnalysis({
     manifest,
+    inputConfig,
     pageEntries,
     featurePoints,
     testCases,
     executionResults,
     screenshotsIndex
   });
+  const nodeNextRoundPlan = analysisPack.nextRoundPlan;
   analysisPack.nextRoundPlan = normalizePythonNextRoundPlan(pythonNextRoundPlan, executionResults, roundId);
+  if ((analysisPack.analysis.missing_scope_targets || []).length) {
+    analysisPack.nextRoundPlan = {
+      ...nodeNextRoundPlan,
+      current_round_id: roundId
+    };
+  }
   analysisPack.humanTasks = normalizePythonHumanTasks(await readPythonJson(pyRunDir, 'human_tasks.json'));
   if (analysisPack.nextRoundPlan.requires_human_approval) {
     const existingTaskIds = new Set(analysisPack.humanTasks.items.map((item) => item.task_id));
@@ -1584,6 +1686,7 @@ async function setV3RunLifecycleStatus(runId, action, body = {}, options = {}) {
 
 async function analyzeV3Run(runId, options = {}) {
   const { runDir, manifest } = await readManifest(runId, options);
+  const inputConfig = await readJsonIfExists(path.join(runDir, ARTIFACTS.input_config)) || {};
   const pageEntries = await readJsonRequired(path.join(runDir, ARTIFACTS.page_entries), 'page_entries 缺失，不能复盘。');
   const featurePoints = await readJsonRequired(path.join(runDir, ARTIFACTS.feature_points), 'feature_points 缺失，不能复盘。');
   const testCases = await readJsonRequired(path.join(runDir, ARTIFACTS.generated_test_cases), 'generated_test_cases 缺失，不能复盘。');
@@ -1592,6 +1695,7 @@ async function analyzeV3Run(runId, options = {}) {
 
   const analysisPack = makeRoundAnalysis({
     manifest,
+    inputConfig,
     pageEntries,
     featurePoints,
     testCases,
@@ -1603,8 +1707,8 @@ async function analyzeV3Run(runId, options = {}) {
     runDir,
     manifest,
     analysisPack.nextRoundPlan.requires_human_approval ? 'waiting_human' : 'completed',
-    'ai_round_analysis',
-    'AI 复盘产物已生成。',
+    'rule_round_analysis',
+    '规则复盘产物已生成；当前未接入可追踪 AI 模型调用。',
     { decision: analysisPack.nextRoundPlan.decision }
   );
   return {

@@ -690,6 +690,18 @@ def _build_round_analysis(
     ]
     source_status = _text(discovery_payload.get("status")) if discovery_payload else "demo_safe"
     failure_clusters = []
+    missing_scope_targets = _missing_scope_targets(config, pages, features)
+    if missing_scope_targets:
+        failure_clusters.append(
+            {
+                "cluster_id": "scope_target_not_found",
+                "title": f"未发现用户指定目标页面：{'、'.join(missing_scope_targets)}",
+                "severity": "high",
+                "case_ids": [],
+                "suggestion": "继续扩大页面覆盖，或先在浏览器中展开/进入目标菜单后从运行中心继续下一轮。",
+                "target_texts": missing_scope_targets,
+            }
+        )
     if execution_mode == "real_browser" and real_browser_payload and real_browser_payload.get("status") != "completed":
         failure_clusters.append(
             {
@@ -733,7 +745,10 @@ def _build_round_analysis(
     return {
         "schema_version": V3_SCHEMA_VERSION,
         "generated_at": _now(),
-        "analysis_mode": "deterministic_ai_review_stub",
+        "analysis_mode": "deterministic_rule_review",
+        "ai_provider_status": "not_connected",
+        "scope_targets": _scope_targets(config),
+        "missing_scope_targets": missing_scope_targets,
         "target_name": config.target_name,
         "coverage": {
             "page_count": len(pages),
@@ -794,6 +809,19 @@ def _build_human_tasks(
                 "status": "open",
                 "title": "连接已登录浏览器后运行真实发现",
                 "ui_action": "在运行中心填写首页 URL 与 CDP 地址，点击开始发现。",
+                "blocks_next_round": False,
+            }
+        )
+    missing_scope_targets = round_analysis.get("missing_scope_targets") or []
+    if missing_scope_targets:
+        tasks.append(
+            {
+                "task_id": "human_task_scope_target_not_found",
+                "type": "scope_target_recovery",
+                "status": "open",
+                "title": f"未发现指定目标：{'、'.join(missing_scope_targets)}",
+                "ui_action": "可直接进入下一轮扩大覆盖；如果仍未发现，请在真实浏览器中展开目标菜单或进入目标页面后重新开始自动评测。",
+                "target_texts": missing_scope_targets,
                 "blocks_next_round": False,
             }
         )
@@ -903,6 +931,7 @@ def _render_report(
         f"- Start URL: `{config.start_url or 'demo/safe mode'}`",
         f"- Safety Policy: `{_normalize_safety_policy(config.safety_policy)}`",
         f"- Allowed Side Effects: `{', '.join(config.allowed_side_effect_actions) or 'none'}`",
+        f"- Scope: `{_text(config.metadata.get('scope')) or 'none'}`",
         f"- Generated At: `{_now()}`",
         "",
         "## 总览",
@@ -914,7 +943,7 @@ def _render_report(
         f"- 策略阻断: {blocked}",
         f"- 人工任务: {human_tasks['open_task_count']}",
         "",
-        "## AI 复盘",
+        "## 规则复盘",
         "",
         f"- 质量判断: {round_analysis['quality_judgement']}",
         f"- 下一轮状态: {next_round_plan['status']}",
@@ -1299,6 +1328,65 @@ def _mapping(value: Any) -> dict[str, Any]:
 
 def _text(value: Any) -> str:
     return str(value).strip() if value is not None else ""
+
+
+def _scope_targets(config: V3RunConfig) -> list[str]:
+    scope = _text(config.metadata.get("scope"))
+    if not scope:
+        return []
+    targets: list[str] = []
+    for left, right in (("“", "”"), ('"', '"'), ("'", "'")):
+        start = 0
+        while True:
+            open_at = scope.find(left, start)
+            if open_at == -1:
+                break
+            close_at = scope.find(right, open_at + 1)
+            if close_at == -1:
+                break
+            target = _text(scope[open_at + 1 : close_at])
+            if len(target) >= 2 and target not in targets:
+                targets.append(target)
+            start = close_at + 1
+    if targets:
+        return targets[:5]
+    if not targets and "页面" not in scope and "入口" not in scope:
+        return []
+    cleaned = scope
+    for token in ("优先", "完成", "页面", "入口", "覆盖", "测试", "请", "先", "进行", "的", "和", "、", "，", "。"):
+        cleaned = cleaned.replace(token, " ")
+    for target in cleaned.split():
+        target = _text(target.strip("\"'“”"))
+        if len(target) >= 2 and target not in targets:
+            targets.append(target)
+    return targets[:5]
+
+
+def _item_matches_target(item: dict[str, Any], target: str) -> bool:
+    values = [
+        item.get("name"),
+        item.get("title"),
+        item.get("url"),
+        item.get("page_type"),
+        item.get("semantic_page_type"),
+        item.get("feature_type"),
+        " ".join(item.get("menu_path", []) or []),
+    ]
+    haystack = " ".join(str(value) for value in values if value).lower()
+    return target.lower() in haystack
+
+
+def _missing_scope_targets(
+    config: V3RunConfig,
+    pages: list[dict[str, Any]],
+    features: list[dict[str, Any]],
+) -> list[str]:
+    return [
+        target
+        for target in _scope_targets(config)
+        if not any(_item_matches_target(page, target) for page in pages)
+        and not any(_item_matches_target(feature, target) for feature in features)
+    ]
 
 
 def _default_run_id(target_name: str) -> str:

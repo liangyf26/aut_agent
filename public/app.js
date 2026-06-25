@@ -658,7 +658,7 @@ function browserPreflightMessage() {
   const preflight = state.stage2BrowserPreflight || {};
   if (preflight.ok) {
     const targetText = Number.isInteger(preflight.targetCount)
-      ? `，可见 ${preflight.targetCount} 个页面 target`
+      ? `，浏览器中有 ${preflight.targetCount} 个可调试 target（不等于已发现页面入口）`
       : '';
     return `${preflight.message || '真实浏览器已连接'}${targetText}`;
   }
@@ -844,7 +844,7 @@ async function runStage2V3Action(runId, action) {
     pause: '已请求暂停',
     resume: '已请求继续',
     stop: '已请求停止',
-    'analyze-round': '已触发 AI 复盘',
+    'analyze-round': '已触发规则复盘',
     'continue-next-round': '已请求进入下一轮',
     'generate-report': '已请求生成报告'
   }[action] || '已提交操作';
@@ -1516,7 +1516,7 @@ function renderStage2V3Shell() {
   if (!run) {
     runEyebrow.textContent = '等待创建';
     runTitle.textContent = '从一个 run 开始';
-    runSubtitle.textContent = '填写左侧最少信息后创建 run，运行中心会承接发现、执行、AI 复盘、人工处理和报告查看。';
+    runSubtitle.textContent = '填写左侧最少信息后创建 run，运行中心会承接发现、执行、复盘、人工处理和报告查看。';
     actions.innerHTML = '<span class="status-pill warning">尚未选择</span>';
     metrics.innerHTML = renderStage2MetricCards(null);
     monitor.innerHTML = renderStage2Monitor(null);
@@ -1602,7 +1602,7 @@ function renderStage2RunActions(run) {
     <button class="ghost-action compact-action primary-compact-action" data-stage2-run-action="start" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '按所选执行模式启动。' : disabledReason)}" ${disabled}>开始自动评测</button>
     <button class="ghost-action compact-action" data-stage2-run-action="pause" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '请求暂停当前 run。' : disabledReason)}" ${disabled}>暂停</button>
     <button class="ghost-action compact-action" data-stage2-run-action="resume" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '请求继续当前 run。' : disabledReason)}" ${disabled}>继续</button>
-    <button class="ghost-action compact-action" data-stage2-run-action="analyze-round" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '触发 AI 复盘。' : disabledReason)}" ${disabled}>AI 复盘</button>
+    <button class="ghost-action compact-action" data-stage2-run-action="analyze-round" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '触发规则复盘；当前未接入可追踪 AI 模型调用。' : disabledReason)}" ${disabled}>规则复盘</button>
     <button class="ghost-action compact-action" data-stage2-run-action="continue-next-round" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(continueReason)}" ${continueDisabled}>进入下一轮</button>
     <button class="ghost-action compact-action" data-stage2-run-action="generate-report" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '生成或刷新报告。' : disabledReason)}" ${disabled}>生成报告</button>
     <button class="ghost-action compact-action danger-action" data-stage2-run-action="stop" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '停止当前 run。' : disabledReason)}" ${disabled}>停止</button>
@@ -1684,7 +1684,7 @@ function renderStage2Timeline(run) {
     return `
       <div class="stage2-empty">
         <strong>等待第一条运行事件</strong>
-        <p>v3 要求持续落盘进度事件。后端接入后，这里会显示 preflight、discovery、执行、AI 复盘和报告阶段。</p>
+        <p>v3 要求持续落盘进度事件。后端接入后，这里会显示 preflight、discovery、执行、复盘和报告阶段。</p>
       </div>
     `;
   }
@@ -1721,7 +1721,7 @@ function getStage2Timeline(run) {
     ['feature_analysis', '功能点识别'],
     ['case_generation', '用例生成'],
     ['execution', '安全执行'],
-    ['ai_analysis', 'AI 复盘'],
+    ['rule_analysis', '规则复盘'],
     ['reporting', '报告']
   ];
   const current = run.currentPhase || run.status || '';
@@ -1740,7 +1740,7 @@ function renderStage2V3OverviewTab() {
     return;
   }
   if (!run) {
-    container.innerHTML = renderStage2Empty('运行中心等待 run', '左侧创建 run 后，运行中心会把发现、执行、AI 复盘、人工介入和报告入口串成一条主流程。');
+    container.innerHTML = renderStage2Empty('运行中心等待 run', '左侧创建 run 后，运行中心会把发现、执行、复盘、人工介入和报告入口串成一条主流程。');
     return;
   }
   const analysis = getRunRoundAnalysis(run);
@@ -1775,10 +1775,10 @@ function renderStage2V3OverviewTab() {
       </article>
       <article class="stage2-work-card">
         <header>
-          <strong>AI 复盘摘要</strong>
+          <strong>复盘摘要</strong>
           <span class="tag">${escapeHtml(String(analysis.confidence ?? analysis.ai_confidence ?? '-'))}</span>
         </header>
-        <p>${escapeHtml(analysis.summary || analysis.coverage_summary?.summary || analysis.failure_summary?.summary || '暂无 AI 复盘产物。')}</p>
+        <p>${escapeHtml(analysis.summary || analysis.coverage_summary?.summary || analysis.failure_summary?.summary || (analysis.ai_provider_status === 'not_connected' ? '当前为规则复盘，尚未接入可追踪 AI 模型调用。' : '暂无复盘产物。'))}</p>
         <div class="tag-row">
           <span class="tag">${escapeHtml(String((analysis.human_tasks || analysis.humanTasks || []).length || getRunHumanTasks(run).length))} 个人工项</span>
           <span class="tag">${escapeHtml(String((analysis.improvement_candidates || analysis.improvementCandidates || []).length || 0))} 个改进候选</span>
@@ -1863,7 +1863,7 @@ function renderStage2V3AiTab() {
     return;
   }
   if (!run) {
-    container.innerHTML = renderStage2Empty('等待 AI 复盘', '每轮自动执行结束后，AI 应分析失败、证据质量和下一轮策略。');
+    container.innerHTML = renderStage2Empty('等待复盘', '每轮自动执行结束后，系统应分析失败、证据质量和下一轮策略。');
     return;
   }
   const analysis = getRunRoundAnalysis(run);
@@ -1876,7 +1876,10 @@ function renderStage2V3AiTab() {
           ['覆盖摘要', analysis.coverage_summary?.summary || analysis.coverageSummary?.summary || analysis.summary || '-'],
           ['失败摘要', analysis.failure_summary?.summary || analysis.failureSummary?.summary || '-'],
           ['证据质量', analysis.evidence_quality?.summary || analysis.evidenceQuality?.summary || '-'],
-          ['AI 置信度', analysis.confidence ?? analysis.ai_confidence ?? '-']
+          ['复盘模式', analysis.analysis_mode || analysis.analysisMode || '-'],
+          ['模型状态', analysis.ai_provider_status || analysis.aiProviderStatus || '-'],
+          ['未命中目标', (analysis.missing_scope_targets || analysis.missingScopeTargets || []).join('、') || '-'],
+          ['置信度', analysis.confidence ?? analysis.ai_confidence ?? '-']
         ])}
       </article>
       <article class="stage2-work-card">
@@ -3396,6 +3399,8 @@ function stageLabel(value = '') {
     case_generation: '用例生成',
     execution: '安全执行',
     ai_analysis: 'AI 复盘',
+    rule_round_analysis: '规则复盘',
+    rule_analysis: '规则复盘',
     submitted: '已提交',
     confirmed: '已确认',
     running: '执行中',

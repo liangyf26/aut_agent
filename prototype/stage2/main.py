@@ -1137,6 +1137,7 @@ async def run_v3_assessment_entrypoint(
     use_live_discovery: bool,
     execution_mode: str,
     safety_policy: str,
+    scope: str,
     allowed_side_effect_actions: list[str] | None,
     reuse_run_dir: bool,
     max_pages: int,
@@ -1167,6 +1168,7 @@ async def run_v3_assessment_entrypoint(
         metadata={
             "entrypoint": "prototype.stage2.main --run-v3",
             "template_name": template_name,
+            "scope": scope,
             "safety_policy": safety_policy,
             "allowed_side_effect_actions": list(allowed_side_effect_actions or ()),
         },
@@ -1382,6 +1384,11 @@ def main() -> None:
         choices=("low_risk_only", "test_env_full_access"),
         default="low_risk_only",
         help="For --run-v3, choose low_risk_only or test_env_full_access.",
+    )
+    parser.add_argument(
+        "--v3-scope",
+        default="",
+        help="For --run-v3, user-provided exploration scope or priority target text.",
     )
     parser.add_argument(
         "--v3-allow-side-effect-action",
@@ -1621,6 +1628,7 @@ def main() -> None:
                         use_live_discovery=args.v3_use_live_discovery,
                         execution_mode=args.v3_execution_mode,
                         safety_policy=args.v3_safety_policy,
+                        scope=args.v3_scope,
                         allowed_side_effect_actions=args.v3_allow_side_effect_action,
                         reuse_run_dir=args.v3_reuse_run_dir,
                         max_pages=args.v3_max_pages,

@@ -356,6 +356,44 @@ test('stage2 v3 run center starts real_browser mode through Python v3 bridge', a
   });
 });
 
+test('stage2 v3 run center keeps next round open when scoped target is not discovered', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '目标页面未命中系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      scope: '优先完成“线上备案申请”页面'
+    }, { runsDir });
+    let received = null;
+    const started = await startV3Run(created.run.runId, {
+      executionMode: 'real_browser'
+    }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        received = { args };
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId);
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    assert.equal(argValue(received.args, '--v3-scope'), '优先完成“线上备案申请”页面');
+    assert.equal(started.run.summary.nextDecision, 'auto_continue');
+
+    const runDir = path.join(runsDir, created.run.runId);
+    const analysis = await readJson(path.join(runDir, 'round_analysis.json'));
+    const nextRoundPlan = await readJson(path.join(runDir, 'next_round_plan.json'));
+    assert.deepEqual(analysis.missing_scope_targets, ['线上备案申请']);
+    assert.equal(analysis.ai_provider_status, 'not_connected');
+    assert.equal(nextRoundPlan.decision, 'auto_continue');
+    assert.equal(nextRoundPlan.should_continue, true);
+    assert.match(nextRoundPlan.next_round_goal, /线上备案申请/);
+  });
+});
+
 test('stage2 v3 run center persists and forwards test environment full access policy', async () => {
   await withTempRunsDir(async (runsDir) => {
     const created = await createV3Run({

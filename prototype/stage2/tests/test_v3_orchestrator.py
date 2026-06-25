@@ -126,6 +126,44 @@ def test_v3_run_can_consume_existing_discovery_paths() -> None:
         assert next_round_plan["status"] == "ready"
 
 
+def test_v3_run_records_missing_scope_target_without_marking_goal_complete() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        result = asyncio.run(
+            run_v3_assessment(
+                V3RunConfig(
+                    target_name="目标页面未命中系统",
+                    start_url="https://example.test/home",
+                    artifact_root=root / "runs",
+                    run_id="scope_missing_contract",
+                    max_pages=1,
+                    metadata={"scope": "优先完成“线上备案申请”页面"},
+                )
+            )
+        )
+
+        run_dir = Path(result["run_dir"])
+        round_analysis = _read_json(run_dir / "round_analysis.json")
+        human_tasks = _read_json(run_dir / "human_tasks.json")
+        next_round_plan = _read_json(run_dir / "next_round_plan.json")
+        report = (run_dir / "report.md").read_text(encoding="utf-8")
+
+        assert round_analysis["analysis_mode"] == "deterministic_rule_review"
+        assert round_analysis["ai_provider_status"] == "not_connected"
+        assert round_analysis["missing_scope_targets"] == ["线上备案申请"]
+        assert any(
+            cluster["cluster_id"] == "scope_target_not_found"
+            for cluster in round_analysis["failure_clusters"]
+        )
+        assert any(
+            task["task_id"] == "human_task_scope_target_not_found"
+            for task in human_tasks["tasks"]
+        )
+        assert next_round_plan["status"] == "ready"
+        assert "## 规则复盘" in report
+
+
 def test_v3_test_env_full_access_allows_side_effect_cases_without_human_review() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
