@@ -8,6 +8,7 @@ const path = require('path');
 const {
   analyzeV3Run,
   checkBrowserPreflight,
+  checkStage2ModelProfiles,
   continueNextRound,
   createV3Run,
   generateV3Report,
@@ -55,6 +56,42 @@ async function withFakeCdpServer(callback) {
   try {
     const { port } = server.address();
     return await callback(`http://127.0.0.1:${port}`);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+async function withFakeOpenAiCompatibleServer(callback) {
+  const requests = [];
+  const server = http.createServer(async (req, res) => {
+    if (req.method === 'POST' && req.url === '/v1/chat/completions') {
+      const chunks = [];
+      for await (const chunk of req) {
+        chunks.push(chunk);
+      }
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+      requests.push(body);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        id: `chatcmpl_${requests.length}`,
+        object: 'chat.completion',
+        choices: [{
+          index: 0,
+          message: body.tools
+            ? { role: 'assistant', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'ping', arguments: '{}' } }] }
+            : { role: 'assistant', content: '{"ok":true}' },
+          finish_reason: body.tools ? 'tool_calls' : 'stop'
+        }]
+      }));
+      return;
+    }
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const { port } = server.address();
+    return await callback(`http://127.0.0.1:${port}/v1`, requests);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
@@ -264,6 +301,87 @@ test('stage2 v3 browser preflight returns visible unavailable state', async () =
   const failed = await checkBrowserPreflight('http://127.0.0.1:1', { timeoutMs: 800 });
   assert.equal(failed.ok, false);
   assert.match(failed.message, /CDP/);
+});
+
+test('stage2 v3 run center loads model profiles, preflights them, and persists run selection', async () => {
+  await withFakeOpenAiCompatibleServer(async (baseUrl, requests) => {
+    await withTempRunsDir(async (runsDir) => {
+      const configPath = path.join(runsDir, 'stage2-model-profiles.json');
+      await fs.writeFile(configPath, JSON.stringify({
+        schema_version: 'stage2_model_profiles.v1',
+        profiles: [
+          {
+            id: 'deepseek-v4',
+            label: 'DeepSeek V4',
+            provider: 'openai_compatible',
+            baseUrl,
+            apiKey: 'test-key',
+            model: 'deepseek-v4-flash',
+            browserUseMode: 'chatopenai_structured'
+          },
+          {
+            id: 'offline-model',
+            label: 'Offline Model',
+            provider: 'openai_compatible',
+            baseUrl: 'http://127.0.0.1:1/v1',
+            apiKey: 'test-key',
+            model: 'offline-model'
+          }
+        ]
+      }, null, 2));
+
+      const preflight = await checkStage2ModelProfiles({ configPath, timeoutMs: 800 });
+      assert.equal(preflight.schema_version, 'stage2_model_profile_preflight.v1');
+      assert.equal(preflight.profiles.length, 2);
+      assert.equal(preflight.profiles[0].id, 'deepseek-v4');
+      assert.equal(preflight.profiles[0].status, 'available');
+      assert.equal(preflight.profiles[0].capability_tags.chat_completion, true);
+      assert.equal(preflight.profiles[0].capability_tags.json_object_response_format, true);
+      assert.equal(preflight.profiles[0].capability_tags.json_schema_response_format, true);
+      assert.equal(preflight.profiles[0].capability_tags.tool_calling, true);
+      assert.equal(preflight.profiles[0].capability_tags.browser_use_chatopenai_structured, true);
+      assert.equal(preflight.profiles[1].status, 'unavailable');
+      assert.ok(requests.length >= 4);
+
+      const created = await createV3Run({
+        systemName: '多模型样例系统',
+        entryUrl: 'https://example.com/home',
+        cdpUrl: 'http://localhost:9222',
+        modelProfileIds: ['deepseek-v4', 'offline-model']
+      }, { runsDir, modelProfileConfigPath: configPath });
+
+      assert.deepEqual(created.run.modelProfileIds, ['deepseek-v4', 'offline-model']);
+      assert.equal(created.run.modelProfiles[0].label, 'DeepSeek V4');
+      assert.equal(created.run.modelProfiles[0].apiKeyConfigured, true);
+      assert.equal(created.run.modelProfiles[0].apiKey, undefined);
+
+      let received = null;
+      await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+        runsDir,
+        modelProfileConfigPath: configPath,
+        pythonRunner: async ({ args, artifactRoot }) => {
+          received = { args };
+          const runId = argValue(args, '--v3-run-id');
+          const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId);
+          return {
+            stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+            stderr: ''
+          };
+        }
+      });
+
+      assert.deepEqual(
+        received.args.filter((item, index) => received.args[index - 1] === '--v3-model-profile'),
+        ['deepseek-v4', 'offline-model']
+      );
+
+      const inputConfig = await readJson(path.join(runsDir, created.run.runId, 'input_config.json'));
+      assert.deepEqual(inputConfig.selected_model_profile_ids, ['deepseek-v4', 'offline-model']);
+      assert.equal(inputConfig.selected_model_profiles[0].id, 'deepseek-v4');
+      assert.equal(inputConfig.selected_model_profiles[0].api_key_configured, true);
+      assert.equal(inputConfig.selected_model_profiles[0].api_key, undefined);
+    });
+  });
 });
 
 test('stage2 v3 run center creates a draft run and starts a stable artifact contract', async () => {

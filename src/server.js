@@ -21,6 +21,7 @@ const {
 const {
   analyzeV3Run,
   checkBrowserPreflight,
+  checkStage2ModelProfiles,
   continueNextRound,
   createV3Run,
   generateV3Report,
@@ -196,6 +197,15 @@ async function handleApi(req, res, pathname) {
     try {
       const query = new URL(req.url, `http://${req.headers.host}`).searchParams;
       sendJson(res, 200, await checkBrowserPreflight(query.get('cdpUrl') || query.get('cdp_url')));
+    } catch (error) {
+      sendStage2V3Error(res, error);
+    }
+    return true;
+  }
+
+  if (req.method === 'GET' && pathname === '/api/stage2/v3/model-profiles') {
+    try {
+      sendJson(res, 200, await checkStage2ModelProfiles());
     } catch (error) {
       sendStage2V3Error(res, error);
     }

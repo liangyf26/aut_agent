@@ -161,6 +161,7 @@ const state = {
   stage2LocalRuns: loadStage2LocalRuns(),
   stage2ActionLog: [],
   stage2BrowserPreflight: { status: 'unknown', ok: false, message: '浏览器连接状态待检查。' },
+  stage2ModelPreflight: { status: 'unknown', profiles: [], message: '模型预检状态待检查。' },
   stage2RunsApiAvailable: null,
   stage2LastError: '',
   selectedRunId: null,
@@ -348,10 +349,11 @@ function fillForm(project) {
 }
 
 async function loadDashboardData() {
-  const [projectsPayload, stage2Payload, stage2RunsPayload] = await Promise.all([
+  const [projectsPayload, stage2Payload, stage2RunsPayload, modelPreflightPayload] = await Promise.all([
     api('/api/projects'),
     api('/api/stage2/overview').catch(() => ({ overview: null })),
-    api('/api/stage2/v3/runs').catch((error) => ({ error }))
+    api('/api/stage2/v3/runs').catch((error) => ({ error })),
+    api('/api/stage2/v3/model-profiles').catch((error) => ({ error }))
   ]);
 
   state.projects = projectsPayload.projects;
@@ -359,6 +361,9 @@ async function loadDashboardData() {
   state.stage2RunsApiAvailable = !stage2RunsPayload.error;
   state.stage2LastError = stage2RunsPayload.error ? stage2RunsPayload.error.message : '';
   state.stage2Runs = normalizeStage2Runs(stage2RunsPayload, state.stage2Overview);
+  state.stage2ModelPreflight = modelPreflightPayload.error
+    ? { status: 'failed', profiles: [], message: `模型预检失败：${modelPreflightPayload.error.message}` }
+    : { status: 'checked', profiles: modelPreflightPayload.profiles || [], message: '模型预检已完成。' };
 
   if (state.currentProject?.id) {
     state.currentProject = state.projects.find((item) => item.id === state.currentProject.id) || null;
@@ -732,6 +737,51 @@ function renderStage2BrowserPreflight() {
   node.textContent = browserPreflightMessage();
 }
 
+function renderStage2ModelPreflight() {
+  const node = document.querySelector('#stage2ModelProfiles');
+  if (!node) {
+    return;
+  }
+  const profiles = state.stage2ModelPreflight?.profiles || [];
+  if (!profiles.length) {
+    node.innerHTML = `
+      <div class="stage2-model-profiles-head">
+        <strong>大模型预检</strong>
+        <button class="ghost-button small" id="refreshStage2ModelProfilesButton" type="button">刷新</button>
+      </div>
+      <p class="panel-note">${escapeHtml(state.stage2ModelPreflight?.message || '未配置模型 profiles。')}</p>
+    `;
+    return;
+  }
+  node.innerHTML = `
+    <div class="stage2-model-profiles-head">
+      <strong>大模型预检</strong>
+      <button class="ghost-button small" id="refreshStage2ModelProfilesButton" type="button">刷新</button>
+    </div>
+    <div class="stage2-model-profile-list">
+      ${profiles.map((profile) => {
+        const tags = profile.capability_tags || {};
+        const tagText = [
+          tags.chat_completion ? 'chat' : '',
+          tags.json_schema_response_format ? 'json_schema' : '',
+          tags.tool_calling ? 'tools' : '',
+          tags.browser_use_chatopenai_structured ? 'browser-use' : ''
+        ].filter(Boolean).join(' · ') || '无可用能力标签';
+        const available = profile.status === 'available';
+        return `
+          <label class="stage2-model-profile ${available ? 'available' : 'unavailable'}">
+            <input name="modelProfileIds" type="checkbox" value="${escapeHtml(profile.id)}" ${available ? '' : 'disabled'}>
+            <span>
+              <strong>${escapeHtml(profile.label || profile.id)}</strong>
+              <small>${escapeHtml(profile.model || '')} · ${available ? '可用' : '不可用'} · ${escapeHtml(tagText)}</small>
+            </span>
+          </label>
+        `;
+      }).join('')}
+    </div>
+  `;
+}
+
 function renderStage2SafetyConfirmation() {
   const panel = document.querySelector('#stage2SafetyConfirmation');
   const policySelect = stage2RunForm?.elements?.safetyPolicy;
@@ -752,6 +802,7 @@ async function createStage2Run(event) {
   const data = new FormData(stage2RunForm);
   const safetyPolicy = normalizeStage2SafetyPolicy(data.get('safetyPolicy') || 'low_risk_only');
   const allowedSideEffects = safetyPolicy === 'test_env_full_access' ? [...STAGE2_FULL_ACCESS_ALLOWLIST] : [];
+  const modelProfileIds = [...new Set(data.getAll('modelProfileIds').map((item) => item.trim()).filter(Boolean))];
   const payload = {
     systemName: data.get('systemName')?.trim() || '',
     system_name: data.get('systemName')?.trim() || '',
@@ -772,6 +823,8 @@ async function createStage2Run(event) {
     accountNotes: data.get('accountNotes')?.trim() || '',
     account_notes: data.get('accountNotes')?.trim() || '',
     scope: data.get('scope')?.trim() || '',
+    modelProfileIds,
+    model_profile_ids: modelProfileIds,
     maxPages: Number(data.get('maxPages')) || 30,
     max_pages: Number(data.get('maxPages')) || 30,
     maxRounds: Number(data.get('maxRounds')) || 2,
@@ -1518,6 +1571,7 @@ function renderStage2Overview() {
   renderStage2V3ArtifactsTab();
   renderStage2ActionFeedback();
   renderStage2BrowserPreflight();
+  renderStage2ModelPreflight();
   renderStage2SafetyConfirmation();
 }
 
@@ -3514,6 +3568,16 @@ document.querySelector('#stage2Cockpit')?.addEventListener('click', (event) => {
   const refreshButton = event.target.closest('[data-stage2-action="refresh-runs"]');
   if (refreshButton) {
     refreshStage2Runs();
+    return;
+  }
+
+  const refreshModelsButton = event.target.closest('#refreshStage2ModelProfilesButton');
+  if (refreshModelsButton) {
+    loadDashboardData().then(() => {
+      pushStage2ActionLog('大模型预检状态已刷新。', 'success');
+    }).catch((error) => {
+      pushStage2ActionLog(`大模型预检刷新失败：${error.message}`, 'error');
+    });
     return;
   }
 
