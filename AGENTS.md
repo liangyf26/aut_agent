@@ -84,3 +84,17 @@ python -m prototype.stage2.main --validation-matrix --cdp-url http://localhost:9
 - 更新文档时优先改现有条目，不要在顶部追加会话流水账
 - 若第二阶段 CLI、产物名、里程碑状态变化，需同步更新 `README.md`、`docs/第二阶段原型开发计划.md`、`docs/技术方案第二阶段.md`
 - 若新增长期稳定术语，补到 `CONTEXT.md`
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked in GitHub Issues for `liangyf26/aut_agent`; external PRs are not a triage request surface. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the default five-label triage vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This repo uses a single-context domain layout: root `CONTEXT.md` plus ADRs under `docs/adr/`. See `docs/agents/domain.md`.
