@@ -940,6 +940,68 @@ textarea:focus {
   background: #fffbeb;
 }
 
+.stage2-model-profiles {
+  display: grid;
+  gap: 8px;
+  margin: -2px 0 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.stage2-model-profiles-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.stage2-model-profile-list {
+  display: grid;
+  gap: 6px;
+}
+
+.stage2-model-profile {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f8fafc;
+  font-size: 12px;
+}
+
+.stage2-model-profile.available {
+  border-color: #a7f3d0;
+  background: #ecfdf5;
+}
+
+.stage2-model-profile.unavailable {
+  color: var(--muted);
+  background: #f1f5f9;
+}
+
+.stage2-model-profile input {
+  width: 16px;
+  min-width: 16px;
+  margin-top: 2px;
+}
+
+.stage2-model-profile strong,
+.stage2-model-profile small {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.stage2-model-profile small {
+  margin-top: 2px;
+  color: var(--muted);
+}
+
 .stage2-safety-confirmation {
   display: grid;
   gap: 10px;

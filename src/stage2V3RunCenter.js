@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const { execFile } = require('child_process');
+const fsSync = require('fs');
 const fs = require('fs/promises');
 const path = require('path');
 const { promisify } = require('util');
@@ -7,6 +8,7 @@ const { promisify } = require('util');
 const ROOT_DIR = path.join(__dirname, '..');
 const DEFAULT_STAGE2_RUNS_DIR = path.join(ROOT_DIR, 'artifacts', 'stage2', 'runs');
 const DEFAULT_CDP_URL = 'http://localhost:9222/';
+const DEFAULT_MODEL_PROFILES_PATH = path.join(ROOT_DIR, 'config', 'stage2-model-profiles.json');
 const SAFE_ID_PATTERN = /^[A-Za-z0-9_-]{1,120}$/;
 const LOCAL_CDP_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
 const DEFAULT_PYTHON_COMMAND = process.env.STAGE2_PYTHON || process.env.PYTHON || 'python';
@@ -113,6 +115,78 @@ function normalizeOptionalText(value) {
   return text || null;
 }
 
+function normalizeModelProfileId(value) {
+  return String(value || '').trim().replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 120);
+}
+
+function normalizeArray(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item || '').trim()).filter(Boolean);
+  }
+  if (typeof value === 'string') {
+    return value.split(/[,;\s]+/).map((item) => item.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function modelProfilesConfigPath(options = {}) {
+  return options.configPath
+    || options.modelProfileConfigPath
+    || process.env.STAGE2_MODEL_PROFILES_PATH
+    || DEFAULT_MODEL_PROFILES_PATH;
+}
+
+function redactModelProfile(profile) {
+  return {
+    id: profile.id,
+    label: profile.label,
+    provider: profile.provider,
+    baseUrl: profile.baseUrl,
+    base_url: profile.baseUrl,
+    model: profile.model,
+    browserUseMode: profile.browserUseMode,
+    browser_use_mode: profile.browserUseMode,
+    apiKeyConfigured: Boolean(profile.apiKey),
+    api_key_configured: Boolean(profile.apiKey)
+  };
+}
+
+function loadStage2ModelProfiles(options = {}) {
+  const configPath = modelProfilesConfigPath(options);
+  if (!fsSync.existsSync(configPath)) {
+    return {
+      schema_version: 'stage2_model_profiles.v1',
+      config_path: configPath,
+      profiles: []
+    };
+  }
+  const payload = JSON.parse(fsSync.readFileSync(configPath, 'utf8'));
+  const profiles = (payload.profiles || []).map((profile) => {
+    const id = normalizeModelProfileId(profile.id || profile.name || profile.model);
+    const apiKeyEnv = normalizeOptionalText(profile.apiKeyEnv || profile.api_key_env);
+    return {
+      id,
+      label: normalizeText(profile.label || profile.name, id),
+      provider: normalizeText(profile.provider || profile.type, 'openai_compatible'),
+      baseUrl: normalizeText(profile.baseUrl || profile.base_url, '').replace(/\/$/, ''),
+      apiKey: normalizeText(profile.apiKey || profile.api_key || (apiKeyEnv ? process.env[apiKeyEnv] : ''), ''),
+      apiKeyEnv,
+      model: normalizeText(profile.model, id),
+      browserUseMode: normalizeOptionalText(profile.browserUseMode || profile.browser_use_mode)
+    };
+  }).filter((profile) => profile.id);
+  return {
+    schema_version: 'stage2_model_profiles.v1',
+    config_path: configPath,
+    profiles
+  };
+}
+
+function selectModelProfiles(selectedIds, availableProfiles) {
+  const byId = new Map((availableProfiles || []).map((profile) => [profile.id, profile]));
+  return selectedIds.map((id) => byId.get(id)).filter(Boolean).map(redactModelProfile);
+}
+
 function normalizeHttpUrl(value, fieldName, fallback = null) {
   const raw = normalizeText(value, fallback || '');
   if (!raw) {
@@ -138,10 +212,21 @@ function normalizeCdpUrl(value) {
   return url.toString();
 }
 
-function normalizeInputConfig(body = {}) {
+function normalizeInputConfig(body = {}, options = {}) {
   const systemName = normalizeText(body.systemName || body.system_name || body.targetName, '未命名系统');
   const entryUrl = normalizeHttpUrl(body.entryUrl || body.entry_url || body.homeUrl || body.pageUrl, 'entryUrl');
   const safetyPolicy = normalizeSafetyPolicy(body.safetyPolicy || body.safety_policy);
+  const configuredProfiles = options.modelProfiles || loadStage2ModelProfiles(options).profiles;
+  const selectedModelProfileIds = normalizeArray(
+    body.modelProfileIds
+      || body.model_profile_ids
+      || body.selectedModelProfileIds
+      || body.selected_model_profile_ids
+      || body.modelProfiles
+      || body.model_profiles
+      || body.model
+  ).map(normalizeModelProfileId).filter(Boolean);
+  const selectedModelProfiles = selectModelProfiles(selectedModelProfileIds, configuredProfiles);
   const allowedSideEffectActions = normalizeAllowedSideEffectActions(
     body.allowedSideEffectActions
       || body.allowed_side_effect_actions
@@ -171,6 +256,8 @@ function normalizeInputConfig(body = {}) {
     allowed_side_effect_actions: safetyPolicy === SAFETY_POLICY_TEST_ENV_FULL_ACCESS
       ? (allowedSideEffectActions.length ? allowedSideEffectActions : DEFAULT_FULL_ACCESS_ACTIONS)
       : [],
+    selected_model_profile_ids: selectedModelProfileIds,
+    selected_model_profiles: selectedModelProfiles,
     max_pages: normalizeInteger(body.maxPages || body.max_pages, 30, 1, 200),
     max_features_per_page: normalizeInteger(body.maxFeaturesPerPage || body.max_features_per_page, 30, 1, 200),
     auto_continue: body.autoContinue === true || body.auto_continue === true,
@@ -357,6 +444,134 @@ async function checkBrowserPreflight(cdpUrl = DEFAULT_CDP_URL, options = {}) {
   }
 }
 
+async function postModelProbe(profile, body, options = {}) {
+  const timeoutMs = normalizeInteger(options.timeoutMs || options.timeout_ms, 3000, 500, 30000);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const endpoint = new URL('chat/completions', `${profile.baseUrl.replace(/\/$/, '')}/`).toString();
+    const headers = { 'Content-Type': 'application/json' };
+    if (profile.apiKey) {
+      headers.Authorization = `Bearer ${profile.apiKey}`;
+    }
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      signal: controller.signal,
+      headers,
+      body: JSON.stringify({
+        model: profile.model,
+        messages: [{ role: 'user', content: 'Return {"ok": true}.' }],
+        max_tokens: 32,
+        ...body
+      })
+    });
+    if (!response.ok) {
+      return { ok: false, reason: `HTTP ${response.status}` };
+    }
+    const payload = await response.json().catch(() => ({}));
+    return { ok: true, payload };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: error.name === 'AbortError' ? 'timeout' : error.message
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function preflightModelProfile(profile, options = {}) {
+  const checkedAt = nowIso();
+  if (profile.provider !== 'openai_compatible') {
+    return {
+      id: profile.id,
+      label: profile.label,
+      provider: profile.provider,
+      model: profile.model,
+      status: 'unsupported',
+      checked_at: checkedAt,
+      capability_tags: {},
+      checks: { provider: { ok: false, reason: '当前仅支持 OpenAI-compatible 模型预检。' } },
+      profile: redactModelProfile(profile)
+    };
+  }
+  const plain = await postModelProbe(profile, {}, options);
+  const jsonObject = plain.ok ? await postModelProbe(profile, {
+    response_format: { type: 'json_object' }
+  }, options) : { ok: false, reason: plain.reason };
+  const jsonSchema = plain.ok ? await postModelProbe(profile, {
+    response_format: {
+      type: 'json_schema',
+      json_schema: {
+        name: 'stage2_model_preflight',
+        schema: {
+          type: 'object',
+          properties: { ok: { type: 'boolean' } },
+          required: ['ok'],
+          additionalProperties: false
+        }
+      }
+    }
+  }, options) : { ok: false, reason: plain.reason };
+  const tools = plain.ok ? await postModelProbe(profile, {
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'ping',
+        description: 'Capability probe ping.',
+        parameters: {
+          type: 'object',
+          properties: {},
+          additionalProperties: false
+        }
+      }
+    }]
+  }, options) : { ok: false, reason: plain.reason };
+  const capabilityTags = {
+    chat_completion: plain.ok,
+    json_object_response_format: jsonObject.ok,
+    json_schema_response_format: jsonSchema.ok,
+    tool_calling: tools.ok,
+    browser_use_chatopenai_structured: plain.ok
+      && jsonSchema.ok
+      && profile.browserUseMode === 'chatopenai_structured'
+  };
+  return {
+    id: profile.id,
+    label: profile.label,
+    provider: profile.provider,
+    model: profile.model,
+    status: plain.ok ? 'available' : 'unavailable',
+    checked_at: checkedAt,
+    capability_tags: capabilityTags,
+    checks: {
+      chat_completion: { ok: plain.ok, reason: plain.reason || null },
+      json_object_response_format: { ok: jsonObject.ok, reason: jsonObject.reason || null },
+      json_schema_response_format: { ok: jsonSchema.ok, reason: jsonSchema.reason || null },
+      tool_calling: { ok: tools.ok, reason: tools.reason || null },
+      browser_use: {
+        ok: capabilityTags.browser_use_chatopenai_structured,
+        mode: profile.browserUseMode || null
+      }
+    },
+    profile: redactModelProfile(profile)
+  };
+}
+
+async function checkStage2ModelProfiles(options = {}) {
+  const config = loadStage2ModelProfiles(options);
+  const profiles = [];
+  for (const profile of config.profiles) {
+    profiles.push(await preflightModelProfile(profile, options));
+  }
+  return {
+    schema_version: 'stage2_model_profile_preflight.v1',
+    config_path: config.config_path,
+    checked_at: nowIso(),
+    profiles
+  };
+}
+
 async function appendEvent(runDir, event) {
   await fs.mkdir(runDir, { recursive: true });
   await fs.appendFile(
@@ -376,6 +591,8 @@ function buildManifest({ runId, inputConfig, status, createdAt, updatedAt, round
     safety_policy: inputConfig.safety_policy,
     full_access_confirmed: inputConfig.full_access_confirmed,
     allowed_side_effect_actions: inputConfig.allowed_side_effect_actions,
+    selected_model_profile_ids: inputConfig.selected_model_profile_ids,
+    selected_model_profiles: inputConfig.selected_model_profiles,
     status,
     created_at: createdAt,
     updated_at: updatedAt,
@@ -473,6 +690,12 @@ function buildPublicRun(runDir, manifest, artifacts = {}) {
     safetyPolicy: manifest.safety_policy || artifacts.input_config?.safety_policy || SAFETY_POLICY_LOW_RISK_ONLY,
     allowedSideEffectActions: manifest.allowed_side_effect_actions
       || artifacts.input_config?.allowed_side_effect_actions
+      || [],
+    modelProfileIds: manifest.selected_model_profile_ids
+      || artifacts.input_config?.selected_model_profile_ids
+      || [],
+    modelProfiles: manifest.selected_model_profiles
+      || artifacts.input_config?.selected_model_profiles
       || [],
     fullAccessConfirmed: Boolean(manifest.full_access_confirmed || artifacts.input_config?.full_access_confirmed),
     currentRoundId: manifest.current_round_id,
@@ -648,7 +871,7 @@ async function createV3Run(body = {}, options = {}) {
   const runId = createRunId();
   const runDir = path.join(runsDir, runId);
   const createdAt = nowIso();
-  const inputConfig = normalizeInputConfig(body);
+  const inputConfig = normalizeInputConfig(body, options);
   const manifest = buildManifest({
     runId,
     inputConfig,
@@ -1247,6 +1470,9 @@ async function runPythonV3Orchestrator({ runId, runsDir, runDir, inputConfig, bo
   }
   for (const action of inputConfig.allowed_side_effect_actions || []) {
     args.push('--v3-allow-side-effect-action', action);
+  }
+  for (const profileId of inputConfig.selected_model_profile_ids || []) {
+    args.push('--v3-model-profile', profileId);
   }
   if (body.useLiveDiscovery !== false && body.use_live_discovery !== false) {
     args.push('--v3-use-live-discovery');
@@ -2095,6 +2321,7 @@ module.exports = {
   Stage2V3InputError,
   analyzeV3Run,
   checkBrowserPreflight,
+  checkStage2ModelProfiles,
   continueNextRound,
   createV3Run,
   generateV3Report,
