@@ -882,7 +882,9 @@ test('stage2 v3 run center persists and forwards test environment full access po
     const manifest = await readJson(path.join(runDir, 'run_manifest.json'));
     const inputConfig = await readJson(path.join(runDir, 'input_config.json'));
     const executionResults = await readJson(path.join(runDir, 'execution_results.json'));
+    const publicRun = await getV3Run(created.run.runId, { runsDir });
     assert.equal(manifest.safety_policy, 'test_env_full_access');
+    assert.equal(publicRun.run.fullAccessConfirmed, true);
     assert.equal(inputConfig.full_access_confirmed, true);
     assert.deepEqual(inputConfig.allowed_side_effect_actions, ['submit', 'delete', 'approve']);
     assert.equal(argValue(received.args, '--v3-safety-policy'), 'test_env_full_access');
