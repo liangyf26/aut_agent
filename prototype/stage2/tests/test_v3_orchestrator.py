@@ -427,5 +427,131 @@ def test_v3_real_browser_menu_discovery_writes_menu_artifacts_without_counting_c
         assert round_analysis["missing_scope_targets"] == []
 
 
+def test_v3_target_tracking_links_found_second_level_menu_target() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        async def fake_real_browser_provider(
+            config: V3RunConfig,
+            run_dir: Path,
+        ) -> dict[str, object]:
+            return {
+                "schema_version": "stage2_v3_run.v1",
+                "status": "completed",
+                "preflight_result": {"ok": True, "status": "completed"},
+                "menu_entries": [
+                    {
+                        "menu_id": "menu_001",
+                        "text": "业务办理",
+                        "level": 1,
+                        "is_leaf": False,
+                        "status": "expanded",
+                        "source": "playwright.menu_discovery",
+                    },
+                    {
+                        "menu_id": "menu_002",
+                        "text": "线上备案申请",
+                        "level": 2,
+                        "parent_id": "menu_001",
+                        "menu_path": ["业务办理", "线上备案申请"],
+                        "is_leaf": True,
+                        "status": "discovered",
+                        "route_hint": "/online/apply",
+                        "source": "playwright.menu_discovery",
+                        "screenshot_refs": ["menu_001_after_expand"],
+                    },
+                ],
+                "menu_tree": {"schema_version": "stage2_menu_tree.v1", "root_count": 1, "nodes": []},
+                "menu_traversal_log": [],
+                "screenshots_index": {"schema_version": "stage2_v3_run.v1", "screenshots": []},
+                "pages": [],
+                "features": [],
+            }
+
+        result = asyncio.run(
+            run_v3_assessment(
+                V3RunConfig(
+                    target_name="追本溯源管理平台",
+                    start_url="https://example.test/index",
+                    cdp_url="http://localhost:9222",
+                    execution_mode="real_browser",
+                    artifact_root=root / "runs",
+                    run_id="target_found",
+                    metadata={"prioritized_targets": ["线上备案申请"]},
+                ),
+                real_browser_provider=fake_real_browser_provider,
+            )
+        )
+
+        run_dir = Path(result["run_dir"])
+        round_analysis = _read_json(run_dir / "round_analysis.json")
+        next_round_plan = _read_json(run_dir / "next_round_plan.json")
+
+        assert round_analysis["missing_scope_targets"] == []
+        assert round_analysis["target_tracking"][0]["target"] == "线上备案申请"
+        assert round_analysis["target_tracking"][0]["status"] == "found"
+        assert round_analysis["target_tracking"][0]["matched_menu_entry_ids"] == ["menu_002"]
+        assert round_analysis["target_tracking"][0]["evidence_quality"] == "high"
+        assert next_round_plan["target_search_goals"] == []
+
+
+def test_v3_target_tracking_carries_unfound_target_forward() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        result = asyncio.run(
+            run_v3_assessment(
+                V3RunConfig(
+                    target_name="追本溯源管理平台",
+                    start_url="https://example.test/index",
+                    artifact_root=root / "runs",
+                    run_id="target_missing",
+                    max_pages=1,
+                    metadata={"prioritized_targets": ["线上备案申请"]},
+                )
+            )
+        )
+
+        run_dir = Path(result["run_dir"])
+        round_analysis = _read_json(run_dir / "round_analysis.json")
+        next_round_plan = _read_json(run_dir / "next_round_plan.json")
+
+        assert round_analysis["missing_scope_targets"] == ["线上备案申请"]
+        assert round_analysis["target_tracking"][0]["status"] == "missed"
+        assert round_analysis["target_tracking"][0]["missed_reason"] == "not_found_in_menu_or_page_artifacts"
+        assert round_analysis["target_tracking"][0]["evidence_quality"] == "low"
+        assert next_round_plan["target_search_goals"] == ["线上备案申请"]
+
+
+def test_v3_target_tracking_respects_user_waived_target() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        result = asyncio.run(
+            run_v3_assessment(
+                V3RunConfig(
+                    target_name="追本溯源管理平台",
+                    start_url="https://example.test/index",
+                    artifact_root=root / "runs",
+                    run_id="target_waived",
+                    max_pages=1,
+                    metadata={
+                        "prioritized_targets": ["线上备案申请"],
+                        "waived_targets": ["线上备案申请"],
+                    },
+                )
+            )
+        )
+
+        run_dir = Path(result["run_dir"])
+        round_analysis = _read_json(run_dir / "round_analysis.json")
+        next_round_plan = _read_json(run_dir / "next_round_plan.json")
+
+        assert round_analysis["missing_scope_targets"] == []
+        assert round_analysis["target_tracking"][0]["status"] == "waived"
+        assert round_analysis["target_tracking"][0]["waived"] is True
+        assert next_round_plan["target_search_goals"] == []
+
+
 def _read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))

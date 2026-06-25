@@ -528,6 +528,61 @@ test('stage2 v3 run center exposes first-round menu discovery separately from br
   });
 });
 
+test('stage2 v3 run center tracks prioritized and waived target pages across Python bridge', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      scope: '第一轮完整遍历菜单入口',
+      prioritizedTargets: ['线上备案申请', '备案进度查询'],
+      waivedTargets: ['旧版备案页面']
+    }, { runsDir });
+    let received = null;
+
+    const started = await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        received = { args };
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId);
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    const inputConfig = await readJson(path.join(runsDir, created.run.runId, 'input_config.json'));
+    assert.deepEqual(inputConfig.prioritized_targets, ['线上备案申请', '备案进度查询']);
+    assert.deepEqual(inputConfig.waived_targets, ['旧版备案页面']);
+    assert.deepEqual(
+      received.args.filter((item, index) => received.args[index - 1] === '--v3-prioritized-target'),
+      ['线上备案申请', '备案进度查询']
+    );
+    assert.deepEqual(
+      received.args.filter((item, index) => received.args[index - 1] === '--v3-waived-target'),
+      ['旧版备案页面']
+    );
+
+    assert.equal(started.run.summary.targetTracking.total, 3);
+    assert.equal(started.run.summary.targetTracking.found, 1);
+    assert.equal(started.run.summary.targetTracking.missed, 1);
+    assert.equal(started.run.summary.targetTracking.waived, 1);
+    assert.equal(started.run.targetTracking.items[0].status, 'found');
+    assert.equal(started.run.targetTracking.items[0].matched_items[0].kind, 'menu_entry');
+    assert.equal(started.run.targetTracking.items[0].matched_items[0].menu_id, 'menu_online_apply');
+    assert.deepEqual(started.run.missedTargets, ['备案进度查询']);
+
+    const runDir = path.join(runsDir, created.run.runId);
+    const analysis = await readJson(path.join(runDir, 'round_analysis.json'));
+    const nextRoundPlan = await readJson(path.join(runDir, 'next_round_plan.json'));
+    assert.deepEqual(analysis.missing_scope_targets, ['备案进度查询']);
+    assert.equal(analysis.target_tracking.find((item) => item.target === '旧版备案页面').status, 'waived');
+    assert.deepEqual(nextRoundPlan.target_search_goals, ['备案进度查询']);
+  });
+});
+
 test('stage2 v3 run center returns visible operation feedback and persisted status context', async () => {
   await withTempRunsDir(async (runsDir) => {
     const created = await createV3Run({
@@ -641,7 +696,7 @@ test('stage2 v3 run center keeps next round open when scoped target is not disco
       systemName: '目标页面未命中系统',
       entryUrl: 'https://example.com/home',
       cdpUrl: 'http://localhost:9222',
-      scope: '优先完成“线上备案申请”页面'
+      scope: '优先完成“备案进度查询”页面'
     }, { runsDir });
     let received = null;
     const started = await startV3Run(created.run.runId, {
@@ -659,17 +714,17 @@ test('stage2 v3 run center keeps next round open when scoped target is not disco
       }
     });
 
-    assert.equal(argValue(received.args, '--v3-scope'), '优先完成“线上备案申请”页面');
+    assert.equal(argValue(received.args, '--v3-scope'), '优先完成“备案进度查询”页面');
     assert.equal(started.run.summary.nextDecision, 'auto_continue');
 
     const runDir = path.join(runsDir, created.run.runId);
     const analysis = await readJson(path.join(runDir, 'round_analysis.json'));
     const nextRoundPlan = await readJson(path.join(runDir, 'next_round_plan.json'));
-    assert.deepEqual(analysis.missing_scope_targets, ['线上备案申请']);
+    assert.deepEqual(analysis.missing_scope_targets, ['备案进度查询']);
     assert.equal(analysis.ai_provider_status, 'not_connected');
     assert.equal(nextRoundPlan.decision, 'auto_continue');
     assert.equal(nextRoundPlan.should_continue, true);
-    assert.match(nextRoundPlan.next_round_goal, /线上备案申请/);
+    assert.match(nextRoundPlan.next_round_goal, /备案进度查询/);
   });
 });
 
