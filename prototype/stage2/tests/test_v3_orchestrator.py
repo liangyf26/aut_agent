@@ -427,6 +427,154 @@ def test_v3_real_browser_menu_discovery_writes_menu_artifacts_without_counting_c
         assert round_analysis["missing_scope_targets"] == []
 
 
+def test_v3_second_round_menu_leaf_page_exploration_persists_attempts_and_count_explanation() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        async def fake_real_browser_provider(
+            config: V3RunConfig,
+            run_dir: Path,
+        ) -> dict[str, object]:
+            return {
+                "schema_version": "stage2_v3_run.v1",
+                "status": "completed",
+                "message": "second round page exploration completed",
+                "browser_targets": [{"url": "https://example.test/index"}],
+                "menu_tree": {
+                    "schema_version": "stage2_menu_tree.v1",
+                    "status": "completed",
+                    "root_count": 1,
+                    "leaf_count": 2,
+                    "nodes": [],
+                },
+                "menu_entries": [
+                    {
+                        "menu_id": "menu_apply",
+                        "text": "线上备案申请",
+                        "menu_path": ["业务办理", "线上备案申请"],
+                        "is_leaf": True,
+                        "status": "discovered",
+                        "route_hint": "/online/apply",
+                        "source": "playwright.menu_discovery",
+                    },
+                    {
+                        "menu_id": "menu_archive",
+                        "text": "归档查询",
+                        "menu_path": ["查询统计", "归档查询"],
+                        "is_leaf": True,
+                        "status": "discovered",
+                        "route_hint": "/archive/query",
+                        "source": "playwright.menu_discovery",
+                    },
+                ],
+                "page_exploration_log": [
+                    {
+                        "event": "enter_menu_leaf",
+                        "menu_id": "menu_apply",
+                        "status": "reachable",
+                        "page_entry_id": "page_apply",
+                        "screenshot_ref": "page_apply_visible",
+                    },
+                    {
+                        "event": "enter_menu_leaf",
+                        "menu_id": "menu_archive",
+                        "status": "failed",
+                        "failure_reason": "navigation_timeout",
+                    },
+                ],
+                "pages": [
+                    {
+                        "page_id": "page_apply",
+                        "page_entry_id": "page_apply",
+                        "menu_id": "menu_apply",
+                        "name": "线上备案申请",
+                        "url": "https://example.test/online/apply",
+                        "menu_path": ["业务办理", "线上备案申请"],
+                        "page_type": "form_entry",
+                        "semantic_page_type": "form_entry",
+                        "discovery_depth": 1,
+                        "status": "reachable",
+                        "source": "playwright.menu_page_exploration",
+                        "screenshot_refs": ["page_apply_visible"],
+                    },
+                    {
+                        "page_id": "page_archive",
+                        "page_entry_id": "page_archive",
+                        "menu_id": "menu_archive",
+                        "name": "归档查询",
+                        "url": "https://example.test/archive/query",
+                        "menu_path": ["查询统计", "归档查询"],
+                        "page_type": "query_list",
+                        "semantic_page_type": "query_list",
+                        "discovery_depth": 1,
+                        "status": "unreachable",
+                        "source": "playwright.menu_page_exploration",
+                        "screenshot_refs": [],
+                        "failure_reason": "navigation_timeout",
+                    },
+                ],
+                "features": [
+                    {
+                        "feature_id": "feature_submit",
+                        "feature_point_id": "feature_submit",
+                        "page_id": "page_apply",
+                        "page_entry_id": "page_apply",
+                        "name": "提交",
+                        "feature_type": "submit",
+                        "risk_level": "high",
+                        "source": "playwright.light_interaction",
+                        "confidence": 0.91,
+                    }
+                ],
+                "screenshots_index": {
+                    "schema_version": "stage2_v3_run.v1",
+                    "screenshots": [
+                        {
+                            "screenshot_id": "page_apply_visible",
+                            "relative_path": "screenshots/page_apply_visible.png",
+                            "stage": "page_exploration",
+                        }
+                    ],
+                    "items": [],
+                },
+            }
+
+        result = asyncio.run(
+            run_v3_assessment(
+                V3RunConfig(
+                    target_name="追本溯源管理平台",
+                    start_url="https://example.test/index",
+                    cdp_url="http://localhost:9222",
+                    execution_mode="real_browser",
+                    artifact_root=root / "runs",
+                    run_id="page_exploration",
+                    max_pages=30,
+                ),
+                real_browser_provider=fake_real_browser_provider,
+            )
+        )
+
+        run_dir = Path(result["run_dir"])
+        page_entries = _read_json(run_dir / "page_entries.json")["page_entries"]
+        feature_points = _read_json(run_dir / "feature_points.json")["feature_points"]
+        round_analysis = _read_json(run_dir / "round_analysis.json")
+        exploration_log = (run_dir / "page_exploration_log.jsonl").read_text(encoding="utf-8")
+
+        assert [page["status"] for page in page_entries] == ["reachable", "unreachable"]
+        assert page_entries[0]["source"] == "playwright.menu_page_exploration"
+        assert page_entries[0]["page_type"] == "form_entry"
+        assert page_entries[1]["failure_reason"] == "navigation_timeout"
+        assert "menu_archive" in exploration_log
+        assert feature_points[0]["auto_verifiable"] is True
+        assert feature_points[0]["verification_strategy"] == "side_effect_policy_gate"
+        assert feature_points[0]["review_status"] == "pending"
+        assert round_analysis["coverage"]["menu_leaf_count"] == 2
+        assert round_analysis["coverage"]["page_count"] == 2
+        assert round_analysis["coverage"]["feature_count"] == 1
+        assert round_analysis["count_explanation"]["menu_leaf_vs_page_entries"] == "2 menu leaves attempted; 2 page entries recorded."
+        assert round_analysis["count_explanation"]["browser_targets"] == "1 browser targets are diagnostic CDP targets, not discovered business pages."
+
+
 def test_v3_target_tracking_links_found_second_level_menu_target() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)

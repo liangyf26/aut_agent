@@ -122,6 +122,12 @@ async def run_v3_assessment(
     )
     writer.write_json("pages.json", {"schema_version": V3_SCHEMA_VERSION, "pages": pages, "items": pages})
     writer.write_json("page_entries.json", {"schema_version": V3_SCHEMA_VERSION, "page_entries": pages, "items": pages})
+    page_exploration_log = _extract_page_exploration_log(
+        real_browser_payload,
+        pages=pages,
+        menu_entries=menu_artifacts["menu_entries"],
+    )
+    writer.write_jsonl("page_exploration_log.jsonl", page_exploration_log)
     writer.update_state("feature_identification", "running", f"identified {len(pages)} page entries")
 
     features = _build_features(
@@ -220,6 +226,7 @@ async def run_v3_assessment(
                 "menu_tree.json",
                 "menu_entries.json",
                 "menu_traversal_log.jsonl",
+                "page_exploration_log.jsonl",
                 "navigation_tree.json",
                 "pages.json",
                 "features.json",
@@ -351,18 +358,22 @@ def _build_pages(
     real_browser_payload: dict[str, Any] | None = None,
     menu_entries: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    if real_browser_payload:
+        real_pages = real_browser_payload.get("pages") or real_browser_payload.get("page_entries")
+        if isinstance(real_pages, dict):
+            real_pages = real_pages.get("items") or real_pages.get("page_entries")
+        has_page_exploration = bool(real_browser_payload.get("page_exploration_log") or real_browser_payload.get("page_exploration_log_path"))
+        if isinstance(real_pages, list) and real_pages and (
+            has_page_exploration
+            or any("menu_page_exploration" in _text(item.get("source")) for item in real_pages if isinstance(item, dict))
+        ):
+            return _normalize_real_browser_pages(config, real_pages)
     if menu_entries:
         pages = _pages_from_menu_entries(config, menu_entries)
         if pages:
-            return pages[: max(0, config.max_pages)]
-    if real_browser_payload:
-        real_pages = real_browser_payload.get("pages")
-        if isinstance(real_pages, list):
-            return [item for item in real_pages if isinstance(item, dict)][
-                : max(0, config.max_pages)
-            ]
-        if _normalize_execution_mode(config.execution_mode) == "real_browser":
-            return []
+            return pages[: max(1, config.max_pages)]
+    if real_browser_payload and _normalize_execution_mode(config.execution_mode) == "real_browser":
+        return []
     discovered = _load_discovery_list(discovery_payload, "page_entries", "page_entries_path")
     pages: list[dict[str, Any]] = []
     for index, item in enumerate(discovered[: max(1, config.max_pages)], start=1):
@@ -386,6 +397,50 @@ def _build_pages(
     if pages:
         return pages
     return _demo_pages(config)
+
+
+def _normalize_real_browser_pages(
+    config: V3RunConfig,
+    pages: list[Any],
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(pages[: max(1, config.max_pages)], start=1):
+        if not isinstance(item, dict):
+            continue
+        page_id = _text(item.get("page_entry_id")) or _text(item.get("page_id")) or f"page_{index:03d}"
+        name = _text(item.get("name")) or _text(item.get("title")) or f"页面入口 {index}"
+        url = _text(item.get("url")) or config.start_url
+        page_type = (
+            _text(item.get("page_type"))
+            or _text(item.get("semantic_page_type"))
+            or _infer_page_type(name, url)
+        )
+        status = _text(item.get("status")) or "reachable"
+        screenshot_refs = item.get("screenshot_refs")
+        if not isinstance(screenshot_refs, list):
+            screenshot_refs = []
+        normalized.append(
+            {
+                "page_id": page_id,
+                "page_entry_id": page_id,
+                "menu_id": _text(item.get("menu_id")),
+                "name": name,
+                "url": url,
+                "menu_path": item.get("menu_path") if isinstance(item.get("menu_path"), list) else [],
+                "page_type": page_type,
+                "semantic_page_type": page_type,
+                "discovery_depth": _int_or_default(item.get("discovery_depth"), 1),
+                "status": status,
+                "source": _text(item.get("source")) or "playwright.menu_page_exploration",
+                "confidence": item.get("confidence", "observed" if status == "reachable" else "failed"),
+                "priority": _text(item.get("priority")) or ("high" if index <= 5 else "normal"),
+                "requires_human_review": bool(item.get("requires_human_review", status != "reachable")),
+                "screenshot_refs": screenshot_refs,
+                "failure_reason": _text(item.get("failure_reason")),
+                "evidence": _mapping(item.get("evidence")),
+            }
+        )
+    return normalized
 
 
 def _build_menu_artifacts(
@@ -506,6 +561,52 @@ def _extract_menu_traversal_log(source: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
+def _extract_page_exploration_log(
+    source: dict[str, Any],
+    *,
+    pages: list[dict[str, Any]],
+    menu_entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    items = source.get("page_exploration_log")
+    if isinstance(items, list):
+        return [item for item in items if isinstance(item, dict)]
+    path_text = _text(source.get("page_exploration_log_path"))
+    if path_text:
+        path = Path(path_text)
+        if path.exists():
+            records: list[dict[str, Any]] = []
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    records.append(parsed)
+            return records
+    page_by_menu_id = {
+        _text(page.get("menu_id")): page for page in pages if _text(page.get("menu_id"))
+    }
+    records = []
+    for entry in menu_entries:
+        if not entry.get("is_leaf"):
+            continue
+        page = page_by_menu_id.get(_text(entry.get("menu_id")))
+        records.append(
+            {
+                "event": "enter_menu_leaf",
+                "menu_id": entry.get("menu_id"),
+                "menu_path": entry.get("menu_path", []),
+                "status": page.get("status", "reachable") if page else "not_attempted",
+                "page_entry_id": page.get("page_entry_id") if page else None,
+                "failure_reason": page.get("failure_reason") if page else "no_page_entry_recorded",
+                "screenshot_ref": (page.get("screenshot_refs") or [None])[0] if page else None,
+            }
+        )
+    return records
+
+
 def _navigation_tree_from_menu_tree(tree: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": "stage2_navigation_tree.v1",
@@ -569,7 +670,10 @@ def _build_features(
         real_features = real_browser_payload.get("features")
         if isinstance(real_features, list):
             return _limit_features_per_page(
-                [item for item in real_features if isinstance(item, dict)],
+                _normalize_real_browser_features(
+                    [item for item in real_features if isinstance(item, dict)],
+                    pages,
+                ),
                 config.max_features_per_page,
             )
         if _normalize_execution_mode(config.execution_mode) == "real_browser":
@@ -602,6 +706,48 @@ def _build_features(
     if features:
         return _limit_features_per_page(features, config.max_features_per_page)
     return _demo_features(pages, config.max_features_per_page)
+
+
+def _normalize_real_browser_features(
+    features: list[dict[str, Any]],
+    pages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    page_ids = {page["page_id"] for page in pages if page.get("page_id")}
+    default_page_id = pages[0]["page_id"] if pages else "page_001"
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(features, start=1):
+        feature_type = _normalize_feature_type(
+            _text(item.get("feature_type")) or _text(item.get("action_type")) or "view"
+        )
+        page_id = _text(item.get("page_entry_id")) or _text(item.get("page_id")) or default_page_id
+        if page_ids and page_id not in page_ids:
+            page_id = default_page_id
+        risk_level = _text(item.get("risk_level")) or _risk_level(feature_type)
+        normalized.append(
+            {
+                "feature_id": _text(item.get("feature_point_id"))
+                or _text(item.get("feature_id"))
+                or f"feature_{index:03d}",
+                "feature_point_id": _text(item.get("feature_point_id"))
+                or _text(item.get("feature_id"))
+                or f"feature_{index:03d}",
+                "page_id": page_id,
+                "page_entry_id": page_id,
+                "name": _text(item.get("name")) or f"功能点 {index}",
+                "feature_type": feature_type,
+                "source": _text(item.get("source")) or "playwright.menu_page_exploration",
+                "confidence": item.get("confidence", "observed"),
+                "risk_level": risk_level,
+                "requires_test_data": feature_type in {"create", "edit", "submit", "delete", "approve", "save"},
+                "auto_verifiable": bool(item.get("auto_verifiable", True)),
+                "verification_strategy": _text(item.get("verification_strategy"))
+                or ("side_effect_policy_gate" if risk_level == "high" else "playwright_visible_control"),
+                "review_status": _text(item.get("review_status"))
+                or ("pending" if risk_level == "high" else "auto_included"),
+                "evidence": _mapping(item.get("evidence")),
+            }
+        )
+    return normalized
 
 
 def _build_cases(features: list[dict[str, Any]], *, config: V3RunConfig) -> list[dict[str, Any]]:
@@ -912,6 +1058,7 @@ def _build_round_analysis(
         menu_artifacts.get("browser_target_count"),
         _browser_target_count(real_browser_payload or {}),
     )
+    menu_leaf_count = sum(1 for item in menu_entries if item.get("is_leaf"))
     target_tracking = _build_target_tracking(
         config=config,
         pages=pages,
@@ -999,7 +1146,7 @@ def _build_round_analysis(
         "target_name": config.target_name,
         "coverage": {
             "menu_entry_count": len(menu_entries),
-            "menu_leaf_count": sum(1 for item in menu_entries if item.get("is_leaf")),
+            "menu_leaf_count": menu_leaf_count,
             "menu_root_count": _int_or_default(menu_tree.get("root_count"), 0),
             "browser_target_count": browser_target_count,
             "page_count": len(pages),
@@ -1009,6 +1156,17 @@ def _build_round_analysis(
             "blocked_count": len(blocked),
             "failed_or_skipped_count": len(failed_or_skipped),
             "execution_mode": execution_mode,
+        },
+        "count_explanation": {
+            "menu_leaf_vs_page_entries": (
+                f"{menu_leaf_count} menu leaves attempted; {len(pages)} page entries recorded."
+            ),
+            "page_entries_vs_feature_points": (
+                f"{len(pages)} page entries yielded {len(features)} feature points after default-visible and light-interaction scanning."
+            ),
+            "browser_targets": (
+                f"{browser_target_count} browser targets are diagnostic CDP targets, not discovered business pages."
+            ),
         },
         "quality_judgement": _quality_judgement(pages, features, blocked + failed_or_skipped),
         "failure_clusters": failure_clusters,

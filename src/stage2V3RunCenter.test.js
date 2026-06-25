@@ -180,6 +180,10 @@ async function writeFakePythonV3Artifacts(artifactRoot, runId, overrides = {}) {
     JSON.stringify({ event: 'expand', menu_id: 'menu_business', status: 'success', screenshot_ref: 'menu_business_after_expand' }),
     JSON.stringify({ event: 'scan', menu_id: 'menu_query', status: 'leaf_discovered' })
   ].join('\n'));
+  await fs.writeFile(path.join(pythonRunDir, 'page_exploration_log.jsonl'), [
+    JSON.stringify({ event: 'enter_menu_leaf', menu_id: 'menu_online_apply', status: 'reachable', page_entry_id: 'page_home' }),
+    JSON.stringify({ event: 'enter_menu_leaf', menu_id: 'menu_query', status: 'not_attempted', failure_reason: 'max_pages_reached' })
+  ].join('\n'));
   await fs.writeFile(path.join(pythonRunDir, 'page_entries.json'), JSON.stringify({
     schema_version: 'stage2_page_entries.v3',
     items: [{
@@ -515,6 +519,7 @@ test('stage2 v3 run center exposes first-round menu discovery separately from br
 
     assert.ok(started.run.artifacts.menu_tree.href.includes('/artifacts/menu_tree'));
     assert.ok(started.run.artifacts.menu_entries.href.includes('/artifacts/menu_entries'));
+    assert.ok(started.run.artifacts.page_exploration_log.href.includes('/artifacts/page_exploration_log'));
     assert.equal(started.run.summary.menuEntries, 4);
     assert.equal(started.run.summary.menuLeaves, 2);
     assert.equal(started.run.summary.menuRoots, 3);
@@ -525,6 +530,8 @@ test('stage2 v3 run center exposes first-round menu discovery separately from br
     assert.equal(run.artifacts.menu_tree.root_count, 3);
     assert.equal(run.artifacts.menu_entries.items[1].text, '线上备案申请');
     assert.match(run.artifacts.menu_traversal_log, /menu_business_after_expand/);
+    assert.match(run.artifacts.page_exploration_log, /enter_menu_leaf/);
+    assert.match(run.run.summary.countExplanation.menu_leaf_vs_page_entries, /menu leaves attempted/);
   });
 });
 
