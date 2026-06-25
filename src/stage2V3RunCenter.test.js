@@ -728,6 +728,108 @@ test('stage2 v3 run center keeps next round open when scoped target is not disco
   });
 });
 
+test('stage2 v3 continue next round starts execution instead of ending in planned state', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '下一轮执行系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      scope: '优先完成“备案进度查询”页面'
+    }, { runsDir });
+    const calls = [];
+    const pythonRunner = async ({ args, artifactRoot }) => {
+      calls.push(args);
+      const runId = argValue(args, '--v3-run-id');
+      const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId);
+      return {
+        stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+        stderr: ''
+      };
+    };
+
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, { runsDir, pythonRunner });
+    const continued = await continueNextRound(created.run.runId, {}, { runsDir, pythonRunner });
+
+    assert.equal(calls.length, 2);
+    assert.notEqual(continued.run.status, 'planned');
+    assert.equal(continued.run.status, 'completed');
+    assert.equal(continued.run.currentRoundId, 'round_002');
+    assert.equal(continued.operation.status, 'succeeded');
+    assert.ok(continued.run.recentEvents.some((event) => event.type === 'next_round_queued'));
+    assert.ok(continued.run.recentEvents.some((event) => event.type === 'status_changed' && event.phase === 'round_analysis'));
+  });
+});
+
+test('stage2 v3 continue next round returns precise blockers for unmet prerequisites', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '下一轮阻塞系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+    await startV3Run(created.run.runId, { executionMode: 'contract_only' }, { runsDir });
+    const runDir = path.join(runsDir, created.run.runId);
+
+    const cases = [{
+      name: 'executor',
+      plan: { decision: 'auto_continue', prerequisite_blockers: [{ code: 'executor_unavailable' }] },
+      code: 'executor_unavailable',
+      hint: /执行器|Python/
+    }, {
+      name: 'browser-use',
+      plan: { decision: 'auto_continue', prerequisite_blockers: [{ code: 'browser_use_unavailable' }] },
+      code: 'browser_use_unavailable',
+      hint: /Browser-use/
+    }, {
+      name: 'playwright',
+      plan: { decision: 'auto_continue', prerequisite_blockers: [{ code: 'playwright_disconnected' }] },
+      code: 'playwright_disconnected',
+      hint: /Playwright|CDP/
+    }, {
+      name: 'model',
+      plan: { decision: 'auto_continue', prerequisite_blockers: [{ code: 'model_unavailable' }] },
+      code: 'model_unavailable',
+      hint: /模型/
+    }, {
+      name: 'human',
+      plan: { decision: 'wait_human_review', requires_human_approval: true },
+      code: 'human_approval_required',
+      hint: /人工/
+    }, {
+      name: 'budget',
+      plan: { decision: 'stop_budget_exhausted' },
+      code: 'budget_exhausted',
+      hint: /预算|上限/
+    }, {
+      name: 'no-improvement',
+      plan: { decision: 'stop_no_improvement' },
+      code: 'no_improvement',
+      hint: /改进/
+    }];
+
+    for (const item of cases) {
+      await fs.writeFile(path.join(runDir, 'next_round_plan.json'), JSON.stringify({
+        schema_version: 'stage2_next_round_plan.v3',
+        current_round_id: 'round_001',
+        should_continue: item.plan.decision === 'auto_continue',
+        next_round_goal: '继续下一轮。',
+        target_page_entry_ids: [],
+        target_feature_point_ids: [],
+        planned_improvements: [],
+        risk_level: 'low',
+        requires_human_approval: false,
+        ...item.plan
+      }, null, 2));
+
+      const blocked = await continueNextRound(created.run.runId, {}, { runsDir });
+      assert.equal(blocked.operation.status, 'blocked', item.name);
+      assert.equal(blocked.operation.error.code, item.code, item.name);
+      assert.match(blocked.operation.nextAction, item.hint, item.name);
+      assert.notEqual(blocked.run.status, 'planned', item.name);
+    }
+  });
+});
+
 test('stage2 v3 run center persists and forwards test environment full access policy', async () => {
   await withTempRunsDir(async (runsDir) => {
     const created = await createV3Run({
@@ -1004,7 +1106,8 @@ test('stage2 v3 run center saves human task results and gates next round approva
     assert.equal(blocked.run.status, 'waiting_human');
 
     const continued = await continueNextRound(created.run.runId, { approved: true }, { runsDir });
-    assert.equal(continued.run.status, 'planned');
+    assert.notEqual(continued.run.status, 'planned');
+    assert.equal(continued.run.status, 'waiting_human');
     assert.equal(continued.run.currentRoundId, 'round_002');
   });
 });
