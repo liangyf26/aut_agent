@@ -3573,6 +3573,7 @@ function stageLabel(value = '') {
     case_generation: '用例生成',
     execution: '安全执行',
     ai_analysis: 'AI 复盘',
+    ai_round_analysis: 'AI 复盘',
     rule_round_analysis: '规则复盘',
     rule_analysis: '规则复盘',
     submitted: '已提交',
