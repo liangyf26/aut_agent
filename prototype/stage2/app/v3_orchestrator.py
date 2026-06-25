@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from prototype.stage2.app.runtime.policy_gate import (
     POLICY_ALLOWED,
@@ -99,7 +99,27 @@ async def run_v3_assessment(
             }
             writer.write_json("source_discovery.json", discovery_payload)
 
-    pages = _build_pages(config, discovery_payload, real_browser_payload=real_browser_payload)
+    menu_artifacts = _build_menu_artifacts(
+        discovery_payload=discovery_payload,
+        real_browser_payload=real_browser_payload,
+    )
+    writer.write_json("menu_tree.json", menu_artifacts["menu_tree"])
+    writer.write_json("menu_entries.json", menu_artifacts["menu_entries_payload"])
+    writer.write_json("navigation_tree.json", menu_artifacts["navigation_tree"])
+    writer.write_jsonl("menu_traversal_log.jsonl", menu_artifacts["menu_traversal_log"])
+    if menu_artifacts["menu_entries"]:
+        writer.update_state(
+            "menu_discovery",
+            "running",
+            f"discovered {len(menu_artifacts['menu_entries'])} menu entries",
+        )
+
+    pages = _build_pages(
+        config,
+        discovery_payload,
+        real_browser_payload=real_browser_payload,
+        menu_entries=menu_artifacts["menu_entries"],
+    )
     writer.write_json("pages.json", {"schema_version": V3_SCHEMA_VERSION, "pages": pages, "items": pages})
     writer.write_json("page_entries.json", {"schema_version": V3_SCHEMA_VERSION, "page_entries": pages, "items": pages})
     writer.update_state("feature_identification", "running", f"identified {len(pages)} page entries")
@@ -143,6 +163,7 @@ async def run_v3_assessment(
         cases=cases,
         execution_results=execution_results,
         real_browser_payload=real_browser_payload,
+        menu_artifacts=menu_artifacts,
     )
     writer.write_json("round_analysis.json", round_analysis)
     writer.update_state("ai_review", "running", "round analysis generated")
@@ -196,6 +217,10 @@ async def run_v3_assessment(
             name: str(writer.run_dir / name)
             for name in (
                 "run_state.json",
+                "menu_tree.json",
+                "menu_entries.json",
+                "menu_traversal_log.jsonl",
+                "navigation_tree.json",
                 "pages.json",
                 "features.json",
                 "cases.json",
@@ -209,6 +234,8 @@ async def run_v3_assessment(
         "summary": {
             "target_name": config.target_name,
             "page_count": len(pages),
+            "menu_entry_count": len(menu_artifacts["menu_entries"]),
+            "browser_target_count": menu_artifacts["browser_target_count"],
             "feature_count": len(features),
             "case_count": len(cases),
             "executed_count": sum(
@@ -267,6 +294,10 @@ class V3RunArtifactWriter:
             "artifact_contract": [
                 "run_state.json",
                 "preflight_result.json",
+                "menu_tree.json",
+                "menu_entries.json",
+                "menu_traversal_log.jsonl",
+                "navigation_tree.json",
                 "pages.json",
                 "page_entries.json",
                 "features.json",
@@ -286,6 +317,13 @@ class V3RunArtifactWriter:
         path = self.run_dir / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
+
+    def write_jsonl(self, relative_path: str, items: list[dict[str, Any]]) -> Path:
+        path = self.run_dir / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [json.dumps(item, ensure_ascii=False) for item in items]
+        path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
         return path
 
     def write_text(self, relative_path: str, text: str) -> Path:
@@ -311,7 +349,12 @@ def _build_pages(
     discovery_payload: dict[str, Any],
     *,
     real_browser_payload: dict[str, Any] | None = None,
+    menu_entries: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    if menu_entries:
+        pages = _pages_from_menu_entries(config, menu_entries)
+        if pages:
+            return pages[: max(0, config.max_pages)]
     if real_browser_payload:
         real_pages = real_browser_payload.get("pages")
         if isinstance(real_pages, list):
@@ -343,6 +386,176 @@ def _build_pages(
     if pages:
         return pages
     return _demo_pages(config)
+
+
+def _build_menu_artifacts(
+    *,
+    discovery_payload: dict[str, Any],
+    real_browser_payload: dict[str, Any],
+) -> dict[str, Any]:
+    source = real_browser_payload if real_browser_payload else discovery_payload
+    entries = _extract_menu_entries(source)
+    tree = _mapping(source.get("menu_tree"))
+    if not tree:
+        tree = {
+            "schema_version": "stage2_menu_tree.v1",
+            "status": "not_available",
+            "root_count": 0,
+            "nodes": [],
+            "notes": ["本轮未产出菜单树；不能把 raw CDP target 数视为菜单覆盖。"],
+        }
+    elif "schema_version" not in tree:
+        tree = {"schema_version": "stage2_menu_tree.v1", **tree}
+    traversal_log = _extract_menu_traversal_log(source)
+    navigation_tree = _mapping(source.get("navigation_tree")) or _navigation_tree_from_menu_tree(tree)
+    return {
+        "menu_tree": tree,
+        "menu_entries": entries,
+        "menu_entries_payload": {
+            "schema_version": "stage2_menu_entries.v1",
+            "menu_entries": entries,
+            "items": entries,
+            "entry_count": len(entries),
+            "leaf_count": sum(1 for item in entries if item.get("is_leaf")),
+            "source": _menu_artifact_source(entries, source),
+        },
+        "menu_traversal_log": traversal_log,
+        "navigation_tree": navigation_tree,
+        "browser_target_count": _browser_target_count(real_browser_payload),
+    }
+
+
+def _extract_menu_entries(source: dict[str, Any]) -> list[dict[str, Any]]:
+    entries = source.get("menu_entries")
+    if isinstance(entries, dict):
+        entries = entries.get("menu_entries") or entries.get("items")
+    if isinstance(entries, list):
+        return [_normalize_menu_entry(item, index) for index, item in enumerate(entries, start=1) if isinstance(item, dict)]
+    tree = _mapping(source.get("menu_tree"))
+    nodes = tree.get("nodes")
+    if isinstance(nodes, list):
+        flattened: list[dict[str, Any]] = []
+        _flatten_menu_nodes(nodes, flattened, parent_path=[])
+        return [_normalize_menu_entry(item, index) for index, item in enumerate(flattened, start=1)]
+    return []
+
+
+def _normalize_menu_entry(item: dict[str, Any], index: int) -> dict[str, Any]:
+    menu_id = _text(item.get("menu_id")) or _text(item.get("id")) or f"menu_{index:03d}"
+    text = _text(item.get("text")) or _text(item.get("name")) or f"菜单项 {index}"
+    menu_path = item.get("menu_path")
+    if not isinstance(menu_path, list):
+        menu_path = [part for part in (_text(item.get("path")).split("/") if item.get("path") else []) if part]
+    if not menu_path:
+        menu_path = [text]
+    status = _text(item.get("status")) or "discovered"
+    return {
+        "menu_id": menu_id,
+        "text": text,
+        "level": _int_or_default(item.get("level"), len(menu_path) or 1),
+        "parent_id": _text(item.get("parent_id")) or None,
+        "menu_path": [str(part) for part in menu_path],
+        "is_leaf": bool(item.get("is_leaf")),
+        "expandable": bool(item.get("expandable")),
+        "route_hint": _text(item.get("route_hint") or item.get("url") or item.get("href")),
+        "locator_candidates": item.get("locator_candidates") if isinstance(item.get("locator_candidates"), list) else [],
+        "source": _text(item.get("source")) or "playwright.menu_discovery",
+        "screenshot_refs": item.get("screenshot_refs") if isinstance(item.get("screenshot_refs"), list) else [],
+        "status": status,
+        "failure_reason": _text(item.get("failure_reason")) or None,
+    }
+
+
+def _flatten_menu_nodes(
+    nodes: list[Any],
+    out: list[dict[str, Any]],
+    *,
+    parent_path: list[str],
+) -> None:
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        text = _text(node.get("text")) or _text(node.get("name"))
+        menu_path = node.get("menu_path") if isinstance(node.get("menu_path"), list) else [*parent_path, text]
+        entry = {**node, "menu_path": menu_path}
+        out.append(entry)
+        children = node.get("children")
+        if isinstance(children, list):
+            _flatten_menu_nodes(children, out, parent_path=[str(part) for part in menu_path])
+
+
+def _extract_menu_traversal_log(source: dict[str, Any]) -> list[dict[str, Any]]:
+    items = source.get("menu_traversal_log")
+    if isinstance(items, list):
+        return [item for item in items if isinstance(item, dict)]
+    path_text = _text(source.get("menu_traversal_log_path"))
+    if path_text:
+        path = Path(path_text)
+        if path.exists():
+            records: list[dict[str, Any]] = []
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    records.append(parsed)
+            return records
+    return []
+
+
+def _navigation_tree_from_menu_tree(tree: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": "stage2_navigation_tree.v1",
+        "source": "menu_tree",
+        "nodes": tree.get("nodes") if isinstance(tree.get("nodes"), list) else [],
+    }
+
+
+def _menu_artifact_source(entries: list[dict[str, Any]], source: dict[str, Any]) -> str:
+    if entries:
+        sources = sorted({_text(item.get("source")) for item in entries if item.get("source")})
+        return "+".join(sources) if sources else "playwright.menu_discovery"
+    return _text(source.get("source")) or "not_available"
+
+
+def _pages_from_menu_entries(
+    config: V3RunConfig,
+    menu_entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    pages: list[dict[str, Any]] = []
+    for index, entry in enumerate(menu_entries, start=1):
+        if not entry.get("is_leaf"):
+            continue
+        status = _text(entry.get("status"))
+        if status.startswith("failed"):
+            continue
+        route_hint = _text(entry.get("route_hint"))
+        url = urljoin(config.start_url, route_hint) if route_hint else config.start_url
+        page_id = f"menu_page_{len(pages) + 1:03d}"
+        pages.append(
+            {
+                "page_id": page_id,
+                "page_entry_id": page_id,
+                "menu_id": entry["menu_id"],
+                "name": entry["text"],
+                "url": url,
+                "source": entry["source"],
+                "confidence": "menu_leaf_discovered",
+                "semantic_page_type": _infer_page_type(entry["text"], url),
+                "priority": "high" if index <= 5 else "normal",
+                "requires_human_review": status in {"permission_blocked", "blocked", "unknown"},
+                "evidence": {
+                    "menu_path": entry.get("menu_path", []),
+                    "screenshot_refs": entry.get("screenshot_refs", []),
+                    "status": status,
+                    "failure_reason": entry.get("failure_reason"),
+                },
+            }
+        )
+    return pages
 
 
 def _build_features(
@@ -668,6 +881,7 @@ def _build_round_analysis(
     cases: list[dict[str, Any]],
     execution_results: list[dict[str, Any]],
     real_browser_payload: dict[str, Any] | None = None,
+    menu_artifacts: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     execution_mode = _normalize_execution_mode(config.execution_mode)
     blocked = [item for item in execution_results if item["status"].startswith("blocked")]
@@ -689,6 +903,15 @@ def _build_round_analysis(
         if item["status"].startswith(("real_failed", "failed", "skipped", "login_required", "side_effect_failed"))
     ]
     source_status = _text(discovery_payload.get("status")) if discovery_payload else "demo_safe"
+    menu_artifacts = menu_artifacts or {}
+    menu_entries = [
+        item for item in menu_artifacts.get("menu_entries", []) if isinstance(item, dict)
+    ]
+    menu_tree = _mapping(menu_artifacts.get("menu_tree"))
+    browser_target_count = _int_or_default(
+        menu_artifacts.get("browser_target_count"),
+        _browser_target_count(real_browser_payload or {}),
+    )
     failure_clusters = []
     missing_scope_targets = _missing_scope_targets(config, pages, features)
     if missing_scope_targets:
@@ -742,6 +965,21 @@ def _build_round_analysis(
                 "suggestion": "检查 CDP 地址、登录状态和目标页面可达性。",
             }
         )
+    if (
+        execution_mode == "real_browser"
+        and real_browser_payload
+        and real_browser_payload.get("status") == "completed"
+        and not menu_entries
+    ):
+        failure_clusters.append(
+            {
+                "cluster_id": "menu_discovery_incomplete",
+                "title": "真实浏览器本轮未产出菜单入口树",
+                "severity": "high",
+                "case_ids": [],
+                "suggestion": "使用 Browser-use + Playwright 菜单遍历，而不是把当前页 DOM 或 CDP target 枚举当成页面覆盖。",
+            }
+        )
     return {
         "schema_version": V3_SCHEMA_VERSION,
         "generated_at": _now(),
@@ -751,6 +989,10 @@ def _build_round_analysis(
         "missing_scope_targets": missing_scope_targets,
         "target_name": config.target_name,
         "coverage": {
+            "menu_entry_count": len(menu_entries),
+            "menu_leaf_count": sum(1 for item in menu_entries if item.get("is_leaf")),
+            "menu_root_count": _int_or_default(menu_tree.get("root_count"), 0),
+            "browser_target_count": browser_target_count,
             "page_count": len(pages),
             "feature_count": len(features),
             "case_count": len(cases),
@@ -1324,6 +1566,21 @@ def _infer_page_type(name: str, url: str) -> str:
 
 def _mapping(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _int_or_default(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _browser_target_count(real_browser_payload: dict[str, Any]) -> int:
+    targets = real_browser_payload.get("browser_targets")
+    if isinstance(targets, list):
+        return len(targets)
+    preflight = _mapping(real_browser_payload.get("preflight_result"))
+    return _int_or_default(preflight.get("browser_target_count"), 0)
 
 
 def _text(value: Any) -> str:

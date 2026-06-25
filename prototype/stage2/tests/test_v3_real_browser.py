@@ -10,6 +10,7 @@ if str(ROOT_DIR) not in sys.path:
 from prototype.stage2.app.v3_orchestrator import V3RunConfig  # noqa: E402
 from prototype.stage2.app.v3_real_browser import (  # noqa: E402
     TEST_ENV_FULL_ACCESS_POLICY,
+    build_menu_discovery_artifacts,
     _infer_feature_type,
     _plan_side_effect_actions,
     _side_effect_execution_result,
@@ -111,3 +112,106 @@ def test_side_effect_feature_type_inference_keeps_distinct_actions() -> None:
     assert _infer_feature_type("保存", "button", "") == "save"
     assert _infer_feature_type("提交", "button", "") == "submit"
     assert _infer_feature_type("删除", "button", "") == "delete"
+
+
+def test_menu_discovery_artifacts_capture_success_failure_permission_and_evidence() -> None:
+    bundle = build_menu_discovery_artifacts(
+        start_url="https://example.test/index",
+        menu_candidates=[
+            {
+                "discovery_id": "m1",
+                "text": "业务办理",
+                "level": 1,
+                "expandable": True,
+                "locator": "[data-menu='business']",
+                "screenshot_id": "menu_initial",
+            },
+            {
+                "discovery_id": "m2",
+                "parent_id": "m1",
+                "text": "线上备案申请",
+                "level": 2,
+                "href": "/online/apply",
+                "locator": "[data-menu='online-apply']",
+                "screenshot_id": "menu_m1_after_expand",
+            },
+            {
+                "discovery_id": "m3",
+                "text": "备案查询",
+                "level": 1,
+                "href": "/record-query",
+                "locator": "[data-menu='query']",
+                "screenshot_id": "menu_initial",
+            },
+            {
+                "discovery_id": "m4",
+                "text": "系统管理",
+                "level": 1,
+                "expandable": True,
+                "disabled": True,
+                "locator": "[data-menu='system']",
+                "screenshot_id": "menu_initial",
+            },
+            {
+                "discovery_id": "m5",
+                "text": "报表中心",
+                "level": 1,
+                "expandable": True,
+                "locator": "[data-menu='report']",
+                "screenshot_id": "menu_initial",
+            },
+        ],
+        traversal_events=[
+            {
+                "event": "expand",
+                "menu_id": "m1",
+                "status": "success",
+                "screenshot_ref": "menu_m1_after_expand",
+            },
+            {
+                "event": "expand",
+                "menu_id": "m4",
+                "status": "permission_blocked",
+                "failure_reason": "permission_denied",
+            },
+            {
+                "event": "expand",
+                "menu_id": "m5",
+                "status": "failed",
+                "failure_reason": "no_child_menu_appeared",
+                "screenshot_ref": "menu_m5_expand_failed",
+            },
+        ],
+        screenshots=[
+            {"screenshot_id": "menu_initial", "relative_path": "screenshots/menu_initial.png"},
+            {
+                "screenshot_id": "menu_m1_after_expand",
+                "relative_path": "screenshots/menu_m1_after_expand.png",
+            },
+            {
+                "screenshot_id": "menu_m5_expand_failed",
+                "relative_path": "screenshots/menu_m5_expand_failed.png",
+            },
+        ],
+    )
+
+    entries = bundle["menu_entries"]
+    assert bundle["menu_tree"]["root_count"] == 4
+    assert bundle["menu_tree"]["status"] == "incomplete"
+    assert [entry["text"] for entry in entries if entry["is_leaf"]] == [
+        "线上备案申请",
+        "备案查询",
+    ]
+    assert next(entry for entry in entries if entry["text"] == "业务办理")["status"] == "expanded"
+    assert (
+        next(entry for entry in entries if entry["text"] == "系统管理")["status"]
+        == "permission_blocked"
+    )
+    assert next(entry for entry in entries if entry["text"] == "报表中心")[
+        "failure_reason"
+    ] == "no_child_menu_appeared"
+    assert next(entry for entry in entries if entry["text"] == "线上备案申请")[
+        "menu_path"
+    ] == ["业务办理", "线上备案申请"]
+    assert bundle["menu_traversal_log"][2]["screenshot_ref"] == "menu_m5_expand_failed"
+    assert bundle["screenshots_index"]["screenshots"][1]["stage"] == "menu_discovery"

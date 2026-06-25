@@ -26,6 +26,9 @@ const ARTIFACTS = {
   preflight_result: 'preflight_result.json',
   system_map: 'system_map.json',
   navigation_tree: 'navigation_tree.json',
+  menu_tree: 'menu_tree.json',
+  menu_entries: 'menu_entries.json',
+  menu_traversal_log: 'menu_traversal_log.jsonl',
   page_entries: 'page_entries.json',
   feature_points: 'feature_points.json',
   discovery_review: 'discovery_review.json',
@@ -343,6 +346,14 @@ async function readJsonIfExists(filePath) {
   }
 }
 
+async function readTextIfExists(filePath) {
+  try {
+    return await fs.readFile(filePath, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
 async function readProgressEventsIfExists(filePath, limit = 20) {
   try {
     const raw = await fs.readFile(filePath, 'utf8');
@@ -646,6 +657,26 @@ function summarizeItems(items) {
   return Array.isArray(items) ? items.length : 0;
 }
 
+function artifactItems(payload, ...keys) {
+  if (!payload) {
+    return [];
+  }
+  if (Array.isArray(payload)) {
+    return payload;
+  }
+  for (const key of keys) {
+    if (Array.isArray(payload[key])) {
+      return payload[key];
+    }
+  }
+  return Array.isArray(payload.items) ? payload.items : [];
+}
+
+function numberOrZero(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
+}
+
 function summarizeExecution(items = []) {
   const byStatus = {};
   for (const item of items) {
@@ -674,6 +705,7 @@ function summarizeExecution(items = []) {
 
 function buildPublicRun(runDir, manifest, artifacts = {}) {
   const executionItems = artifacts.execution_results?.items || [];
+  const menuEntryItems = artifactItems(artifacts.menu_entries, 'menu_entries');
   const executionMode = artifacts.current_status?.execution_mode || manifest.execution_mode || null;
   const currentStatus = artifacts.current_status || buildCurrentStatus(
     manifest,
@@ -709,6 +741,13 @@ function buildPublicRun(runDir, manifest, artifacts = {}) {
     operability: makeRunOperability(manifest, artifacts, currentStatus),
     rounds: manifest.rounds || [],
     summary: {
+      menuEntries: summarizeItems(menuEntryItems),
+      menuLeaves: menuEntryItems.filter((item) => item && item.is_leaf).length,
+      menuRoots: numberOrZero(artifacts.menu_tree?.root_count),
+      browserTargets: numberOrZero(
+        artifacts.preflight_result?.browser_target_count
+        || artifacts.round_analysis?.coverage?.browser_target_count
+      ),
       pageEntries: summarizeItems(artifacts.page_entries?.items),
       featurePoints: summarizeItems(artifacts.feature_points?.items),
       generatedTestCases: summarizeItems(artifacts.generated_test_cases?.items),
@@ -727,6 +766,8 @@ async function loadRunArtifacts(runDir) {
     'input_config',
     'current_status',
     'preflight_result',
+    'menu_tree',
+    'menu_entries',
     'page_entries',
     'feature_points',
     'generated_test_cases',
@@ -742,6 +783,7 @@ async function loadRunArtifacts(runDir) {
   ]));
   return {
     ...Object.fromEntries(entries),
+    menu_traversal_log: await readTextIfExists(path.join(runDir, ARTIFACTS.menu_traversal_log)),
     progress_events: await readProgressEventsIfExists(path.join(runDir, ARTIFACTS.progress_events))
   };
 }
@@ -990,6 +1032,39 @@ function makeDiscoveryArtifacts(manifest, inputConfig) {
     items: [pageEntry]
   };
   return { systemMap, navigationTree, pageEntries };
+}
+
+function makeEmptyMenuArtifacts(status = 'not_available') {
+  const menuTree = {
+    schema_version: 'stage2_menu_tree.v1',
+    status,
+    root_count: 0,
+    entry_count: 0,
+    leaf_count: 0,
+    nodes: [],
+    notes: ['本轮未产出第一轮菜单遍历结果。']
+  };
+  const menuEntries = {
+    schema_version: 'stage2_menu_entries.v1',
+    items: [],
+    menu_entries: [],
+    entry_count: 0,
+    leaf_count: 0
+  };
+  return { menuTree, menuEntries, menuTraversalLog: '' };
+}
+
+function normalizeMenuEntries(payload) {
+  const items = artifactItems(payload, 'menu_entries')
+    .filter((item) => item && typeof item === 'object');
+  return {
+    schema_version: payload?.schema_version || 'stage2_menu_entries.v1',
+    ...payload,
+    items,
+    menu_entries: items,
+    entry_count: numberOrZero(payload?.entry_count) || items.length,
+    leaf_count: numberOrZero(payload?.leaf_count) || items.filter((item) => item.is_leaf).length
+  };
 }
 
 function inferFeatureTypes(inputConfig) {
@@ -1759,6 +1834,7 @@ async function updateRunStatus(runDir, manifest, status, phase, message, extra =
 async function persistContractOnlyArtifacts(runDir, manifest, inputConfig, executionMode = 'contract_only') {
   const preflightResult = makePreflightResult(manifest, inputConfig, executionMode);
   const { systemMap, navigationTree, pageEntries } = makeDiscoveryArtifacts(manifest, inputConfig);
+  const { menuTree, menuEntries, menuTraversalLog } = makeEmptyMenuArtifacts('contract_only');
   const featurePoints = makeFeatureArtifacts(inputConfig);
   const discoveryReview = makeDiscoveryReview(featurePoints);
   const testCases = makeGeneratedTestCases(featurePoints);
@@ -1777,6 +1853,9 @@ async function persistContractOnlyArtifacts(runDir, manifest, inputConfig, execu
   await writeJson(path.join(runDir, ARTIFACTS.preflight_result), preflightResult);
   await writeJson(path.join(runDir, ARTIFACTS.system_map), systemMap);
   await writeJson(path.join(runDir, ARTIFACTS.navigation_tree), navigationTree);
+  await writeJson(path.join(runDir, ARTIFACTS.menu_tree), menuTree);
+  await writeJson(path.join(runDir, ARTIFACTS.menu_entries), menuEntries);
+  await fs.writeFile(path.join(runDir, ARTIFACTS.menu_traversal_log), menuTraversalLog, 'utf8');
   await writeJson(path.join(runDir, ARTIFACTS.page_entries), pageEntries);
   await writeJson(path.join(runDir, ARTIFACTS.feature_points), featurePoints);
   await writeJson(path.join(runDir, ARTIFACTS.discovery_review), discoveryReview);
@@ -1807,6 +1886,7 @@ async function persistRealBrowserFailure(runDir, manifest, inputConfig, processR
     finished_at: processResult.finishedAt
   };
   const { systemMap, navigationTree, pageEntries } = makeDiscoveryArtifacts(manifest, inputConfig);
+  const { menuTree, menuEntries, menuTraversalLog } = makeEmptyMenuArtifacts('failed');
   const featurePoints = makeFeatureArtifacts(inputConfig);
   const discoveryReview = makeDiscoveryReview(featurePoints);
   const testCases = makeGeneratedTestCases(featurePoints);
@@ -1846,6 +1926,9 @@ async function persistRealBrowserFailure(runDir, manifest, inputConfig, processR
   await writeJson(path.join(runDir, ARTIFACTS.preflight_result), preflightResult);
   await writeJson(path.join(runDir, ARTIFACTS.system_map), systemMap);
   await writeJson(path.join(runDir, ARTIFACTS.navigation_tree), navigationTree);
+  await writeJson(path.join(runDir, ARTIFACTS.menu_tree), menuTree);
+  await writeJson(path.join(runDir, ARTIFACTS.menu_entries), menuEntries);
+  await fs.writeFile(path.join(runDir, ARTIFACTS.menu_traversal_log), menuTraversalLog, 'utf8');
   await writeJson(path.join(runDir, ARTIFACTS.page_entries), pageEntries);
   await writeJson(path.join(runDir, ARTIFACTS.feature_points), featurePoints);
   await writeJson(path.join(runDir, ARTIFACTS.discovery_review), discoveryReview);
@@ -1858,6 +1941,9 @@ async function persistRealBrowserFailure(runDir, manifest, inputConfig, processR
 
 async function persistRealBrowserArtifacts(runDir, manifest, inputConfig, processResult, roundId) {
   const pyRunDir = await findPythonRunDir(processResult);
+  const pythonPreflight = await readPythonJson(pyRunDir, 'preflight_result.json');
+  const menuTree = await readPythonJson(pyRunDir, 'menu_tree.json') || makeEmptyMenuArtifacts().menuTree;
+  const menuEntries = await readPythonJson(pyRunDir, 'menu_entries.json') || makeEmptyMenuArtifacts().menuEntries;
   const pageEntries = normalizePythonPageEntries(
     await readPythonJson(pyRunDir, 'page_entries.json') || await readPythonJson(pyRunDir, 'pages.json'),
     inputConfig
@@ -1908,6 +1994,12 @@ async function persistRealBrowserArtifacts(runDir, manifest, inputConfig, proces
     run_id: manifest.run_id,
     execution_mode: 'real_browser',
     status: 'completed',
+    browser_target_count: numberOrZero(
+      pythonPreflight?.browser_target_count
+      || pythonPreflight?.checks?.raw_cdp?.target_count
+      || pythonPreflight?.checks?.browser_targets?.count
+    ),
+    python_preflight: pythonPreflight || null,
     checks: {
       input_config: { ok: true },
       cdp_url: { ok: true, url: inputConfig.cdp_url },
@@ -1919,6 +2011,12 @@ async function persistRealBrowserArtifacts(runDir, manifest, inputConfig, proces
   });
   await writeJson(path.join(runDir, ARTIFACTS.system_map), systemMap);
   await writeJson(path.join(runDir, ARTIFACTS.navigation_tree), navigationTree);
+  await writeJson(path.join(runDir, ARTIFACTS.menu_tree), menuTree);
+  await writeJson(path.join(runDir, ARTIFACTS.menu_entries), normalizeMenuEntries(menuEntries));
+  await copyTextFileIfExists(
+    path.join(pyRunDir || '', 'menu_traversal_log.jsonl'),
+    path.join(runDir, ARTIFACTS.menu_traversal_log)
+  );
   await writeJson(path.join(runDir, ARTIFACTS.page_entries), pageEntries);
   await writeJson(path.join(runDir, ARTIFACTS.feature_points), featurePoints);
   await writeJson(path.join(runDir, ARTIFACTS.discovery_review), discoveryReview);
@@ -1993,6 +2091,9 @@ async function startV3Run(runId, body = {}, options = {}) {
       'preflight_result',
       'system_map',
       'navigation_tree',
+      'menu_tree',
+      'menu_entries',
+      'menu_traversal_log',
       'page_entries',
       'feature_points',
       'discovery_review',

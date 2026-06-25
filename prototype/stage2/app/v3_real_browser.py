@@ -24,19 +24,472 @@ DEFAULT_SIDE_EFFECT_TOTAL_LIMIT = 4
 DEFAULT_SIDE_EFFECT_PER_TYPE_LIMIT = 1
 
 
+def build_menu_discovery_artifacts(
+    *,
+    start_url: str,
+    menu_candidates: list[dict[str, Any]],
+    traversal_events: list[dict[str, Any]],
+    screenshots: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build the stable first-round menu discovery artifact contract."""
+
+    event_by_menu_id = {
+        _text(event.get("menu_id")): event
+        for event in traversal_events
+        if isinstance(event, dict) and _text(event.get("menu_id"))
+    }
+    children_by_parent: dict[str, list[dict[str, Any]]] = {}
+    raw_entries: list[dict[str, Any]] = []
+    for index, candidate in enumerate(menu_candidates, start=1):
+        if not isinstance(candidate, dict):
+            continue
+        menu_id = _text(candidate.get("discovery_id")) or _text(candidate.get("menu_id")) or f"menu_{index:03d}"
+        parent_id = _text(candidate.get("parent_id"))
+        raw_entry = {
+            **candidate,
+            "menu_id": menu_id,
+            "parent_id": parent_id or None,
+        }
+        raw_entries.append(raw_entry)
+        if parent_id:
+            children_by_parent.setdefault(parent_id, []).append(raw_entry)
+
+    entries: list[dict[str, Any]] = []
+    for index, raw_entry in enumerate(raw_entries, start=1):
+        menu_id = raw_entry["menu_id"]
+        event = event_by_menu_id.get(menu_id, {})
+        status = _menu_entry_status(raw_entry, event, children_by_parent.get(menu_id, []))
+        failure_reason = _text(event.get("failure_reason")) or _text(raw_entry.get("failure_reason"))
+        screenshot_refs = _menu_screenshot_refs(raw_entry, event)
+        href = _text(raw_entry.get("href") or raw_entry.get("route_hint") or raw_entry.get("url"))
+        menu_path = _menu_path(raw_entry, raw_entries)
+        expandable = bool(raw_entry.get("expandable"))
+        entry = {
+            "menu_id": menu_id,
+            "text": _text(raw_entry.get("text") or raw_entry.get("name")) or f"菜单项 {index}",
+            "level": _int_or_default(raw_entry.get("level"), len(menu_path) or 1),
+            "parent_id": raw_entry.get("parent_id"),
+            "menu_path": menu_path,
+            "is_leaf": bool(raw_entry.get("is_leaf"))
+            or (not expandable and status not in {"permission_blocked", "expansion_failed"}),
+            "expandable": expandable,
+            "route_hint": href,
+            "locator_candidates": _locator_candidates(raw_entry),
+            "source": _text(raw_entry.get("source")) or "playwright.menu_discovery",
+            "screenshot_refs": screenshot_refs,
+            "status": status,
+            "failure_reason": failure_reason or None,
+        }
+        entries.append(entry)
+
+    entry_by_id = {entry["menu_id"]: entry for entry in entries}
+    root_entries = [entry for entry in entries if not entry.get("parent_id")]
+    tree_nodes = [_tree_node(entry, entry_by_id, children_by_parent) for entry in root_entries]
+    has_failure = any(
+        entry["status"] in {"permission_blocked", "expansion_failed"}
+        or bool(entry.get("failure_reason"))
+        for entry in entries
+    )
+    screenshots_index = _menu_screenshots_index(screenshots)
+    return {
+        "menu_tree": {
+            "schema_version": "stage2_menu_tree.v1",
+            "status": "incomplete" if has_failure else "completed",
+            "start_url": start_url,
+            "root_count": len(root_entries),
+            "entry_count": len(entries),
+            "leaf_count": sum(1 for entry in entries if entry["is_leaf"]),
+            "nodes": tree_nodes,
+        },
+        "menu_entries": entries,
+        "menu_traversal_log": [event for event in traversal_events if isinstance(event, dict)],
+        "screenshots_index": screenshots_index,
+    }
+
+
 async def collect_real_browser_artifacts(config: V3RunConfig, run_dir: Path) -> dict[str, Any]:
-    """Collect low-risk evidence from Chrome DevTools Protocol without extra deps."""
+    """Collect first-round menu evidence from a connected real browser."""
 
     if not config.cdp_url:
         return _blocked("cdp_required", "真实浏览器模式需要 CDP 地址，例如 http://localhost:9222。")
     try:
-        return await _collect_with_raw_cdp(config, run_dir)
+        return await _collect_with_playwright_menu_discovery(config, run_dir)
+    except ImportError as exc:
+        raw_payload = await _collect_with_raw_cdp(config, run_dir)
+        raw_payload["executor_stack"] = {
+            "playwright": {
+                "status": "unavailable",
+                "failure_reason": f"{type(exc).__name__}: {exc}",
+            },
+            "browser_use": {
+                "status": "not_invoked",
+                "selected_model": config.model_name,
+                "reason": "first-round deterministic menu traversal can run with Playwright; Browser-use is reserved for semantic recovery.",
+            },
+            "raw_cdp": {"status": "diagnostic_fallback"},
+        }
+        raw_payload.setdefault(
+            "menu_tree",
+            {
+                "schema_version": "stage2_menu_tree.v1",
+                "status": "not_available",
+                "root_count": 0,
+                "nodes": [],
+                "notes": ["Playwright 不可用，raw CDP 仅作为诊断兜底，不能计入菜单覆盖。"],
+            },
+        )
+        raw_payload.setdefault("menu_entries", [])
+        raw_payload.setdefault("menu_traversal_log", [])
+        return raw_payload
     except Exception as exc:
         return _blocked(
-            "cdp_connect_failed",
-            f"真实浏览器执行失败：{type(exc).__name__}: {exc}",
+            "playwright_menu_discovery_failed",
+            f"Playwright 菜单遍历失败：{type(exc).__name__}: {exc}",
             cdp_url=config.cdp_url,
         )
+
+
+async def _collect_with_playwright_menu_discovery(
+    config: V3RunConfig,
+    run_dir: Path,
+) -> dict[str, Any]:
+    from playwright.async_api import async_playwright
+
+    screenshots_dir = run_dir / "screenshots"
+    screenshots_dir.mkdir(parents=True, exist_ok=True)
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.connect_over_cdp(config.cdp_url)
+        try:
+            page = await _resolve_playwright_target_page(browser, config.start_url)
+            browser_targets = _list_cdp_targets(config.cdp_url)
+            menu_bundle = await _discover_menu_with_playwright(page, screenshots_dir, config)
+            if _looks_like_login_text(await _safe_playwright_body_text(page)):
+                return {
+                    "schema_version": V3_SCHEMA_VERSION,
+                    "status": "blocked",
+                    "failure_reason": "login_required",
+                    "message": "目标页面看起来仍在登录或接管页，请先在浏览器中完成人工登录后重试。",
+                    "preflight_result": _preflight(False, "login_required", config.cdp_url),
+                    "browser_targets": browser_targets,
+                    "menu_tree": menu_bundle["menu_tree"],
+                    "menu_entries": menu_bundle["menu_entries"],
+                    "menu_traversal_log": menu_bundle["menu_traversal_log"],
+                    "pages": [],
+                    "features": [],
+                    "screenshots_index": menu_bundle["screenshots_index"],
+                }
+            preflight = _preflight(True, "ok", config.cdp_url)
+            preflight["checks"]["playwright"] = {"ok": True}
+            preflight["browser_target_count"] = len(browser_targets)
+            return {
+                "schema_version": V3_SCHEMA_VERSION,
+                "status": "completed",
+                "failure_reason": None,
+                "message": "已通过 Playwright 连接真实浏览器完成第一轮菜单入口遍历。",
+                "source": "playwright.menu_discovery",
+                "preflight_result": preflight,
+                "executor_stack": {
+                    "playwright": {"status": "used", "cdp_url": config.cdp_url},
+                    "browser_use": {
+                        "status": "available_for_semantic_recovery",
+                        "selected_model": config.model_name,
+                        "reason": "第一轮先由 Playwright 确定性展开菜单；语义歧义和目标追踪由 Browser-use/模型恢复层接管。",
+                    },
+                    "raw_cdp": {"status": "diagnostic_only", "browser_target_count": len(browser_targets)},
+                },
+                "browser_targets": browser_targets,
+                "menu_tree": menu_bundle["menu_tree"],
+                "menu_entries": menu_bundle["menu_entries"],
+                "menu_traversal_log": menu_bundle["menu_traversal_log"],
+                "pages": [],
+                "features": [],
+                "screenshots_index": menu_bundle["screenshots_index"],
+            }
+        finally:
+            await browser.close()
+
+
+async def _resolve_playwright_target_page(browser: Any, start_url: str) -> Any:
+    pages: list[Any] = []
+    for context in browser.contexts:
+        pages.extend(context.pages)
+    if not pages:
+        raise RuntimeError("未发现可用页面，无法执行 Playwright 菜单遍历")
+    page = next((item for item in pages if start_url and start_url in item.url), pages[0])
+    await page.bring_to_front()
+    await page.wait_for_load_state("domcontentloaded")
+    if start_url and start_url not in page.url:
+        await page.goto(start_url, wait_until="domcontentloaded")
+        await page.wait_for_timeout(1200)
+    return page
+
+
+def _list_cdp_targets(cdp_url: str) -> list[dict[str, Any]]:
+    base = cdp_url.rstrip("/") + "/"
+    try:
+        targets = _http_json(urljoin(base, "json/list"))
+    except Exception:
+        return []
+    if not isinstance(targets, list):
+        return []
+    return [
+        {
+            "id": _text(item.get("id")),
+            "type": _text(item.get("type")),
+            "title": _text(item.get("title")),
+            "url": _text(item.get("url")),
+        }
+        for item in targets
+        if isinstance(item, dict)
+    ]
+
+
+async def _discover_menu_with_playwright(
+    page: Any,
+    screenshots_dir: Path,
+    config: V3RunConfig,
+) -> dict[str, Any]:
+    screenshots: list[dict[str, Any]] = [
+        await _capture_playwright_screenshot(
+            page,
+            screenshots_dir,
+            "menu_initial",
+            "第一轮菜单初始可见状态",
+        )
+    ]
+    candidates = await _scan_menu_candidates_playwright(page)
+    for candidate in candidates:
+        candidate.setdefault("screenshot_id", "menu_initial")
+
+    traversal_events: list[dict[str, Any]] = []
+    seen_keys = {_menu_candidate_key(item) for item in candidates}
+    expandable_roots = [
+        item
+        for item in candidates
+        if item.get("expandable") and not item.get("parent_id")
+    ][: max(1, int(config.max_pages or 1))]
+    for candidate in expandable_roots:
+        menu_id = _text(candidate.get("discovery_id"))
+        if candidate.get("disabled"):
+            traversal_events.append(
+                {
+                    "event": "expand",
+                    "menu_id": menu_id,
+                    "status": "permission_blocked",
+                    "failure_reason": "permission_denied",
+                }
+            )
+            continue
+        try:
+            locator = page.locator(f"[data-stage2-menu-id='{menu_id}']").first
+            if callable(locator):
+                locator = locator()
+            await locator.scroll_into_view_if_needed(timeout=1000)
+            await locator.click(timeout=2500)
+            await page.wait_for_timeout(600)
+            screenshot_id = f"{menu_id}_after_expand"
+            screenshots.append(
+                await _capture_playwright_screenshot(
+                    page,
+                    screenshots_dir,
+                    screenshot_id,
+                    f"展开菜单：{candidate.get('text')}",
+                )
+            )
+            after_candidates = await _scan_menu_candidates_playwright(
+                page,
+                parent_candidate=candidate,
+            )
+            new_children: list[dict[str, Any]] = []
+            for item in after_candidates:
+                key = _menu_candidate_key(item)
+                if key in seen_keys:
+                    continue
+                item["parent_id"] = menu_id
+                item["level"] = max(
+                    _int_or_default(candidate.get("level"), 1) + 1,
+                    _int_or_default(item.get("level"), 2),
+                )
+                item["screenshot_id"] = screenshot_id
+                seen_keys.add(key)
+                new_children.append(item)
+            candidates.extend(new_children)
+            traversal_events.append(
+                {
+                    "event": "expand",
+                    "menu_id": menu_id,
+                    "status": "success" if new_children else "failed",
+                    "failure_reason": None if new_children else "no_child_menu_appeared",
+                    "screenshot_ref": screenshot_id,
+                    "new_child_count": len(new_children),
+                }
+            )
+        except Exception as exc:
+            traversal_events.append(
+                {
+                    "event": "expand",
+                    "menu_id": menu_id,
+                    "status": "failed",
+                    "failure_reason": f"{type(exc).__name__}: {exc}",
+                }
+            )
+
+    return build_menu_discovery_artifacts(
+        start_url=page.url,
+        menu_candidates=candidates,
+        traversal_events=traversal_events,
+        screenshots=screenshots,
+    )
+
+
+async def _scan_menu_candidates_playwright(
+    page: Any,
+    *,
+    parent_candidate: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    candidates = await page.evaluate(_menu_candidate_scan_script())
+    if not isinstance(candidates, list):
+        return []
+    parent_level = _int_or_default((parent_candidate or {}).get("level"), 0)
+    normalized = [item for item in candidates if isinstance(item, dict) and _text(item.get("text"))]
+    if parent_candidate:
+        parent_text = _text(parent_candidate.get("text"))
+        return [
+            item
+            for item in normalized
+            if _text(item.get("text")) != parent_text
+            and _int_or_default(item.get("level"), parent_level + 1) >= parent_level
+        ]
+    return normalized
+
+
+async def _capture_playwright_screenshot(
+    page: Any,
+    screenshots_dir: Path,
+    screenshot_id: str,
+    label: str,
+) -> dict[str, Any]:
+    path = screenshots_dir / f"{screenshot_id}.png"
+    await page.screenshot(path=str(path), full_page=True)
+    return {
+        "screenshot_id": screenshot_id,
+        "label": label,
+        "path": str(path),
+        "relative_path": str(path.relative_to(screenshots_dir.parent)),
+        "stage": "menu_discovery",
+        "source": "playwright.menu_discovery",
+    }
+
+
+def _menu_candidate_key(item: dict[str, Any]) -> str:
+    return "|".join(
+        [
+            _text(item.get("text")),
+            _text(item.get("href") or item.get("route_hint")),
+            _text(item.get("locator")),
+        ]
+    )
+
+
+async def _safe_playwright_body_text(page: Any) -> str:
+    with suppress(Exception):
+        return await page.locator("body").inner_text(timeout=1200)
+    return ""
+
+
+def _looks_like_login_text(text: str) -> bool:
+    lowered = _text(text).lower()
+    return any(word in lowered for word in ("login", "sign in", "登录", "登陆", "验证码", "密码"))
+
+
+def _menu_candidate_scan_script() -> str:
+    return """
+    () => {
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+      };
+      const compact = (value, max = 100) => String(value || '').replace(/\\s+/g, ' ').trim().slice(0, max);
+      const text = (el) => compact(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('data-title'));
+      const cssPath = (el) => {
+        if (!el || !el.tagName) return '';
+        if (el.id) return `#${CSS.escape(el.id)}`;
+        const parts = [];
+        let current = el;
+        while (current && current.nodeType === 1 && parts.length < 5) {
+          let selector = current.tagName.toLowerCase();
+          const classes = Array.from(current.classList || [])
+            .filter((name) => name && name.length < 40 && !/^is-/.test(name))
+            .slice(0, 2);
+          if (classes.length) selector += '.' + classes.map((name) => CSS.escape(name)).join('.');
+          const parent = current.parentElement;
+          if (parent) {
+            const siblings = Array.from(parent.children).filter((node) => node.tagName === current.tagName);
+            if (siblings.length > 1) selector += `:nth-of-type(${siblings.indexOf(current) + 1})`;
+          }
+          parts.unshift(selector);
+          current = parent;
+        }
+        return parts.join(' > ');
+      };
+      const levelOf = (el) => {
+        const aria = Number(el.getAttribute('aria-level') || 0);
+        if (aria) return aria;
+        const nested = el.closest('.el-sub-menu .el-menu, .ant-menu-sub, ul ul, [role="menu"] [role="menu"]');
+        if (nested) return 2;
+        return 1;
+      };
+      const isExpandable = (el) => {
+        const cls = String(el.className || '').toLowerCase();
+        return el.getAttribute('aria-expanded') !== null
+          || cls.includes('submenu')
+          || cls.includes('sub-menu')
+          || Boolean(el.querySelector('ul, [role="menu"], .el-menu, .ant-menu'));
+      };
+      const isDisabled = (el) => {
+        const cls = String(el.className || '').toLowerCase();
+        return Boolean(el.disabled)
+          || el.getAttribute('aria-disabled') === 'true'
+          || cls.includes('disabled');
+      };
+      const selectors = [
+        'nav a, aside a, [role="navigation"] a',
+        '[role="menuitem"]',
+        '.el-menu-item, .el-sub-menu__title, .ant-menu-item, .ant-menu-submenu-title',
+        '[class*="menu-item"], [class*="menu__item"], [class*="submenu"], [class*="nav-item"]',
+        'a[href]'
+      ].join(',');
+      const seen = new Set();
+      return Array.from(document.querySelectorAll(selectors))
+        .filter(visible)
+        .map((el, index) => {
+          const label = text(el);
+          if (!label) return null;
+          const href = el.href || el.getAttribute('href') || '';
+          const key = `${label}|${href}|${cssPath(el)}`;
+          if (seen.has(key)) return null;
+          seen.add(key);
+          const existing = el.getAttribute('data-stage2-menu-id');
+          const id = existing || `menu_${index + 1}`;
+          el.setAttribute('data-stage2-menu-id', id);
+          return {
+            discovery_id: id,
+            text: label,
+            level: levelOf(el),
+            href,
+            route_hint: href,
+            locator: cssPath(el),
+            expandable: isExpandable(el),
+            disabled: isDisabled(el),
+            aria_disabled: el.getAttribute('aria-disabled') || '',
+            source: 'playwright.menu_discovery',
+          };
+        })
+        .filter(Boolean)
+        .slice(0, 240);
+    }
+    """
 
 
 async def _collect_with_raw_cdp(config: V3RunConfig, run_dir: Path) -> dict[str, Any]:
@@ -811,6 +1264,130 @@ def _blocked(reason: str, message: str, *, cdp_url: str = "") -> dict[str, Any]:
         "features": [],
         "screenshots_index": _screenshots_index([]),
     }
+
+
+def _menu_entry_status(
+    candidate: dict[str, Any],
+    event: dict[str, Any],
+    children: list[dict[str, Any]],
+) -> str:
+    event_status = _text(event.get("status"))
+    if event_status == "success":
+        return "expanded" if candidate.get("expandable") else "discovered"
+    if event_status == "permission_blocked":
+        return "permission_blocked"
+    if event_status in {"failed", "error"}:
+        return "expansion_failed"
+    if candidate.get("disabled") or _text(candidate.get("aria_disabled")) == "true":
+        return "permission_blocked"
+    explicit_status = _text(candidate.get("status"))
+    if explicit_status:
+        return explicit_status
+    if candidate.get("expandable") and children:
+        return "expanded"
+    return "discovered"
+
+
+def _menu_screenshot_refs(candidate: dict[str, Any], event: dict[str, Any]) -> list[str]:
+    refs: list[str] = []
+    for value in (
+        candidate.get("screenshot_id"),
+        candidate.get("screenshot_ref"),
+        event.get("screenshot_ref"),
+    ):
+        text = _text(value)
+        if text and text not in refs:
+            refs.append(text)
+    raw_refs = candidate.get("screenshot_refs")
+    if isinstance(raw_refs, list):
+        for value in raw_refs:
+            text = _text(value)
+            if text and text not in refs:
+                refs.append(text)
+    return refs
+
+
+def _menu_path(entry: dict[str, Any], all_entries: list[dict[str, Any]]) -> list[str]:
+    explicit = entry.get("menu_path")
+    if isinstance(explicit, list) and explicit:
+        return [str(part) for part in explicit if _text(part)]
+    by_id = {_text(item.get("menu_id")): item for item in all_entries}
+    parts: list[str] = []
+    current: dict[str, Any] | None = entry
+    seen: set[str] = set()
+    while current:
+        current_id = _text(current.get("menu_id"))
+        if current_id in seen:
+            break
+        seen.add(current_id)
+        label = _text(current.get("text") or current.get("name"))
+        if label:
+            parts.append(label)
+        parent_id = _text(current.get("parent_id"))
+        current = by_id.get(parent_id) if parent_id else None
+    return list(reversed(parts))
+
+
+def _locator_candidates(entry: dict[str, Any]) -> list[dict[str, str]]:
+    raw = entry.get("locator_candidates")
+    if isinstance(raw, list):
+        return [item for item in raw if isinstance(item, dict)]
+    candidates: list[dict[str, str]] = []
+    locator = _text(entry.get("locator"))
+    if locator:
+        candidates.append({"kind": "css", "value": locator})
+    text = _text(entry.get("text") or entry.get("name"))
+    if text:
+        candidates.append({"kind": "text", "value": text})
+    return candidates
+
+
+def _tree_node(
+    entry: dict[str, Any],
+    entry_by_id: dict[str, dict[str, Any]],
+    children_by_parent: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    children = [
+        _tree_node(entry_by_id[child["menu_id"]], entry_by_id, children_by_parent)
+        for child in children_by_parent.get(entry["menu_id"], [])
+        if child.get("menu_id") in entry_by_id
+    ]
+    return {
+        key: value
+        for key, value in {**entry, "children": children}.items()
+        if value not in (None, [], "")
+    }
+
+
+def _menu_screenshots_index(items: list[dict[str, Any]]) -> dict[str, Any]:
+    screenshots = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        screenshot_id = _text(item.get("screenshot_id"))
+        if not screenshot_id:
+            continue
+        screenshots.append(
+            {
+                **item,
+                "screenshot_id": screenshot_id,
+                "stage": _text(item.get("stage")) or "menu_discovery",
+                "source": _text(item.get("source")) or "playwright.menu_discovery",
+            }
+        )
+    return {
+        "schema_version": V3_SCHEMA_VERSION,
+        "screenshots": screenshots,
+        "items": screenshots,
+        "notes": ["第一轮菜单遍历截图证据。"] if screenshots else [],
+    }
+
+
+def _int_or_default(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _now() -> str:

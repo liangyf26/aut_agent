@@ -1394,6 +1394,10 @@ function normalizeStage2Run(run = {}, source = 'v3') {
     createdAt: run.createdAt || run.created_at || manifest.created_at || run.started_at || '',
     updatedAt: run.updatedAt || run.updated_at || manifest.updated_at || run.finished_at || run.started_at || '',
     counts: {
+      menus: Number(stats.menuEntries ?? stats.menu_entries ?? run.menuEntryCount ?? run.menu_entry_count ?? 0),
+      menuLeaves: Number(stats.menuLeaves ?? stats.menu_leaves ?? run.menuLeafCount ?? run.menu_leaf_count ?? 0),
+      menuRoots: Number(stats.menuRoots ?? stats.menu_roots ?? run.menuRootCount ?? run.menu_root_count ?? 0),
+      browserTargets: Number(stats.browserTargets ?? stats.browser_targets ?? run.browserTargetCount ?? run.browser_target_count ?? 0),
       pages: Number(stats.pageEntries ?? stats.pages ?? run.pageCount ?? run.page_count ?? toArrayItems(run.pageEntries || run.page_entries).length ?? 0),
       features: Number(stats.featurePoints ?? stats.features ?? run.featureCount ?? run.feature_count ?? toArrayItems(run.featurePoints || run.feature_points).length ?? 0),
       cases: Number(stats.testCases ?? stats.cases ?? run.caseCount ?? run.case_count ?? toArrayItems(run.generatedTestCases || run.generated_test_cases).length ?? 0),
@@ -1724,12 +1728,13 @@ function renderStage2MetricCards(run) {
   const executionTotal = Number(counts.executed || 0);
   const passRate = executionTotal ? `${Math.round((Number(counts.passed || 0) / executionTotal) * 100)}%` : '-';
   const items = [
-    ['页面入口', counts.pages || 0, '自动发现范围'],
+    ['菜单入口', counts.menus || 0, `${counts.menuRoots || 0} 一级 / ${counts.menuLeaves || 0} 叶子`],
+    ['页面入口', counts.pages || 0, `浏览器 target ${counts.browserTargets || 0}`],
     ['功能点', counts.features || 0, '可测交互目标'],
     ['执行用例', counts.cases || 0, '按类型生成'],
     ['已执行', executionTotal || 0, `${counts.failed || 0} 失败 / ${counts.skipped || 0} 跳过`],
-    ['通过率', passRate, '基础路径状态'],
-    ['人工任务', counts.humanTasks || getRunHumanTasks(run || {}).length || 0, '通过界面处理']
+    ['人工任务', counts.humanTasks || getRunHumanTasks(run || {}).length || 0, '通过界面处理'],
+    ['通过率', passRate, '基础路径状态']
   ];
   return items.map(([label, value, note]) => `
     <article class="stage2-meter">

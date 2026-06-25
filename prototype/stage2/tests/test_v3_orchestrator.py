@@ -246,5 +246,186 @@ def test_v3_test_env_full_access_allows_side_effect_cases_without_human_review()
         assert next_round_plan["status"] == "ready"
 
 
+def test_v3_real_browser_menu_discovery_writes_menu_artifacts_without_counting_cdp_targets() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        async def fake_real_browser_provider(
+            config: V3RunConfig,
+            run_dir: Path,
+        ) -> dict[str, object]:
+            return {
+                "schema_version": "stage2_v3_run.v1",
+                "status": "completed",
+                "message": "menu discovery completed",
+                "preflight_result": {
+                    "schema_version": "stage2_v3_run.v1",
+                    "ok": True,
+                    "status": "completed",
+                    "browser_target_count": 3,
+                },
+                "browser_targets": [
+                    {"url": "https://example.test/index"},
+                    {"url": "https://example.test/debug"},
+                    {"url": "https://example.test/blank"},
+                ],
+                "menu_tree": {
+                    "schema_version": "stage2_menu_tree.v1",
+                    "status": "completed",
+                    "root_count": 3,
+                    "nodes": [
+                        {
+                            "menu_id": "menu_001",
+                            "text": "业务办理",
+                            "level": 1,
+                            "is_leaf": False,
+                            "expandable": True,
+                            "status": "expanded",
+                            "children": [
+                                {
+                                    "menu_id": "menu_002",
+                                    "text": "线上备案申请",
+                                    "level": 2,
+                                    "parent_id": "menu_001",
+                                    "is_leaf": True,
+                                    "expandable": False,
+                                    "status": "discovered",
+                                    "route_hint": "/online/apply",
+                                    "screenshot_refs": ["menu_001_after_expand"],
+                                }
+                            ],
+                        },
+                        {
+                            "menu_id": "menu_003",
+                            "text": "备案查询",
+                            "level": 1,
+                            "is_leaf": True,
+                            "expandable": False,
+                            "status": "discovered",
+                        },
+                        {
+                            "menu_id": "menu_004",
+                            "text": "系统管理",
+                            "level": 1,
+                            "is_leaf": False,
+                            "expandable": True,
+                            "status": "permission_blocked",
+                            "failure_reason": "permission_denied",
+                        },
+                    ],
+                },
+                "menu_entries": [
+                    {
+                        "menu_id": "menu_001",
+                        "text": "业务办理",
+                        "level": 1,
+                        "is_leaf": False,
+                        "status": "expanded",
+                    },
+                    {
+                        "menu_id": "menu_002",
+                        "text": "线上备案申请",
+                        "level": 2,
+                        "parent_id": "menu_001",
+                        "menu_path": ["业务办理", "线上备案申请"],
+                        "is_leaf": True,
+                        "status": "discovered",
+                        "route_hint": "/online/apply",
+                        "locator_candidates": [{"kind": "text", "value": "线上备案申请"}],
+                        "screenshot_refs": ["menu_001_after_expand"],
+                        "source": "playwright.menu_discovery",
+                    },
+                    {
+                        "menu_id": "menu_003",
+                        "text": "备案查询",
+                        "level": 1,
+                        "menu_path": ["备案查询"],
+                        "is_leaf": True,
+                        "status": "discovered",
+                        "source": "playwright.menu_discovery",
+                    },
+                    {
+                        "menu_id": "menu_004",
+                        "text": "系统管理",
+                        "level": 1,
+                        "menu_path": ["系统管理"],
+                        "is_leaf": False,
+                        "status": "permission_blocked",
+                        "failure_reason": "permission_denied",
+                        "source": "playwright.menu_discovery",
+                    },
+                ],
+                "menu_traversal_log": [
+                    {
+                        "event": "expand",
+                        "menu_id": "menu_001",
+                        "status": "success",
+                        "screenshot_ref": "menu_001_after_expand",
+                    },
+                    {
+                        "event": "expand",
+                        "menu_id": "menu_004",
+                        "status": "permission_blocked",
+                        "failure_reason": "permission_denied",
+                    },
+                ],
+                "screenshots_index": {
+                    "schema_version": "stage2_v3_run.v1",
+                    "screenshots": [
+                        {
+                            "screenshot_id": "menu_001_after_expand",
+                            "relative_path": "screenshots/menu_001_after_expand.png",
+                            "stage": "menu_discovery",
+                        }
+                    ],
+                    "items": [],
+                },
+                "pages": [
+                    {
+                        "page_id": "raw_current_page",
+                        "name": "当前首页",
+                        "url": "https://example.test/index",
+                        "source": "real_browser_cdp",
+                    }
+                ],
+                "features": [],
+            }
+
+        result = asyncio.run(
+            run_v3_assessment(
+                V3RunConfig(
+                    target_name="追本溯源管理平台",
+                    start_url="https://example.test/index",
+                    cdp_url="http://localhost:9222",
+                    execution_mode="real_browser",
+                    artifact_root=root / "runs",
+                    run_id="menu_contract",
+                    max_pages=30,
+                    metadata={"scope": "优先完成“线上备案申请”页面"},
+                ),
+                real_browser_provider=fake_real_browser_provider,
+            )
+        )
+
+        run_dir = Path(result["run_dir"])
+        menu_tree = _read_json(run_dir / "menu_tree.json")
+        menu_entries = _read_json(run_dir / "menu_entries.json")["menu_entries"]
+        page_entries = _read_json(run_dir / "page_entries.json")["page_entries"]
+        traversal_log = (run_dir / "menu_traversal_log.jsonl").read_text(encoding="utf-8")
+        round_analysis = _read_json(run_dir / "round_analysis.json")
+
+        assert menu_tree["root_count"] == 3
+        assert any(entry["text"] == "线上备案申请" for entry in menu_entries)
+        assert "permission_denied" in traversal_log
+        assert result["summary"]["browser_target_count"] == 3
+        assert result["summary"]["menu_entry_count"] == 4
+        assert result["summary"]["page_count"] == 2
+        assert [page["name"] for page in page_entries] == ["线上备案申请", "备案查询"]
+        assert all(page["source"] == "playwright.menu_discovery" for page in page_entries)
+        assert round_analysis["coverage"]["browser_target_count"] == 3
+        assert round_analysis["coverage"]["menu_entry_count"] == 4
+        assert round_analysis["missing_scope_targets"] == []
+
+
 def _read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))

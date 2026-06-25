@@ -105,6 +105,81 @@ function argValue(args, name) {
 async function writeFakePythonV3Artifacts(artifactRoot, runId, overrides = {}) {
   const pythonRunDir = path.join(artifactRoot, runId);
   await fs.mkdir(pythonRunDir, { recursive: true });
+  await fs.writeFile(path.join(pythonRunDir, 'menu_tree.json'), JSON.stringify({
+    schema_version: 'stage2_menu_tree.v1',
+    status: 'completed',
+    root_count: 3,
+    entry_count: 4,
+    leaf_count: 2,
+    nodes: [{
+      menu_id: 'menu_business',
+      text: '业务办理',
+      level: 1,
+      is_leaf: false,
+      status: 'expanded',
+      children: [{
+        menu_id: 'menu_online_apply',
+        text: '线上备案申请',
+        level: 2,
+        parent_id: 'menu_business',
+        is_leaf: true,
+        status: 'discovered'
+      }]
+    }, {
+      menu_id: 'menu_query',
+      text: '备案查询',
+      level: 1,
+      is_leaf: true,
+      status: 'discovered'
+    }, {
+      menu_id: 'menu_system',
+      text: '系统管理',
+      level: 1,
+      is_leaf: false,
+      status: 'expanded'
+    }]
+  }, null, 2));
+  await fs.writeFile(path.join(pythonRunDir, 'menu_entries.json'), JSON.stringify({
+    schema_version: 'stage2_menu_entries.v1',
+    items: [{
+      menu_id: 'menu_business',
+      text: '业务办理',
+      level: 1,
+      is_leaf: false,
+      status: 'expanded',
+      source: 'playwright.menu_discovery'
+    }, {
+      menu_id: 'menu_online_apply',
+      text: '线上备案申请',
+      level: 2,
+      parent_id: 'menu_business',
+      menu_path: ['业务办理', '线上备案申请'],
+      is_leaf: true,
+      status: 'discovered',
+      source: 'playwright.menu_discovery',
+      screenshot_refs: ['menu_business_after_expand']
+    }, {
+      menu_id: 'menu_query',
+      text: '备案查询',
+      level: 1,
+      menu_path: ['备案查询'],
+      is_leaf: true,
+      status: 'discovered',
+      source: 'playwright.menu_discovery'
+    }, {
+      menu_id: 'menu_system',
+      text: '系统管理',
+      level: 1,
+      menu_path: ['系统管理'],
+      is_leaf: false,
+      status: 'expanded',
+      source: 'playwright.menu_discovery'
+    }]
+  }, null, 2));
+  await fs.writeFile(path.join(pythonRunDir, 'menu_traversal_log.jsonl'), [
+    JSON.stringify({ event: 'expand', menu_id: 'menu_business', status: 'success', screenshot_ref: 'menu_business_after_expand' }),
+    JSON.stringify({ event: 'scan', menu_id: 'menu_query', status: 'leaf_discovered' })
+  ].join('\n'));
   await fs.writeFile(path.join(pythonRunDir, 'page_entries.json'), JSON.stringify({
     schema_version: 'stage2_page_entries.v3',
     items: [{
@@ -414,6 +489,42 @@ test('stage2 v3 run center creates a draft run and starts a stable artifact cont
     assert.ok(run.artifacts.execution_results.items.every((item) => item.status !== 'passed'));
     assert.ok(run.artifacts.execution_results.items.some((item) => item.failure_reason === 'contract_only_mode'));
     assert.equal(run.artifacts.next_round_plan.requires_human_approval, true);
+  });
+});
+
+test('stage2 v3 run center exposes first-round menu discovery separately from browser targets', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      scope: '优先完成“线上备案申请”页面'
+    }, { runsDir });
+
+    const started = await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId);
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    assert.ok(started.run.artifacts.menu_tree.href.includes('/artifacts/menu_tree'));
+    assert.ok(started.run.artifacts.menu_entries.href.includes('/artifacts/menu_entries'));
+    assert.equal(started.run.summary.menuEntries, 4);
+    assert.equal(started.run.summary.menuLeaves, 2);
+    assert.equal(started.run.summary.menuRoots, 3);
+    assert.equal(started.run.summary.browserTargets, 0);
+    assert.equal(started.run.summary.pageEntries, 1);
+
+    const run = await getV3Run(created.run.runId, { runsDir });
+    assert.equal(run.artifacts.menu_tree.root_count, 3);
+    assert.equal(run.artifacts.menu_entries.items[1].text, '线上备案申请');
+    assert.match(run.artifacts.menu_traversal_log, /menu_business_after_expand/);
   });
 });
 
