@@ -891,7 +891,7 @@ function operationStatusForRun(run) {
   if (['running'].includes(run.status)) {
     return 'running';
   }
-  if (['planned'].includes(run.status)) {
+  if (['queued', 'planned'].includes(run.status)) {
     return 'queued';
   }
   return 'succeeded';
@@ -915,6 +915,9 @@ function nextActionForRun(run) {
   }
   if (run.status === 'running') {
     return '等待执行器推进，或刷新查看最新进度。';
+  }
+  if (run.status === 'queued') {
+    return '下一轮已入队，等待执行器启动或刷新查看最新进度。';
   }
   if (run.status === 'paused') {
     return '可以继续、停止或查看当前证据。';
@@ -2481,39 +2484,144 @@ async function saveHumanTaskResult(runId, body = {}, options = {}) {
   return { run, operation: makeOperationFeedback('save_human_task', run), humanTasks: nextHumanTasks };
 }
 
+const NEXT_ROUND_BLOCKERS = {
+  human_approval_required: {
+    message: '下一轮计划需要人工批准后才能继续。',
+    remediation: '请在运行中心完成人工确认或审核任务后继续。'
+  },
+  executor_unavailable: {
+    message: '执行器不可用，无法启动下一轮真实执行。',
+    remediation: '请检查后端 Python 执行器、运行中心服务和 Python 依赖后重试。'
+  },
+  browser_use_unavailable: {
+    message: 'Browser-use 能力不可用，无法执行智能浏览探索。',
+    remediation: '请安装或启用 Browser-use 相关依赖，或切换到可用模型/执行模式后重试。'
+  },
+  playwright_disconnected: {
+    message: 'Playwright/CDP 未连接，无法驱动真实浏览器。',
+    remediation: '请确认 Chrome 以 9222 调试端口启动、CDP URL 可访问，并保持已登录页面打开。'
+  },
+  model_unavailable: {
+    message: '所选大模型不可用，无法完成下一轮智能分析或报告生成。',
+    remediation: '请在运行中心刷新大模型预检，改选可用模型后重试。'
+  },
+  budget_exhausted: {
+    message: '下一轮预算或轮次上限已用尽。',
+    remediation: '请提高最大轮次/预算，或生成当前报告后创建新的更大范围 run。',
+    terminal: true
+  },
+  no_improvement: {
+    message: '复盘判断继续执行没有新增改进收益。',
+    remediation: '请查看改进候选；如仍需探索，请调整优先目标或扩大探索范围后新建 run。',
+    terminal: true
+  },
+  goal_completed: {
+    message: '当前目标已完成，无需进入下一轮；可生成报告或创建新的更大范围 run。',
+    remediation: '请生成报告，或创建新的更大范围 run。',
+    terminal: true
+  }
+};
+
+function normalizeNextRoundBlockerCode(value) {
+  const code = String(value || '').trim();
+  const aliases = {
+    human_review_required: 'human_approval_required',
+    wait_human_review: 'human_approval_required',
+    python_executor_unavailable: 'executor_unavailable',
+    python_unavailable: 'executor_unavailable',
+    browser_unavailable: 'playwright_disconnected',
+    cdp_unavailable: 'playwright_disconnected',
+    cdp_connect_failed: 'playwright_disconnected',
+    playwright_missing: 'playwright_disconnected',
+    stop_budget_exhausted: 'budget_exhausted',
+    resource_budget_exhausted: 'budget_exhausted',
+    stop_no_improvement: 'no_improvement',
+    stop_goal_completed: 'goal_completed'
+  };
+  return aliases[code] || code;
+}
+
+function firstPlanBlockerCode(nextRoundPlan = {}) {
+  const blockers = nextRoundPlan.prerequisite_blockers
+    || nextRoundPlan.prerequisiteBlockers
+    || nextRoundPlan.blockers
+    || [];
+  const first = Array.isArray(blockers) ? blockers[0] : blockers;
+  return normalizeNextRoundBlockerCode(
+    first?.code
+      || first?.reason
+      || nextRoundPlan.blocker_code
+      || nextRoundPlan.blockerCode
+  );
+}
+
+function makeNextRoundBlocker(code, nextRoundPlan = {}) {
+  const normalized = normalizeNextRoundBlockerCode(code);
+  const spec = NEXT_ROUND_BLOCKERS[normalized];
+  if (!spec) {
+    return null;
+  }
+  return {
+    code: normalized,
+    message: nextRoundPlan.blocker_message || nextRoundPlan.blockerMessage || spec.message,
+    remediation: nextRoundPlan.remediation_hint || nextRoundPlan.remediationHint || spec.remediation,
+    terminal: Boolean(spec.terminal)
+  };
+}
+
+function resolveNextRoundBlocker(nextRoundPlan = {}, { approved = false } = {}) {
+  const explicitBlocker = makeNextRoundBlocker(firstPlanBlockerCode(nextRoundPlan), nextRoundPlan);
+  if (explicitBlocker) {
+    return explicitBlocker;
+  }
+  if (nextRoundPlan.requires_human_approval && !approved) {
+    return makeNextRoundBlocker('human_approval_required', nextRoundPlan);
+  }
+  if (nextRoundPlan.decision === 'wait_human_review' && !approved) {
+    return makeNextRoundBlocker('human_approval_required', nextRoundPlan);
+  }
+  if (nextRoundPlan.decision === 'stop_budget_exhausted') {
+    return makeNextRoundBlocker('budget_exhausted', nextRoundPlan);
+  }
+  if (nextRoundPlan.decision === 'stop_no_improvement') {
+    return makeNextRoundBlocker('no_improvement', nextRoundPlan);
+  }
+  if (nextRoundPlan.decision === 'stop_goal_completed') {
+    return makeNextRoundBlocker('goal_completed', nextRoundPlan);
+  }
+  return null;
+}
+
 async function continueNextRound(runId, body = {}, options = {}) {
   const { runDir, manifest } = await readManifest(runId, options);
+  const inputConfig = await readJsonIfExists(path.join(runDir, ARTIFACTS.input_config)) || {};
   const nextRoundPlan = await readJsonRequired(path.join(runDir, ARTIFACTS.next_round_plan), 'next_round_plan 缺失。');
   const approved = body.approved === true || body.decision === 'approve';
-  const stopDecision = [
-    'stop_goal_completed',
-    'stop_no_improvement',
-    'stop_budget_exhausted'
-  ].includes(nextRoundPlan.decision);
-  if (nextRoundPlan.requires_human_approval && !approved) {
+  const blocker = resolveNextRoundBlocker(nextRoundPlan, { approved });
+  if (blocker) {
     const saved = await updateRunStatus(
       runDir,
       manifest,
-      'waiting_human',
+      blocker.terminal ? 'completed' : 'waiting_human',
       'next_round_blocked',
-      '下一轮计划需要人工批准后才能继续。',
-      { decision: nextRoundPlan.decision }
+      blocker.message,
+      { decision: nextRoundPlan.decision, blocker_code: blocker.code }
     );
     const run = buildPublicRun(runDir, saved, await loadRunArtifacts(runDir));
-    return { run, operation: makeOperationFeedback('continue_next_round', run), nextRoundPlan };
-  }
-  if (stopDecision) {
-    const restoredRoundId = nextRoundPlan.current_round_id || manifest.current_round_id;
-    const saved = await updateRunStatus(
-      runDir,
-      { ...manifest, current_round_id: restoredRoundId },
-      'completed',
-      'next_round_not_required',
-      '当前目标已完成，无需进入下一轮；可生成报告或创建新的更大范围 run。',
-      { decision: nextRoundPlan.decision, next_round_required: false }
-    );
-    const run = buildPublicRun(runDir, saved, await loadRunArtifacts(runDir));
-    return { run, operation: makeOperationFeedback('continue_next_round', run), nextRoundPlan };
+    return {
+      run,
+      operation: makeOperationFeedback('continue_next_round', run, {
+        status: 'blocked',
+        message: blocker.message,
+        nextAction: blocker.remediation,
+        error: {
+          code: blocker.code,
+          message: blocker.message,
+          remediation: blocker.remediation
+        }
+      }),
+      nextRoundPlan
+    };
   }
 
   const currentRounds = manifest.rounds || [];
@@ -2526,22 +2634,34 @@ async function continueNextRound(runId, body = {}, options = {}) {
     finished_at: null,
     input_artifacts: ['round_analysis', 'next_round_plan', 'human_tasks'],
     output_artifacts: [],
-    status: 'planned'
+    status: 'queued'
   };
-  const saved = await updateRunStatus(
+  await updateRunStatus(
     runDir,
     {
       ...manifest,
       current_round_id: roundId,
       rounds: [...currentRounds, round]
     },
-    'planned',
-    'next_round_planned',
-    '下一轮已创建，等待执行器推进。',
-    { next_round_id: roundId }
+    'queued',
+    'next_round_queued',
+    '下一轮已入队，正在启动执行器。',
+    { next_round_id: roundId, decision: nextRoundPlan.decision }
   );
-  const run = buildPublicRun(runDir, saved, await loadRunArtifacts(runDir));
-  return { run, operation: makeOperationFeedback('continue_next_round', run), nextRoundPlan };
+  await appendEvent(runDir, {
+    type: 'next_round_queued',
+    round_id: roundId,
+    decision: nextRoundPlan.decision,
+    target_search_goals: nextRoundPlan.target_search_goals || []
+  });
+  return startV3Run(runId, {
+    ...body,
+    roundId,
+    goal: round.goal,
+    executionMode: body.executionMode || body.execution_mode || manifest.execution_mode || inputConfig.execution_mode || 'real_browser',
+    maxPages: body.maxPages || body.max_pages || inputConfig.max_pages,
+    maxFeaturesPerPage: body.maxFeaturesPerPage || body.max_features_per_page || inputConfig.max_features_per_page
+  }, options);
 }
 
 function makeReport({ manifest, pageEntries, featurePoints, testCases, executionResults, roundAnalysis, nextRoundPlan, humanTasks }) {
