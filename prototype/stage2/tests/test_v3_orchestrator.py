@@ -246,6 +246,210 @@ def test_v3_test_env_full_access_allows_side_effect_cases_without_human_review()
         assert next_round_plan["status"] == "ready"
 
 
+def test_v3_execution_cases_record_verdict_evidence_and_failure_clusters() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        async def fake_real_browser_provider(
+            config: V3RunConfig,
+            run_dir: Path,
+        ) -> dict[str, object]:
+            return {
+                "schema_version": "stage2_v3_run.v1",
+                "status": "completed",
+                "message": "execution completed",
+                "preflight_result": {"ok": True, "status": "completed"},
+                "pages": [
+                    {
+                        "page_id": "page_records",
+                        "page_entry_id": "page_records",
+                        "name": "记录管理",
+                        "url": "https://example.test/records",
+                        "semantic_page_type": "query_list",
+                        "status": "reachable",
+                        "source": "playwright.menu_page_exploration",
+                        "screenshot_refs": ["page_records_entry"],
+                    }
+                ],
+                "features": [
+                    {
+                        "feature_id": "feature_query",
+                        "page_id": "page_records",
+                        "name": "查询记录",
+                        "feature_type": "query",
+                        "risk_level": "low",
+                    },
+                    {
+                        "feature_id": "feature_detail",
+                        "page_id": "page_records",
+                        "name": "查看详情",
+                        "feature_type": "detail",
+                        "risk_level": "low",
+                    },
+                    {
+                        "feature_id": "feature_delete",
+                        "page_id": "page_records",
+                        "name": "删除记录",
+                        "feature_type": "delete",
+                        "risk_level": "high",
+                    },
+                ],
+                "case_execution_results": [
+                    {
+                        "feature_id": "feature_query",
+                        "status": "passed",
+                        "verdict": "passed",
+                        "actions": [{"action": "click", "target": "查询", "status": "passed"}],
+                        "page_feedback": ["列表刷新完成"],
+                        "screenshot_refs": ["page_records_entry", "feature_query_feedback"],
+                    },
+                    {
+                        "feature_id": "feature_detail",
+                        "status": "failed",
+                        "verdict": "failed",
+                        "actions": [{"action": "click", "target": "详情", "status": "failed"}],
+                        "page_feedback": ["详情弹窗未出现"],
+                        "screenshot_refs": ["feature_detail_failure"],
+                        "failure_reason": "assertion_failed: expected detail dialog",
+                    },
+                ],
+                "side_effect_results": [
+                    {
+                        "action_type": "delete",
+                        "status": "side_effect_executed",
+                        "verdict": "passed",
+                        "actions": [
+                            {"action": "click", "target": "删除", "status": "passed"},
+                            {"action": "click", "target": "确认", "status": "passed"},
+                        ],
+                        "page_feedback": ["删除成功"],
+                        "screenshot_refs": ["feature_delete_confirm", "feature_delete_success"],
+                    }
+                ],
+                "screenshots_index": {
+                    "schema_version": "stage2_v3_run.v1",
+                    "screenshots": [
+                        {"screenshot_id": "page_records_entry", "stage": "page_entry"},
+                        {"screenshot_id": "feature_query_feedback", "stage": "feature_feedback"},
+                        {"screenshot_id": "feature_detail_failure", "stage": "failure"},
+                        {"screenshot_id": "feature_delete_confirm", "stage": "feature_start"},
+                        {"screenshot_id": "feature_delete_success", "stage": "feature_feedback"},
+                    ],
+                    "items": [],
+                },
+            }
+
+        result = asyncio.run(
+            run_v3_assessment(
+                V3RunConfig(
+                    target_name="测试环境系统",
+                    start_url="https://example.test/records",
+                    cdp_url="http://localhost:9222",
+                    execution_mode="real_browser",
+                    artifact_root=root / "runs",
+                    run_id="execution_contract",
+                    safety_policy="test_env_full_access",
+                    allowed_side_effect_actions=("delete",),
+                ),
+                real_browser_provider=fake_real_browser_provider,
+            )
+        )
+
+        run_dir = Path(result["run_dir"])
+        cases = _read_json(run_dir / "generated_test_cases.json")["test_cases"]
+        execution_results = _read_json(run_dir / "execution_results.json")["results"]
+        round_analysis = _read_json(run_dir / "round_analysis.json")
+
+        query_case = next(case for case in cases if case["feature_id"] == "feature_query")
+        assert query_case["target"]["feature_id"] == "feature_query"
+        assert query_case["expected_feedback"]
+        assert query_case["assertions"]
+        assert query_case["risk_policy"]["decision"] == "allow"
+        assert query_case["requires_human_confirmation"] is False
+
+        by_feature = {item["feature_id"]: item for item in execution_results}
+        assert by_feature["feature_query"]["status"] == "passed"
+        assert by_feature["feature_query"]["verdict"] == "passed"
+        assert by_feature["feature_query"]["page_feedback"] == ["列表刷新完成"]
+        assert by_feature["feature_query"]["screenshot_refs"] == [
+            "page_records_entry",
+            "feature_query_feedback",
+        ]
+        assert by_feature["feature_detail"]["status"] == "failed"
+        assert by_feature["feature_detail"]["verdict"] == "failed"
+        assert by_feature["feature_detail"]["manual_confirmation_required"] is True
+        assert "assertion_failed" in by_feature["feature_detail"]["failure_reason"]
+        assert by_feature["feature_delete"]["status"] == "side_effect_executed"
+        assert by_feature["feature_delete"]["verdict"] == "passed"
+
+        assert result["summary"]["executed_count"] == 2
+        assert result["summary"]["failed_or_skipped_count"] == 1
+        assert any(
+            cluster["reason"] == "assertion_failed"
+            and cluster["case_ids"] == [by_feature["feature_detail"]["case_id"]]
+            for cluster in round_analysis["failure_clusters"]
+        )
+
+
+def test_v3_low_risk_policy_skips_high_risk_execution_with_verdict() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        async def fake_real_browser_provider(
+            config: V3RunConfig,
+            run_dir: Path,
+        ) -> dict[str, object]:
+            return {
+                "schema_version": "stage2_v3_run.v1",
+                "status": "completed",
+                "preflight_result": {"ok": True, "status": "completed"},
+                "pages": [
+                    {
+                        "page_id": "page_records",
+                        "name": "记录管理",
+                        "url": "https://example.test/records",
+                        "source": "playwright.menu_page_exploration",
+                    }
+                ],
+                "features": [
+                    {
+                        "feature_id": "feature_delete",
+                        "page_id": "page_records",
+                        "name": "删除记录",
+                        "feature_type": "delete",
+                        "risk_level": "high",
+                    }
+                ],
+                "screenshots_index": {"schema_version": "stage2_v3_run.v1", "screenshots": []},
+            }
+
+        result = asyncio.run(
+            run_v3_assessment(
+                V3RunConfig(
+                    target_name="低风险策略系统",
+                    start_url="https://example.test/records",
+                    cdp_url="http://localhost:9222",
+                    execution_mode="real_browser",
+                    artifact_root=root / "runs",
+                    run_id="policy_skip_contract",
+                ),
+                real_browser_provider=fake_real_browser_provider,
+            )
+        )
+
+        run_dir = Path(result["run_dir"])
+        cases = _read_json(run_dir / "generated_test_cases.json")["test_cases"]
+        execution_results = _read_json(run_dir / "execution_results.json")["results"]
+
+        assert cases[0]["requires_human_confirmation"] is True
+        assert cases[0]["risk_policy"]["decision"] == "deny"
+        assert execution_results[0]["status"] == "skipped_by_policy"
+        assert execution_results[0]["verdict"] == "skipped"
+        assert execution_results[0]["manual_confirmation_required"] is True
+        assert execution_results[0]["failure_reason"] == "policy_denied"
+        assert result["summary"]["blocked_count"] == 1
+
+
 def test_v3_real_browser_menu_discovery_writes_menu_artifacts_without_counting_cdp_targets() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)

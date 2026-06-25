@@ -251,12 +251,18 @@ async def run_v3_assessment(
                 if item["status"]
                 in {
                     "passed_safe_placeholder",
+                    "passed",
                     "real_passed",
+                    "side_effect_executed",
                     "authorized_by_policy_placeholder",
                     "real_authorized_side_effect_pending_executor",
                 }
             ),
-            "blocked_count": sum(1 for item in execution_results if item["status"].startswith("blocked")),
+            "blocked_count": sum(
+                1
+                for item in execution_results
+                if item["status"].startswith("blocked") or item["status"] == "skipped_by_policy"
+            ),
             "failed_or_skipped_count": sum(
                 1
                 for item in execution_results
@@ -795,18 +801,40 @@ def _build_cases(features: list[dict[str, Any]], *, config: V3RunConfig) -> list
         cases.append(
             {
                 "case_id": f"case_{index:03d}",
+                "test_case_id": f"case_{index:03d}",
                 "feature_id": feature["feature_id"],
+                "feature_point_id": feature["feature_id"],
                 "page_id": feature["page_id"],
+                "page_entry_id": feature["page_id"],
                 "name": f"{feature['name']}基础路径验证",
+                "title": f"{feature['name']}基础路径验证",
                 "case_type": feature_type,
+                "type_template": feature_type,
+                "target": {
+                    "page_id": feature["page_id"],
+                    "feature_id": feature["feature_id"],
+                    "feature_name": feature.get("name"),
+                    "feature_type": feature_type,
+                },
                 "risk_level": risk_level,
                 "policy_risk_level": policy_risk_level,
                 "auto_allowed": auto_allowed,
                 "policy_decision": policy_decision,
+                "risk_policy": {
+                    "decision": "allow" if auto_allowed else "deny",
+                    "status": policy_decision.get("status"),
+                    "risk_level": policy_risk_level,
+                    "reason_code": policy_decision.get("reason_code"),
+                    "requires_allowlist": bool(policy_decision.get("requires_allowlist")),
+                },
                 "policy_evidence": _build_policy_evidence(config, policy_decision),
                 "steps": _case_steps(feature_type),
+                "preconditions": _case_preconditions(feature_type),
+                "expected_feedback": [_expected_result(feature_type)],
+                "assertions": _case_assertions(feature_type),
                 "expected_result": _expected_result(feature_type),
                 "data_requirements": _data_requirements(feature_type),
+                "requires_human_confirmation": not auto_allowed,
             }
         )
     return cases
@@ -826,14 +854,22 @@ def _execute_cases(
             results.append(
                 {
                     "case_id": case["case_id"],
+                    "test_case_id": case["case_id"],
                     "feature_id": case["feature_id"],
+                    "feature_point_id": case["feature_id"],
                     "status": "blocked_by_policy",
+                    "verdict": "skipped",
                     "execution_mode": "safe_placeholder",
                     "started_at": _now(),
                     "finished_at": _now(),
                     "evidence": [],
+                    "actions": [],
+                    "page_feedback": [],
+                    "screenshot_refs": [],
                     "policy_decision": case.get("policy_decision", {}),
                     "policy_evidence": case.get("policy_evidence", {}),
+                    "manual_confirmation_required": True,
+                    "failure_reason": "policy_denied",
                     "message": "高风险或需要业务数据的动作未自动执行，已转成人工任务。",
                 }
             )
@@ -842,14 +878,22 @@ def _execute_cases(
             results.append(
                 {
                     "case_id": case["case_id"],
+                    "test_case_id": case["case_id"],
                     "feature_id": case["feature_id"],
+                    "feature_point_id": case["feature_id"],
                     "status": "authorized_by_policy_placeholder",
+                    "verdict": "skipped",
                     "execution_mode": "safe_placeholder",
                     "started_at": _now(),
                     "finished_at": _now(),
                     "evidence": [],
+                    "actions": [],
+                    "page_feedback": [],
+                    "screenshot_refs": [],
                     "policy_decision": case.get("policy_decision", {}),
                     "policy_evidence": case.get("policy_evidence", {}),
+                    "manual_confirmation_required": False,
+                    "failure_reason": "contract_only_mode",
                     "message": "测试环境全权限模式已授权该副作用动作；当前 contract_only 模式仅落盘策略证据，真实执行由浏览器执行器消费。",
                 }
             )
@@ -857,14 +901,22 @@ def _execute_cases(
         results.append(
             {
                 "case_id": case["case_id"],
+                "test_case_id": case["case_id"],
                 "feature_id": case["feature_id"],
+                "feature_point_id": case["feature_id"],
                 "status": "passed_safe_placeholder",
+                "verdict": "passed",
                 "execution_mode": "safe_placeholder",
                 "started_at": _now(),
                 "finished_at": _now(),
                 "evidence": [],
+                "actions": [{"action": "contract_generate", "target": case["feature_id"], "status": "passed"}],
+                "page_feedback": ["占位模式已生成执行型用例契约。"],
+                "screenshot_refs": [],
                 "policy_decision": case.get("policy_decision", {}),
                 "policy_evidence": case.get("policy_evidence", {}),
+                "manual_confirmation_required": False,
+                "failure_reason": None,
                 "message": _safe_execution_message(config),
             }
         )
@@ -905,6 +957,12 @@ def _execute_real_browser_cases(
         for item in real_browser_payload.get("features", [])
         if isinstance(item, dict) and item.get("feature_id")
     }
+    case_execution_results = [
+        item
+        for item in real_browser_payload.get("case_execution_results", [])
+        if isinstance(item, dict)
+    ]
+    used_case_execution_result_indexes: set[int] = set()
     side_effect_results = [
         item
         for item in real_browser_payload.get("side_effect_results", [])
@@ -917,14 +975,22 @@ def _execute_real_browser_cases(
             results.append(
                 {
                     "case_id": case["case_id"],
+                    "test_case_id": case["case_id"],
                     "feature_id": case["feature_id"],
-                    "status": "blocked_by_policy",
+                    "feature_point_id": case["feature_id"],
+                    "status": "skipped_by_policy",
+                    "verdict": "skipped",
                     "execution_mode": "real_browser",
                     "started_at": started_at,
                     "finished_at": _now(),
                     "evidence": [],
+                    "actions": [],
+                    "page_feedback": [],
+                    "screenshot_refs": [],
                     "policy_decision": case.get("policy_decision", {}),
                     "policy_evidence": case.get("policy_evidence", {}),
+                    "manual_confirmation_required": True,
+                    "failure_reason": "policy_denied",
                     "message": "真实浏览器模式未执行高风险或需要业务数据的动作，已转成人工任务。",
                 }
             )
@@ -937,44 +1003,74 @@ def _execute_real_browser_cases(
             )
             if side_effect_match:
                 results.append(
-                    {
-                        **side_effect_match,
-                        "case_id": case["case_id"],
-                        "feature_id": case["feature_id"],
-                        "execution_mode": "real_browser",
-                        "policy_decision": side_effect_match.get("policy_decision")
-                        or case.get("policy_decision", {}),
-                        "policy_evidence": case.get("policy_evidence", {}),
-                        "message": side_effect_match.get("message")
-                        or "测试环境全权限模式已执行白名单副作用动作，并记录前后证据。",
-                    }
+                    _normalize_case_execution_result(
+                        case,
+                        side_effect_match,
+                        execution_mode="real_browser",
+                        default_status="side_effect_executed",
+                        default_verdict="passed",
+                        default_message="测试环境全权限模式已执行白名单副作用动作，并记录前后证据。",
+                    )
                 )
                 continue
             results.append(
                 {
                     "case_id": case["case_id"],
+                    "test_case_id": case["case_id"],
                     "feature_id": case["feature_id"],
+                    "feature_point_id": case["feature_id"],
                     "status": "skipped_not_observed",
+                    "verdict": "skipped",
                     "execution_mode": "real_browser",
                     "started_at": started_at,
                     "finished_at": _now(),
                     "evidence": screenshot_refs,
+                    "actions": [],
+                    "page_feedback": [],
+                    "screenshot_refs": screenshot_refs,
                     "policy_decision": case.get("policy_decision", {}),
                     "policy_evidence": case.get("policy_evidence", {}),
+                    "manual_confirmation_required": True,
+                    "failure_reason": "not_observed",
                     "message": "该副作用动作已授权，但当前页面未产生匹配的可审计执行结果。",
                 }
+            )
+            continue
+        execution_match = _take_case_execution_result_for_case(
+            case,
+            case_execution_results,
+            used_case_execution_result_indexes,
+        )
+        if execution_match:
+            results.append(
+                _normalize_case_execution_result(
+                    case,
+                    execution_match,
+                    execution_mode="real_browser",
+                    default_status="passed",
+                    default_verdict="passed",
+                    default_message="已通过真实浏览器执行该低风险功能点，并记录页面反馈与截图证据。",
+                )
             )
             continue
         if case["feature_id"] not in observed_feature_ids:
             results.append(
                 {
                     "case_id": case["case_id"],
+                    "test_case_id": case["case_id"],
                     "feature_id": case["feature_id"],
+                    "feature_point_id": case["feature_id"],
                     "status": "skipped_not_observed",
+                    "verdict": "skipped",
                     "execution_mode": "real_browser",
                     "started_at": started_at,
                     "finished_at": _now(),
                     "evidence": screenshot_refs,
+                    "actions": [],
+                    "page_feedback": [],
+                    "screenshot_refs": screenshot_refs,
+                    "manual_confirmation_required": True,
+                    "failure_reason": "not_observed",
                     "message": "真实浏览器扫描未重新定位到该功能点，未执行点击。",
                 }
             )
@@ -982,16 +1078,24 @@ def _execute_real_browser_cases(
         results.append(
             {
                 "case_id": case["case_id"],
+                "test_case_id": case["case_id"],
                 "feature_id": case["feature_id"],
+                "feature_point_id": case["feature_id"],
                 "status": "real_authorized_side_effect_pending_executor"
                 if _is_side_effect_case(case)
                 else "real_passed",
+                "verdict": "passed",
                 "execution_mode": "real_browser",
                 "started_at": started_at,
                 "finished_at": _now(),
                 "evidence": screenshot_refs,
+                "actions": [{"action": "observe_feature", "target": case["feature_id"], "status": "passed"}],
+                "page_feedback": ["功能点入口可见。"],
+                "screenshot_refs": screenshot_refs,
                 "policy_decision": case.get("policy_decision", {}),
                 "policy_evidence": case.get("policy_evidence", {}),
+                "manual_confirmation_required": False,
+                "failure_reason": None,
                 "message": (
                     "测试环境全权限模式已授权该副作用动作；当前真实浏览器扫描已确认入口可见，等待动作执行器执行。"
                     if _is_side_effect_case(case)
@@ -1018,6 +1122,86 @@ def _take_side_effect_result_for_case(
     return None
 
 
+def _take_case_execution_result_for_case(
+    case: dict[str, Any],
+    case_execution_results: list[dict[str, Any]],
+    used_indexes: set[int],
+) -> dict[str, Any] | None:
+    feature_id = _text(case.get("feature_id"))
+    case_id = _text(case.get("case_id"))
+    for index, result in enumerate(case_execution_results):
+        if index in used_indexes:
+            continue
+        if _text(result.get("feature_id") or result.get("feature_point_id")) == feature_id:
+            used_indexes.add(index)
+            return result
+        if _text(result.get("case_id") or result.get("test_case_id")) == case_id:
+            used_indexes.add(index)
+            return result
+    return None
+
+
+def _normalize_case_execution_result(
+    case: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    execution_mode: str,
+    default_status: str,
+    default_verdict: str,
+    default_message: str,
+) -> dict[str, Any]:
+    status = _text(result.get("status")) or default_status
+    verdict = _text(result.get("verdict")) or _verdict_from_status(status, default_verdict)
+    screenshot_refs = _string_list(result.get("screenshot_refs") or result.get("evidence"))
+    actions = result.get("actions")
+    if not isinstance(actions, list):
+        actions = []
+    page_feedback = result.get("page_feedback")
+    if not isinstance(page_feedback, list):
+        page_feedback = []
+    failure_reason = _text(result.get("failure_reason")) or None
+    return {
+        **result,
+        "case_id": case["case_id"],
+        "test_case_id": case["case_id"],
+        "feature_id": case["feature_id"],
+        "feature_point_id": case["feature_id"],
+        "status": status,
+        "verdict": verdict,
+        "execution_mode": execution_mode,
+        "started_at": _text(result.get("started_at")) or _now(),
+        "finished_at": _text(result.get("finished_at")) or _now(),
+        "actions": actions,
+        "page_feedback": page_feedback,
+        "screenshot_refs": screenshot_refs,
+        "evidence": screenshot_refs,
+        "policy_decision": result.get("policy_decision") or case.get("policy_decision", {}),
+        "policy_evidence": case.get("policy_evidence", {}),
+        "manual_confirmation_required": bool(
+            result.get("manual_confirmation_required", verdict != "passed")
+        ),
+        "failure_reason": failure_reason,
+        "message": _text(result.get("message")) or default_message,
+    }
+
+
+def _verdict_from_status(status: str, default: str) -> str:
+    if status in {"passed", "real_passed", "side_effect_executed", "passed_safe_placeholder"}:
+        return "passed"
+    if status.startswith(("failed", "real_failed", "side_effect_failed")):
+        return "failed"
+    if status.startswith(("skipped", "blocked")) or status in {"login_required"}:
+        return "skipped"
+    return default
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [_text(item) for item in value if _text(item)]
+    text = _text(value)
+    return [text] if text else []
+
+
 def _build_round_analysis(
     *,
     config: V3RunConfig,
@@ -1030,13 +1214,18 @@ def _build_round_analysis(
     menu_artifacts: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     execution_mode = _normalize_execution_mode(config.execution_mode)
-    blocked = [item for item in execution_results if item["status"].startswith("blocked")]
+    blocked = [
+        item
+        for item in execution_results
+        if item["status"].startswith("blocked") or item["status"] == "skipped_by_policy"
+    ]
     passed = [
         item
         for item in execution_results
         if item["status"]
         in {
             "passed_safe_placeholder",
+            "passed",
             "real_passed",
             "side_effect_executed",
             "authorized_by_policy_placeholder",
@@ -1098,6 +1287,19 @@ def _build_round_analysis(
                 "severity": "medium",
                 "case_ids": [item["case_id"] for item in blocked],
                 "suggestion": "在运行中心用界面确认白名单、补充测试数据或录制人工样本。",
+            }
+        )
+    for reason, items in _group_failed_execution_results(failed_or_skipped):
+        if reason == "policy_denied":
+            continue
+        failure_clusters.append(
+            {
+                "cluster_id": reason,
+                "reason": reason,
+                "title": _failure_cluster_title(reason),
+                "severity": "medium",
+                "case_ids": [item["case_id"] for item in items],
+                "suggestion": _failure_cluster_suggestion(reason),
             }
         )
     if execution_mode != "real_browser" and not config.use_live_discovery:
@@ -1235,7 +1437,9 @@ def _build_human_tasks(
             }
         )
     blocked_case_ids = [
-        item["case_id"] for item in execution_results if item["status"] == "blocked_by_policy"
+        item["case_id"]
+        for item in execution_results
+        if item["status"] in {"blocked_by_policy", "skipped_by_policy"}
     ]
     if blocked_case_ids:
         tasks.append(
@@ -1652,6 +1856,31 @@ def _case_steps(feature_type: str) -> list[dict[str, Any]]:
     return steps_by_type.get(feature_type, [{"action": "inspect", "target": "feature"}])
 
 
+def _case_preconditions(feature_type: str) -> list[str]:
+    base = ["使用当前测试账号已登录会话。", "从所属页面入口标准起点开始。"]
+    if feature_type in {"create", "edit", "submit", "save", "delete", "remove", "approve"}:
+        return base + ["当前安全策略允许该副作用动作，且测试数据或目标记录已准备。"]
+    return base
+
+
+def _case_assertions(feature_type: str) -> list[str]:
+    assertions_by_type = {
+        "navigation": ["page_loaded", "no_frontend_error"],
+        "view": ["target_visible", "no_frontend_error"],
+        "query": ["feedback_changed_or_empty_state_visible", "no_frontend_error"],
+        "reset": ["filters_reset", "no_frontend_error"],
+        "detail": ["detail_panel_or_page_visible", "no_frontend_error"],
+        "create": ["form_feedback_visible"],
+        "edit": ["form_feedback_visible"],
+        "submit": ["submit_feedback_visible"],
+        "save": ["save_feedback_visible"],
+        "delete": ["delete_feedback_visible"],
+        "remove": ["remove_feedback_visible"],
+        "approve": ["approval_feedback_visible"],
+    }
+    return assertions_by_type.get(feature_type, ["manual_verdict_required"])
+
+
 def _expected_result(feature_type: str) -> str:
     if feature_type in {"navigation", "view", "detail"}:
         return "页面或目标区域稳定可见，无明显前端错误。"
@@ -1682,6 +1911,44 @@ def _quality_judgement(
     if blocked:
         return "partial_loop_waiting_human"
     return "minimum_loop_ready"
+
+
+def _group_failed_execution_results(
+    results: list[dict[str, Any]],
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for result in results:
+        reason = _failure_reason_key(result)
+        groups.setdefault(reason, []).append(result)
+    return list(groups.items())
+
+
+def _failure_reason_key(result: dict[str, Any]) -> str:
+    raw_reason = _text(result.get("failure_reason"))
+    if raw_reason:
+        return raw_reason.split(":", 1)[0].strip() or raw_reason
+    status = _text(result.get("status"))
+    if status:
+        return status
+    return "unknown_failure"
+
+
+def _failure_cluster_title(reason: str) -> str:
+    titles = {
+        "assertion_failed": "页面反馈或断言未达预期",
+        "not_observed": "功能点未在真实页面中重新定位",
+        "skipped_not_observed": "功能点未在真实页面中重新定位",
+        "contract_only_mode": "占位模式未真实执行",
+    }
+    return titles.get(reason, f"执行失败或跳过：{reason}")
+
+
+def _failure_cluster_suggestion(reason: str) -> str:
+    if reason == "assertion_failed":
+        return "检查页面反馈、定位器和预期断言；必要时沉淀为项目级修正。"
+    if reason in {"not_observed", "skipped_not_observed"}:
+        return "扩大页面探索或补充定位提示后重新执行该功能点。"
+    return "查看执行结果中的 actions、page_feedback 和 screenshot_refs 后决定下一轮修正。"
 
 
 def _safe_execution_message(config: V3RunConfig) -> str:

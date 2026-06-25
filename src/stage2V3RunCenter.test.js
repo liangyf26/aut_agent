@@ -697,6 +697,77 @@ test('stage2 v3 run center starts real_browser mode through Python v3 bridge', a
   });
 });
 
+test('stage2 v3 run center exposes execution verdict counts and recent evidence', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '执行证据样例系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+    const started = await startV3Run(created.run.runId, {
+      executionMode: 'real_browser'
+    }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          executionItems: [{
+            test_case_id: 'case_nav',
+            feature_point_id: 'feature_nav',
+            status: 'passed',
+            verdict: 'passed',
+            execution_mode: 'real_browser',
+            actions: [{ action: 'goto', status: 'passed' }],
+            page_feedback: ['首页加载完成'],
+            screenshot_refs: ['screenshots/home_entry.png'],
+            failure_reason: null,
+            manual_confirmation_required: false
+          }, {
+            test_case_id: 'case_query',
+            feature_point_id: 'feature_query',
+            status: 'failed',
+            verdict: 'failed',
+            execution_mode: 'real_browser',
+            actions: [{ action: 'click', target: '查询', status: 'failed' }],
+            page_feedback: ['列表没有刷新'],
+            screenshot_refs: ['screenshots/query_failure.png'],
+            failure_reason: 'assertion_failed',
+            manual_confirmation_required: true
+          }, {
+            test_case_id: 'case_delete',
+            feature_point_id: 'feature_delete',
+            status: 'skipped_by_policy',
+            verdict: 'skipped',
+            execution_mode: 'real_browser',
+            actions: [],
+            page_feedback: [],
+            screenshot_refs: [],
+            failure_reason: 'policy_denied',
+            manual_confirmation_required: true
+          }]
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'waiting_human' }),
+          stderr: ''
+        };
+      }
+    });
+
+    assert.equal(started.run.summary.execution.total, 3);
+    assert.equal(started.run.summary.execution.passed, 1);
+    assert.equal(started.run.summary.execution.failed, 1);
+    assert.equal(started.run.summary.execution.blocked, 1);
+    assert.equal(started.run.summary.execution.skipped, 1);
+    assert.deepEqual(
+      started.run.summary.execution.recentEvidence.map((item) => item.testCaseId),
+      ['case_nav', 'case_query', 'case_delete']
+    );
+    assert.equal(started.run.summary.execution.recentEvidence[0].screenshotRefs[0], 'screenshots/home_entry.png');
+    assert.equal(started.run.summary.execution.recentEvidence[1].failureReason, 'assertion_failed');
+    assert.equal(started.run.summary.execution.recentEvidence[2].failureReason, 'policy_denied');
+  });
+});
+
 test('stage2 v3 run center keeps next round open when scoped target is not discovered', async () => {
   await withTempRunsDir(async (runsDir) => {
     const created = await createV3Run({

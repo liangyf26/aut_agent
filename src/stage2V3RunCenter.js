@@ -730,14 +730,39 @@ function summarizeExecution(items = []) {
     + (byStatus.side_effect_failed || 0);
   const skipped = (byStatus.skipped || 0)
     + (byStatus.skipped_no_executor || 0)
-    + (byStatus.skipped_not_observed || 0);
+    + (byStatus.skipped_not_observed || 0)
+    + (byStatus.skipped_by_policy || 0);
+  const blocked = (byStatus.blocked_by_policy || 0)
+    + (byStatus.skipped_by_policy || 0);
+  const recentEvidence = items
+    .filter((item) => {
+      const screenshots = Array.isArray(item.screenshot_refs) ? item.screenshot_refs : [];
+      const feedback = Array.isArray(item.page_feedback) ? item.page_feedback : [];
+      const actions = Array.isArray(item.actions) ? item.actions : [];
+      return screenshots.length || feedback.length || actions.length || item.failure_reason;
+    })
+    .slice(0, 5)
+    .map((item) => ({
+      testCaseId: item.test_case_id || item.case_id || null,
+      featurePointId: item.feature_point_id || item.feature_id || null,
+      status: item.status || 'unknown',
+      verdict: item.verdict || null,
+      executionMode: item.execution_mode || null,
+      actionCount: Array.isArray(item.actions) ? item.actions.length : 0,
+      pageFeedback: Array.isArray(item.page_feedback) ? item.page_feedback.slice(0, 3) : [],
+      screenshotRefs: Array.isArray(item.screenshot_refs) ? item.screenshot_refs.slice(0, 4) : [],
+      failureReason: item.failure_reason || null,
+      manualConfirmationRequired: Boolean(item.manual_confirmation_required)
+    }));
   return {
     total: items.length,
     passed,
     failed,
     skipped,
+    blocked,
     needs_review: byStatus.needs_review || 0,
-    by_status: byStatus
+    by_status: byStatus,
+    recentEvidence
   };
 }
 
