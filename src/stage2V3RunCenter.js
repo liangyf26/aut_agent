@@ -132,6 +132,25 @@ function normalizeArray(value) {
   return [];
 }
 
+function normalizeTextList(value) {
+  if (Array.isArray(value)) {
+    return value
+      .flatMap((item) => normalizeTextList(item))
+      .filter(Boolean);
+  }
+  if (value === null || value === undefined) {
+    return [];
+  }
+  return String(value)
+    .split(/\r?\n|[;,，、]/)
+    .map((item) => item.trim())
+    .filter((item) => item.length >= 2);
+}
+
+function uniqueTextList(...values) {
+  return [...new Set(values.flatMap((value) => normalizeTextList(value)))];
+}
+
 function modelProfilesConfigPath(options = {}) {
   return options.configPath
     || options.modelProfileConfigPath
@@ -238,6 +257,20 @@ function normalizeInputConfig(body = {}, options = {}) {
       || body.sideEffectAllowlist
       || body.side_effect_allowlist
   );
+  const prioritizedTargets = uniqueTextList(
+    body.prioritizedTargets,
+    body.prioritized_targets,
+    body.targetNames,
+    body.target_names,
+    body.pageTargets,
+    body.page_targets
+  ).slice(0, 20);
+  const waivedTargets = uniqueTextList(
+    body.waivedTargets,
+    body.waived_targets,
+    body.waivedPageTargets,
+    body.waived_page_targets
+  ).slice(0, 20);
   const fullAccessConfirmed = body.fullAccessConfirmed === true
     || body.full_access_confirmed === true
     || body.safetyPolicyConfirmed === true
@@ -259,6 +292,8 @@ function normalizeInputConfig(body = {}, options = {}) {
     allowed_side_effect_actions: safetyPolicy === SAFETY_POLICY_TEST_ENV_FULL_ACCESS
       ? (allowedSideEffectActions.length ? allowedSideEffectActions : DEFAULT_FULL_ACCESS_ACTIONS)
       : [],
+    prioritized_targets: prioritizedTargets,
+    waived_targets: waivedTargets,
     selected_model_profile_ids: selectedModelProfileIds,
     selected_model_profiles: selectedModelProfiles,
     max_pages: normalizeInteger(body.maxPages || body.max_pages, 30, 1, 200),
@@ -602,6 +637,8 @@ function buildManifest({ runId, inputConfig, status, createdAt, updatedAt, round
     safety_policy: inputConfig.safety_policy,
     full_access_confirmed: inputConfig.full_access_confirmed,
     allowed_side_effect_actions: inputConfig.allowed_side_effect_actions,
+    prioritized_targets: inputConfig.prioritized_targets || [],
+    waived_targets: inputConfig.waived_targets || [],
     selected_model_profile_ids: inputConfig.selected_model_profile_ids,
     selected_model_profiles: inputConfig.selected_model_profiles,
     status,
@@ -703,9 +740,31 @@ function summarizeExecution(items = []) {
   };
 }
 
+function normalizeTargetTracking(payload) {
+  const items = Array.isArray(payload)
+    ? payload
+    : Array.isArray(payload?.items)
+      ? payload.items
+      : [];
+  const counts = items.reduce((acc, item) => {
+    const status = item.status || 'unknown';
+    acc[status] = (acc[status] || 0) + 1;
+    return acc;
+  }, {});
+  return {
+    schema_version: 'stage2_target_tracking.v3',
+    total: items.length,
+    found: counts.found || 0,
+    missed: counts.missed || 0,
+    waived: counts.waived || 0,
+    items
+  };
+}
+
 function buildPublicRun(runDir, manifest, artifacts = {}) {
   const executionItems = artifacts.execution_results?.items || [];
   const menuEntryItems = artifactItems(artifacts.menu_entries, 'menu_entries');
+  const targetTracking = normalizeTargetTracking(artifacts.round_analysis?.target_tracking);
   const executionMode = artifacts.current_status?.execution_mode || manifest.execution_mode || null;
   const currentStatus = artifacts.current_status || buildCurrentStatus(
     manifest,
@@ -722,6 +781,12 @@ function buildPublicRun(runDir, manifest, artifacts = {}) {
     safetyPolicy: manifest.safety_policy || artifacts.input_config?.safety_policy || SAFETY_POLICY_LOW_RISK_ONLY,
     allowedSideEffectActions: manifest.allowed_side_effect_actions
       || artifacts.input_config?.allowed_side_effect_actions
+      || [],
+    prioritizedTargets: manifest.prioritized_targets
+      || artifacts.input_config?.prioritized_targets
+      || [],
+    waivedTargets: manifest.waived_targets
+      || artifacts.input_config?.waived_targets
       || [],
     modelProfileIds: manifest.selected_model_profile_ids
       || artifacts.input_config?.selected_model_profile_ids
@@ -753,10 +818,25 @@ function buildPublicRun(runDir, manifest, artifacts = {}) {
       generatedTestCases: summarizeItems(artifacts.generated_test_cases?.items),
       execution: summarizeExecution(executionItems),
       pendingHumanTasks: (artifacts.human_tasks?.items || []).filter((item) => item.status === 'pending').length,
+      targetTracking: {
+        total: targetTracking.total,
+        found: targetTracking.found,
+        missed: targetTracking.missed,
+        waived: targetTracking.waived
+      },
       nextDecision: artifacts.next_round_plan?.decision || null,
       executionMode,
       safetyPolicy: manifest.safety_policy || artifacts.input_config?.safety_policy || SAFETY_POLICY_LOW_RISK_ONLY
     },
+    targetTracking,
+    missedTargets: targetTracking.items
+      .filter((item) => item.status === 'missed')
+      .map((item) => item.target)
+      .filter(Boolean),
+    foundTargets: targetTracking.items
+      .filter((item) => item.status === 'found')
+      .map((item) => item.target)
+      .filter(Boolean),
     artifacts: artifactRefs(manifest.run_id)
   };
 }
@@ -1200,20 +1280,37 @@ function groupFailures(executionResults) {
 }
 
 function extractScopeTargets(inputConfig = {}) {
+  const explicit = uniqueTextList(
+    inputConfig.prioritized_targets,
+    inputConfig.prioritizedTargets,
+    inputConfig.target_names,
+    inputConfig.targetNames,
+    inputConfig.page_targets,
+    inputConfig.pageTargets
+  );
   const scope = normalizeOptionalText(
     inputConfig.scope
       || inputConfig.scopeText
       || inputConfig.explorationScope
       || inputConfig.exploration_scope
   );
+  const targets = [...explicit];
   if (!scope) {
-    return [];
+    return targets.slice(0, 20);
   }
   const quoted = [...scope.matchAll(/[“"']([^”"']{2,80})[”"']/g)]
     .map((match) => normalizeOptionalText(match[1]))
     .filter(Boolean);
+  for (const target of quoted) {
+    if (!targets.includes(target)) {
+      targets.push(target);
+    }
+  }
+  if (explicit.length && !quoted.length) {
+    return targets.slice(0, 20);
+  }
   if (!quoted.length && !/[页面入口]/.test(scope)) {
-    return [];
+    return targets.slice(0, 20);
   }
   const cleaned = scope
     .replace(/[“"'][^”"']{2,80}[”"']/g, ' ')
@@ -1221,7 +1318,12 @@ function extractScopeTargets(inputConfig = {}) {
     .split(/\s+/)
     .map((item) => normalizeOptionalText(item))
     .filter((item) => item && item.length >= 2);
-  return [...new Set([...quoted, ...cleaned])].slice(0, 5);
+  for (const target of cleaned) {
+    if (!targets.includes(target)) {
+      targets.push(target);
+    }
+  }
+  return targets.slice(0, 20);
 }
 
 function itemMatchesScopeTarget(item, target) {
@@ -1229,9 +1331,12 @@ function itemMatchesScopeTarget(item, target) {
     item.name,
     item.title,
     item.url,
+    item.route_hint,
+    item.text,
     item.menu_path,
     item.feature_type,
     item.page_type,
+    item.semantic_page_type,
     item.source
   ]
     .flat()
@@ -1241,15 +1346,118 @@ function itemMatchesScopeTarget(item, target) {
   return haystack.includes(String(target || '').toLowerCase());
 }
 
-function findMissingScopeTargets(inputConfig, pageEntries, featurePoints) {
-  const targets = extractScopeTargets(inputConfig);
-  if (!targets.length) {
-    return [];
+function extractWaivedTargets(inputConfig = {}) {
+  return uniqueTextList(
+    inputConfig.waived_targets,
+    inputConfig.waivedTargets,
+    inputConfig.waived_page_targets,
+    inputConfig.waivedPageTargets
+  );
+}
+
+function menuEntryMatchItem(entry) {
+  return {
+    ...entry,
+    name: entry.name || entry.text,
+    title: entry.title || entry.text,
+    url: entry.url || entry.route_hint
+  };
+}
+
+function targetMatchRecord(kind, item) {
+  if (kind === 'menu_entry') {
+    return {
+      kind,
+      menu_id: item.menu_id || item.id || '',
+      text: item.text || item.name || item.title || '',
+      menu_path: item.menu_path || [],
+      route_hint: item.route_hint || '',
+      screenshot_refs: item.screenshot_refs || []
+    };
   }
+  if (kind === 'page_entry') {
+    return {
+      kind,
+      page_entry_id: item.page_entry_id || item.page_id || '',
+      name: item.name || item.title || '',
+      url: item.url || '',
+      menu_path: item.menu_path || []
+    };
+  }
+  return {
+    kind,
+    feature_point_id: item.feature_point_id || item.feature_id || '',
+    page_entry_id: item.page_entry_id || item.page_id || '',
+    name: item.name || item.title || '',
+    feature_type: item.feature_type || ''
+  };
+}
+
+function buildTargetTracking(inputConfig, pageEntries, featurePoints, menuEntries = { items: [] }) {
+  const waivedTargets = extractWaivedTargets(inputConfig);
+  const targets = [...new Set([...extractScopeTargets(inputConfig), ...waivedTargets])].slice(0, 20);
   const pages = pageEntries.items || [];
   const features = featurePoints.items || [];
-  return targets.filter((target) => !pages.some((item) => itemMatchesScopeTarget(item, target))
-    && !features.some((item) => itemMatchesScopeTarget(item, target)));
+  const menus = artifactItems(menuEntries, 'items', 'menu_entries');
+  return targets.map((target) => {
+    if (waivedTargets.includes(target)) {
+      return {
+        target,
+        status: 'waived',
+        waived: true,
+        matched_items: [],
+        matched_menu_entry_ids: [],
+        matched_page_ids: [],
+        matched_feature_ids: [],
+        evidence_quality: 'waived_by_user',
+        missed_reason: null
+      };
+    }
+    const menuMatches = menus.filter((item) => itemMatchesScopeTarget(menuEntryMatchItem(item), target));
+    const pageMatches = pages.filter((item) => itemMatchesScopeTarget(item, target));
+    const featureMatches = features.filter((item) => itemMatchesScopeTarget(item, target));
+    if (menuMatches.length || pageMatches.length || featureMatches.length) {
+      return {
+        target,
+        status: 'found',
+        waived: false,
+        matched_items: [
+          ...menuMatches.map((item) => targetMatchRecord('menu_entry', item)),
+          ...pageMatches.map((item) => targetMatchRecord('page_entry', item)),
+          ...featureMatches.map((item) => targetMatchRecord('feature_point', item))
+        ],
+        matched_menu_entry_ids: menuMatches.map((item) => item.menu_id || item.id).filter(Boolean),
+        matched_page_ids: pageMatches.map((item) => item.page_entry_id || item.page_id).filter(Boolean),
+        matched_feature_ids: featureMatches.map((item) => item.feature_point_id || item.feature_id).filter(Boolean),
+        evidence_quality: menuMatches.length ? 'high' : 'medium',
+        missed_reason: null
+      };
+    }
+    return {
+      target,
+      status: 'missed',
+      waived: false,
+      matched_items: [],
+      matched_menu_entry_ids: [],
+      matched_page_ids: [],
+      matched_feature_ids: [],
+      evidence_quality: 'low',
+      missed_reason: 'not_found_in_menu_or_page_artifacts',
+      evidence: {
+        searched_sources: ['menu_text', 'menu_path', 'route_hint', 'page_entries', 'feature_points'],
+        menu_entry_count: menus.length,
+        page_count: pages.length,
+        feature_count: features.length
+      }
+    };
+  });
+}
+
+function findMissingScopeTargets(targetTracking) {
+  return (Array.isArray(targetTracking) ? targetTracking : [])
+    .filter((item) => item.status === 'missed')
+    .map((item) => item.target)
+    .filter(Boolean);
 }
 
 function buildHumanTasks(featurePoints, executionResults, nextRoundPlan = null) {
@@ -1321,11 +1529,13 @@ function makeRoundAnalysis({
   featurePoints,
   testCases,
   executionResults,
-  screenshotsIndex
+  screenshotsIndex,
+  menuEntries
 }) {
   const executionSummary = summarizeExecution(executionResults.items || []);
   const failureClusters = groupFailures(executionResults);
-  const missingScopeTargets = findMissingScopeTargets(inputConfig, pageEntries, featurePoints);
+  const targetTracking = buildTargetTracking(inputConfig, pageEntries, featurePoints, menuEntries);
+  const missingScopeTargets = findMissingScopeTargets(targetTracking);
   if (missingScopeTargets.length) {
     failureClusters.push({
       cluster_id: `cluster_${String(failureClusters.length + 1).padStart(3, '0')}`,
@@ -1382,6 +1592,7 @@ function makeRoundAnalysis({
     ai_provider_status: 'not_connected',
     scope_targets: extractScopeTargets(inputConfig),
     missing_scope_targets: missingScopeTargets,
+    target_tracking: targetTracking,
     confidence: 0.72
   };
 
@@ -1409,7 +1620,11 @@ function makeRoundAnalysis({
     target_feature_point_ids: (featurePoints.items || [])
       .filter((item) => item.auto_verifiable)
       .map((item) => item.feature_point_id),
+    target_search_goals: missingScopeTargets,
     planned_improvements: analysis.improvement_candidates,
+    analysis_refs: {
+      target_tracking: 'round_analysis.target_tracking'
+    },
     risk_level: 'low',
     requires_human_approval: failureClusters.length > 0 && missingScopeTargets.length === 0
   };
@@ -1542,6 +1757,12 @@ async function runPythonV3Orchestrator({ runId, runsDir, runDir, inputConfig, bo
   ];
   if (inputConfig.scope) {
     args.push('--v3-scope', inputConfig.scope);
+  }
+  for (const target of inputConfig.prioritized_targets || []) {
+    args.push('--v3-prioritized-target', target);
+  }
+  for (const target of inputConfig.waived_targets || []) {
+    args.push('--v3-waived-target', target);
   }
   for (const action of inputConfig.allowed_side_effect_actions || []) {
     args.push('--v3-allow-side-effect-action', action);
@@ -1812,7 +2033,9 @@ function normalizePythonNextRoundPlan(payload, executionResults, roundId) {
       : payload?.next_round_goal || payload?.primary_reason || '继续下一轮自动评测。',
     target_page_entry_ids: payload?.target_page_entry_ids || [],
     target_feature_point_ids: payload?.target_feature_point_ids || [],
+    target_search_goals: payload?.target_search_goals || [],
     planned_improvements: payload?.planned_improvements || payload?.recommended_actions || [],
+    analysis_refs: payload?.analysis_refs || {},
     risk_level: payload?.risk_level || 'low',
     requires_human_approval: Boolean(hasBlockingEvidenceGap || payload?.requires_human_approval || payload?.status === 'blocked_waiting_human')
   };
@@ -1847,7 +2070,8 @@ async function persistContractOnlyArtifacts(runDir, manifest, inputConfig, execu
     featurePoints,
     testCases,
     executionResults,
-    screenshotsIndex
+    screenshotsIndex,
+    menuEntries
   });
 
   await writeJson(path.join(runDir, ARTIFACTS.preflight_result), preflightResult);
@@ -1915,7 +2139,8 @@ async function persistRealBrowserFailure(runDir, manifest, inputConfig, processR
     featurePoints,
     testCases,
     executionResults,
-    screenshotsIndex
+    screenshotsIndex,
+    menuEntries: makeEmptyMenuArtifacts().menuEntries
   });
   analysisPack.nextRoundPlan.current_round_id = roundId;
   analysisPack.nextRoundPlan.decision = 'wait_human_review';
@@ -1970,7 +2195,8 @@ async function persistRealBrowserArtifacts(runDir, manifest, inputConfig, proces
     featurePoints,
     testCases,
     executionResults,
-    screenshotsIndex
+    screenshotsIndex,
+    menuEntries
   });
   const nodeNextRoundPlan = analysisPack.nextRoundPlan;
   analysisPack.nextRoundPlan = normalizePythonNextRoundPlan(pythonNextRoundPlan, executionResults, roundId);
@@ -2181,6 +2407,7 @@ async function analyzeV3Run(runId, options = {}) {
   const testCases = await readJsonRequired(path.join(runDir, ARTIFACTS.generated_test_cases), 'generated_test_cases 缺失，不能复盘。');
   const executionResults = await readJsonRequired(path.join(runDir, ARTIFACTS.execution_results), 'execution_results 缺失，不能复盘。');
   const screenshotsIndex = await readJsonIfExists(path.join(runDir, ARTIFACTS.screenshots_index)) || makeScreenshotsIndex();
+  const menuEntries = await readJsonIfExists(path.join(runDir, ARTIFACTS.menu_entries)) || makeEmptyMenuArtifacts().menuEntries;
 
   const analysisPack = makeRoundAnalysis({
     manifest,
@@ -2189,7 +2416,8 @@ async function analyzeV3Run(runId, options = {}) {
     featurePoints,
     testCases,
     executionResults,
-    screenshotsIndex
+    screenshotsIndex,
+    menuEntries
   });
   await persistAnalysisPack(runDir, analysisPack);
   const saved = await updateRunStatus(

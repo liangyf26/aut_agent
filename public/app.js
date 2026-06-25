@@ -797,12 +797,21 @@ function renderStage2SafetyConfirmation() {
   }
 }
 
+function parseStage2TextList(value) {
+  return String(value || '')
+    .split(/\r?\n|[;,，、]/)
+    .map((item) => item.trim())
+    .filter((item) => item.length >= 2);
+}
+
 async function createStage2Run(event) {
   event.preventDefault();
   const data = new FormData(stage2RunForm);
   const safetyPolicy = normalizeStage2SafetyPolicy(data.get('safetyPolicy') || 'low_risk_only');
   const allowedSideEffects = safetyPolicy === 'test_env_full_access' ? [...STAGE2_FULL_ACCESS_ALLOWLIST] : [];
   const modelProfileIds = [...new Set(data.getAll('modelProfileIds').map((item) => item.trim()).filter(Boolean))];
+  const prioritizedTargets = parseStage2TextList(data.get('prioritizedTargets'));
+  const waivedTargets = parseStage2TextList(data.get('waivedTargets'));
   const payload = {
     systemName: data.get('systemName')?.trim() || '',
     system_name: data.get('systemName')?.trim() || '',
@@ -823,6 +832,10 @@ async function createStage2Run(event) {
     accountNotes: data.get('accountNotes')?.trim() || '',
     account_notes: data.get('accountNotes')?.trim() || '',
     scope: data.get('scope')?.trim() || '',
+    prioritizedTargets,
+    prioritized_targets: prioritizedTargets,
+    waivedTargets,
+    waived_targets: waivedTargets,
     modelProfileIds,
     model_profile_ids: modelProfileIds,
     maxPages: Number(data.get('maxPages')) || 30,
@@ -1372,6 +1385,7 @@ function normalizeStage2Run(run = {}, source = 'v3') {
   const manifest = run.run_manifest || run.manifest || {};
   const stats = run.stats || run.summary || {};
   const runId = getRunId(run) || `stage2_${Date.now()}`;
+  const targetTracking = normalizeStage2TargetTracking(run.targetTracking || run.target_tracking);
   return {
     ...run,
     runId,
@@ -1390,6 +1404,11 @@ function normalizeStage2Run(run = {}, source = 'v3') {
     executionMode: getStage2ExecutionMode(run),
     safetyPolicy: getStage2SafetyPolicy(run),
     allowedSideEffects: getStage2AllowedSideEffects(run),
+    prioritizedTargets: run.prioritizedTargets || run.prioritized_targets || manifest.prioritized_targets || [],
+    waivedTargets: run.waivedTargets || run.waived_targets || manifest.waived_targets || [],
+    targetTracking,
+    missedTargets: run.missedTargets || run.missed_targets || targetTracking.items.filter((item) => item.status === 'missed').map((item) => item.target).filter(Boolean),
+    foundTargets: run.foundTargets || run.found_targets || targetTracking.items.filter((item) => item.status === 'found').map((item) => item.target).filter(Boolean),
     realExecutionAvailable: Boolean(run.realExecutionAvailable || run.real_execution_available || run.capabilities?.realBrowserExecution || run.capabilities?.real_browser_execution || run.preflight?.cdp_available),
     createdAt: run.createdAt || run.created_at || manifest.created_at || run.started_at || '',
     updatedAt: run.updatedAt || run.updated_at || manifest.updated_at || run.finished_at || run.started_at || '',
@@ -1405,7 +1424,10 @@ function normalizeStage2Run(run = {}, source = 'v3') {
       passed: Number(stats.passed ?? stats.passedCount ?? stats.verificationSuccesses ?? run.passedCount ?? 0),
       failed: Number(stats.failed ?? stats.failedCount ?? run.failedCount ?? 0),
       skipped: Number(stats.skipped ?? stats.skippedCount ?? run.skippedCount ?? 0),
-      humanTasks: Number(stats.humanTasks ?? stats.pendingHumanTasks ?? run.pendingHumanTaskCount ?? 0)
+      humanTasks: Number(stats.humanTasks ?? stats.pendingHumanTasks ?? run.pendingHumanTaskCount ?? 0),
+      targetFound: Number(stats.targetTracking?.found ?? stats.target_found ?? targetTracking.found ?? 0),
+      targetMissed: Number(stats.targetTracking?.missed ?? stats.target_missed ?? targetTracking.missed ?? 0),
+      targetWaived: Number(stats.targetTracking?.waived ?? stats.target_waived ?? targetTracking.waived ?? 0)
     }
   };
 }
@@ -1459,6 +1481,22 @@ function toArrayItems(value) {
   return [];
 }
 
+function normalizeStage2TargetTracking(value) {
+  const items = toArrayItems(value);
+  const counts = items.reduce((acc, item) => {
+    const status = item.status || 'unknown';
+    acc[status] = (acc[status] || 0) + 1;
+    return acc;
+  }, {});
+  return {
+    total: items.length,
+    found: counts.found || 0,
+    missed: counts.missed || 0,
+    waived: counts.waived || 0,
+    items
+  };
+}
+
 function getRunArtifact(run, ...keys) {
   for (const key of keys) {
     if (run?.[key]) {
@@ -1504,6 +1542,16 @@ function getRunHumanTasks(run) {
 
 function getRunRoundAnalysis(run) {
   return getRunArtifact(run, 'roundAnalysis', 'round_analysis') || run?.aiReview || run?.analysis || {};
+}
+
+function getRunTargetTracking(run) {
+  const analysis = getRunRoundAnalysis(run);
+  return normalizeStage2TargetTracking(
+    run?.targetTracking
+      || run?.target_tracking
+      || analysis.target_tracking
+      || analysis.targetTracking
+  );
 }
 
 function getRunNextRoundPlan(run) {
@@ -1833,6 +1881,7 @@ function renderStage2V3OverviewTab() {
   const executionMode = getStage2ExecutionMode(run);
   const safetyPolicy = getStage2SafetyPolicy(run);
   const allowedSideEffects = getStage2AllowedSideEffects(run);
+  const targetTracking = getRunTargetTracking(run);
   container.innerHTML = `
     <section class="stage2-overview-grid">
       <article class="stage2-work-card">
@@ -1848,6 +1897,7 @@ function renderStage2V3OverviewTab() {
             ['执行模式', executionModeLabel(executionMode)],
             ['安全策略', safetyPolicyLabel(safetyPolicy)],
             ['副作用白名单', allowedSideEffects.length ? allowedSideEffects.join(', ') : '无'],
+            ['优先目标', (run.prioritizedTargets || []).join('、') || '-'],
             ['系统', run.systemName],
             ['入口', run.entryUrl || '-'],
             ['创建时间', formatDate(run.createdAt)],
@@ -1866,6 +1916,7 @@ function renderStage2V3OverviewTab() {
         <div class="tag-row">
           <span class="tag">${escapeHtml(String((analysis.human_tasks || analysis.humanTasks || []).length || getRunHumanTasks(run).length))} 个人工项</span>
           <span class="tag">${escapeHtml(String((analysis.improvement_candidates || analysis.improvementCandidates || []).length || 0))} 个改进候选</span>
+          <span class="tag">目标 ${escapeHtml(String(targetTracking.found))}/${escapeHtml(String(targetTracking.total))}</span>
         </div>
       </article>
       <article class="stage2-work-card">
@@ -1876,6 +1927,7 @@ function renderStage2V3OverviewTab() {
         <p>${escapeHtml(nextPlan.next_round_goal || nextPlan.nextRoundGoal || nextPlan.reason || '暂无下一轮计划。')}</p>
         <div class="tag-row">
           <span class="tag">${escapeHtml(nextPlan.should_continue || nextPlan.shouldContinue ? '建议继续' : '未建议继续')}</span>
+          <span class="tag">${escapeHtml((nextPlan.target_search_goals || nextPlan.targetSearchGoals || []).join('、') || '无目标待追踪')}</span>
           <span class="tag">${escapeHtml(nextPlan.risk_level || nextPlan.riskLevel || '风险未知')}</span>
         </div>
       </article>
@@ -1952,6 +2004,7 @@ function renderStage2V3AiTab() {
   }
   const analysis = getRunRoundAnalysis(run);
   const nextPlan = getRunNextRoundPlan(run);
+  const targetTracking = getRunTargetTracking(run);
   container.innerHTML = `
     <section class="stage2-ai-grid">
       <article class="stage2-work-card">
@@ -1971,15 +2024,48 @@ function renderStage2V3AiTab() {
         ${renderStage2KeyValueList([
           ['是否继续', nextPlan.should_continue || nextPlan.shouldContinue ? '是' : '否'],
           ['下一轮目标', nextPlan.next_round_goal || nextPlan.nextRoundGoal || '-'],
+          ['目标搜索', (nextPlan.target_search_goals || nextPlan.targetSearchGoals || []).join('、') || '-'],
           ['风险等级', nextPlan.risk_level || nextPlan.riskLevel || '-'],
           ['需要人工批准', nextPlan.requires_human_approval || nextPlan.requiresHumanApproval ? '是' : '否']
         ])}
+      </article>
+      <article class="stage2-work-card stage2-work-card-wide">
+        <header><strong>目标页面追踪</strong><span class="tag">${escapeHtml(String(targetTracking.found))}/${escapeHtml(String(targetTracking.total))}</span></header>
+        ${renderStage2TargetTrackingList(targetTracking.items)}
       </article>
       <article class="stage2-work-card stage2-work-card-wide">
         <header><strong>改进与沉淀候选</strong><span class="tag">${escapeHtml(String((analysis.improvement_candidates || analysis.improvementCandidates || []).length || 0))}</span></header>
         ${renderStage2CompactList(analysis.improvement_candidates || analysis.improvementCandidates || [], '暂无改进候选。')}
       </article>
     </section>
+  `;
+}
+
+function renderStage2TargetTrackingList(items) {
+  if (!items.length) {
+    return `<div class="stage2-empty"><p>暂无目标页面追踪记录。</p></div>`;
+  }
+  const statusText = {
+    found: '已命中',
+    missed: '未命中',
+    waived: '已豁免'
+  };
+  return `
+    <div class="stage2-compact-list">
+      ${items.map((item) => {
+    const matched = toArrayItems(item.matched_items || item.matchedItems)
+      .map((match) => match.text || match.name || match.menu_id || match.page_entry_id || match.feature_point_id)
+      .filter(Boolean)
+      .join('、');
+    return `
+          <article>
+            <strong>${escapeHtml(item.target || '-')}</strong>
+            <p>${escapeHtml(matched || item.missed_reason || item.missedReason || item.evidence_quality || '-')}</p>
+            <span class="tag ${item.status === 'found' ? 'passed' : item.status === 'missed' ? 'manual' : ''}">${escapeHtml(statusText[item.status] || item.status || '-')}</span>
+          </article>
+        `;
+  }).join('')}
+    </div>
   `;
 }
 

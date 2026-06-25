@@ -912,8 +912,16 @@ def _build_round_analysis(
         menu_artifacts.get("browser_target_count"),
         _browser_target_count(real_browser_payload or {}),
     )
+    target_tracking = _build_target_tracking(
+        config=config,
+        pages=pages,
+        features=features,
+        menu_entries=menu_entries,
+    )
     failure_clusters = []
-    missing_scope_targets = _missing_scope_targets(config, pages, features)
+    missing_scope_targets = [
+        item["target"] for item in target_tracking if item["status"] == "missed"
+    ]
     if missing_scope_targets:
         failure_clusters.append(
             {
@@ -987,6 +995,7 @@ def _build_round_analysis(
         "ai_provider_status": "not_connected",
         "scope_targets": _scope_targets(config),
         "missing_scope_targets": missing_scope_targets,
+        "target_tracking": target_tracking,
         "target_name": config.target_name,
         "coverage": {
             "menu_entry_count": len(menu_entries),
@@ -1124,6 +1133,11 @@ def _build_next_round_plan(
         "status": "blocked_waiting_human" if blocking_tasks else "ready",
         "should_start_next_round": should_continue,
         "target_stage": "safe_execution" if blocking_tasks else "live_discovery",
+        "target_search_goals": [
+            item["target"]
+            for item in round_analysis.get("target_tracking", [])
+            if item.get("status") == "missed"
+        ],
         "primary_reason": "存在需要界面确认的高风险动作或测试数据。"
         if blocking_tasks
         else "当前最小闭环已完成，可进入下一轮扩大页面覆盖。",
@@ -1142,6 +1156,7 @@ def _build_next_round_plan(
             "failure_cluster_count": len(round_analysis["failure_clusters"]),
             "quality_judgement": round_analysis["quality_judgement"],
             "target_name": config.target_name,
+            "target_tracking": round_analysis.get("target_tracking", []),
         },
     }
 
@@ -1588,10 +1603,22 @@ def _text(value: Any) -> str:
 
 
 def _scope_targets(config: V3RunConfig) -> list[str]:
+    explicit = _metadata_text_list(
+        config.metadata,
+        "prioritized_targets",
+        "prioritizedTargets",
+        "target_names",
+        "targetNames",
+        "page_targets",
+        "pageTargets",
+    )
     scope = _text(config.metadata.get("scope"))
-    if not scope:
-        return []
     targets: list[str] = []
+    for target in explicit:
+        if target not in targets:
+            targets.append(target)
+    if not scope:
+        return targets[:10]
     for left, right in (("“", "”"), ('"', '"'), ("'", "'")):
         start = 0
         while True:
@@ -1619,11 +1646,147 @@ def _scope_targets(config: V3RunConfig) -> list[str]:
     return targets[:5]
 
 
+def _waived_targets(config: V3RunConfig) -> list[str]:
+    return _metadata_text_list(
+        config.metadata,
+        "waived_targets",
+        "waivedTargets",
+        "waived_page_targets",
+        "waivedPageTargets",
+    )
+
+
+def _metadata_text_list(metadata: dict[str, Any], *keys: str) -> list[str]:
+    items: list[str] = []
+    for key in keys:
+        value = metadata.get(key)
+        if value is None:
+            continue
+        raw_items: list[Any]
+        if isinstance(value, str):
+            raw_items = [part.strip() for part in value.replace(";", ",").split(",")]
+        elif isinstance(value, (list, tuple, set)):
+            raw_items = list(value)
+        else:
+            raw_items = [value]
+        for item in raw_items:
+            text = _text(item)
+            if len(text) >= 2 and text not in items:
+                items.append(text)
+    return items
+
+
+def _build_target_tracking(
+    *,
+    config: V3RunConfig,
+    pages: list[dict[str, Any]],
+    features: list[dict[str, Any]],
+    menu_entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    waived = set(_waived_targets(config))
+    targets = list(dict.fromkeys([*_scope_targets(config), *waived]))
+    tracking: list[dict[str, Any]] = []
+    for target in targets:
+        if target in waived:
+            tracking.append(
+                {
+                    "target": target,
+                    "status": "waived",
+                    "waived": True,
+                    "matched_menu_entry_ids": [],
+                    "matched_page_ids": [],
+                    "matched_feature_ids": [],
+                    "evidence_quality": "waived_by_user",
+                    "missed_reason": None,
+                }
+            )
+            continue
+        menu_matches = [
+            item for item in menu_entries if _item_matches_target(_menu_entry_match_item(item), target)
+        ]
+        page_matches = [item for item in pages if _item_matches_target(item, target)]
+        feature_matches = [item for item in features if _item_matches_target(item, target)]
+        if menu_matches or page_matches or feature_matches:
+            tracking.append(
+                {
+                    "target": target,
+                    "status": "found",
+                    "waived": False,
+                    "matched_menu_entry_ids": [
+                        _text(item.get("menu_id")) for item in menu_matches if item.get("menu_id")
+                    ],
+                    "matched_page_ids": [
+                        _text(item.get("page_id") or item.get("page_entry_id"))
+                        for item in page_matches
+                        if item.get("page_id") or item.get("page_entry_id")
+                    ],
+                    "matched_feature_ids": [
+                        _text(item.get("feature_id") or item.get("feature_point_id"))
+                        for item in feature_matches
+                        if item.get("feature_id") or item.get("feature_point_id")
+                    ],
+                    "evidence_quality": "high" if menu_matches else "medium",
+                    "missed_reason": None,
+                    "evidence": {
+                        "menu_paths": [item.get("menu_path", []) for item in menu_matches],
+                        "route_hints": [
+                            _text(item.get("route_hint")) for item in menu_matches if item.get("route_hint")
+                        ],
+                        "screenshot_refs": sorted(
+                            {
+                                _text(ref)
+                                for item in menu_matches
+                                for ref in (item.get("screenshot_refs") or [])
+                                if _text(ref)
+                            }
+                        ),
+                    },
+                }
+            )
+            continue
+        tracking.append(
+            {
+                "target": target,
+                "status": "missed",
+                "waived": False,
+                "matched_menu_entry_ids": [],
+                "matched_page_ids": [],
+                "matched_feature_ids": [],
+                "evidence_quality": "low",
+                "missed_reason": "not_found_in_menu_or_page_artifacts",
+                "evidence": {
+                    "searched_sources": [
+                        "menu_text",
+                        "menu_path",
+                        "route_hint",
+                        "page_entries",
+                        "feature_points",
+                    ],
+                    "menu_entry_count": len(menu_entries),
+                    "page_count": len(pages),
+                    "feature_count": len(features),
+                },
+            }
+        )
+    return tracking
+
+
+def _menu_entry_match_item(entry: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": entry.get("text"),
+        "title": entry.get("text"),
+        "url": entry.get("route_hint"),
+        "menu_path": entry.get("menu_path", []),
+        "source": entry.get("source"),
+    }
+
+
 def _item_matches_target(item: dict[str, Any], target: str) -> bool:
     values = [
         item.get("name"),
         item.get("title"),
         item.get("url"),
+        item.get("route_hint"),
         item.get("page_type"),
         item.get("semantic_page_type"),
         item.get("feature_type"),

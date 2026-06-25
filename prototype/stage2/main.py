@@ -1138,6 +1138,8 @@ async def run_v3_assessment_entrypoint(
     execution_mode: str,
     safety_policy: str,
     scope: str,
+    prioritized_targets: list[str] | None,
+    waived_targets: list[str] | None,
     allowed_side_effect_actions: list[str] | None,
     reuse_run_dir: bool,
     max_pages: int,
@@ -1169,6 +1171,8 @@ async def run_v3_assessment_entrypoint(
             "entrypoint": "prototype.stage2.main --run-v3",
             "template_name": template_name,
             "scope": scope,
+            "prioritized_targets": list(prioritized_targets or ()),
+            "waived_targets": list(waived_targets or ()),
             "safety_policy": safety_policy,
             "allowed_side_effect_actions": list(allowed_side_effect_actions or ()),
         },
@@ -1389,6 +1393,18 @@ def main() -> None:
         "--v3-scope",
         default="",
         help="For --run-v3, user-provided exploration scope or priority target text.",
+    )
+    parser.add_argument(
+        "--v3-prioritized-target",
+        action="append",
+        default=[],
+        help="For --run-v3, prioritized target page/menu text. May be repeated.",
+    )
+    parser.add_argument(
+        "--v3-waived-target",
+        action="append",
+        default=[],
+        help="For --run-v3, user-waived target page/menu text. May be repeated.",
     )
     parser.add_argument(
         "--v3-allow-side-effect-action",
@@ -1629,6 +1645,8 @@ def main() -> None:
                         execution_mode=args.v3_execution_mode,
                         safety_policy=args.v3_safety_policy,
                         scope=args.v3_scope,
+                        prioritized_targets=args.v3_prioritized_target,
+                        waived_targets=args.v3_waived_target,
                         allowed_side_effect_actions=args.v3_allow_side_effect_action,
                         reuse_run_dir=args.v3_reuse_run_dir,
                         max_pages=args.v3_max_pages,
