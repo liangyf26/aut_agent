@@ -434,12 +434,12 @@ test('stage2 v3 run center loads model profiles, preflights them, and persists r
       assert.equal(created.run.modelProfiles[0].apiKeyConfigured, true);
       assert.equal(created.run.modelProfiles[0].apiKey, undefined);
 
-      let received = null;
+      const received = [];
       await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
         runsDir,
         modelProfileConfigPath: configPath,
         pythonRunner: async ({ args, artifactRoot }) => {
-          received = { args };
+          received.push({ args });
           const runId = argValue(args, '--v3-run-id');
           const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId);
           return {
@@ -450,7 +450,7 @@ test('stage2 v3 run center loads model profiles, preflights them, and persists r
       });
 
       assert.deepEqual(
-        received.args.filter((item, index) => received.args[index - 1] === '--v3-model-profile'),
+        received.map((call) => argValue(call.args, '--v3-model-profile')),
         ['deepseek-v4', 'offline-model']
       );
 
@@ -765,6 +765,132 @@ test('stage2 v3 run center exposes execution verdict counts and recent evidence'
     assert.equal(started.run.summary.execution.recentEvidence[0].screenshotRefs[0], 'screenshots/home_entry.png');
     assert.equal(started.run.summary.execution.recentEvidence[1].failureReason, 'assertion_failed');
     assert.equal(started.run.summary.execution.recentEvidence[2].failureReason, 'policy_denied');
+  });
+});
+
+test('stage2 v3 run center executes selected model profiles sequentially and writes comparison summary', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const modelProfiles = [{
+      id: 'qwen',
+      label: 'Qwen',
+      provider: 'openai_compatible',
+      model: 'qwen-test',
+      apiKeyConfigured: true
+    }, {
+      id: 'deepseek',
+      label: 'DeepSeek',
+      provider: 'openai_compatible',
+      model: 'deepseek-test',
+      apiKeyConfigured: true
+    }];
+    const created = await createV3Run({
+      systemName: '多模型样例系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      modelProfileIds: ['qwen', 'deepseek']
+    }, { runsDir, modelProfiles });
+    const calls = [];
+
+    const started = await startV3Run(created.run.runId, {
+      executionMode: 'real_browser'
+    }, {
+      runsDir,
+      modelProfiles,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        calls.push({ model: argValue(args, '--v3-model-profile'), args });
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          executionItems: [{
+            test_case_id: `case_${calls.length}`,
+            status: calls.length === 1 ? 'passed' : 'failed',
+            verdict: calls.length === 1 ? 'passed' : 'failed',
+            execution_mode: 'real_browser',
+            actions: [{ action: 'goto', status: 'passed' }],
+            page_feedback: [`model ${calls.length}`],
+            screenshot_refs: [`screenshots/model_${calls.length}.png`],
+            failure_reason: calls.length === 1 ? null : 'assertion_failed',
+            manual_confirmation_required: calls.length !== 1
+          }]
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    assert.deepEqual(calls.map((item) => item.model), ['qwen', 'deepseek']);
+    assert.equal(started.run.summary.modelComparison.total, 2);
+    assert.equal(started.run.summary.modelComparison.completed, 2);
+    assert.equal(started.run.summary.modelComparison.failed, 0);
+
+    const runDir = path.join(runsDir, created.run.runId);
+    const comparison = await readJson(path.join(runDir, 'model_comparison.json'));
+    assert.equal(comparison.items.length, 2);
+    assert.deepEqual(comparison.items.map((item) => item.model_profile_id), ['qwen', 'deepseek']);
+    assert.ok(comparison.items.every((item) => item.shared_config_signature === comparison.shared_config_signature));
+    assert.equal(comparison.items[0].execution.passed, 1);
+    assert.equal(comparison.items[1].execution.failed, 1);
+    assert.ok(comparison.items[0].artifacts.run_dir.includes('model_attempts'));
+  });
+});
+
+test('stage2 v3 multi-model comparison continues after one model failure', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const modelProfiles = [{
+      id: 'broken',
+      label: 'Broken Model',
+      provider: 'openai_compatible',
+      model: 'broken-test',
+      apiKeyConfigured: true
+    }, {
+      id: 'steady',
+      label: 'Steady Model',
+      provider: 'openai_compatible',
+      model: 'steady-test',
+      apiKeyConfigured: true
+    }];
+    const created = await createV3Run({
+      systemName: '多模型失败续跑系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      modelProfileIds: ['broken', 'steady']
+    }, { runsDir, modelProfiles });
+    const calls = [];
+
+    const started = await startV3Run(created.run.runId, {
+      executionMode: 'real_browser'
+    }, {
+      runsDir,
+      modelProfiles,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const model = argValue(args, '--v3-model-profile');
+        calls.push(model);
+        if (model === 'broken') {
+          const error = new Error('model route failed');
+          error.code = 3;
+          error.stderr = 'model unavailable';
+          throw error;
+        }
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId);
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    assert.deepEqual(calls, ['broken', 'steady']);
+    assert.equal(started.run.status, 'completed');
+    assert.equal(started.run.summary.modelComparison.total, 2);
+    assert.equal(started.run.summary.modelComparison.completed, 1);
+    assert.equal(started.run.summary.modelComparison.failed, 1);
+
+    const comparison = await readJson(path.join(runsDir, created.run.runId, 'model_comparison.json'));
+    assert.equal(comparison.items[0].status, 'failed');
+    assert.equal(comparison.items[0].failure_reason, 'python_v3_orchestrator_failed');
+    assert.equal(comparison.items[1].status, 'completed');
   });
 });
 

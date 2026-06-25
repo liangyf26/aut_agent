@@ -43,6 +43,7 @@ const ARTIFACTS = {
   next_round_plan: 'next_round_plan.json',
   human_tasks: 'human_tasks.json',
   promotion_candidates: 'promotion_candidates.json',
+  model_comparison: 'model_comparison.json',
   python_execution: 'python_execution.json',
   run_report_json: path.join('reports', 'run_report.json'),
   run_report_md: path.join('reports', 'run_report.md')
@@ -766,6 +767,17 @@ function summarizeExecution(items = []) {
   };
 }
 
+function summarizeModelComparison(payload = null) {
+  const items = Array.isArray(payload?.items) ? payload.items : [];
+  return {
+    total: Number(payload?.total ?? items.length ?? 0),
+    completed: Number(payload?.completed ?? items.filter((item) => item.status === 'completed').length ?? 0),
+    failed: Number(payload?.failed ?? items.filter((item) => item.status === 'failed').length ?? 0),
+    ranking: Array.isArray(payload?.ranking) ? payload.ranking : [],
+    items
+  };
+}
+
 function normalizeTargetTracking(payload) {
   const items = Array.isArray(payload)
     ? payload
@@ -853,8 +865,10 @@ function buildPublicRun(runDir, manifest, artifacts = {}) {
       nextDecision: artifacts.next_round_plan?.decision || null,
       executionMode,
       safetyPolicy: manifest.safety_policy || artifacts.input_config?.safety_policy || SAFETY_POLICY_LOW_RISK_ONLY,
-      countExplanation: artifacts.round_analysis?.count_explanation || {}
+      countExplanation: artifacts.round_analysis?.count_explanation || {},
+      modelComparison: summarizeModelComparison(artifacts.model_comparison)
     },
+    modelComparison: artifacts.model_comparison || null,
     targetTracking,
     missedTargets: targetTracking.items
       .filter((item) => item.status === 'missed')
@@ -882,6 +896,7 @@ async function loadRunArtifacts(runDir) {
     'round_analysis',
     'next_round_plan',
     'human_tasks',
+    'model_comparison',
     'run_report_json'
   ];
   const entries = await Promise.all(keys.map(async (key) => [
@@ -1762,8 +1777,86 @@ async function resolvePythonCommand(options = {}) {
 }
 
 async function runPythonV3Orchestrator({ runId, runsDir, runDir, inputConfig, body, roundId }, options = {}) {
+  return runPythonV3OrchestratorAttempt({ runId, runsDir, runDir, inputConfig, body, roundId }, options);
+}
+
+async function runSequentialModelAttempts(context, options = {}) {
+  const { runId, runDir, inputConfig } = context;
+  const selectedModelIds = inputConfig.selected_model_profile_ids || [];
+  const profilesById = new Map((inputConfig.selected_model_profiles || []).map((profile) => [profile.id, profile]));
+  const sharedConfigSignature = sharedRunConfigSignature(inputConfig);
+  const attemptsRoot = path.join(runDir, 'model_attempts');
+  const items = [];
+  let representativeResult = null;
+  for (let index = 0; index < selectedModelIds.length; index += 1) {
+    const modelProfileId = selectedModelIds[index];
+    const attemptRunId = `${runId}__model_${String(index + 1).padStart(2, '0')}_${ensureSafeId(modelProfileId, 'modelProfileId')}`;
+    await appendEvent(runDir, {
+      type: 'model_attempt_started',
+      run_id: runId,
+      attempt_run_id: attemptRunId,
+      model_profile_id: modelProfileId,
+      index: index + 1
+    });
+    const processResult = await runPythonV3OrchestratorAttempt({
+      ...context,
+      runId: attemptRunId,
+      artifactRoot: attemptsRoot,
+      modelProfileId
+    }, options);
+    const item = await summarizeModelAttempt({
+      processResult,
+      modelProfile: profilesById.get(modelProfileId) || { id: modelProfileId },
+      modelProfileId,
+      sharedConfigSignature,
+      index
+    });
+    items.push(item);
+    await appendEvent(runDir, {
+      type: 'model_attempt_finished',
+      run_id: runId,
+      attempt_run_id: attemptRunId,
+      model_profile_id: modelProfileId,
+      status: item.status,
+      failure_reason: item.failure_reason || null
+    });
+    if (processResult.ok && !representativeResult) {
+      representativeResult = processResult;
+    }
+  }
+  const comparison = buildModelComparisonSummary({
+    runId,
+    inputConfig,
+    sharedConfigSignature,
+    items
+  });
+  await writeJson(path.join(runDir, ARTIFACTS.model_comparison), comparison);
+  if (representativeResult) {
+    return {
+      ...representativeResult,
+      modelComparison: comparison
+    };
+  }
+  const firstFailure = items[0] || {};
+  return {
+    ok: false,
+    failureReason: firstFailure.failure_reason || 'all_model_attempts_failed',
+    command: '',
+    args: [],
+    artifactRoot: attemptsRoot,
+    startedAt: comparison.started_at,
+    finishedAt: comparison.finished_at,
+    exitCode: null,
+    stdout: '',
+    stderr: firstFailure.error || 'All selected model attempts failed.',
+    error: firstFailure.error || 'All selected model attempts failed.',
+    modelComparison: comparison
+  };
+}
+
+async function runPythonV3OrchestratorAttempt({ runId, runsDir, runDir, inputConfig, body, roundId, artifactRoot: artifactRootOverride, modelProfileId }, options = {}) {
   const executionMode = normalizeExecutionMode(body.executionMode || body.execution_mode || 'real_browser');
-  const artifactRoot = runsDir;
+  const artifactRoot = artifactRootOverride || runsDir;
   const command = await resolvePythonCommand(options);
   const args = [
     '-m',
@@ -1806,7 +1899,10 @@ async function runPythonV3Orchestrator({ runId, runsDir, runDir, inputConfig, bo
   for (const action of inputConfig.allowed_side_effect_actions || []) {
     args.push('--v3-allow-side-effect-action', action);
   }
-  for (const profileId of inputConfig.selected_model_profile_ids || []) {
+  const profileIds = modelProfileId
+    ? [modelProfileId]
+    : inputConfig.selected_model_profile_ids || [];
+  for (const profileId of profileIds) {
     args.push('--v3-model-profile', profileId);
   }
   if (body.useLiveDiscovery !== false && body.use_live_discovery !== false) {
@@ -1869,6 +1965,164 @@ async function runPythonV3Orchestrator({ runId, runsDir, runDir, inputConfig, bo
     stderr,
     result: parsed
   };
+}
+
+function sharedRunConfigSignature(inputConfig = {}) {
+  const stable = {
+    system_name: inputConfig.system_name,
+    entry_url: inputConfig.entry_url,
+    cdp_url: inputConfig.cdp_url,
+    scope: inputConfig.scope,
+    safety_policy: inputConfig.safety_policy,
+    allowed_side_effect_actions: inputConfig.allowed_side_effect_actions || [],
+    prioritized_targets: inputConfig.prioritized_targets || [],
+    waived_targets: inputConfig.waived_targets || [],
+    max_pages: inputConfig.max_pages,
+    max_features_per_page: inputConfig.max_features_per_page
+  };
+  return crypto.createHash('sha256').update(JSON.stringify(stable)).digest('hex').slice(0, 16);
+}
+
+async function summarizeModelAttempt({
+  processResult,
+  modelProfile,
+  modelProfileId,
+  sharedConfigSignature,
+  index
+}) {
+  const pyRunDir = processResult.ok ? await findPythonRunDir(processResult) : null;
+  const pageEntries = normalizePythonPageEntries(
+    await readPythonJson(pyRunDir, ARTIFACTS.page_entries),
+    { system_name: '', entry_url: '' }
+  );
+  const featurePoints = normalizePythonFeaturePoints(await readPythonJson(pyRunDir, ARTIFACTS.feature_points));
+  const testCases = normalizePythonTestCases(await readPythonJson(pyRunDir, ARTIFACTS.generated_test_cases));
+  const executionResults = normalizePythonExecutionResults(await readPythonJson(pyRunDir, ARTIFACTS.execution_results));
+  const menuEntries = normalizeMenuEntries(
+    await readPythonJson(pyRunDir, ARTIFACTS.menu_entries) || makeEmptyMenuArtifacts().menuEntries
+  );
+  const roundAnalysis = await readPythonJson(pyRunDir, ARTIFACTS.round_analysis) || {};
+  const execution = summarizeExecution(executionResults.items || []);
+  const coverage = {
+    menu_entries: summarizeItems(artifactItems(menuEntries, 'items', 'menu_entries')),
+    page_entries: summarizeItems(pageEntries.items || []),
+    feature_points: summarizeItems(featurePoints.items || []),
+    generated_cases: summarizeItems(testCases.items || []),
+    executed_cases: execution.total
+  };
+  return {
+    attempt_id: `model_attempt_${String(index + 1).padStart(2, '0')}`,
+    model_profile_id: modelProfileId,
+    model_profile: redactModelProfile(modelProfile),
+    shared_config_signature: sharedConfigSignature,
+    status: processResult.ok ? 'completed' : 'failed',
+    started_at: processResult.startedAt,
+    finished_at: processResult.finishedAt,
+    elapsed_ms: elapsedMs(processResult.startedAt, processResult.finishedAt),
+    failure_reason: processResult.ok ? null : processResult.failureReason,
+    error: processResult.ok ? null : processResult.error,
+    capability_preflight: {
+      profile: redactModelProfile(modelProfile),
+      selected_for_attempt: true
+    },
+    coverage,
+    execution,
+    evidence_quality: evidenceQualityForAttempt(executionResults, roundAnalysis),
+    stability: stabilityForAttempt(processResult, execution),
+    compatibility_issues: compatibilityIssuesForAttempt(processResult, roundAnalysis),
+    artifacts: {
+      run_dir: pyRunDir,
+      stdout: processResult.stdout || '',
+      stderr: processResult.stderr || ''
+    }
+  };
+}
+
+function buildModelComparisonSummary({ runId, inputConfig, sharedConfigSignature, items }) {
+  const startedTimes = items.map((item) => item.started_at).filter(Boolean).sort();
+  const finishedTimes = items.map((item) => item.finished_at).filter(Boolean).sort();
+  return {
+    schema_version: 'stage2_model_comparison.v1',
+    run_id: runId,
+    generated_at: nowIso(),
+    started_at: startedTimes[0] || null,
+    finished_at: finishedTimes[finishedTimes.length - 1] || null,
+    shared_config_signature: sharedConfigSignature,
+    selected_model_profile_ids: inputConfig.selected_model_profile_ids || [],
+    total: items.length,
+    completed: items.filter((item) => item.status === 'completed').length,
+    failed: items.filter((item) => item.status === 'failed').length,
+    items,
+    ranking: [...items]
+      .sort((left, right) => modelAttemptScore(right) - modelAttemptScore(left))
+      .map((item, index) => ({
+        rank: index + 1,
+        model_profile_id: item.model_profile_id,
+        score: modelAttemptScore(item),
+        status: item.status,
+        summary: `${item.coverage.page_entries} 页面 / ${item.coverage.feature_points} 功能点 / ${item.execution.passed} 通过 / ${item.execution.failed} 失败`
+      }))
+  };
+}
+
+function modelAttemptScore(item) {
+  if (item.status !== 'completed') {
+    return -1;
+  }
+  return (item.coverage.page_entries * 2)
+    + item.coverage.feature_points
+    + item.execution.passed
+    - item.execution.failed
+    - item.execution.skipped;
+}
+
+function elapsedMs(startedAt, finishedAt) {
+  const start = new Date(startedAt || 0).getTime();
+  const finish = new Date(finishedAt || 0).getTime();
+  return Number.isFinite(start) && Number.isFinite(finish) && start > 0 && finish >= start
+    ? finish - start
+    : null;
+}
+
+function evidenceQualityForAttempt(executionResults, roundAnalysis = {}) {
+  if (roundAnalysis.evidence_quality) {
+    return roundAnalysis.evidence_quality;
+  }
+  const items = executionResults.items || [];
+  const withScreenshots = items.filter((item) => (item.screenshot_refs || []).length).length;
+  return {
+    screenshot_backed_results: withScreenshots,
+    total_results: items.length,
+    summary: items.length
+      ? `${withScreenshots}/${items.length} execution results include screenshot evidence.`
+      : 'No execution evidence was produced.'
+  };
+}
+
+function stabilityForAttempt(processResult, execution) {
+  if (!processResult.ok) {
+    return { status: 'failed', score: 0 };
+  }
+  const total = execution.total || 0;
+  const unstable = execution.failed + execution.skipped;
+  return {
+    status: unstable ? 'partial' : 'stable',
+    score: total ? Math.max(0, Math.round(((total - unstable) / total) * 100)) / 100 : 0
+  };
+}
+
+function compatibilityIssuesForAttempt(processResult, roundAnalysis = {}) {
+  const issues = [];
+  if (!processResult.ok) {
+    issues.push({
+      code: processResult.failureReason || 'model_attempt_failed',
+      message: processResult.error || processResult.stderr || 'Model attempt failed.'
+    });
+  }
+  for (const error of roundAnalysis.review_errors || []) {
+    issues.push(error);
+  }
+  return issues;
 }
 
 async function findPythonRunDir(processResult) {
@@ -2337,14 +2591,25 @@ async function startV3Run(runId, body = {}, options = {}) {
   if (executionMode === 'contract_only') {
     analysisPack = await persistContractOnlyArtifacts(runDir, runningManifest, inputConfig, executionMode);
   } else {
-    const processResult = await runPythonV3Orchestrator({
-      runId,
-      runsDir: getRunsDir(options),
-      runDir,
-      inputConfig,
-      body,
-      roundId
-    }, options);
+    const selectedModelIds = inputConfig.selected_model_profile_ids || [];
+    const processResult = selectedModelIds.length > 1
+      ? await runSequentialModelAttempts({
+        runId,
+        runsDir: getRunsDir(options),
+        runDir,
+        inputConfig,
+        body,
+        roundId
+      }, options)
+      : await runPythonV3Orchestrator({
+        runId,
+        runsDir: getRunsDir(options),
+        runDir,
+        inputConfig,
+        body,
+        roundId,
+        modelProfileId: selectedModelIds[0] || null
+      }, options);
     if (processResult.ok) {
       analysisPack = await persistRealBrowserArtifacts(runDir, runningManifest, inputConfig, processResult, roundId);
     } else {
