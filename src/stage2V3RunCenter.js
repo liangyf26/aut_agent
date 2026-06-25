@@ -896,6 +896,7 @@ async function loadRunArtifacts(runDir) {
     'round_analysis',
     'next_round_plan',
     'human_tasks',
+    'promotion_candidates',
     'model_comparison',
     'run_report_json'
   ];
@@ -1706,10 +1707,115 @@ function makeFailureSummary(failureClusters) {
   };
 }
 
-function makePromotionCandidates() {
+function evidenceRefsForItem(item = {}) {
+  return [
+    ...(Array.isArray(item.screenshot_refs) ? item.screenshot_refs : []),
+    ...(Array.isArray(item.evidence_refs) ? item.evidence_refs : [])
+  ].filter(Boolean);
+}
+
+function makePromotionCandidates({
+  manifest = {},
+  pageEntries = { items: [] },
+  featurePoints = { items: [] },
+  testCases = { items: [] },
+  executionResults = { items: [] },
+  roundAnalysis = {}
+} = {}) {
+  const pageItems = artifactItems(pageEntries, 'page_entries');
+  const featureItems = artifactItems(featurePoints, 'feature_points');
+  const caseItems = artifactItems(testCases, 'test_cases');
+  const resultItems = artifactItems(executionResults, 'results');
+  const passedResults = resultItems.filter((item) => ['passed', 'real_passed', 'side_effect_executed'].includes(item.status));
+  const failedOrSkippedResults = resultItems.filter((item) => item.failure_reason || ['failed', 'real_failed', 'skipped', 'skipped_by_policy', 'blocked_by_policy', 'needs_review'].includes(item.status));
+  const candidates = [];
+
+  for (const page of pageItems.slice(0, 8)) {
+    candidates.push({
+      candidate_id: `project_page_alias_${page.page_entry_id || normalizeModelProfileId(page.name || 'page')}`,
+      layer: 'project',
+      asset_type: 'alias',
+      title: `沉淀页面别名：${page.name || page.page_entry_id}`,
+      asset_value: {
+        page_entry_id: page.page_entry_id,
+        name: page.name,
+        menu_path: page.menu_path || [],
+        url: page.url || manifest.entry_url || null
+      },
+      evidence_refs: evidenceRefsForItem(page).concat(['page_entries']),
+      confidence: typeof page.confidence === 'number' ? page.confidence : 0.78,
+      requires_human_approval: false,
+      auto_apply: false
+    });
+  }
+
+  for (const feature of featureItems.slice(0, 8)) {
+    const locatorCandidates = Array.isArray(feature.locator_candidates) ? feature.locator_candidates : [];
+    candidates.push({
+      candidate_id: `project_stable_locator_${feature.feature_point_id || normalizeModelProfileId(feature.name || 'feature')}`,
+      layer: 'project',
+      asset_type: 'stable_locator',
+      title: `沉淀稳定定位线索：${feature.name || feature.feature_point_id}`,
+      asset_value: {
+        page_entry_id: feature.page_entry_id,
+        feature_point_id: feature.feature_point_id,
+        feature_type: feature.feature_type || 'unknown',
+        locator_candidates: locatorCandidates,
+        fallback_locator_hint: feature.name || feature.feature_point_id
+      },
+      evidence_refs: evidenceRefsForItem(feature).concat(['feature_points', 'execution_results']),
+      confidence: typeof feature.confidence === 'number' ? feature.confidence : 0.7,
+      requires_human_approval: false,
+      auto_apply: false
+    });
+  }
+
+  if (caseItems.length || failedOrSkippedResults.length) {
+    candidates.push({
+      candidate_id: 'project_test_data_suggestions',
+      layer: 'project',
+      asset_type: 'test_data_suggestion',
+      title: '沉淀下一轮测试数据与人工录入建议',
+      asset_value: {
+        case_count: caseItems.length,
+        blocked_or_skipped_reasons: [...new Set(failedOrSkippedResults.map((item) => item.failure_reason || item.status).filter(Boolean))],
+        suggested_source: '从已通过路径、失败断言和人工确认项中补齐可复用测试数据。'
+      },
+      evidence_refs: ['generated_test_cases', 'execution_results', 'human_tasks'],
+      confidence: passedResults.length ? 0.76 : 0.62,
+      requires_human_approval: false,
+      auto_apply: false
+    });
+  }
+
+  if ((roundAnalysis.improvement_candidates || []).length || resultItems.length) {
+    candidates.push({
+      candidate_id: 'platform_promotion_requires_review',
+      layer: 'platform',
+      asset_type: 'platform_baseline_candidate',
+      title: '平台级基线晋升候选需人工审批',
+      asset_value: {
+        source_run_id: manifest.run_id || null,
+        candidate_scope: 'locators_aliases_waits_and_test_data',
+        auto_apply_policy: 'disabled'
+      },
+      evidence_refs: ['round_analysis', 'promotion_candidates', 'run_report_json'],
+      confidence: 0.65,
+      requires_human_approval: true,
+      auto_apply: false
+    });
+  }
+
   return {
     schema_version: 'stage2_promotion_candidates.v3',
-    items: []
+    generated_at: nowIso(),
+    source_run_id: manifest.run_id || null,
+    policy: {
+      project_level_candidates_may_be_saved: true,
+      platform_level_requires_human_approval: true,
+      auto_apply_platform_candidates: false
+    },
+    items: candidates
   };
 }
 
@@ -3109,8 +3215,190 @@ async function continueNextRound(runId, body = {}, options = {}) {
   }, options);
 }
 
-function makeReport({ manifest, pageEntries, featurePoints, testCases, executionResults, roundAnalysis, nextRoundPlan, humanTasks }) {
-  const executionSummary = summarizeExecution(executionResults.items || []);
+function testCasesForFeature(testCaseItems, featurePointId) {
+  return testCaseItems.filter((item) => (item.feature_point_id || item.feature_id || '') === featurePointId);
+}
+
+function executionsForCase(executionItems, testCaseId) {
+  return executionItems.filter((item) => (item.test_case_id || item.case_id || '') === testCaseId);
+}
+
+function resultVerdict(result = {}) {
+  if (result.verdict) {
+    return result.verdict;
+  }
+  if (result.status) {
+    return result.status;
+  }
+  return 'not_executed';
+}
+
+function buildCoverageByPage({ menuEntries = { items: [] }, pageEntries = { items: [] }, featurePoints = { items: [] }, testCases = { items: [] }, executionResults = { items: [] } }) {
+  const menuItems = artifactItems(menuEntries, 'menu_entries');
+  const pageItems = artifactItems(pageEntries, 'page_entries');
+  const featureItems = artifactItems(featurePoints, 'feature_points');
+  const testCaseItems = artifactItems(testCases, 'test_cases');
+  const executionItems = artifactItems(executionResults, 'results');
+
+  return pageItems.map((page) => {
+    const pageMenuPath = Array.isArray(page.menu_path) ? page.menu_path : [];
+    const menuEntry = menuItems.find((item) => {
+      const itemPath = Array.isArray(item.menu_path) ? item.menu_path : [];
+      return item.page_entry_id === page.page_entry_id
+        || item.href === page.url
+        || (itemPath.length && pageMenuPath.length && itemPath.join(' / ') === pageMenuPath.join(' / '));
+    }) || null;
+    const pageFeatures = featureItems.filter((feature) => feature.page_entry_id === page.page_entry_id);
+    return {
+      menu_entry: menuEntry,
+      menu_path: pageMenuPath,
+      page,
+      features: pageFeatures.map((feature) => {
+        const cases = testCasesForFeature(testCaseItems, feature.feature_point_id);
+        return {
+          feature,
+          test_cases: cases.map((testCase) => {
+            const executions = executionsForCase(executionItems, testCase.test_case_id);
+            const latestExecution = executions[executions.length - 1] || null;
+            return {
+              test_case: testCase,
+              execution: latestExecution,
+              evidence: {
+                screenshot_refs: latestExecution?.screenshot_refs || [],
+                actions: latestExecution?.actions || [],
+                page_feedback: latestExecution?.page_feedback || []
+              },
+              verdict: latestExecution ? resultVerdict(latestExecution) : 'not_executed',
+              skipped_reason: latestExecution?.failure_reason || null
+            };
+          })
+        };
+      })
+    };
+  });
+}
+
+function buildSkippedAreas({ pageEntries = { items: [] }, featurePoints = { items: [] }, testCases = { items: [] }, executionResults = { items: [] }, humanTasks = { items: [] } }) {
+  const pageItems = artifactItems(pageEntries, 'page_entries');
+  const featureItems = artifactItems(featurePoints, 'feature_points');
+  const testCaseItems = artifactItems(testCases, 'test_cases');
+  const executionItems = artifactItems(executionResults, 'results');
+  const skippedStatuses = new Set(['skipped', 'skipped_no_executor', 'skipped_not_observed', 'skipped_by_policy', 'blocked_by_policy', 'needs_review', 'failed', 'real_failed', 'login_required']);
+  const executedCaseIds = new Set(executionItems.map((item) => item.test_case_id || item.case_id).filter(Boolean));
+  const skipped = [];
+
+  for (const result of executionItems) {
+    if (!skippedStatuses.has(result.status) && !result.failure_reason && !result.manual_confirmation_required) {
+      continue;
+    }
+    const testCase = testCaseItems.find((item) => item.test_case_id === result.test_case_id) || null;
+    const feature = featureItems.find((item) => item.feature_point_id === (result.feature_point_id || testCase?.feature_point_id)) || null;
+    const page = pageItems.find((item) => item.page_entry_id === feature?.page_entry_id) || null;
+    skipped.push({
+      kind: 'execution_result',
+      page_entry_id: page?.page_entry_id || null,
+      feature_point_id: feature?.feature_point_id || result.feature_point_id || null,
+      test_case_id: result.test_case_id || null,
+      title: testCase?.title || feature?.name || result.test_case_id || '未命名执行项',
+      status: result.status || 'unknown',
+      reason: result.failure_reason || result.status || 'needs_review',
+      evidence_refs: evidenceRefsForItem(result)
+    });
+  }
+
+  for (const testCase of testCaseItems) {
+    if (executedCaseIds.has(testCase.test_case_id)) {
+      continue;
+    }
+    const feature = featureItems.find((item) => item.feature_point_id === testCase.feature_point_id) || null;
+    skipped.push({
+      kind: 'not_executed_test_case',
+      page_entry_id: feature?.page_entry_id || null,
+      feature_point_id: feature?.feature_point_id || testCase.feature_point_id || null,
+      test_case_id: testCase.test_case_id,
+      title: testCase.title || testCase.test_case_id,
+      status: 'not_executed',
+      reason: testCase.requires_human_confirmation ? 'requires_human_confirmation' : 'no_execution_result',
+      evidence_refs: ['generated_test_cases']
+    });
+  }
+
+  for (const task of artifactItems(humanTasks, 'human_tasks')) {
+    if (task.status === 'completed') {
+      continue;
+    }
+    skipped.push({
+      kind: 'human_task',
+      page_entry_id: task.page_entry_id || null,
+      feature_point_id: task.feature_point_id || null,
+      test_case_id: task.test_case_id || null,
+      title: task.title || task.reason || '人工处理项',
+      status: task.status || 'pending',
+      reason: task.reason || 'human_task_pending',
+      evidence_refs: task.evidence_refs || ['human_tasks']
+    });
+  }
+
+  return skipped;
+}
+
+function buildModelComparisonCommentary(modelComparison = null) {
+  const summary = summarizeModelComparison(modelComparison);
+  const commentary = summary.items.map((item) => {
+    const coverage = item.coverage || {};
+    const execution = item.execution || {};
+    const evidenceQuality = item.evidence_quality || {};
+    const stability = item.stability || {};
+    const issues = item.compatibility_issues || [];
+    const parts = [
+      `覆盖 ${coverage.page_entries || 0} 个页面、${coverage.feature_points || 0} 个功能点`,
+      `通过 ${execution.passed || 0}、失败 ${execution.failed || 0}、跳过 ${execution.skipped || 0}`,
+      `耗时 ${item.elapsed_ms == null ? '未知' : `${item.elapsed_ms}ms`}`,
+      `证据质量 ${evidenceQuality.summary || evidenceQuality.status || '未评估'}`,
+      `稳定性 ${stability.status || 'unknown'}${typeof stability.score === 'number' ? `/${stability.score}` : ''}`
+    ];
+    if ((execution.failed || 0) > 0 || issues.length || item.status === 'failed') {
+      parts.push(`失败模式 ${issues.map((issue) => issue.code || issue.message).filter(Boolean).join(', ') || item.failure_reason || '存在失败用例'}`);
+      parts.push('适用性：需要人工复核失败原因后再扩大范围。');
+    } else {
+      parts.push('适用性：适合继续扩大同类页面遍历。');
+    }
+    return {
+      model_profile_id: item.model_profile_id,
+      status: item.status,
+      score: modelAttemptScore(item),
+      commentary: parts.join('；')
+    };
+  });
+  return {
+    ...summary,
+    commentary
+  };
+}
+
+function markdownValue(value) {
+  if (value == null || value === '') {
+    return '-';
+  }
+  if (Array.isArray(value)) {
+    return value.length ? value.join(' / ') : '-';
+  }
+  if (typeof value === 'object') {
+    return JSON.stringify(value);
+  }
+  return String(value);
+}
+
+function makeReport({ manifest, menuEntries, pageEntries, featurePoints, testCases, executionResults, roundAnalysis, nextRoundPlan, humanTasks, modelComparison, promotionCandidates }) {
+  const pageItems = artifactItems(pageEntries, 'page_entries');
+  const featureItems = artifactItems(featurePoints, 'feature_points');
+  const testCaseItems = artifactItems(testCases, 'test_cases');
+  const executionItems = artifactItems(executionResults, 'results');
+  const humanTaskItems = artifactItems(humanTasks, 'human_tasks');
+  const executionSummary = summarizeExecution(executionItems);
+  const coverageByPage = buildCoverageByPage({ menuEntries, pageEntries, featurePoints, testCases, executionResults });
+  const skippedAreas = buildSkippedAreas({ pageEntries, featurePoints, testCases, executionResults, humanTasks });
+  const modelComparisonReport = buildModelComparisonCommentary(modelComparison);
   const reportJson = {
     schema_version: 'stage2_run_report.v3',
     run_id: manifest.run_id,
@@ -3120,13 +3408,17 @@ function makeReport({ manifest, pageEntries, featurePoints, testCases, execution
       status: manifest.status,
       safety_policy: manifest.safety_policy || SAFETY_POLICY_LOW_RISK_ONLY,
       allowed_side_effect_actions: manifest.allowed_side_effect_actions || [],
-      page_entries: summarizeItems(pageEntries.items),
-      feature_points: summarizeItems(featurePoints.items),
-      generated_test_cases: summarizeItems(testCases.items),
+      page_entries: summarizeItems(pageItems),
+      feature_points: summarizeItems(featureItems),
+      generated_test_cases: summarizeItems(testCaseItems),
       execution: executionSummary,
-      pending_human_tasks: (humanTasks.items || []).filter((item) => item.status === 'pending').length,
+      pending_human_tasks: humanTaskItems.filter((item) => item.status === 'pending').length,
       next_decision: nextRoundPlan.decision
     },
+    coverage_by_page: coverageByPage,
+    skipped_areas: skippedAreas,
+    model_comparison: modelComparisonReport,
+    promotion_candidates: promotionCandidates,
     sections: [
       {
         title: '运行概况',
@@ -3137,14 +3429,43 @@ function makeReport({ manifest, pageEntries, featurePoints, testCases, execution
           { label: 'allowed_side_effect_actions', value: (manifest.allowed_side_effect_actions || []).join(', ') || 'none' }
         ]
       },
-      { title: '页面入口发现', items: pageEntries.items || [] },
-      { title: '功能点识别', items: featurePoints.items || [] },
-      { title: '执行型测试用例', items: testCases.items || [] },
-      { title: '自动执行结果', items: executionResults.items || [] },
+      { title: '覆盖与结果矩阵', items: coverageByPage },
+      { title: '未执行/阻断/需复核区域', items: skippedAreas },
+      { title: '页面入口发现', items: pageItems },
+      { title: '功能点识别', items: featureItems },
+      { title: '执行型测试用例', items: testCaseItems },
+      { title: '自动执行结果', items: executionItems },
+      { title: '模型效果对比', items: modelComparisonReport.commentary || [] },
+      { title: '项目级沉淀候选', items: artifactItems(promotionCandidates, 'promotion_candidates') },
       { title: 'AI 复盘与下一轮计划', facts: [{ label: 'decision', value: nextRoundPlan.decision }], items: roundAnalysis.improvement_candidates || [] },
-      { title: '人工确认项', items: humanTasks.items || [] }
+      { title: '人工确认项', items: humanTaskItems }
     ]
   };
+
+  const coverageLines = coverageByPage.flatMap((pageBlock) => {
+    const header = `- ${markdownValue(pageBlock.page.name || pageBlock.page.page_entry_id)} (${markdownValue(pageBlock.page.page_entry_id)}) · 菜单: ${markdownValue(pageBlock.menu_path)}`;
+    const featureLines = pageBlock.features.flatMap((featureBlock) => {
+      const feature = featureBlock.feature;
+      const caseLines = featureBlock.test_cases.map((caseBlock) => {
+        const screenshots = caseBlock.evidence.screenshot_refs || [];
+        return `    - 用例 ${markdownValue(caseBlock.test_case.title || caseBlock.test_case.test_case_id)}: ${markdownValue(caseBlock.verdict)} · 证据 ${markdownValue(screenshots)}`;
+      });
+      return [
+        `  - 功能点 ${markdownValue(feature.name || feature.feature_point_id)} [${markdownValue(feature.feature_type)}]`,
+        ...(caseLines.length ? caseLines : ['    - 暂无执行型用例'])
+      ];
+    });
+    return [header, ...(featureLines.length ? featureLines : ['  - 暂无功能点'])];
+  });
+  const skippedLines = skippedAreas.length
+    ? skippedAreas.map((item) => `- [${markdownValue(item.status)}] ${markdownValue(item.title)} · 原因: ${markdownValue(item.reason)} · 证据: ${markdownValue(item.evidence_refs)}`)
+    : ['- 暂无未执行、阻断或需复核区域。'];
+  const modelLines = modelComparisonReport.items.length
+    ? modelComparisonReport.commentary.map((item) => `- ${markdownValue(item.model_profile_id)}: ${markdownValue(item.commentary)}`)
+    : ['- 本 run 未配置多模型对比。'];
+  const promotionLines = artifactItems(promotionCandidates, 'promotion_candidates').length
+    ? artifactItems(promotionCandidates, 'promotion_candidates').map((item) => `- [${markdownValue(item.layer)} / ${markdownValue(item.asset_type)}] ${markdownValue(item.title)} · confidence ${markdownValue(item.confidence)} · auto_apply ${markdownValue(item.auto_apply)}`)
+    : ['- 暂无沉淀候选。'];
 
   const md = [
     `# ${manifest.system_name} 第二阶段 v3 运行报告`,
@@ -3163,9 +3484,25 @@ function makeReport({ manifest, pageEntries, featurePoints, testCases, execution
     '',
     '本报告由 Node.js v3 Run API 基于稳定 artifact 契约生成。`real_browser` 模式会调用 Python v3 orchestrator 获取真实浏览器证据；`contract_only` 或执行失败时，报告会明确标注未获得真实执行证据。',
     '',
+    '## 覆盖与结果矩阵',
+    '',
+    ...(coverageLines.length ? coverageLines : ['- 暂无页面覆盖数据。']),
+    '',
+    '## 未执行/阻断/需复核区域',
+    '',
+    ...skippedLines,
+    '',
+    '## 模型效果对比',
+    '',
+    ...modelLines,
+    '',
+    '## 项目级沉淀候选',
+    '',
+    ...promotionLines,
+    '',
     '## 人工确认项',
     '',
-    ...(humanTasks.items || []).map((item) => `- [${item.status}] ${item.title}: ${item.reason}`)
+    ...(humanTaskItems.length ? humanTaskItems.map((item) => `- [${item.status}] ${item.title}: ${item.reason}`) : ['- 暂无人工确认项。'])
   ].join('\n');
 
   return { reportJson, md };
@@ -3173,6 +3510,7 @@ function makeReport({ manifest, pageEntries, featurePoints, testCases, execution
 
 async function generateV3Report(runId, options = {}) {
   const { runDir, manifest } = await readManifest(runId, options);
+  const menuEntries = await readJsonIfExists(path.join(runDir, ARTIFACTS.menu_entries)) || { items: [] };
   const pageEntries = await readJsonIfExists(path.join(runDir, ARTIFACTS.page_entries)) || { items: [] };
   const featurePoints = await readJsonIfExists(path.join(runDir, ARTIFACTS.feature_points)) || { items: [] };
   const testCases = await readJsonIfExists(path.join(runDir, ARTIFACTS.generated_test_cases)) || { items: [] };
@@ -3180,16 +3518,29 @@ async function generateV3Report(runId, options = {}) {
   const roundAnalysis = await readJsonIfExists(path.join(runDir, ARTIFACTS.round_analysis)) || { improvement_candidates: [] };
   const nextRoundPlan = await readJsonIfExists(path.join(runDir, ARTIFACTS.next_round_plan)) || { decision: 'unknown' };
   const humanTasks = await readJsonIfExists(path.join(runDir, ARTIFACTS.human_tasks)) || { items: [] };
+  const modelComparison = await readJsonIfExists(path.join(runDir, ARTIFACTS.model_comparison)) || { items: [] };
+  const promotionCandidates = makePromotionCandidates({
+    manifest,
+    pageEntries,
+    featurePoints,
+    testCases,
+    executionResults,
+    roundAnalysis
+  });
   const { reportJson, md } = makeReport({
     manifest,
+    menuEntries,
     pageEntries,
     featurePoints,
     testCases,
     executionResults,
     roundAnalysis,
     nextRoundPlan,
-    humanTasks
+    humanTasks,
+    modelComparison,
+    promotionCandidates
   });
+  await writeJson(path.join(runDir, ARTIFACTS.promotion_candidates), promotionCandidates);
   await writeJson(path.join(runDir, ARTIFACTS.run_report_json), reportJson);
   await fs.writeFile(path.join(runDir, ARTIFACTS.run_report_md), `${md}\n`, 'utf8');
   const saved = await updateRunStatus(runDir, manifest, manifest.status, 'reporting', 'run 报告已生成。');

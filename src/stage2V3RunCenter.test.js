@@ -1284,6 +1284,154 @@ test('stage2 v3 run center performs deterministic analysis and writes report art
   });
 });
 
+test('stage2 v3 report organizes structured artifacts and skipped areas', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '报告样例系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          executionItems: [{
+            test_case_id: 'case_nav',
+            feature_point_id: 'feature_nav',
+            status: 'passed',
+            verdict: 'passed',
+            execution_mode: 'real_browser',
+            actions: [{ action: 'goto', status: 'passed' }],
+            page_feedback: ['首页加载完成'],
+            screenshot_refs: ['screenshots/home_entry.png'],
+            failure_reason: null,
+            manual_confirmation_required: false
+          }, {
+            test_case_id: 'case_delete',
+            feature_point_id: 'feature_delete',
+            status: 'skipped_by_policy',
+            verdict: 'skipped',
+            execution_mode: 'real_browser',
+            actions: [],
+            page_feedback: [],
+            screenshot_refs: [],
+            failure_reason: 'policy_denied',
+            manual_confirmation_required: true
+          }]
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'waiting_human' }),
+          stderr: ''
+        };
+      }
+    });
+
+    const reported = await generateV3Report(created.run.runId, { runsDir });
+    assert.ok(reported.report.coverage_by_page.length >= 1);
+    assert.equal(reported.report.coverage_by_page[0].page.page_entry_id, 'page_home');
+    assert.ok(reported.report.coverage_by_page[0].features[0].test_cases.length >= 1);
+    assert.ok(reported.report.skipped_areas.some((item) => item.reason === 'policy_denied'));
+    assert.ok(reported.report.sections.some((section) => section.title === '覆盖与结果矩阵'));
+    assert.ok(reported.report.sections.some((section) => section.title === '未执行/阻断/需复核区域'));
+
+    const reportMd = await fs.readFile(path.join(runsDir, created.run.runId, 'reports', 'run_report.md'), 'utf8');
+    assert.match(reportMd, /## 覆盖与结果矩阵/);
+    assert.match(reportMd, /policy_denied/);
+    assert.ok(reportMd.includes('screenshots/home_entry.png'));
+  });
+});
+
+test('stage2 v3 report includes multi-model effectiveness commentary', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const modelProfiles = [{
+      id: 'model-a',
+      label: 'Model A',
+      provider: 'openai_compatible',
+      model: 'a',
+      apiKeyConfigured: true
+    }, {
+      id: 'model-b',
+      label: 'Model B',
+      provider: 'openai_compatible',
+      model: 'b',
+      apiKeyConfigured: true
+    }];
+    const created = await createV3Run({
+      systemName: '多模型报告系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      modelProfileIds: ['model-a', 'model-b']
+    }, { runsDir, modelProfiles });
+    let callCount = 0;
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      modelProfiles,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        callCount += 1;
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          executionItems: [{
+            test_case_id: `case_${callCount}`,
+            status: callCount === 1 ? 'passed' : 'failed',
+            verdict: callCount === 1 ? 'passed' : 'failed',
+            execution_mode: 'real_browser',
+            actions: [{ action: 'goto', status: 'passed' }],
+            page_feedback: [`model ${callCount}`],
+            screenshot_refs: [`screenshots/model_${callCount}.png`],
+            failure_reason: callCount === 1 ? null : 'assertion_failed',
+            manual_confirmation_required: callCount !== 1
+          }]
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    const reported = await generateV3Report(created.run.runId, { runsDir });
+    assert.equal(reported.report.model_comparison.items.length, 2);
+    assert.ok(reported.report.model_comparison.commentary.some((item) => item.model_profile_id === 'model-a'));
+    assert.ok(reported.report.model_comparison.commentary.some((item) => /失败/.test(item.commentary)));
+
+    const reportMd = await fs.readFile(path.join(runsDir, created.run.runId, 'reports', 'run_report.md'), 'utf8');
+    assert.match(reportMd, /## 模型效果对比/);
+    assert.match(reportMd, /model-a/);
+    assert.match(reportMd, /model-b/);
+  });
+});
+
+test('stage2 v3 report writes project-level promotion candidates with human-gated platform candidates', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '沉淀候选系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId);
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+    await generateV3Report(created.run.runId, { runsDir });
+
+    const promotion = await readJson(path.join(runsDir, created.run.runId, 'promotion_candidates.json'));
+    assert.ok(promotion.items.some((item) => item.layer === 'project'));
+    assert.ok(promotion.items.some((item) => item.asset_type === 'stable_locator'));
+    assert.ok(promotion.items.some((item) => item.asset_type === 'test_data_suggestion'));
+    assert.ok(promotion.items
+      .filter((item) => item.layer === 'platform')
+      .every((item) => item.requires_human_approval === true && item.auto_apply === false));
+  });
+});
+
 test('stage2 v3 run center merges evidence-bound AI round review when a model profile is available', async () => {
   await withTempRunsDir(async (runsDir) => {
     const created = await createV3Run({
