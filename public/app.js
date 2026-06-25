@@ -1409,6 +1409,7 @@ function normalizeStage2Run(run = {}, source = 'v3') {
     targetTracking,
     missedTargets: run.missedTargets || run.missed_targets || targetTracking.items.filter((item) => item.status === 'missed').map((item) => item.target).filter(Boolean),
     foundTargets: run.foundTargets || run.found_targets || targetTracking.items.filter((item) => item.status === 'found').map((item) => item.target).filter(Boolean),
+    countExplanation: stats.countExplanation || stats.count_explanation || run.countExplanation || run.count_explanation || {},
     realExecutionAvailable: Boolean(run.realExecutionAvailable || run.real_execution_available || run.capabilities?.realBrowserExecution || run.capabilities?.real_browser_execution || run.preflight?.cdp_available),
     createdAt: run.createdAt || run.created_at || manifest.created_at || run.started_at || '',
     updatedAt: run.updatedAt || run.updated_at || manifest.updated_at || run.finished_at || run.started_at || '',
@@ -1913,6 +1914,7 @@ function renderStage2V3OverviewTab() {
           <span class="tag">${escapeHtml(String(analysis.confidence ?? analysis.ai_confidence ?? '-'))}</span>
         </header>
         <p>${escapeHtml(analysis.summary || analysis.coverage_summary?.summary || analysis.failure_summary?.summary || (analysis.ai_provider_status === 'not_connected' ? '当前为规则复盘，尚未接入可追踪 AI 模型调用。' : '暂无复盘产物。'))}</p>
+        <p>${escapeHtml(run.countExplanation?.menu_leaf_vs_page_entries || analysis.count_explanation?.menu_leaf_vs_page_entries || '')}</p>
         <div class="tag-row">
           <span class="tag">${escapeHtml(String((analysis.human_tasks || analysis.humanTasks || []).length || getRunHumanTasks(run).length))} 个人工项</span>
           <span class="tag">${escapeHtml(String((analysis.improvement_candidates || analysis.improvementCandidates || []).length || 0))} 个改进候选</span>

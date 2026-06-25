@@ -181,6 +181,16 @@ async def _collect_with_playwright_menu_discovery(
             preflight = _preflight(True, "ok", config.cdp_url)
             preflight["checks"]["playwright"] = {"ok": True}
             preflight["browser_target_count"] = len(browser_targets)
+            page_bundle = await _explore_menu_leaf_pages_with_playwright(
+                page,
+                menu_bundle["menu_entries"],
+                screenshots_dir,
+                config,
+            )
+            screenshots_index = _merge_screenshot_indexes(
+                menu_bundle["screenshots_index"],
+                page_bundle["screenshots_index"],
+            )
             return {
                 "schema_version": V3_SCHEMA_VERSION,
                 "status": "completed",
@@ -201,9 +211,10 @@ async def _collect_with_playwright_menu_discovery(
                 "menu_tree": menu_bundle["menu_tree"],
                 "menu_entries": menu_bundle["menu_entries"],
                 "menu_traversal_log": menu_bundle["menu_traversal_log"],
-                "pages": [],
-                "features": [],
-                "screenshots_index": menu_bundle["screenshots_index"],
+                "page_exploration_log": page_bundle["page_exploration_log"],
+                "pages": page_bundle["pages"],
+                "features": page_bundle["features"],
+                "screenshots_index": screenshots_index,
             }
         finally:
             await browser.close()
@@ -340,6 +351,199 @@ async def _discover_menu_with_playwright(
         traversal_events=traversal_events,
         screenshots=screenshots,
     )
+
+
+async def _explore_menu_leaf_pages_with_playwright(
+    page: Any,
+    menu_entries: list[dict[str, Any]],
+    screenshots_dir: Path,
+    config: V3RunConfig,
+) -> dict[str, Any]:
+    pages: list[dict[str, Any]] = []
+    features: list[dict[str, Any]] = []
+    logs: list[dict[str, Any]] = []
+    screenshots: list[dict[str, Any]] = []
+    leaf_entries = [
+        entry
+        for entry in menu_entries
+        if entry.get("is_leaf") and _text(entry.get("status")) not in {"permission_blocked", "failed"}
+    ][: max(1, int(config.max_pages or 1))]
+    for index, entry in enumerate(leaf_entries, start=1):
+        menu_id = _text(entry.get("menu_id")) or f"menu_leaf_{index:03d}"
+        page_id = f"menu_page_{index:03d}"
+        try:
+            locator = page.locator(f"[data-stage2-menu-id='{menu_id}']").first
+            if callable(locator):
+                locator = locator()
+            await locator.scroll_into_view_if_needed(timeout=1000)
+            await locator.click(timeout=2500)
+            await page.wait_for_load_state("domcontentloaded", timeout=4000)
+            await page.wait_for_timeout(500)
+            snapshot = await page.evaluate(
+                _dom_collection_expression(),
+                {"maxPages": 1, "maxFeatures": int(config.max_features_per_page or 1)},
+            )
+            screenshot_id = f"{page_id}_visible"
+            screenshots.append(
+                await _capture_playwright_screenshot(
+                    page,
+                    screenshots_dir,
+                    screenshot_id,
+                    f"菜单页面：{entry.get('text')}",
+                )
+            )
+            current_url = _text(snapshot.get("url")) or page.url or config.start_url
+            title = _text(snapshot.get("title")) or _text(entry.get("text")) or f"页面入口 {index}"
+            page_type = _infer_page_type(title, current_url)
+            pages.append(
+                {
+                    "page_id": page_id,
+                    "page_entry_id": page_id,
+                    "menu_id": menu_id,
+                    "name": _text(entry.get("text")) or title,
+                    "url": current_url,
+                    "menu_path": entry.get("menu_path", []),
+                    "page_type": page_type,
+                    "semantic_page_type": page_type,
+                    "discovery_depth": 1,
+                    "status": "reachable",
+                    "source": "playwright.menu_page_exploration",
+                    "confidence": "observed",
+                    "screenshot_refs": [screenshot_id],
+                    "failure_reason": None,
+                }
+            )
+            logs.append(
+                {
+                    "event": "enter_menu_leaf",
+                    "menu_id": menu_id,
+                    "menu_path": entry.get("menu_path", []),
+                    "status": "reachable",
+                    "page_entry_id": page_id,
+                    "screenshot_ref": screenshot_id,
+                    "url": current_url,
+                }
+            )
+            features.extend(
+                _build_page_features_from_snapshot(
+                    page_id,
+                    snapshot,
+                    int(config.max_features_per_page or 1),
+                    screenshot_id,
+                    start_index=len(features) + 1,
+                )
+            )
+        except Exception as exc:
+            route_hint = _text(entry.get("route_hint"))
+            url = urljoin(config.start_url, route_hint) if route_hint else config.start_url
+            pages.append(
+                {
+                    "page_id": page_id,
+                    "page_entry_id": page_id,
+                    "menu_id": menu_id,
+                    "name": _text(entry.get("text")) or f"页面入口 {index}",
+                    "url": url,
+                    "menu_path": entry.get("menu_path", []),
+                    "page_type": _infer_page_type(_text(entry.get("text")), url),
+                    "semantic_page_type": _infer_page_type(_text(entry.get("text")), url),
+                    "discovery_depth": 1,
+                    "status": "unreachable",
+                    "source": "playwright.menu_page_exploration",
+                    "confidence": "failed",
+                    "screenshot_refs": [],
+                    "failure_reason": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            logs.append(
+                {
+                    "event": "enter_menu_leaf",
+                    "menu_id": menu_id,
+                    "menu_path": entry.get("menu_path", []),
+                    "status": "failed",
+                    "page_entry_id": page_id,
+                    "failure_reason": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    return {
+        "pages": pages,
+        "features": features,
+        "page_exploration_log": logs,
+        "screenshots_index": _menu_screenshots_index(
+            [{**item, "stage": "page_exploration", "source": "playwright.menu_page_exploration"} for item in screenshots]
+        ),
+    }
+
+
+def _build_page_features_from_snapshot(
+    page_id: str,
+    snapshot: dict[str, Any],
+    max_features_per_page: int,
+    screenshot_id: str,
+    *,
+    start_index: int,
+) -> list[dict[str, Any]]:
+    features: list[dict[str, Any]] = []
+    for offset, control in enumerate(snapshot.get("controls", [])[: max(1, max_features_per_page)], start=0):
+        text = _text(control.get("text")) or f"可见控件 {offset + 1}"
+        feature_type = _infer_feature_type(text, _text(control.get("tag")), _text(control.get("type")))
+        feature_id = f"feature_{start_index + offset:03d}"
+        risk_level = _risk_level(feature_type)
+        features.append(
+            {
+                "feature_id": feature_id,
+                "feature_point_id": feature_id,
+                "page_id": page_id,
+                "page_entry_id": page_id,
+                "name": text,
+                "feature_type": feature_type,
+                "risk_level": risk_level,
+                "auto_verifiable": True,
+                "verification_strategy": "side_effect_policy_gate" if risk_level == "high" else "playwright_visible_control",
+                "source": "playwright.light_interaction",
+                "confidence": "observed",
+                "review_status": "pending" if risk_level == "high" else "auto_included",
+                "evidence": {
+                    "screenshot_id": screenshot_id,
+                    "tag": control.get("tag"),
+                    "type": control.get("type"),
+                    "candidate_index": control.get("candidate_index"),
+                },
+            }
+        )
+    if not features:
+        feature_id = f"feature_{start_index:03d}"
+        features.append(
+            {
+                "feature_id": feature_id,
+                "feature_point_id": feature_id,
+                "page_id": page_id,
+                "page_entry_id": page_id,
+                "name": "页面可见性验证",
+                "feature_type": "view",
+                "risk_level": "low",
+                "auto_verifiable": True,
+                "verification_strategy": "playwright_page_visible",
+                "source": "playwright.menu_page_exploration",
+                "confidence": "observed",
+                "review_status": "auto_included",
+                "evidence": {"screenshot_id": screenshot_id},
+            }
+        )
+    return features
+
+
+def _merge_screenshot_indexes(*indexes: dict[str, Any]) -> dict[str, Any]:
+    screenshots: list[dict[str, Any]] = []
+    for index in indexes:
+        for item in index.get("screenshots", []) or index.get("items", []) or []:
+            if isinstance(item, dict):
+                screenshots.append(item)
+    return {
+        "schema_version": V3_SCHEMA_VERSION,
+        "screenshots": screenshots,
+        "items": screenshots,
+        "notes": ["菜单发现与页面探索截图证据。"] if screenshots else [],
+    }
 
 
 async def _scan_menu_candidates_playwright(

@@ -29,6 +29,7 @@ const ARTIFACTS = {
   menu_tree: 'menu_tree.json',
   menu_entries: 'menu_entries.json',
   menu_traversal_log: 'menu_traversal_log.jsonl',
+  page_exploration_log: 'page_exploration_log.jsonl',
   page_entries: 'page_entries.json',
   feature_points: 'feature_points.json',
   discovery_review: 'discovery_review.json',
@@ -826,7 +827,8 @@ function buildPublicRun(runDir, manifest, artifacts = {}) {
       },
       nextDecision: artifacts.next_round_plan?.decision || null,
       executionMode,
-      safetyPolicy: manifest.safety_policy || artifacts.input_config?.safety_policy || SAFETY_POLICY_LOW_RISK_ONLY
+      safetyPolicy: manifest.safety_policy || artifacts.input_config?.safety_policy || SAFETY_POLICY_LOW_RISK_ONLY,
+      countExplanation: artifacts.round_analysis?.count_explanation || {}
     },
     targetTracking,
     missedTargets: targetTracking.items
@@ -864,6 +866,7 @@ async function loadRunArtifacts(runDir) {
   return {
     ...Object.fromEntries(entries),
     menu_traversal_log: await readTextIfExists(path.join(runDir, ARTIFACTS.menu_traversal_log)),
+    page_exploration_log: await readTextIfExists(path.join(runDir, ARTIFACTS.page_exploration_log)),
     progress_events: await readProgressEventsIfExists(path.join(runDir, ARTIFACTS.progress_events))
   };
 }
@@ -1539,6 +1542,9 @@ function makeRoundAnalysis({
   const failureClusters = groupFailures(executionResults);
   const targetTracking = buildTargetTracking(inputConfig, pageEntries, featurePoints, menuEntries);
   const missingScopeTargets = findMissingScopeTargets(targetTracking);
+  const menuItems = artifactItems(menuEntries, 'items', 'menu_entries');
+  const menuLeafCount = menuItems.filter((item) => item && item.is_leaf).length;
+  const browserTargetCount = numberOrZero(executionResults.browser_target_count || 0);
   if (missingScopeTargets.length) {
     failureClusters.push({
       cluster_id: `cluster_${String(failureClusters.length + 1).padStart(3, '0')}`,
@@ -1596,6 +1602,11 @@ function makeRoundAnalysis({
     scope_targets: extractScopeTargets(inputConfig),
     missing_scope_targets: missingScopeTargets,
     target_tracking: targetTracking,
+    count_explanation: {
+      menu_leaf_vs_page_entries: `${menuLeafCount} menu leaves attempted; ${summarizeItems(pageEntries.items)} page entries recorded.`,
+      page_entries_vs_feature_points: `${summarizeItems(pageEntries.items)} page entries yielded ${summarizeItems(featurePoints.items)} feature points after default-visible and light-interaction scanning.`,
+      browser_targets: `${browserTargetCount} browser targets are diagnostic CDP targets, not discovered business pages.`
+    },
     confidence: 0.72
   };
 
@@ -2245,6 +2256,10 @@ async function persistRealBrowserArtifacts(runDir, manifest, inputConfig, proces
   await copyTextFileIfExists(
     path.join(pyRunDir || '', 'menu_traversal_log.jsonl'),
     path.join(runDir, ARTIFACTS.menu_traversal_log)
+  );
+  await copyTextFileIfExists(
+    path.join(pyRunDir || '', 'page_exploration_log.jsonl'),
+    path.join(runDir, ARTIFACTS.page_exploration_log)
   );
   await writeJson(path.join(runDir, ARTIFACTS.page_entries), pageEntries);
   await writeJson(path.join(runDir, ARTIFACTS.feature_points), featurePoints);
