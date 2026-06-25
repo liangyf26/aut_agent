@@ -2385,6 +2385,133 @@ async function persistAnalysisPack(runDir, analysisPack) {
   await writeJson(path.join(runDir, ARTIFACTS.promotion_candidates), makePromotionCandidates());
 }
 
+function buildAiEvidenceBundle({ inputConfig, pageEntries, featurePoints, testCases, executionResults, screenshotsIndex, menuEntries }) {
+  return {
+    input_config: inputConfig,
+    page_entries: pageEntries.items || [],
+    feature_points: featurePoints.items || [],
+    generated_test_cases: testCases.items || [],
+    execution_results: executionResults.items || [],
+    screenshots: screenshotsIndex.items || screenshotsIndex.screenshots || [],
+    menu_entries: artifactItems(menuEntries, 'items', 'menu_entries'),
+    allowed_evidence_refs: [
+      'input_config',
+      'page_entries',
+      'feature_points',
+      'generated_test_cases',
+      'execution_results',
+      'screenshots_index',
+      'menu_entries',
+      'page_exploration_log'
+    ]
+  };
+}
+
+function selectedAiReviewProfile(inputConfig = {}, options = {}) {
+  const profiles = inputConfig.selected_model_profiles || [];
+  if (!profiles.length) {
+    return null;
+  }
+  const profile = profiles[0];
+  if (options.aiReviewRunner || profile.api_key_configured || profile.apiKeyConfigured) {
+    return profile;
+  }
+  return null;
+}
+
+function validateAiReviewPayload(payload) {
+  return Boolean(
+    payload
+      && typeof payload === 'object'
+      && Array.isArray(payload.improvement_candidates)
+      && payload.improvement_candidates.every((item) => item && typeof item === 'object' && item.candidate_id && item.title)
+  );
+}
+
+function bindAiEvidenceToCandidates(candidates = [], allowedRefs = []) {
+  const allowed = new Set(allowedRefs);
+  return candidates.map((candidate) => {
+    const refs = Array.isArray(candidate.evidence_refs)
+      ? candidate.evidence_refs.filter((ref) => allowed.has(ref))
+      : [];
+    const evidenceBound = refs.length > 0;
+    return {
+      ...candidate,
+      evidence_refs: refs,
+      review_status: evidenceBound ? 'evidence_bound' : 'needs_evidence',
+      blocks_next_round: evidenceBound ? Boolean(candidate.blocks_next_round) : true
+    };
+  });
+}
+
+async function applyAiRoundReview(analysisPack, context, options = {}) {
+  const modelProfile = selectedAiReviewProfile(context.inputConfig, options);
+  if (!modelProfile || typeof options.aiReviewRunner !== 'function') {
+    analysisPack.analysis.ai_provider_status = 'model_unavailable';
+    analysisPack.analysis.review_errors = [{
+      code: 'model_unavailable',
+      message: '未选择可用于 AI 复盘的模型 profile 或未配置 AI review runner，已使用规则复盘。'
+    }];
+    return analysisPack;
+  }
+
+  const evidenceBundle = buildAiEvidenceBundle(context);
+  let payload = null;
+  try {
+    payload = await options.aiReviewRunner({
+      modelProfile,
+      evidenceBundle,
+      draftAnalysis: analysisPack.analysis,
+      draftNextRoundPlan: analysisPack.nextRoundPlan
+    });
+  } catch (error) {
+    analysisPack.analysis.ai_provider_status = 'ai_review_failed';
+    analysisPack.analysis.review_errors = [{
+      code: 'ai_review_failed',
+      message: error.message
+    }];
+    return analysisPack;
+  }
+  if (!validateAiReviewPayload(payload)) {
+    analysisPack.analysis.ai_provider_status = 'invalid_ai_output';
+    analysisPack.analysis.review_errors = [{
+      code: 'invalid_ai_output',
+      message: 'AI 复盘输出不符合结构化 schema，已使用规则复盘。'
+    }];
+    return analysisPack;
+  }
+
+  const candidates = bindAiEvidenceToCandidates(
+    payload.improvement_candidates,
+    evidenceBundle.allowed_evidence_refs
+  );
+  analysisPack.analysis = {
+    ...analysisPack.analysis,
+    ...payload,
+    schema_version: analysisPack.analysis.schema_version,
+    round_id: analysisPack.analysis.round_id,
+    analysis_mode: payload.analysis_mode || 'ai_assisted_review',
+    ai_provider_status: 'completed',
+    model_profile: redactModelProfile(modelProfile),
+    model_profile_id: modelProfile.id,
+    evidence_quality: payload.evidence_quality || analysisPack.analysis.evidence_quality,
+    coverage_summary: payload.coverage_summary || analysisPack.analysis.coverage_summary,
+    failure_summary: payload.failure_summary || analysisPack.analysis.failure_summary,
+    improvement_candidates: candidates,
+    learned_rules: Array.isArray(payload.learned_rules) ? payload.learned_rules : [],
+    next_round_recommendations: Array.isArray(payload.next_round_recommendations)
+      ? payload.next_round_recommendations
+      : [],
+    review_errors: []
+  };
+  analysisPack.nextRoundPlan = {
+    ...analysisPack.nextRoundPlan,
+    planned_improvements: candidates,
+    ai_review_status: 'completed'
+  };
+  return analysisPack;
+}
+
 async function setV3RunLifecycleStatus(runId, action, body = {}, options = {}) {
   const { runDir, manifest } = await readManifest(runId, options);
   const statusByAction = {
@@ -2437,13 +2564,26 @@ async function analyzeV3Run(runId, options = {}) {
     screenshotsIndex,
     menuEntries
   });
+  await applyAiRoundReview(analysisPack, {
+    inputConfig,
+    pageEntries,
+    featurePoints,
+    testCases,
+    executionResults,
+    screenshotsIndex,
+    menuEntries
+  }, options);
   await persistAnalysisPack(runDir, analysisPack);
+  const aiAssisted = analysisPack.analysis.analysis_mode === 'ai_assisted_review'
+    && analysisPack.analysis.ai_provider_status === 'completed';
   const saved = await updateRunStatus(
     runDir,
     manifest,
     analysisPack.nextRoundPlan.requires_human_approval ? 'waiting_human' : 'completed',
-    'rule_round_analysis',
-    '规则复盘产物已生成；当前未接入可追踪 AI 模型调用。',
+    aiAssisted ? 'ai_round_analysis' : 'rule_round_analysis',
+    aiAssisted
+      ? 'AI 复盘产物已生成，并已绑定支持证据。'
+      : '规则复盘产物已生成；AI 复盘不可用或已降级。',
     { decision: analysisPack.nextRoundPlan.decision }
   );
   const run = buildPublicRun(runDir, saved, await loadRunArtifacts(runDir));

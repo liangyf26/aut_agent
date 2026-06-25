@@ -1085,6 +1085,136 @@ test('stage2 v3 run center performs deterministic analysis and writes report art
   });
 });
 
+test('stage2 v3 run center merges evidence-bound AI round review when a model profile is available', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: 'AI 复盘系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      modelProfileIds: ['reviewer'],
+      modelProfiles: [{
+        id: 'reviewer',
+        label: 'Reviewer',
+        provider: 'openai_compatible',
+        model: 'review-model',
+        apiKeyConfigured: true,
+        capabilityTags: { jsonSchema: true }
+      }]
+    }, { runsDir, modelProfiles: [{
+      id: 'reviewer',
+      label: 'Reviewer',
+      provider: 'openai_compatible',
+      model: 'review-model',
+      apiKeyEnv: 'REVIEWER_API_KEY'
+    }] });
+    await startV3Run(created.run.runId, { executionMode: 'contract_only' }, { runsDir });
+
+    const analyzed = await analyzeV3Run(created.run.runId, {
+      runsDir,
+      aiReviewRunner: async ({ evidenceBundle, modelProfile }) => ({
+        analysis_mode: 'ai_assisted_review',
+        model_profile_id: modelProfile.id,
+        confidence: 0.88,
+        coverage_summary: { summary: `reviewed ${evidenceBundle.page_entries.length} pages` },
+        failure_summary: { summary: '需要补齐真实执行证据。' },
+        evidence_quality: { status: 'partial', summary: '有执行结果，无真实截图。' },
+        improvement_candidates: [{
+          candidate_id: 'connect_real_browser',
+          title: '连接真实浏览器后重跑',
+          evidence_refs: ['execution_results']
+        }],
+        learned_rules: ['真实截图缺失时不得声称执行通过'],
+        next_round_recommendations: ['连接 Playwright 后重试']
+      })
+    });
+
+    assert.equal(analyzed.roundAnalysis.analysis_mode, 'ai_assisted_review');
+    assert.equal(analyzed.roundAnalysis.ai_provider_status, 'completed');
+    assert.equal(analyzed.roundAnalysis.model_profile.id, 'reviewer');
+    assert.equal(analyzed.roundAnalysis.improvement_candidates[0].review_status, 'evidence_bound');
+    assert.deepEqual(analyzed.roundAnalysis.learned_rules, ['真实截图缺失时不得声称执行通过']);
+  });
+});
+
+test('stage2 v3 run center degrades AI review to rule review when model is unavailable or output is invalid', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: 'AI 降级系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+    await startV3Run(created.run.runId, { executionMode: 'contract_only' }, { runsDir });
+
+    const unavailable = await analyzeV3Run(created.run.runId, { runsDir });
+    assert.equal(unavailable.roundAnalysis.analysis_mode, 'deterministic_rule_review');
+    assert.equal(unavailable.roundAnalysis.ai_provider_status, 'model_unavailable');
+
+    const createdWithModel = await createV3Run({
+      systemName: 'AI 非法输出系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      modelProfileIds: ['reviewer']
+    }, { runsDir, modelProfiles: [{
+      id: 'reviewer',
+      label: 'Reviewer',
+      provider: 'openai_compatible',
+      model: 'review-model',
+      apiKeyEnv: 'REVIEWER_API_KEY'
+    }] });
+    await startV3Run(createdWithModel.run.runId, { executionMode: 'contract_only' }, { runsDir });
+    const invalid = await analyzeV3Run(createdWithModel.run.runId, {
+      runsDir,
+      aiReviewRunner: async () => ({ invalid: true })
+    });
+    assert.equal(invalid.roundAnalysis.analysis_mode, 'deterministic_rule_review');
+    assert.equal(invalid.roundAnalysis.ai_provider_status, 'invalid_ai_output');
+    assert.ok(invalid.roundAnalysis.review_errors.some((item) => item.code === 'invalid_ai_output'));
+  });
+});
+
+test('stage2 v3 run center marks AI direction claims without evidence as needs evidence', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: 'AI 证据绑定系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      modelProfileIds: ['reviewer'],
+      modelProfiles: [{
+        id: 'reviewer',
+        label: 'Reviewer',
+        provider: 'openai_compatible',
+        model: 'review-model',
+        apiKeyConfigured: true,
+        capabilityTags: { jsonSchema: true }
+      }]
+    }, { runsDir, modelProfiles: [{
+      id: 'reviewer',
+      label: 'Reviewer',
+      provider: 'openai_compatible',
+      model: 'review-model',
+      apiKeyEnv: 'REVIEWER_API_KEY'
+    }] });
+    await startV3Run(created.run.runId, { executionMode: 'contract_only' }, { runsDir });
+
+    const analyzed = await analyzeV3Run(created.run.runId, {
+      runsDir,
+      aiReviewRunner: async () => ({
+        analysis_mode: 'ai_assisted_review',
+        confidence: 0.64,
+        improvement_candidates: [{
+          candidate_id: 'unsupported_claim',
+          title: '声称提交链路已稳定',
+          evidence_refs: []
+        }]
+      })
+    });
+
+    assert.equal(analyzed.roundAnalysis.analysis_mode, 'ai_assisted_review');
+    assert.equal(analyzed.roundAnalysis.improvement_candidates[0].review_status, 'needs_evidence');
+    assert.equal(analyzed.roundAnalysis.improvement_candidates[0].blocks_next_round, true);
+  });
+});
+
 test('stage2 v3 run center saves human task results and gates next round approval', async () => {
   await withTempRunsDir(async (runsDir) => {
     const created = await createV3Run({
