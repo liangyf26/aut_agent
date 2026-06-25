@@ -1385,6 +1385,7 @@ function normalizeStage2Run(run = {}, source = 'v3') {
   const manifest = run.run_manifest || run.manifest || {};
   const stats = run.stats || run.summary || {};
   const executionStats = stats.execution || run.executionSummary || run.execution_summary || {};
+  const modelComparison = stats.modelComparison || stats.model_comparison || run.modelComparison || run.model_comparison || {};
   const runId = getRunId(run) || `stage2_${Date.now()}`;
   const targetTracking = normalizeStage2TargetTracking(run.targetTracking || run.target_tracking);
   return {
@@ -1413,6 +1414,7 @@ function normalizeStage2Run(run = {}, source = 'v3') {
     foundTargets: run.foundTargets || run.found_targets || targetTracking.items.filter((item) => item.status === 'found').map((item) => item.target).filter(Boolean),
     countExplanation: stats.countExplanation || stats.count_explanation || run.countExplanation || run.count_explanation || {},
     executionSummary: executionStats,
+    modelComparison,
     realExecutionAvailable: Boolean(run.realExecutionAvailable || run.real_execution_available || run.capabilities?.realBrowserExecution || run.capabilities?.real_browser_execution || run.preflight?.cdp_available),
     createdAt: run.createdAt || run.created_at || manifest.created_at || run.started_at || '',
     updatedAt: run.updatedAt || run.updated_at || manifest.updated_at || run.finished_at || run.started_at || '',
@@ -1430,6 +1432,9 @@ function normalizeStage2Run(run = {}, source = 'v3') {
       skipped: Number(executionStats.skipped ?? stats.skipped ?? stats.skippedCount ?? run.skippedCount ?? 0),
       blocked: Number(executionStats.blocked ?? stats.blocked ?? stats.blockedCount ?? run.blockedCount ?? 0),
       humanTasks: Number(stats.humanTasks ?? stats.pendingHumanTasks ?? run.pendingHumanTaskCount ?? 0),
+      models: Number(modelComparison.total ?? (run.modelProfileIds || run.model_profile_ids || []).length ?? 0),
+      modelCompleted: Number(modelComparison.completed ?? 0),
+      modelFailed: Number(modelComparison.failed ?? 0),
       targetFound: Number(stats.targetTracking?.found ?? stats.target_found ?? targetTracking.found ?? 0),
       targetMissed: Number(stats.targetTracking?.missed ?? stats.target_missed ?? targetTracking.missed ?? 0),
       targetWaived: Number(stats.targetTracking?.waived ?? stats.target_waived ?? targetTracking.waived ?? 0)
@@ -1887,6 +1892,8 @@ function renderStage2V3OverviewTab() {
   const safetyPolicy = getStage2SafetyPolicy(run);
   const allowedSideEffects = getStage2AllowedSideEffects(run);
   const targetTracking = getRunTargetTracking(run);
+  const modelComparison = run.modelComparison || {};
+  const modelRanking = Array.isArray(modelComparison.ranking) ? modelComparison.ranking : [];
   container.innerHTML = `
     <section class="stage2-overview-grid">
       <article class="stage2-work-card">
@@ -1936,6 +1943,24 @@ function renderStage2V3OverviewTab() {
           <span class="tag">${escapeHtml(nextPlan.should_continue || nextPlan.shouldContinue ? '建议继续' : '未建议继续')}</span>
           <span class="tag">${escapeHtml((nextPlan.target_search_goals || nextPlan.targetSearchGoals || []).join('、') || '无目标待追踪')}</span>
           <span class="tag">${escapeHtml(nextPlan.risk_level || nextPlan.riskLevel || '风险未知')}</span>
+        </div>
+      </article>
+      <article class="stage2-work-card">
+        <header>
+          <strong>模型对比</strong>
+          <span class="tag">${escapeHtml(String(run.counts?.modelCompleted || 0))}/${escapeHtml(String(run.counts?.models || 0))}</span>
+        </header>
+        <p>${escapeHtml(run.counts?.models ? `${run.counts.modelCompleted || 0} 款完成，${run.counts.modelFailed || 0} 款失败。` : '未选择多模型对比。')}</p>
+        <div class="stage2-compact-list">
+          ${modelRanking.length
+            ? modelRanking.slice(0, 3).map((item) => `
+              <article>
+                <strong>${escapeHtml(`#${item.rank || '-'} ${item.model_profile_id || '-'}`)}</strong>
+                <p>${escapeHtml(item.summary || `score ${item.score ?? '-'}`)}</p>
+                <span class="tag">${escapeHtml(item.status || '-')}</span>
+              </article>
+            `).join('')
+            : '<article><strong>暂无排名</strong><p>选择多款模型并运行后生成。</p><span class="tag">pending</span></article>'}
         </div>
       </article>
     </section>
