@@ -1,0 +1,23 @@
+{
+  "schema_version": "stage2_model_profiles.v1",
+  "profiles": [
+    {
+      "id": "local_ai",
+      "label": "local_ai",
+      "provider": "openai_compatible",
+      "baseUrl": "http://172.28.50.9:30000/v1",
+      "apiKey": "123456",
+      "model": "AI-tester",
+      "browserUseMode": "chatopenai"
+    },
+    {
+      "id": "local_qwen",
+      "label": "local_qwen",
+      "provider": "openai_compatible",
+      "baseUrl": "http://172.28.29.24:30000/v1/",
+      "apiKey": "123456",
+      "model": "Qwen3.6-35B-A3B-UD-Q5_K_M-MTP",
+      "browserUseMode": "chatopenai"
+    }
+  ]
+}
