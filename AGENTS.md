@@ -9,10 +9,11 @@
 
 当前真实开发重心是第二阶段 Python 原型。需要先读以下文档，再动代码：
 
-1. `docs/需求分析第二阶段.md`
-2. `docs/技术方案第二阶段.md`
-3. `docs/第二阶段原型开发计划.md`
-4. `CONTEXT.md`
+1. `docs/需求分析第二阶段v3.md`
+2. `docs/技术方案第二阶段v3.md`
+3. `docs/测试手册第二阶段v3.md`
+4. `docs/第二阶段原型开发计划.md`
+5. `CONTEXT.md`
 
 当前围绕“泛化闭环”的专项执行计划采用四步：
 
@@ -74,7 +75,7 @@ python -m prototype.stage2.main --validation-matrix --cdp-url http://localhost:9
 - `--explore-system-map` 在系统地图模板已存在且 `page_url` 未变化时会复用既有模板；如果入口 URL 不同，需换模板名或显式传 `--bootstrap-overwrite`
 - 当前验证层已经形成三层结构：通用模板动作、项目级复用动作族、少量项目胶水；后续抽象优先继续拆剩余项目耦合点，并在 G4 骨架上接入新的真实业务系统
 - 当前验证层已补 G3 护栏，并新增 G4 validation matrix 骨架：`lab_*` 本地模板族与 `suyuan_*` 样本可走进同一套统一汇总链路
-- Node.js 主平台首页现在默认是运行中心优先布局；涉及平台 UI 时，应从 `public/index.html`、`public/app.js`、`src/stage2Dashboard.js` 理解当前外壳，而不是假设仍是表单优先首页。当前 overview 还会聚合 `latest_baseline_freeze_manifest.json` 与 run 级 `promotion_candidate_summary`
+- Node.js 第二阶段 v3 运行中心入口是 `http://localhost:4173/stage2`；涉及平台 UI 时，应从 `public/index.html`、`public/app.js`、`src/stage2Dashboard.js`、`src/stage2V3RunCenter.js` 理解当前外壳，而不是假设仍是表单优先首页。当前 overview 还会聚合 `latest_baseline_freeze_manifest.json` 与 run 级 `promotion_candidate_summary`
 - 运行中心新系统接入卡片会把 `system key/template` 输入归一化为 `<base>_system_map`，并优先暴露系统地图 / discovery 核心 artifact 直链；“步骤结果”链接主要用于排错命令返回
 - 项目级沉淀可以自动落盘；平台级基线沉淀必须人工审核后晋升
 - 生成的 `artifacts/`、日报、报告是证据，不是设计真相；设计真相以 `docs/` 和 `CONTEXT.md` 为准
@@ -82,7 +83,7 @@ python -m prototype.stage2.main --validation-matrix --cdp-url http://localhost:9
 ## /neat 维护规则
 
 - 更新文档时优先改现有条目，不要在顶部追加会话流水账
-- 若第二阶段 CLI、产物名、里程碑状态变化，需同步更新 `README.md`、`docs/第二阶段原型开发计划.md`、`docs/技术方案第二阶段.md`
+- 若第二阶段入口、CLI、产物名、里程碑状态变化，需同步更新 `README.md`、`docs/测试手册第二阶段v3.md`、`docs/第二阶段原型开发计划.md`、`docs/技术方案第二阶段v3.md`
 - 若新增长期稳定术语，补到 `CONTEXT.md`
 
 ## Agent skills
