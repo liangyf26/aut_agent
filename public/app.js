@@ -908,7 +908,8 @@ async function createStage2Run(event) {
   }
 
   state.pendingAction = 'create-stage2-run';
-  pushStage2ActionLog(`正在创建 v3 run，执行模式：${executionModeLabel(payload.executionMode)}，安全策略：${safetyPolicyLabel(payload.safetyPolicy)}。`);
+  state.stage2ActionLog = [];
+  pushStage2ActionLog(`新 run 开始：正在创建 v3 run，执行模式：${executionModeLabel(payload.executionMode)}，安全策略：${safetyPolicyLabel(payload.safetyPolicy)}。`);
   render();
 
   try {

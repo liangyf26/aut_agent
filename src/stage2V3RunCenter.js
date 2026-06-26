@@ -1272,7 +1272,7 @@ function makeGeneratedTestCases(featurePoints) {
   const items = featurePoints.items.map((feature) => ({
     test_case_id: `case_${feature.feature_point_id.replace(/^feature_/, '')}`,
     feature_point_id: feature.feature_point_id,
-    title: `${feature.name} - 最小执行路径`,
+    title: `${feature.feature_point_id} · ${feature.name} - 最小执行路径`,
     type_template: feature.feature_type,
     preconditions: ['使用当前测试账号已登录会话。', '从所属页面入口标准起点开始。'],
     steps: feature.auto_verifiable
@@ -1302,6 +1302,9 @@ function makeExecutionResults(testCases, reason = 'contract_only_mode') {
     schema_version: 'stage2_execution_results.v3',
     items: testCases.items.map((testCase) => ({
       test_case_id: testCase.test_case_id,
+      feature_point_id: testCase.feature_point_id,
+      title: testCase.title,
+      name: testCase.title,
       status: testCase.requires_human_confirmation ? 'needs_review' : 'skipped',
       verdict: testCase.requires_human_confirmation
         ? '需要人工确认后才能执行。'
@@ -1526,6 +1529,33 @@ function findMissingScopeTargets(targetTracking) {
     .filter(Boolean);
 }
 
+function pageStatusIsReachable(page = {}) {
+  return !['unreachable', 'failed', 'blank'].includes(String(page.status || '').trim());
+}
+
+function findUncoveredFoundScopeTargets(targetTracking, pageEntries, featurePoints) {
+  const pages = pageEntries.items || [];
+  const features = featurePoints.items || [];
+  const pageById = new Map();
+  for (const page of pages) {
+    for (const id of [page.page_entry_id, page.page_id].filter(Boolean)) {
+      pageById.set(id, page);
+    }
+  }
+  return (Array.isArray(targetTracking) ? targetTracking : [])
+    .filter((item) => item.status === 'found' && !item.waived)
+    .filter((item) => {
+      const matchedPageIds = Array.isArray(item.matched_page_ids) ? item.matched_page_ids : [];
+      const matchedFeatureIds = Array.isArray(item.matched_feature_ids) ? item.matched_feature_ids : [];
+      const matchedPages = matchedPageIds.map((id) => pageById.get(id)).filter(Boolean);
+      const hasReachablePage = matchedPages.some(pageStatusIsReachable);
+      const hasPageFeature = features.some((feature) => matchedPageIds.includes(feature.page_entry_id || feature.page_id));
+      return !hasReachablePage || (!matchedFeatureIds.length && !hasPageFeature);
+    })
+    .map((item) => item.target)
+    .filter(Boolean);
+}
+
 function buildHumanTasks(featurePoints, executionResults, nextRoundPlan = null) {
   const tasks = [];
   const reviewFeatures = (featurePoints.items || []).filter((item) => item.review_status === 'pending');
@@ -1602,6 +1632,8 @@ function makeRoundAnalysis({
   const failureClusters = groupFailures(executionResults);
   const targetTracking = buildTargetTracking(inputConfig, pageEntries, featurePoints, menuEntries);
   const missingScopeTargets = findMissingScopeTargets(targetTracking);
+  const uncoveredScopeTargets = findUncoveredFoundScopeTargets(targetTracking, pageEntries, featurePoints);
+  const continuationTargets = [...new Set([...missingScopeTargets, ...uncoveredScopeTargets])];
   const menuItems = artifactItems(menuEntries, 'items', 'menu_entries');
   const menuLeafCount = menuItems.filter((item) => item && item.is_leaf).length;
   const browserTargetCount = numberOrZero(executionResults.browser_target_count || 0);
@@ -1615,6 +1647,16 @@ function makeRoundAnalysis({
       suggestion: `本轮未发现用户指定目标：${missingScopeTargets.join('、')}。请扩大探索或先在浏览器展开/进入目标菜单后继续。`
     });
   }
+  if (uncoveredScopeTargets.length) {
+    failureClusters.push({
+      cluster_id: `cluster_${String(failureClusters.length + 1).padStart(3, '0')}`,
+      reason: 'scope_target_discovered_but_uncovered',
+      test_case_ids: [],
+      count: uncoveredScopeTargets.length,
+      target_texts: uncoveredScopeTargets,
+      suggestion: `本轮已发现目标但未进入可验证页面或未识别功能点：${uncoveredScopeTargets.join('、')}。下一轮应优先进入这些页面并补齐功能点扫描。`
+    });
+  }
   const humanTaskReasons = failureClusters
     .filter((cluster) => [
       'manual_review_required',
@@ -1623,7 +1665,8 @@ function makeRoundAnalysis({
       'python_v3_orchestrator_failed',
       'python_executor_unavailable',
       'python_returned_safe_placeholder',
-      'scope_target_not_found'
+      'scope_target_not_found',
+      'scope_target_discovered_but_uncovered'
     ].includes(cluster.reason))
     .map((cluster) => cluster.reason);
 
@@ -1661,6 +1704,7 @@ function makeRoundAnalysis({
     ai_provider_status: 'not_connected',
     scope_targets: extractScopeTargets(inputConfig),
     missing_scope_targets: missingScopeTargets,
+    uncovered_scope_targets: uncoveredScopeTargets,
     target_tracking: targetTracking,
     count_explanation: {
       menu_leaf_vs_page_entries: `${menuLeafCount} menu leaves attempted; ${summarizeItems(pageEntries.items)} page entries recorded.`,
@@ -1679,14 +1723,33 @@ function makeRoundAnalysis({
       evidence_refs: ['input_config', 'page_entries', 'feature_points']
     });
   }
+  if (uncoveredScopeTargets.length) {
+    analysis.improvement_candidates.unshift({
+      candidate_id: 'improve_scope_target_page_coverage',
+      scope: 'discovery',
+      title: `补齐目标页面覆盖：${uncoveredScopeTargets.join('、')}`,
+      confidence: 0.96,
+      evidence_refs: ['page_entries', 'feature_points', 'execution_results']
+    });
+  }
+  const continuationReasons = new Set([
+    'scope_target_not_found',
+    'scope_target_discovered_but_uncovered'
+  ]);
+  const blockingFailureClusters = failureClusters.filter((cluster) => (
+    !continuationReasons.has(cluster.reason)
+  ));
+  const canAutoContinue = continuationTargets.length > 0 && blockingFailureClusters.length === 0;
 
   const nextRoundPlan = {
     schema_version: 'stage2_next_round_plan.v3',
     current_round_id: analysis.round_id,
-    should_continue: missingScopeTargets.length > 0,
-    decision: missingScopeTargets.length ? 'auto_continue' : failureClusters.length ? 'wait_human_review' : 'stop_goal_completed',
+    should_continue: canAutoContinue,
+    decision: canAutoContinue ? 'auto_continue' : failureClusters.length ? 'wait_human_review' : 'stop_goal_completed',
     next_round_goal: missingScopeTargets.length
       ? `继续寻找用户指定目标页面：${missingScopeTargets.join('、')}。`
+      : uncoveredScopeTargets.length
+      ? `优先进入已发现但未覆盖的目标页面：${uncoveredScopeTargets.join('、')}。`
       : failureClusters.length
       ? '处理执行阻塞后，重新执行低风险用例并补齐截图证据。'
       : '本 run 已完成当前范围。',
@@ -1700,7 +1763,7 @@ function makeRoundAnalysis({
       target_tracking: 'round_analysis.target_tracking'
     },
     risk_level: 'low',
-    requires_human_approval: failureClusters.length > 0 && missingScopeTargets.length === 0
+    requires_human_approval: blockingFailureClusters.length > 0
   };
 
   return {
@@ -2122,7 +2185,11 @@ async function summarizeModelAttempt({
   );
   const featurePoints = normalizePythonFeaturePoints(await readPythonJson(pyRunDir, ARTIFACTS.feature_points));
   const testCases = normalizePythonTestCases(await readPythonJson(pyRunDir, ARTIFACTS.generated_test_cases));
-  const executionResults = normalizePythonExecutionResults(await readPythonJson(pyRunDir, ARTIFACTS.execution_results));
+  const executionResults = normalizePythonExecutionResults(
+    await readPythonJson(pyRunDir, ARTIFACTS.execution_results),
+    testCases,
+    featurePoints
+  );
   const menuEntries = normalizeMenuEntries(
     await readPythonJson(pyRunDir, ARTIFACTS.menu_entries) || makeEmptyMenuArtifacts().menuEntries
   );
@@ -2343,13 +2410,33 @@ function normalizePythonTestCases(payload) {
   };
 }
 
-function normalizePythonExecutionResults(payload) {
+function normalizePythonExecutionResults(payload, testCases = { items: [] }, featurePoints = { items: [] }) {
   const results = payload?.schema_version === 'stage2_execution_results.v3' && Array.isArray(payload.items)
     ? payload.items
     : payload?.results || payload?.items || [];
+  const caseById = new Map((testCases.items || []).map((item) => [item.test_case_id, item]));
+  const featureById = new Map((featurePoints.items || []).map((item) => [item.feature_point_id, item]));
   return {
     schema_version: 'stage2_execution_results.v3',
     items: results.map((result) => {
+      const testCaseId = result.test_case_id || result.case_id || '';
+      const testCase = caseById.get(testCaseId) || {};
+      const featurePointId = result.feature_point_id
+        || result.feature_id
+        || testCase.feature_point_id
+        || '';
+      const feature = featureById.get(featurePointId) || {};
+      const featureLabel = featurePointId
+        ? `${featurePointId}${feature.name ? ` · ${feature.name}` : ''}`
+        : '';
+      const rawTitle = result.title
+        || result.name
+        || result.case_title
+        || testCase.title
+        || '';
+      const title = featureLabel && rawTitle && !rawTitle.includes(featurePointId)
+        ? `${featureLabel} · ${rawTitle}`
+        : rawTitle || featureLabel || testCaseId;
       let status = result.status || 'unknown';
       let failureReason = result.failure_reason || null;
       let manualConfirmationRequired = Boolean(result.manual_confirmation_required);
@@ -2364,7 +2451,11 @@ function normalizePythonExecutionResults(payload) {
         failureReason = failureReason || 'side_effect_failed';
       }
       return {
-        test_case_id: result.test_case_id || result.case_id || '',
+        test_case_id: testCaseId,
+        feature_point_id: featurePointId,
+        feature_id: featurePointId,
+        title,
+        name: title,
         status,
         verdict: result.verdict || result.message || '',
         started_at: result.started_at || null,
@@ -2606,7 +2697,11 @@ async function persistRealBrowserArtifacts(runDir, manifest, inputConfig, proces
   const testCases = normalizePythonTestCases(
     await readPythonJson(pyRunDir, 'generated_test_cases.json') || await readPythonJson(pyRunDir, 'cases.json')
   );
-  const executionResults = normalizePythonExecutionResults(await readPythonJson(pyRunDir, 'execution_results.json'));
+  const executionResults = normalizePythonExecutionResults(
+    await readPythonJson(pyRunDir, 'execution_results.json'),
+    testCases,
+    featurePoints
+  );
   const screenshotsIndex = await readPythonJson(pyRunDir, 'screenshots_index.json') || {
     schema_version: 'stage2_screenshots_index.v3',
     items: [],
@@ -2627,7 +2722,7 @@ async function persistRealBrowserArtifacts(runDir, manifest, inputConfig, proces
   });
   const nodeNextRoundPlan = analysisPack.nextRoundPlan;
   analysisPack.nextRoundPlan = normalizePythonNextRoundPlan(pythonNextRoundPlan, executionResults, roundId);
-  if ((analysisPack.analysis.missing_scope_targets || []).length) {
+  if (nodeNextRoundPlan.should_continue) {
     analysisPack.nextRoundPlan = {
       ...nodeNextRoundPlan,
       current_round_id: roundId
@@ -3291,10 +3386,39 @@ function resolveNextRoundBlocker(nextRoundPlan = {}, { approved = false } = {}) 
   return null;
 }
 
+async function refreshStaleCompletedNextRoundPlan(runDir, manifest, inputConfig, nextRoundPlan) {
+  if (nextRoundPlan?.decision !== 'stop_goal_completed' || nextRoundPlan?.should_continue !== false) {
+    return nextRoundPlan;
+  }
+  const artifacts = await loadRunArtifacts(runDir);
+  const refreshed = makeRoundAnalysis({
+    manifest,
+    inputConfig,
+    pageEntries: artifacts.page_entries || { items: [] },
+    featurePoints: artifacts.feature_points || { items: [] },
+    testCases: artifacts.generated_test_cases || { items: [] },
+    executionResults: artifacts.execution_results || { items: [] },
+    screenshotsIndex: artifacts.screenshots_index || { items: [] },
+    menuEntries: artifacts.menu_entries || { items: [] }
+  });
+  if (!refreshed.nextRoundPlan.should_continue) {
+    return nextRoundPlan;
+  }
+  await persistAnalysisPack(runDir, refreshed);
+  await appendEvent(runDir, {
+    type: 'next_round_plan_refreshed',
+    previous_decision: nextRoundPlan.decision,
+    decision: refreshed.nextRoundPlan.decision,
+    reason: 'stale_goal_completed_recalculated_from_artifacts'
+  });
+  return refreshed.nextRoundPlan;
+}
+
 async function continueNextRound(runId, body = {}, options = {}) {
   const { runDir, manifest } = await readManifest(runId, options);
   const inputConfig = await readJsonIfExists(path.join(runDir, ARTIFACTS.input_config)) || {};
-  const nextRoundPlan = await readJsonRequired(path.join(runDir, ARTIFACTS.next_round_plan), 'next_round_plan 缺失。');
+  let nextRoundPlan = await readJsonRequired(path.join(runDir, ARTIFACTS.next_round_plan), 'next_round_plan 缺失。');
+  nextRoundPlan = await refreshStaleCompletedNextRoundPlan(runDir, manifest, inputConfig, nextRoundPlan);
   const approved = body.approved === true || body.decision === 'approve' || await isHumanApprovalSatisfied(runDir);
   const blocker = resolveNextRoundBlocker(nextRoundPlan, { approved });
   if (blocker) {

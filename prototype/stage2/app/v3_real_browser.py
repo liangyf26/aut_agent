@@ -403,11 +403,7 @@ async def _explore_menu_leaf_pages_with_playwright(
         menu_id = _text(entry.get("menu_id")) or f"menu_leaf_{index:03d}"
         page_id = f"menu_page_{index:03d}"
         try:
-            locator = page.locator(f"[data-stage2-menu-id='{menu_id}']").first
-            if callable(locator):
-                locator = locator()
-            await locator.scroll_into_view_if_needed(timeout=1000)
-            await locator.click(timeout=2500)
+            open_result = await _open_menu_entry_page(page, entry, config)
             await page.wait_for_load_state("domcontentloaded", timeout=4000)
             await page.wait_for_timeout(500)
             snapshot = await page.evaluate(
@@ -425,6 +421,38 @@ async def _explore_menu_leaf_pages_with_playwright(
             )
             current_url = _text(snapshot.get("url")) or page.url or config.start_url
             title = _text(snapshot.get("title")) or _text(entry.get("text")) or f"页面入口 {index}"
+            if _snapshot_is_blank(snapshot):
+                pages.append(
+                    {
+                        "page_id": page_id,
+                        "page_entry_id": page_id,
+                        "menu_id": menu_id,
+                        "name": _text(entry.get("text")) or title,
+                        "url": current_url,
+                        "menu_path": entry.get("menu_path", []),
+                        "page_type": _infer_page_type(title, current_url),
+                        "semantic_page_type": _infer_page_type(title, current_url),
+                        "discovery_depth": 1,
+                        "status": "unreachable",
+                        "source": "playwright.menu_page_exploration",
+                        "confidence": "blank",
+                        "screenshot_refs": [screenshot_id],
+                        "failure_reason": "blank_page_after_navigation",
+                    }
+                )
+                logs.append(
+                    {
+                        "event": "enter_menu_leaf",
+                        "menu_id": menu_id,
+                        "menu_path": entry.get("menu_path", []),
+                        "status": "failed",
+                        "page_entry_id": page_id,
+                        "screenshot_ref": screenshot_id,
+                        "url": current_url,
+                        "failure_reason": "blank_page_after_navigation",
+                    }
+                )
+                continue
             page_type = _infer_page_type(title, current_url)
             pages.append(
                 {
@@ -441,6 +469,7 @@ async def _explore_menu_leaf_pages_with_playwright(
                     "source": "playwright.menu_page_exploration",
                     "confidence": "observed",
                     "screenshot_refs": [screenshot_id],
+                    "navigation_method": open_result.get("method"),
                     "failure_reason": None,
                 }
             )
@@ -453,6 +482,7 @@ async def _explore_menu_leaf_pages_with_playwright(
                     "page_entry_id": page_id,
                     "screenshot_ref": screenshot_id,
                     "url": current_url,
+                    "navigation_method": open_result.get("method"),
                 }
             )
             features.extend(
@@ -495,14 +525,109 @@ async def _explore_menu_leaf_pages_with_playwright(
                     "failure_reason": f"{type(exc).__name__}: {exc}",
                 }
             )
+    deduped_pages, deduped_features = _dedupe_page_exploration(pages, features)
     return {
-        "pages": pages,
-        "features": features,
+        "pages": deduped_pages,
+        "features": deduped_features,
         "page_exploration_log": logs,
         "screenshots_index": _menu_screenshots_index(
             [{**item, "stage": "page_exploration", "source": "playwright.menu_page_exploration"} for item in screenshots]
         ),
     }
+
+
+async def _open_menu_entry_page(page: Any, entry: dict[str, Any], config: V3RunConfig) -> dict[str, Any]:
+    menu_id = _text(entry.get("menu_id"))
+    locator_candidates = [{"kind": "css", "value": f"[data-stage2-menu-id='{menu_id}']"}]
+    locator_candidates.extend(_locator_candidates(entry))
+    last_error: Exception | None = None
+    for candidate in locator_candidates:
+        kind = _text(candidate.get("kind"))
+        value = _text(candidate.get("value"))
+        if not value:
+            continue
+        try:
+            if kind == "text":
+                locator = page.get_by_text(value, exact=True).first
+            else:
+                locator = page.locator(value).first
+            if callable(locator):
+                locator = locator()
+            await locator.scroll_into_view_if_needed(timeout=1000)
+            await locator.click(timeout=2500)
+            return {"method": kind or "locator", "value": value}
+        except Exception as exc:
+            last_error = exc
+
+    route_hint = _text(entry.get("route_hint"))
+    if route_hint:
+        target_url = urljoin(config.start_url, route_hint)
+        await page.goto(target_url, wait_until="domcontentloaded", timeout=6000)
+        return {"method": "route_hint", "url": target_url}
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("menu_entry_has_no_locator_or_route")
+
+
+def _snapshot_is_blank(snapshot: dict[str, Any]) -> bool:
+    if not isinstance(snapshot, dict):
+        return True
+    if _text(snapshot.get("title")):
+        return False
+    if snapshot.get("links") or snapshot.get("controls"):
+        return False
+    return not _text(snapshot.get("visibleTextSample"))
+
+
+def _dedupe_page_exploration(
+    pages: list[dict[str, Any]],
+    features: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    selected: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for page in pages:
+        key = _normalize_page_url(_text(page.get("url")))
+        if not key:
+            key = _text(page.get("page_id")) or _text(page.get("name"))
+        existing = selected.get(key)
+        if existing is None:
+            selected[key] = page
+            order.append(key)
+            continue
+        if _page_entry_rank(page) > _page_entry_rank(existing):
+            selected[key] = page
+
+    deduped_pages = [selected[key] for key in order]
+    kept_page_ids = {_text(page.get("page_id")) for page in deduped_pages}
+    deduped_features = [
+        feature
+        for feature in features
+        if _text(feature.get("page_id") or feature.get("page_entry_id")) in kept_page_ids
+    ]
+    return deduped_pages, deduped_features
+
+
+def _normalize_page_url(url: str) -> str:
+    text = _text(url)
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if not parsed.scheme or not parsed.netloc:
+        return text.rstrip("/")
+    path = parsed.path.rstrip("/") or "/"
+    if path in {"/", "/index"}:
+        path = "/index"
+    return f"{parsed.scheme}://{parsed.netloc}{path}"
+
+
+def _page_entry_rank(page: dict[str, Any]) -> tuple[int, int, int, int]:
+    name = _text(page.get("name"))
+    status_rank = 2 if _text(page.get("status")) == "reachable" else 1
+    canonical_home_rank = 1 if name == "首页" else 0
+    noise_rank = 0 if _is_noise_menu_label(name) else 1
+    evidence_rank = len(page.get("screenshot_refs") or [])
+    return (status_rank, canonical_home_rank, noise_rank, evidence_rank)
 
 
 def _build_page_features_from_snapshot(
@@ -659,9 +784,25 @@ def _is_business_menu_evidence(entry: dict[str, Any]) -> bool:
     if _text(entry.get("status")) in {"permission_blocked", "expansion_failed", "failed"}:
         return False
     text = _text(entry.get("text"))
-    if not text or text in {"0", "首页", "大写锁定已打开"}:
+    if not text or text == "首页" or _is_noise_menu_label(text):
         return False
     return bool(entry.get("is_leaf") or _text(entry.get("route_hint")) or _text(entry.get("parent_id")))
+
+
+def _is_noise_menu_label(text: str) -> bool:
+    return _text(text) in {
+        "0",
+        "大写锁定已打开",
+        "Default Medium Small Mini",
+        "Default",
+        "Medium",
+        "Small",
+        "Mini",
+        "个人中心布局设置退出登录",
+        "个人中心",
+        "布局设置",
+        "退出登录",
+    }
 
 
 def _menu_candidate_scan_script() -> str:
@@ -722,12 +863,37 @@ def _menu_candidate_scan_script() -> str:
         '[class*="menu-item"], [class*="menu__item"], [class*="submenu"], [class*="nav-item"]',
         'a[href]'
       ].join(',');
+      const noiseLabels = new Set([
+        '0',
+        '大写锁定已打开',
+        'Default Medium Small Mini',
+        'Default',
+        'Medium',
+        'Small',
+        'Mini',
+        '个人中心布局设置退出登录',
+        '个人中心',
+        '布局设置',
+        '退出登录'
+      ]);
+      const inMenuShell = (el) => Boolean(el.closest(
+        '.sidebar-container, aside, nav, [role="navigation"], .el-menu, .ant-menu'
+      ));
+      const inChromeShell = (el) => Boolean(el.closest(
+        '.navbar, .right-menu, .avatar-container, .sidebar-logo-container, .el-dropdown-menu, #header-search, #size-select'
+      ));
+      const allowedMenuCandidate = (el, label) => {
+        if (noiseLabels.has(label)) return false;
+        if (inChromeShell(el)) return false;
+        return inMenuShell(el);
+      };
       const seen = new Set();
       return Array.from(document.querySelectorAll(selectors))
         .filter(visible)
         .map((el, index) => {
           const label = text(el);
           if (!label) return null;
+          if (!allowedMenuCandidate(el, label)) return null;
           const href = el.href || el.getAttribute('href') || '';
           const key = `${label}|${href}|${cssPath(el)}`;
           if (seen.has(key)) return null;
@@ -1321,6 +1487,7 @@ def _dom_collection_expression() -> str:
         controls,
         title: document.title,
         url: location.href,
+        visibleTextSample: bodyText.replace(/\\s+/g, ' ').trim().slice(0, 200),
         password: Boolean(document.querySelector('input[type="password"]')),
         hasLoginWord: loginWords.some((word) => bodyText.includes(word))
       };

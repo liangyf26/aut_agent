@@ -197,6 +197,7 @@ npm run check
 - 已实现模板 bootstrap 入口：`--bootstrap-template`，可为新系统快速生成 `template.json`、`baseline.json`、`data_schema.json`、`locator_hints.json` 四件套的最小草稿，供第一轮 discovery / human recording 直接使用。
 - 已补 discovery 审核回填最小闭环：支持在已完成 discovery 上加载 `discovery_review_patch.json`，对页面入口和功能点执行忽略、重命名与字段修正，并让后续 discovery / verification 优先消费人工回填后的结果。
 - 已把 discovery 阶段显式化为策略决策：当前会在 `blocked`、`template_seed_only`、`live_enrich`、`skip_completed_discovery` 之间选择，并把决策纳入 run 产物与报告。
+- 已补真实浏览器 v3 菜单/页面探索护栏：菜单扫描会过滤顶部工具、字号选择、个人中心、退出登录等非业务 chrome；页面入口会按规范化 URL 去重，白屏或不可达入口会保留证据并标记为未覆盖。
 - 已实现验证阶段统一执行器，可输出执行日志、关键截图、失败簇、重试计划、运行报告、平台日报和模型对比结果。
 - 已实现运行态进度视图产物：`progress_events.jsonl`、`current_status.json`、`phase_summary.json`。
 - 已把 Node.js 主平台首页调整为运行中心视图：当前可通过 `GET /api/stage2/overview` 聚合 stage2 run、验证矩阵、平台日报、模型对比、人工录制候选审阅摘要、基线冻结清单，以及 `artifacts/stage2/sessions/` 下的 orchestration session 摘要，并展示选中 run 的阶段时间线、判停说明、人工接管摘要、沉淀候选审阅摘要和关键 artifacts 动作区；页面空闲时默认每 15 秒刷新。
@@ -231,6 +232,7 @@ npm run check
 - `--live-discovery` 现在会先遵守能力路由再决定是否执行 live enrich；即使路由可推荐 Browser Use 结构化 discovery，当前主线仍是“模板播种 + Playwright 受控 enrich”，不会把 Browser Use 伪装成 discovery 主执行器。
 - 第二阶段平台闭环已经成立，但当前更像“可演示的原型平台”，还不是可广泛复用的正式平台。
 - 自动续跑现在只会在 `next_round_decision.status=scheduled` 且 `should_start_next_round=true` 时继续；命中 `needs_review` 时会转入人工接管恢复路径，而不是盲目自动重试。
+- v3 run 的用户优先目标若已发现但页面不可达、白屏或尚未识别功能点，应继续下一轮补覆盖；这类情况不应被 `stop_goal_completed` 当成已完成。
 - 当前围绕“泛化闭环”的专项状态是：
   - G1 已完成：把定义了但没接上的共享抽象接通
   - G2 已完成：把复杂真实流程抽成复用动作族

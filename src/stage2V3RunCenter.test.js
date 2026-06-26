@@ -219,7 +219,7 @@ async function writeFakePythonV3Artifacts(artifactRoot, runId, overrides = {}) {
   ].join('\n'));
   await fs.writeFile(path.join(pythonRunDir, 'page_entries.json'), JSON.stringify({
     schema_version: 'stage2_page_entries.v3',
-    items: [{
+    items: overrides.pageItems || [{
       page_entry_id: 'page_home',
       name: '首页',
       url: 'https://example.com/home',
@@ -233,7 +233,7 @@ async function writeFakePythonV3Artifacts(artifactRoot, runId, overrides = {}) {
   }, null, 2));
   await fs.writeFile(path.join(pythonRunDir, 'feature_points.json'), JSON.stringify({
     schema_version: 'stage2_feature_points.v3',
-    items: [{
+    items: overrides.featureItems || [{
       feature_point_id: 'feature_nav',
       page_entry_id: 'page_home',
       name: '首页可达',
@@ -768,7 +768,82 @@ test('stage2 v3 run center starts real_browser mode through Python v3 bridge', a
     const preflight = await readJson(path.join(runDir, 'preflight_result.json'));
     assert.equal(executionResults.items[0].status, 'passed');
     assert.equal(executionResults.items[0].execution_mode, 'real_browser');
+    assert.equal(executionResults.items[0].feature_point_id, 'feature_nav');
+    assert.match(executionResults.items[0].title, /feature_nav/);
+    assert.match(executionResults.items[0].title, /首页可达基础验证/);
     assert.equal(preflight.checks.python_orchestrator.ok, true);
+  });
+});
+
+test('stage2 v3 run center keeps next round open for discovered but uncovered targets', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '目标未覆盖样例系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      prioritizedTargets: ['线上备案申请']
+    }, { runsDir });
+
+    let calls = 0;
+    const pythonRunner = async ({ args, artifactRoot }) => {
+      calls += 1;
+      const runId = argValue(args, '--v3-run-id');
+      const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+        pageItems: [{
+          page_entry_id: 'page_online_apply',
+          name: '线上备案申请',
+          url: 'https://example.com/record/online',
+          menu_path: ['业务办理', '线上备案申请'],
+          page_type: 'form',
+          discovery_depth: 1,
+          status: 'unreachable',
+          source: 'fake_python',
+          screenshot_refs: [],
+          failure_reason: 'blank_page_after_navigation'
+        }],
+        featureItems: []
+      });
+      return {
+        stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+        stderr: ''
+      };
+    };
+
+    await startV3Run(created.run.runId, {
+      executionMode: 'real_browser'
+    }, { runsDir, pythonRunner });
+
+    const runDir = path.join(runsDir, created.run.runId);
+    const nextRoundPlan = await readJson(path.join(runDir, 'next_round_plan.json'));
+    const roundAnalysis = await readJson(path.join(runDir, 'round_analysis.json'));
+
+    assert.equal(nextRoundPlan.should_continue, true);
+    assert.equal(nextRoundPlan.decision, 'auto_continue');
+    assert.match(nextRoundPlan.next_round_goal, /线上备案申请/);
+    assert.deepEqual(roundAnalysis.uncovered_scope_targets, ['线上备案申请']);
+    assert.ok(
+      roundAnalysis.failure_summary.clusters.some((cluster) => (
+        cluster.reason === 'scope_target_discovered_but_uncovered'
+      ))
+    );
+
+    await fs.writeFile(path.join(runDir, 'next_round_plan.json'), JSON.stringify({
+      schema_version: 'stage2_next_round_plan.v3',
+      current_round_id: 'round_001',
+      should_continue: false,
+      decision: 'stop_goal_completed',
+      next_round_goal: '本轮已完成。',
+      target_page_entry_ids: [],
+      target_feature_point_ids: [],
+      planned_improvements: [],
+      risk_level: 'low',
+      requires_human_approval: false
+    }, null, 2));
+
+    const continued = await continueNextRound(created.run.runId, {}, { runsDir, pythonRunner });
+    assert.equal(calls, 2);
+    assert.equal(continued.run.currentRoundId, 'round_002');
+    assert.equal(continued.operation.status, 'succeeded');
   });
 });
 

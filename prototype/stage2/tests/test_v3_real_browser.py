@@ -11,9 +11,12 @@ from prototype.stage2.app.v3_orchestrator import V3RunConfig  # noqa: E402
 from prototype.stage2.app.v3_real_browser import (  # noqa: E402
     TEST_ENV_FULL_ACCESS_POLICY,
     build_menu_discovery_artifacts,
+    _dedupe_page_exploration,
     _infer_feature_type,
+    _normalize_page_url,
     _plan_side_effect_actions,
     _should_block_for_login_text,
+    _snapshot_is_blank,
     _side_effect_execution_result,
 )
 
@@ -318,6 +321,52 @@ def test_menu_discovery_prefers_routed_duplicate_over_unrouted_clone() -> None:
     ]
     assert len(online_entries) == 1
     assert online_entries[0]["route_hint"] == "/record/online"
+
+
+def test_page_exploration_dedupes_home_aliases_and_drops_orphan_features() -> None:
+    pages, features = _dedupe_page_exploration(
+        [
+            {
+                "page_id": "menu_page_001",
+                "name": "追本溯源管理平台",
+                "url": "https://www.zbsykj.com:19096/",
+                "status": "reachable",
+                "screenshot_refs": ["logo_home"],
+            },
+            {
+                "page_id": "menu_page_002",
+                "name": "首页",
+                "url": "https://www.zbsykj.com:19096/index",
+                "status": "reachable",
+                "screenshot_refs": ["home"],
+            },
+            {
+                "page_id": "menu_page_003",
+                "name": "线上备案申请",
+                "url": "https://www.zbsykj.com:19096/record/online",
+                "status": "reachable",
+                "screenshot_refs": ["online"],
+            },
+        ],
+        [
+            {"feature_id": "feature_001", "page_id": "menu_page_001"},
+            {"feature_id": "feature_002", "page_id": "menu_page_002"},
+            {"feature_id": "feature_003", "page_id": "menu_page_003"},
+        ],
+    )
+
+    assert _normalize_page_url("https://www.zbsykj.com:19096/") == (
+        "https://www.zbsykj.com:19096/index"
+    )
+    assert [page["name"] for page in pages] == ["首页", "线上备案申请"]
+    assert [feature["feature_id"] for feature in features] == ["feature_002", "feature_003"]
+
+
+def test_blank_snapshot_is_not_treated_as_visible_page() -> None:
+    assert _snapshot_is_blank({"title": "", "links": [], "controls": [], "visibleTextSample": ""})
+    assert not _snapshot_is_blank(
+        {"title": "", "links": [], "controls": [], "visibleTextSample": "欢迎进入首页"}
+    )
 
 
 def test_login_residual_text_does_not_block_when_menu_evidence_exists() -> None:

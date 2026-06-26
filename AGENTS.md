@@ -70,6 +70,7 @@ python -m prototype.stage2.main --validation-matrix --cdp-url http://localhost:9
 - 高风险真实提交默认禁止，除非项目级白名单显式允许
 - 运行态必须持续落盘结构化产物，至少包含进度事件、当前状态、页面入口、功能点、执行结果、失败簇、报告
 - 初始化/运行阶段现在还会落盘 `routing_summary.json` 与 `discovery_strategy.json`，用于说明模型路由与本轮发现策略
+- 用户指定优先目标若已在菜单/页面中出现但页面不可达、白屏或尚未识别功能点，应归类为 `scope_target_discovered_but_uncovered` 并继续下一轮，不能判为 `stop_goal_completed`
 - 人工录制会话当前除候选草稿外还会落盘 `candidate_template_review.json`；运行中心已消费其摘要和 artifact 链接
 - 新系统首次接入现在建议走“三段法”：先用 `--explore-system-map` 生成系统地图树和页面类型初分，再为目标页面执行 `--bootstrap-template`，随后跑 discovery / human recording、`--template-revision-checklist` 和 connected validation
 - `--explore-system-map` 在系统地图模板已存在且 `page_url` 未变化时会复用既有模板；如果入口 URL 不同，需换模板名或显式传 `--bootstrap-overwrite`
