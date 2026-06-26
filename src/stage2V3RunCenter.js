@@ -124,6 +124,18 @@ function normalizeOptionalText(value) {
   return text || null;
 }
 
+function formatErrorWithCause(error) {
+  const message = error?.message || String(error || 'unknown error');
+  const cause = error?.cause;
+  if (!cause) {
+    return message;
+  }
+  const causeMessage = cause.message || String(cause);
+  return causeMessage && !message.includes(causeMessage)
+    ? `${message}; cause: ${causeMessage}`
+    : message;
+}
+
 function normalizeModelProfileId(value) {
   return String(value || '').trim().replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 120);
 }
@@ -3036,7 +3048,11 @@ async function defaultAiReviewRunner({ modelProfile, evidenceBundle, draftAnalys
       throw new Error(`AI 复盘模型返回 HTTP ${response.status}`);
     }
   } catch (error) {
-    throw new Error(error.name === 'AbortError' ? `AI 复盘模型调用超时：${timeoutMs}ms` : error.message);
+    throw new Error(
+      error.name === 'AbortError'
+        ? `AI 复盘模型调用超时：${timeoutMs}ms`
+        : formatErrorWithCause(error)
+    );
   } finally {
     clearTimeout(timer);
   }
@@ -3101,7 +3117,7 @@ async function applyAiRoundReview(analysisPack, context, options = {}) {
     analysisPack.analysis.ai_provider_status = 'ai_review_failed';
     analysisPack.analysis.review_errors = [{
       code: 'ai_review_failed',
-      message: error.message
+      message: formatErrorWithCause(error)
     }];
     return analysisPack;
   }

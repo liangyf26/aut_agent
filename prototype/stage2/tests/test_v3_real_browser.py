@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -15,10 +16,53 @@ from prototype.stage2.app.v3_real_browser import (  # noqa: E402
     _infer_feature_type,
     _normalize_page_url,
     _plan_side_effect_actions,
+    _resolve_playwright_target_page,
     _should_block_for_login_text,
     _snapshot_is_blank,
     _side_effect_execution_result,
 )
+
+
+class _FakeBodyLocator:
+    def __init__(self, page: "_FakePlaywrightPage") -> None:
+        self.page = page
+
+    async def inner_text(self, timeout: int = 0) -> str:
+        return self.page.body_text
+
+
+class _FakePlaywrightPage:
+    def __init__(self, url: str, body_text: str) -> None:
+        self.url = url
+        self.body_text = body_text
+        self.goto_calls: list[str] = []
+
+    async def bring_to_front(self) -> None:
+        return None
+
+    async def wait_for_load_state(self, state: str) -> None:
+        return None
+
+    async def wait_for_timeout(self, timeout: int) -> None:
+        return None
+
+    async def goto(self, url: str, wait_until: str = "") -> None:
+        self.goto_calls.append(url)
+        self.url = url
+
+    def locator(self, selector: str) -> _FakeBodyLocator:
+        assert selector == "body"
+        return _FakeBodyLocator(self)
+
+
+class _FakePlaywrightContext:
+    def __init__(self, pages: list[_FakePlaywrightPage]) -> None:
+        self.pages = pages
+
+
+class _FakePlaywrightBrowser:
+    def __init__(self, pages: list[_FakePlaywrightPage]) -> None:
+        self.contexts = [_FakePlaywrightContext(pages)]
 
 
 def test_low_risk_only_blocks_side_effect_candidates() -> None:
@@ -323,7 +367,7 @@ def test_menu_discovery_prefers_routed_duplicate_over_unrouted_clone() -> None:
     assert online_entries[0]["route_hint"] == "/record/online"
 
 
-def test_page_exploration_dedupes_home_aliases_and_drops_orphan_features() -> None:
+def test_page_exploration_dedupes_home_aliases_and_keeps_duplicate_features() -> None:
     pages, features = _dedupe_page_exploration(
         [
             {
@@ -359,7 +403,16 @@ def test_page_exploration_dedupes_home_aliases_and_drops_orphan_features() -> No
         "https://www.zbsykj.com:19096/index"
     )
     assert [page["name"] for page in pages] == ["首页", "线上备案申请"]
-    assert [feature["feature_id"] for feature in features] == ["feature_002", "feature_003"]
+    assert [feature["feature_id"] for feature in features] == [
+        "feature_001",
+        "feature_002",
+        "feature_003",
+    ]
+    assert [feature["page_id"] for feature in features] == [
+        "menu_page_002",
+        "menu_page_002",
+        "menu_page_003",
+    ]
 
 
 def test_blank_snapshot_is_not_treated_as_visible_page() -> None:
@@ -367,6 +420,19 @@ def test_blank_snapshot_is_not_treated_as_visible_page() -> None:
     assert not _snapshot_is_blank(
         {"title": "", "links": [], "controls": [], "visibleTextSample": "欢迎进入首页"}
     )
+
+
+def test_resolve_target_page_reloads_matching_url_when_body_is_blank() -> None:
+    page = _FakePlaywrightPage("https://www.zbsykj.com:19096/index", "")
+    resolved = asyncio.run(
+        _resolve_playwright_target_page(
+            _FakePlaywrightBrowser([page]),
+            "https://www.zbsykj.com:19096/index",
+        )
+    )
+
+    assert resolved is page
+    assert page.goto_calls == ["https://www.zbsykj.com:19096/index"]
 
 
 def test_login_residual_text_does_not_block_when_menu_evidence_exists() -> None:

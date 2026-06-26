@@ -238,7 +238,8 @@ async def _resolve_playwright_target_page(browser: Any, start_url: str) -> Any:
     page = next((item for item in pages if start_url and start_url in item.url), pages[0])
     await page.bring_to_front()
     await page.wait_for_load_state("domcontentloaded")
-    if start_url and start_url not in page.url:
+    body_text = await _safe_playwright_body_text(page)
+    if start_url and (start_url not in page.url or not _text(body_text)):
         await page.goto(start_url, wait_until="domcontentloaded")
         await page.wait_for_timeout(1200)
     return page
@@ -586,10 +587,14 @@ def _dedupe_page_exploration(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     selected: dict[str, dict[str, Any]] = {}
     order: list[str] = []
+    page_key_by_id: dict[str, str] = {}
     for page in pages:
         key = _normalize_page_url(_text(page.get("url")))
         if not key:
             key = _text(page.get("page_id")) or _text(page.get("name"))
+        page_id = _text(page.get("page_id") or page.get("page_entry_id"))
+        if page_id:
+            page_key_by_id[page_id] = key
         existing = selected.get(key)
         if existing is None:
             selected[key] = page
@@ -599,12 +604,25 @@ def _dedupe_page_exploration(
             selected[key] = page
 
     deduped_pages = [selected[key] for key in order]
-    kept_page_ids = {_text(page.get("page_id")) for page in deduped_pages}
-    deduped_features = [
-        feature
-        for feature in features
-        if _text(feature.get("page_id") or feature.get("page_entry_id")) in kept_page_ids
-    ]
+    kept_page_id_by_key = {
+        key: _text(page.get("page_id") or page.get("page_entry_id"))
+        for key, page in selected.items()
+    }
+    kept_page_ids = set(kept_page_id_by_key.values())
+    deduped_features: list[dict[str, Any]] = []
+    for feature in features:
+        feature_page_id = _text(feature.get("page_id") or feature.get("page_entry_id"))
+        page_key = page_key_by_id.get(feature_page_id)
+        target_page_id = kept_page_id_by_key.get(page_key or "", feature_page_id)
+        if target_page_id not in kept_page_ids:
+            continue
+        if target_page_id != feature_page_id:
+            feature = {
+                **feature,
+                "page_id": target_page_id,
+                "page_entry_id": target_page_id,
+            }
+        deduped_features.append(feature)
     return deduped_pages, deduped_features
 
 

@@ -1723,6 +1723,18 @@ test('stage2 v3 run center degrades AI review to rule review when model is unava
     assert.equal(invalid.roundAnalysis.analysis_mode, 'deterministic_rule_review');
     assert.equal(invalid.roundAnalysis.ai_provider_status, 'invalid_ai_output');
     assert.ok(invalid.roundAnalysis.review_errors.some((item) => item.code === 'invalid_ai_output'));
+
+    const failed = await analyzeV3Run(createdWithModel.run.runId, {
+      runsDir,
+      aiReviewRunner: async () => {
+        const error = new Error('fetch failed');
+        error.cause = new Error('connect ETIMEDOUT 172.28.29.24:30000');
+        throw error;
+      }
+    });
+    assert.equal(failed.roundAnalysis.ai_provider_status, 'ai_review_failed');
+    assert.match(failed.roundAnalysis.review_errors[0].message, /fetch failed/);
+    assert.match(failed.roundAnalysis.review_errors[0].message, /ETIMEDOUT/);
   });
 });
 
