@@ -775,6 +775,85 @@ test('stage2 v3 run center starts real_browser mode through Python v3 bridge', a
   });
 });
 
+test('stage2 v3 run center preserves Browser Use takeover evidence from Python bridge', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: 'Browser Use 接管样例系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      prioritizedTargets: ['线上备案申请']
+    }, { runsDir });
+
+    const started = await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          pageItems: [{
+            page_entry_id: 'browser_use_target_001',
+            name: '线上备案申请',
+            url: 'https://example.com/record/online',
+            menu_path: ['业务办理', '线上备案申请'],
+            page_type: 'form',
+            discovery_depth: 2,
+            status: 'reachable',
+            source: 'browser_use.semantic_recovery',
+            screenshot_refs: ['browser_use_target_001_final']
+          }],
+          featureItems: [{
+            feature_point_id: 'browser_use_target_001_flow',
+            page_entry_id: 'browser_use_target_001',
+            name: '线上备案申请目标接管流程',
+            feature_type: 'navigation',
+            risk_level: 'low',
+            auto_verifiable: true,
+            verification_strategy: 'browser_use_target_handover',
+            locator_candidates: [],
+            source: 'browser_use.semantic_recovery',
+            confidence: 'agent_observed',
+            review_status: 'auto_included'
+          }],
+          executionItems: [{
+            test_case_id: 'case_browser_use_online_apply',
+            feature_point_id: 'browser_use_target_001_flow',
+            status: 'passed',
+            verdict: 'Browser Use 已进入线上备案申请页面。',
+            started_at: '2026-06-24T00:00:00.000Z',
+            finished_at: '2026-06-24T00:00:01.000Z',
+            actions: [{ source: 'browser_use', action: 'agent_run', status: 'completed' }],
+            page_feedback: ['已进入线上备案申请页面，可见申请表单。'],
+            screenshot_refs: ['browser_use_target_001_initial', 'browser_use_target_001_final'],
+            network_refs: [],
+            failure_reason: null,
+            manual_confirmation_required: false,
+            execution_mode: 'browser_use_takeover'
+          }]
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    const runDir = path.join(runsDir, created.run.runId);
+    const executionResults = await readJson(path.join(runDir, 'execution_results.json'));
+    assert.equal(executionResults.items[0].execution_mode, 'browser_use_takeover');
+    assert.equal(executionResults.items[0].actions[0].source, 'browser_use');
+    assert.deepEqual(executionResults.items[0].page_feedback, ['已进入线上备案申请页面，可见申请表单。']);
+    assert.deepEqual(executionResults.items[0].screenshot_refs, [
+      'browser_use_target_001_initial',
+      'browser_use_target_001_final'
+    ]);
+    assert.equal(started.run.summary.execution.recentEvidence[0].executionMode, 'browser_use_takeover');
+    assert.equal(started.run.summary.execution.recentEvidence[0].actionCount, 1);
+    assert.deepEqual(started.run.summary.execution.recentEvidence[0].screenshotRefs, [
+      'browser_use_target_001_initial',
+      'browser_use_target_001_final'
+    ]);
+  });
+});
+
 test('stage2 v3 run center keeps next round open for discovered but uncovered targets', async () => {
   await withTempRunsDir(async (runsDir) => {
     const created = await createV3Run({
@@ -844,6 +923,186 @@ test('stage2 v3 run center keeps next round open for discovered but uncovered ta
     assert.equal(calls, 2);
     assert.equal(continued.run.currentRoundId, 'round_002');
     assert.equal(continued.operation.status, 'succeeded');
+  });
+});
+
+test('stage2 v3 run center does not treat page-visible placeholder as prioritized target coverage', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '目标仅页面可见样例系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      prioritizedTargets: ['线上备案申请']
+    }, { runsDir });
+
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          pageItems: [{
+            page_entry_id: 'page_online_apply',
+            name: '线上备案申请',
+            url: 'https://example.com/record/online',
+            menu_path: ['备案管理', '线上备案申请'],
+            page_type: 'form',
+            discovery_depth: 1,
+            status: 'reachable',
+            source: 'fake_python',
+            screenshot_refs: ['online_apply_visible']
+          }],
+          featureItems: [{
+            feature_point_id: 'feature_online_apply_visible',
+            page_entry_id: 'page_online_apply',
+            name: '页面可见性验证',
+            feature_type: 'view',
+            risk_level: 'low',
+            auto_verifiable: true,
+            verification_strategy: 'playwright_page_visible',
+            locator_candidates: [],
+            source: 'fake_python',
+            confidence: 0.9,
+            review_status: 'auto_included'
+          }],
+          executionItems: [{
+            test_case_id: 'case_online_apply_visible',
+            feature_point_id: 'feature_online_apply_visible',
+            status: 'real_passed',
+            verdict: '页面可见。',
+            started_at: '2026-06-24T00:00:00.000Z',
+            finished_at: '2026-06-24T00:00:01.000Z',
+            actions: [{ action: 'goto', ok: true }],
+            page_feedback: ['loaded'],
+            screenshot_refs: ['online_apply_visible'],
+            network_refs: [],
+            failure_reason: null,
+            manual_confirmation_required: false,
+            execution_mode: 'real_browser'
+          }]
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    const runDir = path.join(runsDir, created.run.runId);
+    const roundAnalysis = await readJson(path.join(runDir, 'round_analysis.json'));
+    const nextRoundPlan = await readJson(path.join(runDir, 'next_round_plan.json'));
+
+    assert.deepEqual(roundAnalysis.uncovered_scope_targets, ['线上备案申请']);
+    assert.equal(nextRoundPlan.should_continue, true);
+    assert.equal(nextRoundPlan.decision, 'auto_continue');
+    assert.match(nextRoundPlan.next_round_goal, /线上备案申请/);
+    assert.ok(
+      roundAnalysis.failure_summary.clusters.some((cluster) => (
+        cluster.reason === 'scope_target_discovered_but_uncovered'
+      ))
+    );
+  });
+});
+
+test('stage2 v3 run center does not treat visible-only target controls as prioritized flow coverage', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '目标仅控件可见样例系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      prioritizedTargets: ['线上备案申请']
+    }, { runsDir });
+
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          pageItems: [{
+            page_entry_id: 'page_online_apply',
+            name: '线上备案申请',
+            url: 'https://example.com/record/online',
+            menu_path: ['备案管理', '线上备案申请'],
+            page_type: 'form',
+            discovery_depth: 1,
+            status: 'reachable',
+            source: 'fake_python',
+            screenshot_refs: ['online_apply_visible']
+          }],
+          featureItems: [{
+            feature_point_id: 'feature_online_apply_label',
+            page_entry_id: 'page_online_apply',
+            name: '线上备案申请',
+            feature_type: 'navigation',
+            risk_level: 'low',
+            auto_verifiable: true,
+            verification_strategy: 'playwright_visible_control',
+            locator_candidates: [],
+            source: 'fake_python',
+            confidence: 0.9,
+            review_status: 'auto_included'
+          }, {
+            feature_point_id: 'feature_apply_button',
+            page_entry_id: 'page_online_apply',
+            name: '我要申请备案',
+            feature_type: 'view',
+            risk_level: 'low',
+            auto_verifiable: true,
+            verification_strategy: 'playwright_visible_control',
+            locator_candidates: [],
+            source: 'fake_python',
+            confidence: 0.9,
+            review_status: 'auto_included'
+          }],
+          executionItems: [{
+            test_case_id: 'case_online_apply_label',
+            feature_point_id: 'feature_online_apply_label',
+            status: 'real_passed',
+            verdict: 'passed',
+            started_at: '2026-06-24T00:00:00.000Z',
+            finished_at: '2026-06-24T00:00:01.000Z',
+            actions: [{ action: 'observe_feature', target: 'feature_online_apply_label', status: 'passed' }],
+            page_feedback: ['功能点入口可见。'],
+            screenshot_refs: ['online_apply_visible'],
+            network_refs: [],
+            failure_reason: null,
+            manual_confirmation_required: false,
+            execution_mode: 'real_browser'
+          }, {
+            test_case_id: 'case_apply_button',
+            feature_point_id: 'feature_apply_button',
+            status: 'real_passed',
+            verdict: 'passed',
+            started_at: '2026-06-24T00:00:01.000Z',
+            finished_at: '2026-06-24T00:00:02.000Z',
+            actions: [{ action: 'observe_feature', target: 'feature_apply_button', status: 'passed' }],
+            page_feedback: ['功能点入口可见。'],
+            screenshot_refs: ['online_apply_visible'],
+            network_refs: [],
+            failure_reason: null,
+            manual_confirmation_required: false,
+            execution_mode: 'real_browser'
+          }]
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    const runDir = path.join(runsDir, created.run.runId);
+    const roundAnalysis = await readJson(path.join(runDir, 'round_analysis.json'));
+    const nextRoundPlan = await readJson(path.join(runDir, 'next_round_plan.json'));
+
+    assert.deepEqual(roundAnalysis.uncovered_scope_targets, ['线上备案申请']);
+    assert.equal(nextRoundPlan.should_continue, true);
+    assert.equal(nextRoundPlan.decision, 'auto_continue');
+    assert.match(nextRoundPlan.next_round_goal, /线上备案申请/);
+    assert.ok(
+      roundAnalysis.failure_summary.clusters.some((cluster) => (
+        cluster.reason === 'scope_target_discovered_but_uncovered'
+      ))
+    );
   });
 });
 

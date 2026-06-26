@@ -14,9 +14,11 @@ from prototype.stage2.app.v3_real_browser import (  # noqa: E402
     build_menu_discovery_artifacts,
     _dedupe_page_exploration,
     _infer_feature_type,
+    _merge_browser_use_handover,
     _normalize_page_url,
     _plan_side_effect_actions,
     _resolve_playwright_target_page,
+    _target_handover_reasons,
     _should_block_for_login_text,
     _snapshot_is_blank,
     _side_effect_execution_result,
@@ -160,6 +162,8 @@ def test_side_effect_feature_type_inference_keeps_distinct_actions() -> None:
     assert _infer_feature_type("保存", "button", "") == "save"
     assert _infer_feature_type("提交", "button", "") == "submit"
     assert _infer_feature_type("删除", "button", "") == "delete"
+    assert _infer_feature_type("我要申请备案", "button", "") == "create"
+    assert _infer_feature_type("申请备案", "a", "") == "create"
 
 
 def test_menu_discovery_artifacts_capture_success_failure_permission_and_evidence() -> None:
@@ -433,6 +437,117 @@ def test_resolve_target_page_reloads_matching_url_when_body_is_blank() -> None:
 
     assert resolved is page
     assert page.goto_calls == ["https://www.zbsykj.com:19096/index"]
+
+
+def test_prioritized_target_triggers_browser_use_handover_when_uncovered() -> None:
+    config = V3RunConfig(metadata={"prioritized_targets": ["线上备案申请"]})
+
+    reasons = _target_handover_reasons(
+        config,
+        menu_entries=[{
+            "menu_id": "menu_online_apply",
+            "text": "线上备案申请",
+            "menu_path": ["备案管理", "线上备案申请"],
+            "is_leaf": True,
+            "status": "discovered",
+        }],
+        pages=[{
+            "page_id": "menu_page_004",
+            "name": "线上备案申请",
+            "status": "unreachable",
+            "failure_reason": "blank_page_after_navigation",
+        }],
+        features=[],
+    )
+
+    assert reasons == [{
+        "target": "线上备案申请",
+        "reason": "target_page_uncovered",
+        "matched_menu_entry_ids": ["menu_online_apply"],
+        "matched_page_ids": ["menu_page_004"],
+        "matched_feature_ids": [],
+    }]
+
+
+def test_visible_target_control_does_not_suppress_browser_use_handover() -> None:
+    config = V3RunConfig(metadata={"prioritized_targets": ["线上备案申请"]})
+
+    reasons = _target_handover_reasons(
+        config,
+        menu_entries=[{
+            "menu_id": "menu_online_apply",
+            "text": "线上备案申请",
+            "menu_path": ["备案管理", "线上备案申请"],
+            "is_leaf": True,
+            "status": "discovered",
+        }],
+        pages=[{
+            "page_id": "menu_page_002",
+            "name": "线上备案申请",
+            "status": "reachable",
+            "url": "https://example.test/record/online",
+        }],
+        features=[{
+            "feature_id": "feature_online_apply_label",
+            "page_id": "menu_page_002",
+            "name": "线上备案申请",
+            "feature_type": "navigation",
+            "verification_strategy": "playwright_visible_control",
+        }, {
+            "feature_id": "feature_apply_button",
+            "page_id": "menu_page_002",
+            "name": "我要申请备案",
+            "feature_type": "view",
+            "verification_strategy": "playwright_visible_control",
+        }],
+    )
+
+    assert reasons == [{
+        "target": "线上备案申请",
+        "reason": "target_page_uncovered",
+        "matched_menu_entry_ids": ["menu_online_apply"],
+        "matched_page_ids": ["menu_page_002"],
+        "matched_feature_ids": ["feature_online_apply_label"],
+    }]
+
+
+def test_browser_use_handover_payload_merges_into_unified_artifacts() -> None:
+    page_bundle = {
+        "pages": [],
+        "features": [],
+        "page_exploration_log": [],
+        "screenshots_index": {"schema_version": "stage2_v3_run.v1", "screenshots": [], "items": []},
+    }
+    handover = {
+        "status": "completed",
+        "pages": [{"page_id": "browser_use_target_001", "name": "线上备案申请"}],
+        "features": [{
+            "feature_id": "browser_use_target_001_flow",
+            "page_id": "browser_use_target_001",
+            "name": "线上备案申请目标接管流程",
+        }],
+        "case_execution_results": [{
+            "case_id": "browser_use_target_001_flow_case",
+            "feature_id": "browser_use_target_001_flow",
+            "status": "passed",
+        }],
+        "page_exploration_log": [{"event": "browser_use_handover", "status": "completed"}],
+        "screenshots_index": {
+            "schema_version": "stage2_v3_run.v1",
+            "screenshots": [{"screenshot_id": "browser_use_target_001"}],
+            "items": [{"screenshot_id": "browser_use_target_001"}],
+        },
+    }
+
+    merged = _merge_browser_use_handover(page_bundle, handover)
+
+    assert [page["page_id"] for page in merged["pages"]] == ["browser_use_target_001"]
+    assert [feature["feature_id"] for feature in merged["features"]] == [
+        "browser_use_target_001_flow"
+    ]
+    assert merged["case_execution_results"][0]["case_id"] == "browser_use_target_001_flow_case"
+    assert merged["page_exploration_log"][0]["event"] == "browser_use_handover"
+    assert merged["screenshots_index"]["items"][0]["screenshot_id"] == "browser_use_target_001"
 
 
 def test_login_residual_text_does_not_block_when_menu_evidence_exists() -> None:

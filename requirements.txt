@@ -1,0 +1,16 @@
+# Python dependencies used by the stage2 Python prototype and helper tools.
+# Tested in this workspace with C:\Python313\python.exe (Python 3.13.3).
+#
+# After installing Playwright, run:
+#   python -m playwright install chromium
+
+browser-use
+httpx>=0.28.1
+openai>=1.95.1
+playwright>=1.55.0
+pydantic>=2.11.7
+python-dotenv>=1.0.1
+reportlab>=5.0.0
+
+# Test dependencies
+pytest>=7.1.2

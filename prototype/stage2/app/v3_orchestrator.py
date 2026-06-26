@@ -1232,7 +1232,7 @@ def _normalize_case_execution_result(
         "feature_point_id": case["feature_id"],
         "status": status,
         "verdict": verdict,
-        "execution_mode": execution_mode,
+        "execution_mode": _text(result.get("execution_mode")) or execution_mode,
         "started_at": _text(result.get("started_at")) or _now(),
         "finished_at": _text(result.get("finished_at")) or _now(),
         "actions": actions,
@@ -1322,6 +1322,11 @@ def _build_round_analysis(
     missing_scope_targets = [
         item["target"] for item in target_tracking if item["status"] == "missed"
     ]
+    uncovered_scope_targets = _uncovered_scope_targets(
+        target_tracking=target_tracking,
+        pages=pages,
+        features=features,
+    )
     if missing_scope_targets:
         failure_clusters.append(
             {
@@ -1331,6 +1336,17 @@ def _build_round_analysis(
                 "case_ids": [],
                 "suggestion": "继续扩大页面覆盖，或先在浏览器中展开/进入目标菜单后从运行中心继续下一轮。",
                 "target_texts": missing_scope_targets,
+            }
+        )
+    if uncovered_scope_targets:
+        failure_clusters.append(
+            {
+                "cluster_id": "scope_target_discovered_but_uncovered",
+                "title": f"已发现但未覆盖用户指定目标页面：{'、'.join(uncovered_scope_targets)}",
+                "severity": "high",
+                "case_ids": [],
+                "suggestion": "下一轮应优先进入这些页面，识别页面内业务功能点或启用 Browser Use 接管补齐流程测试。",
+                "target_texts": uncovered_scope_targets,
             }
         )
     if execution_mode == "real_browser" and real_browser_payload and real_browser_payload.get("status") != "completed":
@@ -1408,6 +1424,7 @@ def _build_round_analysis(
         "ai_provider_status": "not_connected",
         "scope_targets": _scope_targets(config),
         "missing_scope_targets": missing_scope_targets,
+        "uncovered_scope_targets": uncovered_scope_targets,
         "target_tracking": target_tracking,
         "target_name": config.target_name,
         "coverage": {
@@ -1488,6 +1505,7 @@ def _build_human_tasks(
             }
         )
     missing_scope_targets = round_analysis.get("missing_scope_targets") or []
+    uncovered_scope_targets = round_analysis.get("uncovered_scope_targets") or []
     if missing_scope_targets:
         tasks.append(
             {
@@ -1497,6 +1515,18 @@ def _build_human_tasks(
                 "title": f"未发现指定目标：{'、'.join(missing_scope_targets)}",
                 "ui_action": "可直接进入下一轮扩大覆盖；如果仍未发现，请在真实浏览器中展开目标菜单或进入目标页面后重新开始自动评测。",
                 "target_texts": missing_scope_targets,
+                "blocks_next_round": False,
+            }
+        )
+    if uncovered_scope_targets:
+        tasks.append(
+            {
+                "task_id": "human_task_scope_target_uncovered",
+                "type": "scope_target_recovery",
+                "status": "open",
+                "title": f"已发现但未覆盖指定目标：{'、'.join(uncovered_scope_targets)}",
+                "ui_action": "可直接进入下一轮优先补齐目标页面的功能点识别和流程测试；如 Browser Use 不可用，请先安装依赖或改用人工接管。",
+                "target_texts": uncovered_scope_targets,
                 "blocks_next_round": False,
             }
         )
@@ -1555,7 +1585,10 @@ def _build_next_round_plan(
     should_continue = not blocking_tasks
     target_page_entry_ids = _found_target_page_entry_ids(round_analysis)
     feature_count = _int_or_default(_mapping(round_analysis.get("coverage")).get("feature_count"), 0)
-    should_focus_found_target = should_continue and bool(target_page_entry_ids) and feature_count == 0
+    uncovered_scope_targets = round_analysis.get("uncovered_scope_targets") or []
+    should_focus_found_target = should_continue and bool(target_page_entry_ids) and (
+        feature_count == 0 or bool(uncovered_scope_targets)
+    )
     return {
         "schema_version": V3_SCHEMA_VERSION,
         "generated_at": _now(),
@@ -1575,6 +1608,8 @@ def _build_next_round_plan(
         "target_feature_point_ids": [],
         "primary_reason": "存在需要界面确认的高风险动作或测试数据。"
         if blocking_tasks
+        else f"已命中但未覆盖目标页面：{'、'.join(uncovered_scope_targets)}，下一轮进入页面并补齐功能点/流程测试。"
+        if uncovered_scope_targets
         else f"已命中目标页面：{_found_target_names(round_analysis)}，下一轮进入页面并识别功能点。"
         if should_focus_found_target
         else "当前最小闭环已完成，可进入下一轮扩大页面覆盖。",
@@ -2317,6 +2352,69 @@ def _item_matches_target(item: dict[str, Any], target: str) -> bool:
     ]
     haystack = " ".join(str(value) for value in values if value).lower()
     return target.lower() in haystack
+
+
+def _page_status_is_reachable(page: dict[str, Any]) -> bool:
+    return _text(page.get("status")).strip() not in {"unreachable", "failed", "blank"}
+
+
+def _is_page_visible_placeholder_feature(feature: dict[str, Any]) -> bool:
+    name = _text(feature.get("name") or feature.get("title")).lower()
+    return (
+        _text(feature.get("feature_type") or feature.get("type")) == "view"
+        and _text(feature.get("verification_strategy")) == "playwright_page_visible"
+        and (
+            "页面可见性验证" in name
+            or "page visible" in name
+            or "page visibility" in name
+        )
+    )
+
+
+def _is_shallow_playwright_target_feature(feature: dict[str, Any]) -> bool:
+    feature_type = _text(feature.get("feature_type") or feature.get("type"))
+    strategy = _text(feature.get("verification_strategy"))
+    return _is_page_visible_placeholder_feature(feature) or (
+        strategy == "playwright_visible_control" and feature_type in {"view", "navigation"}
+    )
+
+
+def _uncovered_scope_targets(
+    *,
+    target_tracking: list[dict[str, Any]],
+    pages: list[dict[str, Any]],
+    features: list[dict[str, Any]],
+) -> list[str]:
+    page_by_id: dict[str, dict[str, Any]] = {}
+    for page in pages:
+        for page_id in [_text(page.get("page_id")), _text(page.get("page_entry_id"))]:
+            if page_id:
+                page_by_id[page_id] = page
+    feature_by_id: dict[str, dict[str, Any]] = {}
+    for feature in features:
+        for feature_id in [_text(feature.get("feature_id")), _text(feature.get("feature_point_id"))]:
+            if feature_id:
+                feature_by_id[feature_id] = feature
+    uncovered: list[str] = []
+    for item in target_tracking:
+        if item.get("status") != "found" or item.get("waived"):
+            continue
+        matched_page_ids = [_text(value) for value in item.get("matched_page_ids", []) if _text(value)]
+        matched_feature_ids = [
+            _text(value) for value in item.get("matched_feature_ids", []) if _text(value)
+        ]
+        matched_pages = [page_by_id[page_id] for page_id in matched_page_ids if page_id in page_by_id]
+        has_reachable_page = any(_page_status_is_reachable(page) for page in matched_pages)
+        has_deep_matched_feature = any(
+            feature_id in feature_by_id
+            and not _is_shallow_playwright_target_feature(feature_by_id[feature_id])
+            for feature_id in matched_feature_ids
+        )
+        if not has_reachable_page or not has_deep_matched_feature:
+            target = _text(item.get("target"))
+            if target:
+                uncovered.append(target)
+    return uncovered
 
 
 def _missing_scope_targets(

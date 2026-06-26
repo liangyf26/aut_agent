@@ -1545,6 +1545,22 @@ function pageStatusIsReachable(page = {}) {
   return !['unreachable', 'failed', 'blank'].includes(String(page.status || '').trim());
 }
 
+function isPageVisiblePlaceholderFeature(feature = {}) {
+  const featureType = String(feature.feature_type || feature.type || '').trim();
+  const strategy = String(feature.verification_strategy || '').trim();
+  const name = String(feature.name || feature.title || '').trim();
+  return featureType === 'view'
+    && strategy === 'playwright_page_visible'
+    && /页面可见性验证|page visible|page visibility/i.test(name);
+}
+
+function isShallowPlaywrightTargetFeature(feature = {}) {
+  const featureType = String(feature.feature_type || feature.type || '').trim();
+  const strategy = String(feature.verification_strategy || '').trim();
+  return isPageVisiblePlaceholderFeature(feature)
+    || (strategy === 'playwright_visible_control' && ['view', 'navigation'].includes(featureType));
+}
+
 function findUncoveredFoundScopeTargets(targetTracking, pageEntries, featurePoints) {
   const pages = pageEntries.items || [];
   const features = featurePoints.items || [];
@@ -1554,6 +1570,12 @@ function findUncoveredFoundScopeTargets(targetTracking, pageEntries, featurePoin
       pageById.set(id, page);
     }
   }
+  const featureById = new Map();
+  for (const feature of features) {
+    for (const id of [feature.feature_point_id, feature.feature_id].filter(Boolean)) {
+      featureById.set(id, feature);
+    }
+  }
   return (Array.isArray(targetTracking) ? targetTracking : [])
     .filter((item) => item.status === 'found' && !item.waived)
     .filter((item) => {
@@ -1561,8 +1583,11 @@ function findUncoveredFoundScopeTargets(targetTracking, pageEntries, featurePoin
       const matchedFeatureIds = Array.isArray(item.matched_feature_ids) ? item.matched_feature_ids : [];
       const matchedPages = matchedPageIds.map((id) => pageById.get(id)).filter(Boolean);
       const hasReachablePage = matchedPages.some(pageStatusIsReachable);
-      const hasPageFeature = features.some((feature) => matchedPageIds.includes(feature.page_entry_id || feature.page_id));
-      return !hasReachablePage || (!matchedFeatureIds.length && !hasPageFeature);
+      const hasDeepMatchedFeature = matchedFeatureIds.some((id) => {
+        const feature = featureById.get(id);
+        return feature && !isShallowPlaywrightTargetFeature(feature);
+      });
+      return !hasReachablePage || !hasDeepMatchedFeature;
     })
     .map((item) => item.target)
     .filter(Boolean);

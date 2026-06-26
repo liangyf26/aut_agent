@@ -113,13 +113,22 @@ def build_menu_discovery_artifacts(
     }
 
 
-async def collect_real_browser_artifacts(config: V3RunConfig, run_dir: Path) -> dict[str, Any]:
+async def collect_real_browser_artifacts(
+    config: V3RunConfig,
+    run_dir: Path,
+    *,
+    browser_use_handover_provider: Any | None = None,
+) -> dict[str, Any]:
     """Collect first-round menu evidence from a connected real browser."""
 
     if not config.cdp_url:
         return _blocked("cdp_required", "真实浏览器模式需要 CDP 地址，例如 http://localhost:9222。")
     try:
-        return await _collect_with_playwright_menu_discovery(config, run_dir)
+        return await _collect_with_playwright_menu_discovery(
+            config,
+            run_dir,
+            browser_use_handover_provider=browser_use_handover_provider,
+        )
     except ImportError as exc:
         raw_payload = await _collect_with_raw_cdp(config, run_dir)
         raw_payload["executor_stack"] = {
@@ -158,6 +167,8 @@ async def collect_real_browser_artifacts(config: V3RunConfig, run_dir: Path) -> 
 async def _collect_with_playwright_menu_discovery(
     config: V3RunConfig,
     run_dir: Path,
+    *,
+    browser_use_handover_provider: Any | None = None,
 ) -> dict[str, Any]:
     from playwright.async_api import async_playwright
 
@@ -196,10 +207,40 @@ async def _collect_with_playwright_menu_discovery(
                 screenshots_dir,
                 config,
             )
+            handover_reasons = _target_handover_reasons(
+                config,
+                menu_entries=menu_bundle["menu_entries"],
+                pages=page_bundle["pages"],
+                features=page_bundle["features"],
+            )
+            browser_use_handover = None
+            if handover_reasons:
+                provider = browser_use_handover_provider or _run_browser_use_target_handover
+                browser_use_handover = await provider(
+                    page=page,
+                    config=config,
+                    run_dir=run_dir,
+                    screenshots_dir=screenshots_dir,
+                    handover_reasons=handover_reasons,
+                    menu_bundle=menu_bundle,
+                    page_bundle=page_bundle,
+                )
+                page_bundle = _merge_browser_use_handover(page_bundle, browser_use_handover)
             screenshots_index = _merge_screenshot_indexes(
                 menu_bundle["screenshots_index"],
                 page_bundle["screenshots_index"],
             )
+            browser_use_status = "not_needed"
+            browser_use_reason = "Playwright 已覆盖用户优先目标或本轮未提供优先目标。"
+            if browser_use_handover is not None:
+                browser_use_status = (
+                    "used"
+                    if _text(browser_use_handover.get("status")) == "completed"
+                    else "failed"
+                )
+                browser_use_reason = _text(browser_use_handover.get("message")) or _text(
+                    browser_use_handover.get("failure_reason")
+                )
             return {
                 "schema_version": V3_SCHEMA_VERSION,
                 "status": "completed",
@@ -210,9 +251,9 @@ async def _collect_with_playwright_menu_discovery(
                 "executor_stack": {
                     "playwright": {"status": "used", "cdp_url": config.cdp_url},
                     "browser_use": {
-                        "status": "available_for_semantic_recovery",
+                        "status": browser_use_status,
                         "selected_model": config.model_name,
-                        "reason": "第一轮先由 Playwright 确定性展开菜单；语义歧义和目标追踪由 Browser-use/模型恢复层接管。",
+                        "reason": browser_use_reason,
                     },
                     "raw_cdp": {"status": "diagnostic_only", "browser_target_count": len(browser_targets)},
                 },
@@ -223,6 +264,8 @@ async def _collect_with_playwright_menu_discovery(
                 "page_exploration_log": page_bundle["page_exploration_log"],
                 "pages": page_bundle["pages"],
                 "features": page_bundle["features"],
+                "case_execution_results": page_bundle.get("case_execution_results", []),
+                "browser_use_handover": browser_use_handover,
                 "screenshots_index": screenshots_index,
             }
         finally:
@@ -535,6 +578,344 @@ async def _explore_menu_leaf_pages_with_playwright(
             [{**item, "stage": "page_exploration", "source": "playwright.menu_page_exploration"} for item in screenshots]
         ),
     }
+
+
+def _target_handover_reasons(
+    config: V3RunConfig,
+    *,
+    menu_entries: list[dict[str, Any]],
+    pages: list[dict[str, Any]],
+    features: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    targets = [
+        _text(item)
+        for item in (config.metadata or {}).get("prioritized_targets", [])
+        if _text(item)
+    ]
+    reasons: list[dict[str, Any]] = []
+    for target in targets:
+        matched_menu_ids = [
+            _text(entry.get("menu_id"))
+            for entry in menu_entries
+            if _record_matches_target(entry, target, ("text", "name", "route_hint", "url"))
+            or _path_matches_target(entry.get("menu_path"), target)
+        ]
+        matched_page_ids = [
+            _text(page.get("page_id") or page.get("page_entry_id"))
+            for page in pages
+            if _record_matches_target(page, target, ("name", "title", "url", "failure_reason"))
+            or _path_matches_target(page.get("menu_path"), target)
+        ]
+        matched_feature_ids = [
+            _text(feature.get("feature_id") or feature.get("feature_point_id"))
+            for feature in features
+            if _record_matches_target(feature, target, ("name", "title", "feature_type"))
+        ]
+        deep_matched_feature_ids = [
+            _text(feature.get("feature_id") or feature.get("feature_point_id"))
+            for feature in features
+            if _record_matches_target(feature, target, ("name", "title", "feature_type"))
+            and not _is_shallow_playwright_target_feature(feature)
+        ]
+        target_pages = [
+            page
+            for page in pages
+            if _text(page.get("page_id") or page.get("page_entry_id")) in set(matched_page_ids)
+        ]
+        has_reachable_page = any(_text(page.get("status")) == "reachable" for page in target_pages)
+        if has_reachable_page and deep_matched_feature_ids:
+            continue
+        reasons.append(
+            {
+                "target": target,
+                "reason": "target_page_uncovered" if matched_menu_ids or matched_page_ids else "target_not_found",
+                "matched_menu_entry_ids": [item for item in matched_menu_ids if item],
+                "matched_page_ids": [item for item in matched_page_ids if item],
+                "matched_feature_ids": [item for item in matched_feature_ids if item],
+            }
+        )
+    return reasons
+
+
+def _is_shallow_playwright_target_feature(feature: dict[str, Any]) -> bool:
+    feature_type = _text(feature.get("feature_type") or feature.get("type"))
+    strategy = _text(feature.get("verification_strategy"))
+    return strategy in {"playwright_page_visible", "playwright_visible_control"} and feature_type in {
+        "view",
+        "navigation",
+    }
+
+
+def _merge_browser_use_handover(
+    page_bundle: dict[str, Any],
+    handover: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not handover:
+        return page_bundle
+    return {
+        **page_bundle,
+        "pages": [
+            *(page_bundle.get("pages") or []),
+            *[item for item in handover.get("pages", []) if isinstance(item, dict)],
+        ],
+        "features": [
+            *(page_bundle.get("features") or []),
+            *[item for item in handover.get("features", []) if isinstance(item, dict)],
+        ],
+        "case_execution_results": [
+            *(page_bundle.get("case_execution_results") or []),
+            *[item for item in handover.get("case_execution_results", []) if isinstance(item, dict)],
+        ],
+        "page_exploration_log": [
+            *(page_bundle.get("page_exploration_log") or []),
+            *[item for item in handover.get("page_exploration_log", []) if isinstance(item, dict)],
+        ],
+        "screenshots_index": _merge_screenshot_indexes(
+            page_bundle.get("screenshots_index", {}),
+            handover.get("screenshots_index", {}),
+        ),
+    }
+
+
+def _record_matches_target(record: dict[str, Any], target: str, fields: tuple[str, ...]) -> bool:
+    normalized_target = _text(target)
+    if not normalized_target:
+        return False
+    return any(normalized_target in _text(record.get(field)) for field in fields)
+
+
+def _path_matches_target(path_value: Any, target: str) -> bool:
+    if isinstance(path_value, list):
+        return any(_text(target) in _text(item) for item in path_value)
+    return _text(target) in _text(path_value)
+
+
+async def _run_browser_use_target_handover(
+    *,
+    page: Any,
+    config: V3RunConfig,
+    run_dir: Path,
+    screenshots_dir: Path,
+    handover_reasons: list[dict[str, Any]],
+    menu_bundle: dict[str, Any],
+    page_bundle: dict[str, Any],
+) -> dict[str, Any]:
+    targets = [_text(item.get("target")) for item in handover_reasons if _text(item.get("target"))]
+    screenshots: list[dict[str, Any]] = []
+    with suppress(Exception):
+        screenshots.append(
+            await _capture_playwright_screenshot(
+                page,
+                screenshots_dir,
+                "browser_use_handover_initial",
+                f"Browser Use 接管前状态：{'、'.join(targets)}",
+            )
+        )
+    try:
+        from browser_use import Agent, Browser, ChatOpenAI, Tools  # type: ignore
+    except Exception as exc:
+        return _browser_use_handover_failure(
+            targets,
+            handover_reasons,
+            "browser_use_unavailable",
+            f"Browser Use 依赖不可用：{type(exc).__name__}: {exc}",
+            screenshots,
+        )
+
+    profile = _load_browser_use_model_profile(config.model_name)
+    if not profile:
+        return _browser_use_handover_failure(
+            targets,
+            handover_reasons,
+            "model_profile_unavailable",
+            f"未找到可用于 Browser Use 接管的模型 profile：{config.model_name or '<empty>'}",
+            screenshots,
+        )
+
+    try:
+        browser = Browser(cdp_url=config.cdp_url)
+        tools = Tools()
+
+        @tools.action(description="获取当前页面标题、URL 和可见文本摘要。")
+        async def get_page_feedback() -> str:
+            body_text = await _safe_playwright_body_text(page)
+            title = ""
+            with suppress(Exception):
+                title = await page.title()
+            return json.dumps(
+                {"title": title, "url": page.url, "visible_text": body_text[:2000]},
+                ensure_ascii=False,
+            )
+
+        llm = ChatOpenAI(
+            model=profile["model"],
+            api_key=profile.get("apiKey") or profile.get("api_key") or "EMPTY",
+            base_url=profile.get("baseUrl") or profile.get("base_url"),
+        )
+        agent = Agent(
+            task=_browser_use_handover_task(config, targets, handover_reasons),
+            llm=llm,
+            browser=browser,
+            tools=tools,
+            use_vision=True,
+            max_steps=12,
+            max_actions_per_step=1,
+        )
+        history = await agent.run()
+        screenshots.append(
+            await _capture_playwright_screenshot(
+                page,
+                screenshots_dir,
+                "browser_use_handover_final",
+                f"Browser Use 接管后状态：{'、'.join(targets)}",
+            )
+        )
+        feedback = _text(history)
+        current_url = page.url or config.start_url
+        page_id = "browser_use_target_001"
+        feature_id = "browser_use_target_001_flow"
+        screenshot_refs = [item["screenshot_id"] for item in screenshots if item.get("screenshot_id")]
+        return {
+            "schema_version": V3_SCHEMA_VERSION,
+            "status": "completed",
+            "targets": targets,
+            "handover_reasons": handover_reasons,
+            "message": "Browser Use 已接管优先目标并返回执行历史。",
+            "pages": [{
+                "page_id": page_id,
+                "page_entry_id": page_id,
+                "name": targets[0] if targets else "Browser Use 接管目标",
+                "url": current_url,
+                "menu_path": targets,
+                "page_type": _infer_page_type(targets[0] if targets else "", current_url),
+                "semantic_page_type": _infer_page_type(targets[0] if targets else "", current_url),
+                "discovery_depth": 2,
+                "status": "reachable",
+                "source": "browser_use.semantic_recovery",
+                "confidence": "agent_observed",
+                "screenshot_refs": screenshot_refs,
+            }],
+            "features": [{
+                "feature_id": feature_id,
+                "feature_point_id": feature_id,
+                "page_id": page_id,
+                "page_entry_id": page_id,
+                "name": f"{targets[0] if targets else '优先目标'}目标接管流程",
+                "feature_type": "create" if config.safety_policy == TEST_ENV_FULL_ACCESS_POLICY else "navigation",
+                "risk_level": "high" if config.safety_policy == TEST_ENV_FULL_ACCESS_POLICY else "low",
+                "auto_verifiable": True,
+                "verification_strategy": "browser_use_target_handover",
+                "source": "browser_use.semantic_recovery",
+                "confidence": "agent_observed",
+                "review_status": "auto_included",
+                "evidence": {"screenshot_refs": screenshot_refs},
+            }],
+            "case_execution_results": [{
+                "case_id": "browser_use_target_001_flow_case",
+                "test_case_id": "browser_use_target_001_flow_case",
+                "feature_id": feature_id,
+                "feature_point_id": feature_id,
+                "status": "passed",
+                "verdict": "passed",
+                "execution_mode": "browser_use_takeover",
+                "started_at": _now(),
+                "finished_at": _now(),
+                "actions": [{"source": "browser_use", "action": "agent_run", "target": "、".join(targets), "status": "completed"}],
+                "page_feedback": [feedback[:4000]] if feedback else [],
+                "screenshot_refs": screenshot_refs,
+                "failure_reason": None,
+                "manual_confirmation_required": False,
+                "message": "Browser Use 接管已完成，执行历史和截图已落盘。",
+            }],
+            "page_exploration_log": [{
+                "event": "browser_use_handover",
+                "status": "completed",
+                "targets": targets,
+                "reasons": handover_reasons,
+                "url": current_url,
+            }],
+            "screenshots_index": _menu_screenshots_index(
+                [{**item, "stage": "browser_use_handover", "source": "browser_use.semantic_recovery"} for item in screenshots]
+            ),
+        }
+    except Exception as exc:
+        return _browser_use_handover_failure(
+            targets,
+            handover_reasons,
+            "browser_use_handover_failed",
+            f"Browser Use 接管失败：{type(exc).__name__}: {exc}",
+            screenshots,
+        )
+
+
+def _browser_use_handover_failure(
+    targets: list[str],
+    handover_reasons: list[dict[str, Any]],
+    failure_reason: str,
+    message: str,
+    screenshots: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "schema_version": V3_SCHEMA_VERSION,
+        "status": "failed",
+        "targets": targets,
+        "handover_reasons": handover_reasons,
+        "failure_reason": failure_reason,
+        "message": message,
+        "pages": [],
+        "features": [],
+        "case_execution_results": [],
+        "page_feedback": [message],
+        "page_exploration_log": [{
+            "event": "browser_use_handover",
+            "status": "failed",
+            "targets": targets,
+            "reasons": handover_reasons,
+            "failure_reason": failure_reason,
+            "message": message,
+        }],
+        "screenshots_index": _menu_screenshots_index(
+            [{**item, "stage": "browser_use_handover", "source": "browser_use.semantic_recovery"} for item in screenshots]
+        ),
+    }
+
+
+def _browser_use_handover_task(
+    config: V3RunConfig,
+    targets: list[str],
+    handover_reasons: list[dict[str, Any]],
+) -> str:
+    allowed_actions = "、".join(config.allowed_side_effect_actions) or "无"
+    return f"""你是第二阶段 Browser Use 目标接管 Agent。
+目标：优先进入并验证这些页面/流程：{'、'.join(targets)}。
+入口 URL：{config.start_url}
+安全策略：{config.safety_policy}
+允许副作用动作：{allowed_actions}
+接管原因：{json.dumps(handover_reasons, ensure_ascii=False)}
+
+要求：
+1. 先恢复到可用页面，关闭明显弹窗或遮罩。
+2. 找到目标菜单或页面入口并进入。
+3. 识别页面上的主要按钮、表单、表格或反馈。
+4. 如果没有副作用授权，只做导航、展开、查看、截图前的低风险探索。
+5. 如果已经授权提交/保存/新增等动作，也必须只在测试环境上下文中执行，并报告动作与页面反馈。
+6. 最后用可读文本总结是否到达目标、执行了哪些动作、页面反馈和失败原因。
+"""
+
+
+def _load_browser_use_model_profile(model_name: str | None) -> dict[str, Any] | None:
+    if not model_name:
+        return None
+    default_path = Path(__file__).resolve().parents[3] / "config" / "stage2-model-profiles.json"
+    config_path = Path(os.environ.get("STAGE2_MODEL_PROFILES_PATH", str(default_path)))
+    if not config_path.exists():
+        return None
+    with suppress(Exception):
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        for profile in payload.get("profiles", []):
+            if _text(profile.get("id")) == model_name or _text(profile.get("label")) == model_name:
+                return profile
+    return None
 
 
 async def _open_menu_entry_page(page: Any, entry: dict[str, Any], config: V3RunConfig) -> dict[str, Any]:
@@ -1946,7 +2327,7 @@ def _infer_feature_type(text: str, tag: str, input_type: str) -> str:
         return "save"
     if any(word in lowered for word in ("submit", "提交")):
         return "submit"
-    if any(word in lowered for word in ("add", "new", "create", "新增", "新建")):
+    if any(word in lowered for word in ("add", "new", "create", "新增", "新建", "申请", "申报")):
         return "create"
     if any(word in lowered for word in ("edit", "修改", "编辑")):
         return "edit"

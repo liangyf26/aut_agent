@@ -890,6 +890,312 @@ def test_v3_target_tracking_links_found_second_level_menu_target() -> None:
         assert "线上备案申请" in next_round_plan["primary_reason"]
 
 
+def test_v3_prioritized_target_with_only_page_visible_feature_stays_uncovered() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        async def fake_real_browser_provider(
+            config: V3RunConfig,
+            run_dir: Path,
+        ) -> dict[str, object]:
+            return {
+                "schema_version": "stage2_v3_run.v1",
+                "status": "completed",
+                "preflight_result": {"ok": True, "status": "completed"},
+                "menu_entries": [{
+                    "menu_id": "menu_002",
+                    "text": "线上备案申请",
+                    "level": 2,
+                    "menu_path": ["业务办理", "线上备案申请"],
+                    "is_leaf": True,
+                    "status": "discovered",
+                    "source": "playwright.menu_discovery",
+                }],
+                "menu_tree": {"schema_version": "stage2_menu_tree.v1", "root_count": 1, "nodes": []},
+                "menu_traversal_log": [],
+                "page_exploration_log": [{
+                    "event": "enter_menu_leaf",
+                    "status": "reachable",
+                    "menu_id": "menu_002",
+                    "page_entry_id": "menu_page_001",
+                }],
+                "pages": [{
+                    "page_id": "menu_page_001",
+                    "name": "线上备案申请",
+                    "url": "https://example.test/record/online",
+                    "menu_path": ["业务办理", "线上备案申请"],
+                    "status": "reachable",
+                    "source": "playwright.menu_page_exploration",
+                }],
+                "features": [{
+                    "feature_id": "feature_001",
+                    "page_id": "menu_page_001",
+                    "name": "页面可见性验证",
+                    "feature_type": "view",
+                    "risk_level": "low",
+                    "auto_verifiable": True,
+                    "verification_strategy": "playwright_page_visible",
+                    "source": "playwright.menu_page_exploration",
+                }],
+                "case_execution_results": [{
+                    "case_id": "case_001",
+                    "feature_id": "feature_001",
+                    "status": "real_passed",
+                    "verdict": "页面可见。",
+                    "execution_mode": "real_browser",
+                }],
+                "screenshots_index": {"schema_version": "stage2_v3_run.v1", "screenshots": [], "items": []},
+            }
+
+        result = asyncio.run(
+            run_v3_assessment(
+                V3RunConfig(
+                    target_name="追本溯源管理平台",
+                    start_url="https://example.test/index",
+                    cdp_url="http://localhost:9222",
+                    execution_mode="real_browser",
+                    artifact_root=root / "runs",
+                    run_id="target_page_visible_placeholder",
+                    metadata={"prioritized_targets": ["线上备案申请"]},
+                ),
+                real_browser_provider=fake_real_browser_provider,
+            )
+        )
+
+        run_dir = Path(result["run_dir"])
+        round_analysis = _read_json(run_dir / "round_analysis.json")
+        next_round_plan = _read_json(run_dir / "next_round_plan.json")
+
+        assert round_analysis["missing_scope_targets"] == []
+        assert round_analysis["uncovered_scope_targets"] == ["线上备案申请"]
+        assert next_round_plan["should_start_next_round"] is True
+        assert next_round_plan["target_stage"] == "page_feature_discovery"
+        assert next_round_plan["target_page_entry_ids"] == ["menu_page_001"]
+        assert "线上备案申请" in next_round_plan["primary_reason"]
+
+
+def test_v3_prioritized_target_with_only_visible_controls_stays_uncovered() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        async def fake_real_browser_provider(
+            config: V3RunConfig,
+            run_dir: Path,
+        ) -> dict[str, object]:
+            return {
+                "schema_version": "stage2_v3_run.v1",
+                "status": "completed",
+                "preflight_result": {"ok": True, "status": "completed"},
+                "menu_entries": [{
+                    "menu_id": "menu_002",
+                    "text": "线上备案申请",
+                    "level": 2,
+                    "menu_path": ["业务办理", "线上备案申请"],
+                    "is_leaf": True,
+                    "status": "discovered",
+                    "source": "playwright.menu_discovery",
+                }],
+                "menu_tree": {"schema_version": "stage2_menu_tree.v1", "root_count": 1, "nodes": []},
+                "menu_traversal_log": [],
+                "page_exploration_log": [{
+                    "event": "enter_menu_leaf",
+                    "status": "reachable",
+                    "menu_id": "menu_002",
+                    "page_entry_id": "menu_page_002",
+                }],
+                "pages": [{
+                    "page_id": "menu_page_002",
+                    "name": "线上备案申请",
+                    "url": "https://example.test/record/online",
+                    "menu_path": ["业务办理", "线上备案申请"],
+                    "status": "reachable",
+                    "source": "playwright.menu_page_exploration",
+                }],
+                "features": [{
+                    "feature_id": "feature_online_apply_label",
+                    "page_id": "menu_page_002",
+                    "name": "线上备案申请",
+                    "feature_type": "navigation",
+                    "risk_level": "low",
+                    "auto_verifiable": True,
+                    "verification_strategy": "playwright_visible_control",
+                    "source": "playwright.menu_page_exploration",
+                }, {
+                    "feature_id": "feature_apply_button",
+                    "page_id": "menu_page_002",
+                    "name": "我要申请备案",
+                    "feature_type": "view",
+                    "risk_level": "low",
+                    "auto_verifiable": True,
+                    "verification_strategy": "playwright_visible_control",
+                    "source": "playwright.menu_page_exploration",
+                }],
+                "case_execution_results": [{
+                    "case_id": "case_001",
+                    "feature_id": "feature_online_apply_label",
+                    "status": "real_passed",
+                    "verdict": "passed",
+                    "execution_mode": "real_browser",
+                    "actions": [{"action": "observe_feature", "target": "feature_online_apply_label"}],
+                    "page_feedback": ["功能点入口可见。"],
+                }, {
+                    "case_id": "case_002",
+                    "feature_id": "feature_apply_button",
+                    "status": "real_passed",
+                    "verdict": "passed",
+                    "execution_mode": "real_browser",
+                    "actions": [{"action": "observe_feature", "target": "feature_apply_button"}],
+                    "page_feedback": ["功能点入口可见。"],
+                }],
+                "screenshots_index": {"schema_version": "stage2_v3_run.v1", "screenshots": [], "items": []},
+            }
+
+        result = asyncio.run(
+            run_v3_assessment(
+                V3RunConfig(
+                    target_name="追本溯源管理平台",
+                    start_url="https://example.test/index",
+                    cdp_url="http://localhost:9222",
+                    execution_mode="real_browser",
+                    artifact_root=root / "runs",
+                    run_id="target_visible_controls_only",
+                    metadata={"prioritized_targets": ["线上备案申请"]},
+                ),
+                real_browser_provider=fake_real_browser_provider,
+            )
+        )
+
+        run_dir = Path(result["run_dir"])
+        round_analysis = _read_json(run_dir / "round_analysis.json")
+        next_round_plan = _read_json(run_dir / "next_round_plan.json")
+
+        assert round_analysis["missing_scope_targets"] == []
+        assert round_analysis["uncovered_scope_targets"] == ["线上备案申请"]
+        assert next_round_plan["should_start_next_round"] is True
+        assert next_round_plan["target_stage"] == "page_feature_discovery"
+        assert next_round_plan["target_page_entry_ids"] == ["menu_page_002"]
+        assert "线上备案申请" in next_round_plan["primary_reason"]
+
+
+def test_v3_prioritized_target_handover_artifacts_flow_through_unified_outputs() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        async def fake_real_browser_provider(
+            config: V3RunConfig,
+            run_dir: Path,
+        ) -> dict[str, object]:
+            return {
+                "schema_version": "stage2_v3_run.v1",
+                "status": "completed",
+                "preflight_result": {"ok": True, "status": "completed"},
+                "executor_stack": {
+                    "playwright": {"status": "used"},
+                    "browser_use": {"status": "used", "reason": "target_page_uncovered"},
+                },
+                "menu_entries": [{
+                    "menu_id": "menu_002",
+                    "text": "线上备案申请",
+                    "level": 2,
+                    "menu_path": ["业务办理", "线上备案申请"],
+                    "is_leaf": True,
+                    "status": "discovered",
+                    "source": "playwright.menu_discovery",
+                }],
+                "menu_tree": {"schema_version": "stage2_menu_tree.v1", "root_count": 1, "nodes": []},
+                "menu_traversal_log": [],
+                "page_exploration_log": [
+                    {
+                        "event": "enter_menu_leaf",
+                        "status": "failed",
+                        "menu_id": "menu_002",
+                        "page_entry_id": "menu_page_001",
+                        "failure_reason": "blank_page_after_navigation",
+                    },
+                    {
+                        "event": "browser_use_handover",
+                        "status": "completed",
+                        "targets": ["线上备案申请"],
+                    },
+                ],
+                "pages": [{
+                    "page_id": "browser_use_target_001",
+                    "name": "线上备案申请",
+                    "url": "https://example.test/online/apply",
+                    "menu_path": ["业务办理", "线上备案申请"],
+                    "status": "reachable",
+                    "source": "browser_use.semantic_recovery",
+                    "screenshot_refs": ["browser_use_target_001"],
+                }],
+                "features": [{
+                    "feature_id": "browser_use_target_001_flow",
+                    "page_id": "browser_use_target_001",
+                    "name": "线上备案申请目标接管流程",
+                    "feature_type": "navigation",
+                    "source": "browser_use.semantic_recovery",
+                    "risk_level": "low",
+                    "auto_verifiable": True,
+                    "verification_strategy": "browser_use_target_handover",
+                }],
+                "case_execution_results": [{
+                    "case_id": "case_001",
+                    "feature_id": "browser_use_target_001_flow",
+                    "status": "passed",
+                    "verdict": "passed",
+                    "execution_mode": "browser_use_takeover",
+                    "actions": [{"source": "browser_use", "action": "agent_run", "status": "completed"}],
+                    "page_feedback": ["已进入线上备案申请页面。"],
+                    "screenshot_refs": ["browser_use_target_001"],
+                    "failure_reason": None,
+                }],
+                "screenshots_index": {
+                    "schema_version": "stage2_v3_run.v1",
+                    "screenshots": [{
+                        "screenshot_id": "browser_use_target_001",
+                        "stage": "browser_use_handover",
+                        "source": "browser_use.semantic_recovery",
+                    }],
+                    "items": [{
+                        "screenshot_id": "browser_use_target_001",
+                        "stage": "browser_use_handover",
+                        "source": "browser_use.semantic_recovery",
+                    }],
+                },
+            }
+
+        result = asyncio.run(
+            run_v3_assessment(
+                V3RunConfig(
+                    target_name="追本溯源管理平台",
+                    start_url="https://example.test/index",
+                    cdp_url="http://localhost:9222",
+                    execution_mode="real_browser",
+                    artifact_root=root / "runs",
+                    run_id="target_handover",
+                    metadata={"prioritized_targets": ["线上备案申请"]},
+                ),
+                real_browser_provider=fake_real_browser_provider,
+            )
+        )
+
+        run_dir = Path(result["run_dir"])
+        source_real_browser = _read_json(run_dir / "source_real_browser.json")
+        pages = _read_json(run_dir / "pages.json")["pages"]
+        features = _read_json(run_dir / "features.json")["features"]
+        execution_results = _read_json(run_dir / "execution_results.json")["results"]
+        round_analysis = _read_json(run_dir / "round_analysis.json")
+        exploration_log = (run_dir / "page_exploration_log.jsonl").read_text(encoding="utf-8")
+
+        assert source_real_browser["executor_stack"]["browser_use"]["status"] == "used"
+        assert pages[0]["source"] == "browser_use.semantic_recovery"
+        assert features[0]["verification_strategy"] == "browser_use_target_handover"
+        assert execution_results[0]["execution_mode"] == "browser_use_takeover"
+        assert execution_results[0]["actions"][0]["source"] == "browser_use"
+        assert "browser_use_handover" in exploration_log
+        assert round_analysis["target_tracking"][0]["status"] == "found"
+        assert round_analysis["missing_scope_targets"] == []
+
+
 def test_v3_target_tracking_carries_unfound_target_forward() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
