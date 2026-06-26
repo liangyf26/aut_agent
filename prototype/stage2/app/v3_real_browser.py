@@ -82,8 +82,14 @@ def build_menu_discovery_artifacts(
         }
         entries.append(entry)
 
+    entries = _dedupe_menu_entries(entries)
     entry_by_id = {entry["menu_id"]: entry for entry in entries}
-    root_entries = [entry for entry in entries if not entry.get("parent_id")]
+    children_by_parent = _children_by_parent_from_entries(entries)
+    root_entries = [
+        entry
+        for entry in entries
+        if not entry.get("parent_id") or entry.get("parent_id") not in entry_by_id
+    ]
     tree_nodes = [_tree_node(entry, entry_by_id, children_by_parent) for entry in root_entries]
     has_failure = any(
         entry["status"] in {"permission_blocked", "expansion_failed"}
@@ -163,7 +169,10 @@ async def _collect_with_playwright_menu_discovery(
             page = await _resolve_playwright_target_page(browser, config.start_url)
             browser_targets = _list_cdp_targets(config.cdp_url)
             menu_bundle = await _discover_menu_with_playwright(page, screenshots_dir, config)
-            if _looks_like_login_text(await _safe_playwright_body_text(page)):
+            if _should_block_for_login_text(
+                await _safe_playwright_body_text(page),
+                menu_bundle,
+            ):
                 return {
                     "schema_version": V3_SCHEMA_VERSION,
                     "status": "blocked",
@@ -284,8 +293,15 @@ async def _discover_menu_with_playwright(
         for item in candidates
         if item.get("expandable") and not item.get("parent_id")
     ][: max(1, int(config.max_pages or 1))]
-    for candidate in expandable_roots:
+    expandable_queue = list(expandable_roots)
+    expanded_ids: set[str] = set()
+    max_expand_attempts = max(1, int(config.max_pages or 1)) * 4
+    while expandable_queue and len(expanded_ids) < max_expand_attempts:
+        candidate = expandable_queue.pop(0)
         menu_id = _text(candidate.get("discovery_id"))
+        if not menu_id or menu_id in expanded_ids:
+            continue
+        expanded_ids.add(menu_id)
         if candidate.get("disabled"):
             traversal_events.append(
                 {
@@ -337,6 +353,8 @@ async def _discover_menu_with_playwright(
                 if item_id:
                     seen_ids.add(item_id)
                 new_children.append(item)
+                if item.get("expandable"):
+                    expandable_queue.append(item)
             candidates.extend(new_children)
             traversal_events.append(
                 {
@@ -626,6 +644,24 @@ async def _safe_playwright_body_text(page: Any) -> str:
 def _looks_like_login_text(text: str) -> bool:
     lowered = _text(text).lower()
     return any(word in lowered for word in ("login", "sign in", "登录", "登陆", "验证码", "密码"))
+
+
+def _should_block_for_login_text(text: str, menu_bundle: dict[str, Any]) -> bool:
+    if not _looks_like_login_text(text):
+        return False
+    menu_entries = menu_bundle.get("menu_entries") if isinstance(menu_bundle, dict) else []
+    if not isinstance(menu_entries, list):
+        return True
+    return not any(_is_business_menu_evidence(entry) for entry in menu_entries if isinstance(entry, dict))
+
+
+def _is_business_menu_evidence(entry: dict[str, Any]) -> bool:
+    if _text(entry.get("status")) in {"permission_blocked", "expansion_failed", "failed"}:
+        return False
+    text = _text(entry.get("text"))
+    if not text or text in {"0", "首页", "大写锁定已打开"}:
+        return False
+    return bool(entry.get("is_leaf") or _text(entry.get("route_hint")) or _text(entry.get("parent_id")))
 
 
 def _menu_candidate_scan_script() -> str:
@@ -1492,6 +1528,75 @@ def _blocked(reason: str, message: str, *, cdp_url: str = "") -> dict[str, Any]:
         "features": [],
         "screenshots_index": _screenshots_index([]),
     }
+
+
+def _dedupe_menu_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: dict[tuple[str, ...], dict[str, Any]] = {}
+    order: list[tuple[str, ...]] = []
+    for entry in entries:
+        key = _menu_entry_dedupe_key(entry)
+        existing = deduped.get(key)
+        if existing is None:
+            deduped[key] = entry
+            order.append(key)
+            continue
+        deduped[key] = _merge_menu_entry(existing, entry)
+    return [deduped[key] for key in order]
+
+
+def _menu_entry_dedupe_key(entry: dict[str, Any]) -> tuple[str, ...]:
+    path = [_text(part) for part in entry.get("menu_path", []) if _text(part)]
+    if path:
+        return tuple(path)
+    return (_text(entry.get("parent_id")), _text(entry.get("text")))
+
+
+def _merge_menu_entry(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    winner, loser = (left, right)
+    if _menu_entry_rank(right) > _menu_entry_rank(left):
+        winner, loser = right, left
+    merged = {**loser, **winner}
+    merged["screenshot_refs"] = _merge_unique_text_lists(
+        loser.get("screenshot_refs"),
+        winner.get("screenshot_refs"),
+    )
+    locators = []
+    for source in (loser.get("locator_candidates"), winner.get("locator_candidates")):
+        if isinstance(source, list):
+            for item in source:
+                if isinstance(item, dict) and item not in locators:
+                    locators.append(item)
+    merged["locator_candidates"] = locators
+    return merged
+
+
+def _menu_entry_rank(entry: dict[str, Any]) -> tuple[int, int, int]:
+    return (
+        1 if _text(entry.get("route_hint")) else 0,
+        1 if entry.get("is_leaf") else 0,
+        0 if _text(entry.get("status")) in {"permission_blocked", "expansion_failed", "failed"} else 1,
+    )
+
+
+def _merge_unique_text_lists(*values: Any) -> list[str]:
+    merged: list[str] = []
+    for value in values:
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            text = _text(item)
+            if text and text not in merged:
+                merged.append(text)
+    return merged
+
+
+def _children_by_parent_from_entries(entries: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    children_by_parent: dict[str, list[dict[str, Any]]] = {}
+    for entry in entries:
+        parent_id = _text(entry.get("parent_id"))
+        if parent_id:
+            children_by_parent.setdefault(parent_id, []).append(entry)
+    return children_by_parent
 
 
 def _menu_entry_status(

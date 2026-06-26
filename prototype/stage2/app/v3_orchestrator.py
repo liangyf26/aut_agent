@@ -491,14 +491,78 @@ def _extract_menu_entries(source: dict[str, Any]) -> list[dict[str, Any]]:
     if isinstance(entries, dict):
         entries = entries.get("menu_entries") or entries.get("items")
     if isinstance(entries, list):
-        return [_normalize_menu_entry(item, index) for index, item in enumerate(entries, start=1) if isinstance(item, dict)]
+        return _dedupe_menu_entries(
+            [_normalize_menu_entry(item, index) for index, item in enumerate(entries, start=1) if isinstance(item, dict)]
+        )
     tree = _mapping(source.get("menu_tree"))
     nodes = tree.get("nodes")
     if isinstance(nodes, list):
         flattened: list[dict[str, Any]] = []
         _flatten_menu_nodes(nodes, flattened, parent_path=[])
-        return [_normalize_menu_entry(item, index) for index, item in enumerate(flattened, start=1)]
+        return _dedupe_menu_entries(
+            [_normalize_menu_entry(item, index) for index, item in enumerate(flattened, start=1)]
+        )
     return []
+
+
+def _dedupe_menu_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: dict[tuple[str, ...], dict[str, Any]] = {}
+    order: list[tuple[str, ...]] = []
+    for entry in entries:
+        key = _menu_entry_dedupe_key(entry)
+        existing = deduped.get(key)
+        if existing is None:
+            deduped[key] = entry
+            order.append(key)
+            continue
+        deduped[key] = _merge_menu_entry(existing, entry)
+    return [deduped[key] for key in order]
+
+
+def _menu_entry_dedupe_key(entry: dict[str, Any]) -> tuple[str, ...]:
+    path = [_text(part) for part in entry.get("menu_path", []) if _text(part)]
+    if path:
+        return tuple(path)
+    return (_text(entry.get("parent_id")), _text(entry.get("text")))
+
+
+def _merge_menu_entry(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    winner, loser = (left, right)
+    if _menu_entry_rank(right) > _menu_entry_rank(left):
+        winner, loser = right, left
+    merged = {**loser, **winner}
+    merged["screenshot_refs"] = _unique_texts(
+        loser.get("screenshot_refs"),
+        winner.get("screenshot_refs"),
+    )
+    locators = []
+    for source in (loser.get("locator_candidates"), winner.get("locator_candidates")):
+        if isinstance(source, list):
+            for item in source:
+                if isinstance(item, dict) and item not in locators:
+                    locators.append(item)
+    merged["locator_candidates"] = locators
+    return merged
+
+
+def _menu_entry_rank(entry: dict[str, Any]) -> tuple[int, int, int]:
+    return (
+        1 if _text(entry.get("route_hint")) else 0,
+        1 if entry.get("is_leaf") else 0,
+        0 if _text(entry.get("status")) in {"permission_blocked", "expansion_failed", "failed"} else 1,
+    )
+
+
+def _unique_texts(*values: Any) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            text = _text(item)
+            if text and text not in result:
+                result.append(text)
+    return result
 
 
 def _normalize_menu_entry(item: dict[str, Any], index: int) -> dict[str, Any]:
@@ -1489,22 +1553,35 @@ def _build_next_round_plan(
         item for item in human_tasks["tasks"] if item.get("blocks_next_round") and item["status"] == "open"
     ]
     should_continue = not blocking_tasks
+    target_page_entry_ids = _found_target_page_entry_ids(round_analysis)
+    feature_count = _int_or_default(_mapping(round_analysis.get("coverage")).get("feature_count"), 0)
+    should_focus_found_target = should_continue and bool(target_page_entry_ids) and feature_count == 0
     return {
         "schema_version": V3_SCHEMA_VERSION,
         "generated_at": _now(),
         "status": "blocked_waiting_human" if blocking_tasks else "ready",
         "should_start_next_round": should_continue,
-        "target_stage": "safe_execution" if blocking_tasks else "live_discovery",
+        "target_stage": "safe_execution"
+        if blocking_tasks
+        else "page_feature_discovery"
+        if should_focus_found_target
+        else "live_discovery",
         "target_search_goals": [
             item["target"]
             for item in round_analysis.get("target_tracking", [])
             if item.get("status") == "missed"
         ],
+        "target_page_entry_ids": target_page_entry_ids,
+        "target_feature_point_ids": [],
         "primary_reason": "存在需要界面确认的高风险动作或测试数据。"
         if blocking_tasks
+        else f"已命中目标页面：{_found_target_names(round_analysis)}，下一轮进入页面并识别功能点。"
+        if should_focus_found_target
         else "当前最小闭环已完成，可进入下一轮扩大页面覆盖。",
         "recommended_actions": [
-            "扩大页面入口发现数量",
+            "进入已命中的目标页面进行默认可见控件识别和轻量交互扫描"
+            if should_focus_found_target
+            else "扩大页面入口发现数量",
             "对查询、详情等低风险功能点执行真实 Playwright 验证",
             "把人工确认后的白名单和测试数据沉淀为项目级资产",
         ]
@@ -1521,6 +1598,27 @@ def _build_next_round_plan(
             "target_tracking": round_analysis.get("target_tracking", []),
         },
     }
+
+
+def _found_target_page_entry_ids(round_analysis: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
+    for item in round_analysis.get("target_tracking", []):
+        if not isinstance(item, dict) or item.get("status") != "found":
+            continue
+        for page_id in item.get("matched_page_ids", []):
+            text = _text(page_id)
+            if text and text not in ids:
+                ids.append(text)
+    return ids
+
+
+def _found_target_names(round_analysis: dict[str, Any]) -> str:
+    names = [
+        _text(item.get("target"))
+        for item in round_analysis.get("target_tracking", [])
+        if isinstance(item, dict) and item.get("status") == "found" and _text(item.get("target"))
+    ]
+    return "、".join(names) or "已命中目标"
 
 
 def _render_report(

@@ -1865,6 +1865,7 @@ function renderStage2MetricCards(run) {
 function renderStage2Monitor(run) {
   const nextPlan = getRunNextRoundPlan(run || {});
   const fields = [
+    ['当前轮次', stage2RoundLabel(run)],
     ['当前阶段', run?.currentPhaseLabel || stageLabel(run?.currentPhase || '-')],
     ['当前步骤', run?.currentStepLabel || '-'],
     ['当前对象', run?.currentTargetLabel || '-'],
@@ -1877,6 +1878,19 @@ function renderStage2Monitor(run) {
       <strong>${escapeHtml(String(value || '-'))}</strong>
     </article>
   `).join('');
+}
+
+function stage2RoundLabel(run) {
+  const currentRoundId = run?.currentRoundId || run?.current_round_id || run?.manifest?.current_round_id || run?.currentStatus?.current_round_id || run?.current_status?.current_round_id || '';
+  const rounds = Array.isArray(run?.rounds) ? run.rounds : [];
+  if (currentRoundId) {
+    const index = rounds.findIndex((round) => (round.round_id || round.roundId) === currentRoundId);
+    return index >= 0 ? `${currentRoundId}（第 ${index + 1} 轮）` : currentRoundId;
+  }
+  if (rounds.length) {
+    return `第 ${rounds.length} 轮`;
+  }
+  return '尚未开始';
 }
 
 function renderStage2Timeline(run) {

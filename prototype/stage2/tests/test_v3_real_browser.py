@@ -13,6 +13,7 @@ from prototype.stage2.app.v3_real_browser import (  # noqa: E402
     build_menu_discovery_artifacts,
     _infer_feature_type,
     _plan_side_effect_actions,
+    _should_block_for_login_text,
     _side_effect_execution_result,
 )
 
@@ -269,3 +270,73 @@ def test_menu_discovery_artifacts_tolerate_self_referential_expanded_parent() ->
     assert any(entry["text"] == "线上备案申请" for entry in entries)
     assert bundle["menu_tree"]["root_count"] == 1
     assert bundle["menu_tree"]["nodes"][0]["children"][0]["text"] == "线上备案申请"
+
+
+def test_menu_discovery_prefers_routed_duplicate_over_unrouted_clone() -> None:
+    bundle = build_menu_discovery_artifacts(
+        start_url="https://example.test/index",
+        menu_candidates=[
+            {
+                "discovery_id": "menu_1",
+                "text": "饮片生产",
+                "level": 1,
+                "expandable": True,
+                "locator": "[data-stage2-menu-id='menu_1']",
+            },
+            {
+                "discovery_id": "menu_2",
+                "parent_id": "menu_1",
+                "text": "线上备案申请",
+                "level": 2,
+                "href": "/record/online",
+                "locator": "[data-stage2-menu-id='menu_2']",
+                "screenshot_id": "menu_1_after_expand",
+            },
+            {
+                "discovery_id": "menu_3",
+                "parent_id": "menu_1",
+                "text": "线上备案申请",
+                "level": 2,
+                "href": "",
+                "locator": "[data-stage2-menu-id='menu_3']",
+                "screenshot_id": "menu_1_after_expand",
+            },
+        ],
+        traversal_events=[
+            {
+                "event": "expand",
+                "menu_id": "menu_1",
+                "status": "success",
+                "screenshot_ref": "menu_1_after_expand",
+            }
+        ],
+        screenshots=[],
+    )
+
+    online_entries = [
+        entry for entry in bundle["menu_entries"] if entry["text"] == "线上备案申请"
+    ]
+    assert len(online_entries) == 1
+    assert online_entries[0]["route_hint"] == "/record/online"
+
+
+def test_login_residual_text_does_not_block_when_menu_evidence_exists() -> None:
+    menu_bundle = {
+        "menu_entries": [
+            {
+                "menu_id": "menu_1",
+                "text": "溯源管理",
+                "is_leaf": False,
+                "status": "expanded",
+            },
+            {
+                "menu_id": "menu_2",
+                "text": "线上备案申请",
+                "is_leaf": True,
+                "status": "discovered",
+                "route_hint": "/record/online",
+            },
+        ]
+    }
+
+    assert _should_block_for_login_text("登录 密码 大写锁定已打开", menu_bundle) is False
