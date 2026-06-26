@@ -160,6 +160,7 @@ const state = {
   stage2RunDetails: {},
   stage2LocalRuns: loadStage2LocalRuns(),
   stage2ActionLog: [],
+  selectedStage2ModelProfileIds: [],
   stage2BrowserPreflight: { status: 'unknown', ok: false, message: '浏览器连接状态待检查。' },
   stage2ModelPreflight: { status: 'unknown', profiles: [], message: '模型预检状态待检查。' },
   stage2RunsApiAvailable: null,
@@ -493,7 +494,7 @@ function pushStage2ActionLog(message, tone = 'info') {
     message,
     tone
   };
-  state.stage2ActionLog = [entry, ...state.stage2ActionLog].slice(0, 6);
+  state.stage2ActionLog = [...state.stage2ActionLog, entry].slice(-12);
   saveState.textContent = message;
 }
 
@@ -503,7 +504,13 @@ function pushStage2OperationFeedback(operation, fallbackMessage = '操作已提�
     return;
   }
   const nextAction = operation.nextAction ? ` 下一步：${operation.nextAction}` : '';
-  pushStage2ActionLog(`${operation.message || fallbackMessage}${nextAction}`, operation.tone || 'info');
+  const diagnosticArtifacts = Array.isArray(operation.diagnosticArtifacts)
+    ? operation.diagnosticArtifacts.map((item) => item.label || item.key).filter(Boolean)
+    : [];
+  const diagnostics = diagnosticArtifacts.length
+    ? ` 诊断产物：${diagnosticArtifacts.join('、')}。`
+    : '';
+  pushStage2ActionLog(`${operation.message || fallbackMessage}${nextAction}${diagnostics}`, operation.tone || 'info');
 }
 
 function isStage2V3ActionableRun(run) {
@@ -551,6 +558,39 @@ function getStage2ExecutionMode(run) {
     || run?.manifest?.execution_mode
     || run?.run_manifest?.execution_mode
     || 'contract_only';
+}
+
+function getStage2ModelProfileIds(run) {
+  return run?.modelProfileIds
+    || run?.model_profile_ids
+    || run?.selectedModelProfileIds
+    || run?.selected_model_profile_ids
+    || run?.manifest?.selected_model_profile_ids
+    || run?.inputConfig?.selected_model_profile_ids
+    || run?.input_config?.selected_model_profile_ids
+    || [];
+}
+
+function getStage2ModelLabel(run) {
+  const ids = getStage2ModelProfileIds(run);
+  return ids.length ? ids.join('、') : '未选择模型';
+}
+
+function showStage2RunCreatedDialog(run) {
+  if (typeof window === 'undefined' || typeof window.alert !== 'function') {
+    return;
+  }
+  const runId = getRunId(run) || '未知 run';
+  const executionMode = executionModeLabel(getStage2ExecutionMode(run));
+  const safetyPolicy = safetyPolicyLabel(getStage2SafetyPolicy(run));
+  const modelLabel = getStage2ModelLabel(run);
+  window.alert([
+    'v3 run 创建成功',
+    `Run ID：${runId}`,
+    `执行模式：${executionMode}`,
+    `安全策略：${safetyPolicy}`,
+    `模型：${modelLabel}`
+  ].join('\n'));
 }
 
 function getStage2NextDecision(run) {
@@ -753,6 +793,7 @@ function renderStage2ModelPreflight() {
     `;
     return;
   }
+  const selectedIds = new Set(state.selectedStage2ModelProfileIds || []);
   node.innerHTML = `
     <div class="stage2-model-profiles-head">
       <strong>大模型预检</strong>
@@ -768,9 +809,11 @@ function renderStage2ModelPreflight() {
           tags.browser_use_chatopenai_structured ? 'browser-use' : ''
         ].filter(Boolean).join(' · ') || '无可用能力标签';
         const available = profile.status === 'available';
+        const checked = selectedIds.has(profile.id);
+        const disabled = !available && !checked;
         return `
           <label class="stage2-model-profile ${available ? 'available' : 'unavailable'}">
-            <input name="modelProfileIds" type="checkbox" value="${escapeHtml(profile.id)}" ${available ? '' : 'disabled'}>
+            <input name="modelProfileIds" type="checkbox" value="${escapeHtml(profile.id)}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
             <span>
               <strong>${escapeHtml(profile.label || profile.id)}</strong>
               <small>${escapeHtml(profile.model || '')} · ${available ? '可用' : '不可用'} · ${escapeHtml(tagText)}</small>
@@ -797,6 +840,14 @@ function renderStage2SafetyConfirmation() {
   }
 }
 
+function captureStage2ModelProfileSelection() {
+  const checked = Array.from(document.querySelectorAll('#stage2ModelProfiles input[name="modelProfileIds"]:checked'))
+    .map((item) => item.value)
+    .filter(Boolean);
+  state.selectedStage2ModelProfileIds = [...new Set(checked)];
+  return state.selectedStage2ModelProfileIds;
+}
+
 function parseStage2TextList(value) {
   return String(value || '')
     .split(/\r?\n|[;,，、]/)
@@ -810,6 +861,7 @@ async function createStage2Run(event) {
   const safetyPolicy = normalizeStage2SafetyPolicy(data.get('safetyPolicy') || 'low_risk_only');
   const allowedSideEffects = safetyPolicy === 'test_env_full_access' ? [...STAGE2_FULL_ACCESS_ALLOWLIST] : [];
   const modelProfileIds = [...new Set(data.getAll('modelProfileIds').map((item) => item.trim()).filter(Boolean))];
+  state.selectedStage2ModelProfileIds = modelProfileIds;
   const prioritizedTargets = parseStage2TextList(data.get('prioritizedTargets'));
   const waivedTargets = parseStage2TextList(data.get('waivedTargets'));
   const payload = {
@@ -868,6 +920,7 @@ async function createStage2Run(event) {
     state.selectedRunId = getRunId(run);
     delete state.stage2RunDetails[state.selectedRunId];
     pushStage2OperationFeedback(result.operation, `已创建 v3 run：${state.selectedRunId}`);
+    showStage2RunCreatedDialog(run);
     await loadDashboardData();
   } catch (error) {
     const localRun = normalizeStage2Run({
@@ -936,7 +989,7 @@ async function runStage2V3Action(runId, action) {
     pause: '已请求暂停',
     resume: '已请求继续',
     stop: '已请求停止',
-    'analyze-round': '已触发规则复盘',
+    'analyze-round': '已触发 AI/规则复盘',
     'continue-next-round': '已请求进入下一轮',
     'generate-report': '已请求生成报告'
   }[action] || '已提交操作';
@@ -1691,12 +1744,14 @@ function renderStage2V3Shell() {
     const runKind = getStage2RunKind(item);
     const executionMode = getStage2ExecutionMode(item);
     const safetyPolicy = getStage2SafetyPolicy(item);
+    const modelLabel = getStage2ModelLabel(item);
     return `
       <button class="stage2-run-card ${id === state.selectedRunId ? 'active' : ''}" data-run-id="${escapeHtml(id)}" type="button">
         <span class="tag ${verdictClass(getRunStatus(item))}">${escapeHtml(statusLabel(getRunStatus(item)))}</span>
         <span class="tag ${escapeHtml(runKind.tone)}">${escapeHtml(runKind.label)}</span>
         <span class="tag ${executionMode === 'real_browser' ? 'manual' : 'warning'}">${escapeHtml(executionModeLabel(executionMode))}</span>
         <span class="tag ${escapeHtml(safetyPolicyTone(safetyPolicy))}">${escapeHtml(safetyPolicyLabel(safetyPolicy))}</span>
+        <span class="tag">${escapeHtml(modelLabel)}</span>
         <strong>${escapeHtml(item.systemName || id)}</strong>
         <small>${escapeHtml(id)}</small>
         <p>${escapeHtml(item.latestMessage || item.currentPhaseLabel || item.entryUrl || runKind.reason || '暂无运行摘要')}</p>
@@ -1743,7 +1798,7 @@ function renderStage2RunActions(run) {
     <button class="ghost-action compact-action primary-compact-action" data-stage2-run-action="start" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '按所选执行模式启动。' : disabledReason)}" ${disabled}>开始自动评测</button>
     <button class="ghost-action compact-action" data-stage2-run-action="pause" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '请求暂停当前 run。' : disabledReason)}" ${disabled}>暂停</button>
     <button class="ghost-action compact-action" data-stage2-run-action="resume" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '请求继续当前 run。' : disabledReason)}" ${disabled}>继续</button>
-    <button class="ghost-action compact-action" data-stage2-run-action="analyze-round" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '触发规则复盘；当前未接入可追踪 AI 模型调用。' : disabledReason)}" ${disabled}>规则复盘</button>
+    <button class="ghost-action compact-action" data-stage2-run-action="analyze-round" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '触发 AI 复盘；无可用模型时自动降级为规则复盘。' : disabledReason)}" ${disabled}>AI复盘</button>
     <button class="ghost-action compact-action" data-stage2-run-action="continue-next-round" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(continueReason)}" ${continueDisabled}>进入下一轮</button>
     <button class="ghost-action compact-action" data-stage2-run-action="generate-report" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '生成或刷新报告。' : disabledReason)}" ${disabled}>生成报告</button>
     <button class="ghost-action compact-action danger-action" data-stage2-run-action="stop" data-run-id="${escapeHtml(id)}" type="button" title="${escapeHtml(actionable ? '停止当前 run。' : disabledReason)}" ${disabled}>停止</button>
@@ -1779,6 +1834,10 @@ function renderStage2ActionFeedback() {
     </div>
     <ul>${logs}</ul>
   `;
+  const list = container.querySelector('ul');
+  if (list) {
+    list.scrollTop = list.scrollHeight;
+  }
 }
 
 function renderStage2MetricCards(run) {
@@ -1894,6 +1953,7 @@ function renderStage2V3OverviewTab() {
   const targetTracking = getRunTargetTracking(run);
   const modelComparison = run.modelComparison || {};
   const modelRanking = Array.isArray(modelComparison.ranking) ? modelComparison.ranking : [];
+  const modelLabel = getStage2ModelLabel(run);
   container.innerHTML = `
     <section class="stage2-overview-grid">
       <article class="stage2-work-card">
@@ -1907,6 +1967,7 @@ function renderStage2V3OverviewTab() {
             ['Run ID', getRunId(run)],
             ['Run 类型', runKind.label],
             ['执行模式', executionModeLabel(executionMode)],
+            ['模型', modelLabel],
             ['安全策略', safetyPolicyLabel(safetyPolicy)],
             ['全权限确认', run.fullAccessConfirmed ? '已确认' : '-'],
             ['副作用白名单', allowedSideEffects.length ? allowedSideEffects.join(', ') : '无'],
@@ -3747,11 +3808,19 @@ document.querySelector('#stage2Cockpit')?.addEventListener('click', (event) => {
 
   const refreshModelsButton = event.target.closest('#refreshStage2ModelProfilesButton');
   if (refreshModelsButton) {
+    captureStage2ModelProfileSelection();
     loadDashboardData().then(() => {
       pushStage2ActionLog('大模型预检状态已刷新。', 'success');
     }).catch((error) => {
       pushStage2ActionLog(`大模型预检刷新失败：${error.message}`, 'error');
     });
+    return;
+  }
+
+  const modelProfileInput = event.target.closest('#stage2ModelProfiles input[name="modelProfileIds"]');
+  if (modelProfileInput) {
+    captureStage2ModelProfileSelection();
+    renderStage2Overview();
     return;
   }
 

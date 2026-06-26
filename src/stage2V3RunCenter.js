@@ -58,12 +58,16 @@ class Stage2V3InputError extends Error {
 }
 
 function nowIso() {
-  return new Date().toISOString();
+  return toShanghaiIso(new Date());
 }
 
-function createRunId() {
-  const stamp = new Date()
-    .toISOString()
+function toShanghaiIso(date) {
+  const local = new Date(date.getTime() + 8 * 60 * 60 * 1000);
+  return `${local.toISOString().replace('Z', '')}+08:00`;
+}
+
+function createRunId(now = new Date()) {
+  const stamp = toShanghaiIso(now)
     .replace(/[-:]/g, '')
     .replace('T', '_')
     .slice(0, 15);
@@ -286,6 +290,7 @@ function normalizeInputConfig(body = {}, options = {}) {
     system_name: systemName,
     entry_url: entryUrl,
     cdp_url: normalizeCdpUrl(body.cdpUrl || body.cdp_url),
+    execution_mode: normalizeExecutionMode(body.executionMode || body.execution_mode),
     test_account_note: normalizeOptionalText(body.testAccountNote || body.test_account_note || body.accountNotes),
     login_mode: normalizeText(body.loginMode || body.login_mode, 'human_takeover_or_existing_session'),
     scope: normalizeOptionalText(body.scope || body.scopeText || body.explorationScope),
@@ -637,6 +642,7 @@ function buildManifest({ runId, inputConfig, status, createdAt, updatedAt, round
     entry_url: inputConfig.entry_url,
     cdp_url: inputConfig.cdp_url,
     safety_policy: inputConfig.safety_policy,
+    execution_mode: inputConfig.execution_mode,
     full_access_confirmed: inputConfig.full_access_confirmed,
     allowed_side_effect_actions: inputConfig.allowed_side_effect_actions,
     prioritized_targets: inputConfig.prioritized_targets || [],
@@ -955,7 +961,7 @@ function nextActionForRun(run) {
       : '请确认下一轮计划后继续。';
   }
   if (run.status === 'failed') {
-    return '查看错误详情和执行证据，修复后重试。';
+    return '查看 preflight_result、python_execution、execution_results 和 progress_events，修复后重试。';
   }
   if (run.status === 'running') {
     return '等待执行器推进，或刷新查看最新进度。';
@@ -978,6 +984,18 @@ function nextActionForRun(run) {
   return '查看运行中心建议的下一步动作。';
 }
 
+function diagnosticArtifactsForRun(run) {
+  if (!run || run.status !== 'failed') {
+    return [];
+  }
+  return ['preflight_result', 'python_execution', 'execution_results', 'progress_events']
+    .map((key) => ({
+      key,
+      label: key,
+      href: run.artifacts?.[key]?.href || null
+    }));
+}
+
 function makeOperationFeedback(action, run, overrides = {}) {
   const status = overrides.status || operationStatusForRun(run);
   const message = overrides.message || run?.latestMessage || '操作已提交。';
@@ -990,6 +1008,7 @@ function makeOperationFeedback(action, run, overrides = {}) {
     ),
     message,
     nextAction: overrides.nextAction || nextActionForRun(run),
+    diagnosticArtifacts: overrides.diagnosticArtifacts || diagnosticArtifactsForRun(run),
     error: overrides.error || (status === 'failed'
       ? {
           code: run?.currentStatus?.phase || run?.status || 'failed',
@@ -2453,7 +2472,7 @@ async function updateRunStatus(runDir, manifest, status, phase, message, extra =
   return saved;
 }
 
-async function persistContractOnlyArtifacts(runDir, manifest, inputConfig, executionMode = 'contract_only') {
+async function persistContractOnlyArtifacts(runDir, manifest, inputConfig, executionMode = 'contract_only', options = {}) {
   const preflightResult = makePreflightResult(manifest, inputConfig, executionMode);
   const { systemMap, navigationTree, pageEntries } = makeDiscoveryArtifacts(manifest, inputConfig);
   const { menuTree, menuEntries, menuTraversalLog } = makeEmptyMenuArtifacts('contract_only');
@@ -2472,6 +2491,15 @@ async function persistContractOnlyArtifacts(runDir, manifest, inputConfig, execu
     screenshotsIndex,
     menuEntries
   });
+  await applyAiRoundReview(analysisPack, {
+    inputConfig,
+    pageEntries,
+    featurePoints,
+    testCases,
+    executionResults,
+    screenshotsIndex,
+    menuEntries
+  }, options);
 
   await writeJson(path.join(runDir, ARTIFACTS.preflight_result), preflightResult);
   await writeJson(path.join(runDir, ARTIFACTS.system_map), systemMap);
@@ -2563,7 +2591,7 @@ async function persistRealBrowserFailure(runDir, manifest, inputConfig, processR
   return analysisPack;
 }
 
-async function persistRealBrowserArtifacts(runDir, manifest, inputConfig, processResult, roundId) {
+async function persistRealBrowserArtifacts(runDir, manifest, inputConfig, processResult, roundId, options = {}) {
   const pyRunDir = await findPythonRunDir(processResult);
   const pythonPreflight = await readPythonJson(pyRunDir, 'preflight_result.json');
   const menuTree = await readPythonJson(pyRunDir, 'menu_tree.json') || makeEmptyMenuArtifacts().menuTree;
@@ -2612,6 +2640,15 @@ async function persistRealBrowserArtifacts(runDir, manifest, inputConfig, proces
       analysisPack.humanTasks.items.push(...buildHumanTasks(featurePoints, executionResults, analysisPack.nextRoundPlan).items);
     }
   }
+  await applyAiRoundReview(analysisPack, {
+    inputConfig,
+    pageEntries,
+    featurePoints,
+    testCases,
+    executionResults,
+    screenshotsIndex,
+    menuEntries
+  }, options);
 
   await writeJson(path.join(runDir, ARTIFACTS.python_execution), { ...processResult, pythonRunDir: pyRunDir });
   await writeJson(path.join(runDir, ARTIFACTS.preflight_result), {
@@ -2695,7 +2732,7 @@ async function startV3Run(runId, body = {}, options = {}) {
   let analysisPack;
   let executionFailed = false;
   if (executionMode === 'contract_only') {
-    analysisPack = await persistContractOnlyArtifacts(runDir, runningManifest, inputConfig, executionMode);
+    analysisPack = await persistContractOnlyArtifacts(runDir, runningManifest, inputConfig, executionMode, options);
   } else {
     const selectedModelIds = inputConfig.selected_model_profile_ids || [];
     const processResult = selectedModelIds.length > 1
@@ -2717,7 +2754,7 @@ async function startV3Run(runId, body = {}, options = {}) {
         modelProfileId: selectedModelIds[0] || null
       }, options);
     if (processResult.ok) {
-      analysisPack = await persistRealBrowserArtifacts(runDir, runningManifest, inputConfig, processResult, roundId);
+      analysisPack = await persistRealBrowserArtifacts(runDir, runningManifest, inputConfig, processResult, roundId, options);
     } else {
       executionFailed = true;
       analysisPack = await persistRealBrowserFailure(runDir, runningManifest, inputConfig, processResult, roundId);
@@ -2804,15 +2841,117 @@ function buildAiEvidenceBundle({ inputConfig, pageEntries, featurePoints, testCa
 }
 
 function selectedAiReviewProfile(inputConfig = {}, options = {}) {
-  const profiles = inputConfig.selected_model_profiles || [];
-  if (!profiles.length) {
+  const selectedIds = inputConfig.selected_model_profile_ids || [];
+  if (!selectedIds.length) {
     return null;
   }
-  const profile = profiles[0];
-  if (options.aiReviewRunner || profile.api_key_configured || profile.apiKeyConfigured) {
+  const selectedId = selectedIds[0];
+  const persistedProfiles = inputConfig.selected_model_profiles || [];
+  const persisted = persistedProfiles.find((profile) => profile.id === selectedId) || {};
+  const configuredProfiles = options.modelProfiles || loadStage2ModelProfiles(options).profiles;
+  const configured = (configuredProfiles || []).find((profile) => profile.id === selectedId) || {};
+  const profile = {
+    ...persisted,
+    ...configured,
+    id: selectedId,
+    label: configured.label || persisted.label || selectedId,
+    provider: configured.provider || persisted.provider || 'openai_compatible',
+    baseUrl: configured.baseUrl || persisted.baseUrl || persisted.base_url || '',
+    model: configured.model || persisted.model || selectedId,
+    browserUseMode: configured.browserUseMode || persisted.browserUseMode || persisted.browser_use_mode || null
+  };
+  if (options.aiReviewRunner || (profile.provider === 'openai_compatible' && profile.baseUrl && profile.model)) {
     return profile;
   }
   return null;
+}
+
+function parseJsonObjectFromText(text) {
+  const raw = String(text || '').trim();
+  if (!raw) {
+    return null;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    const candidate = fenced ? fenced[1] : raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1);
+    if (!candidate) {
+      return null;
+    }
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      return null;
+    }
+  }
+}
+
+async function defaultAiReviewRunner({ modelProfile, evidenceBundle, draftAnalysis, draftNextRoundPlan }) {
+  if (modelProfile.provider !== 'openai_compatible' || !modelProfile.baseUrl) {
+    throw new Error('当前仅支持 OpenAI-compatible AI 复盘模型。');
+  }
+  const endpoint = new URL('chat/completions', `${modelProfile.baseUrl.replace(/\/$/, '')}/`).toString();
+  const headers = { 'Content-Type': 'application/json' };
+  if (modelProfile.apiKey) {
+    headers.Authorization = `Bearer ${modelProfile.apiKey}`;
+  }
+  const timeoutMs = normalizeInteger(process.env.STAGE2_AI_REVIEW_TIMEOUT_MS, 60000, 1000, 10 * 60 * 1000);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let response;
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      signal: controller.signal,
+      headers,
+      body: JSON.stringify({
+        model: modelProfile.model,
+        temperature: 0,
+        response_format: { type: 'json_object' },
+        messages: [{
+          role: 'system',
+          content: '你是第二阶段自动化评测运行中心的复盘模型。只输出 JSON，不要输出 Markdown。'
+        }, {
+          role: 'user',
+          content: JSON.stringify({
+            task: '基于证据复盘本轮探索和执行结果，给出改进候选、经验沉淀和下一轮建议。',
+            required_json_shape: {
+              analysis_mode: 'ai_assisted_review',
+              confidence: 0.0,
+              coverage_summary: {},
+              failure_summary: {},
+              evidence_quality: {},
+              improvement_candidates: [{
+                candidate_id: 'string',
+                title: 'string',
+                evidence_refs: ['execution_results']
+              }],
+              learned_rules: ['string'],
+              next_round_recommendations: ['string']
+            },
+            evidence_bundle: evidenceBundle,
+            draft_analysis: draftAnalysis,
+            draft_next_round_plan: draftNextRoundPlan
+          })
+        }]
+      })
+    });
+    if (!response.ok) {
+      throw new Error(`AI 复盘模型返回 HTTP ${response.status}`);
+    }
+  } catch (error) {
+    throw new Error(error.name === 'AbortError' ? `AI 复盘模型调用超时：${timeoutMs}ms` : error.message);
+  } finally {
+    clearTimeout(timer);
+  }
+  const payload = await response.json().catch(() => ({}));
+  const content = payload.choices?.[0]?.message?.content || '';
+  const parsed = parseJsonObjectFromText(content);
+  if (!parsed) {
+    throw new Error('AI 复盘模型没有返回可解析 JSON。');
+  }
+  return parsed;
 }
 
 function validateAiReviewPayload(payload) {
@@ -2842,7 +2981,10 @@ function bindAiEvidenceToCandidates(candidates = [], allowedRefs = []) {
 
 async function applyAiRoundReview(analysisPack, context, options = {}) {
   const modelProfile = selectedAiReviewProfile(context.inputConfig, options);
-  if (!modelProfile || typeof options.aiReviewRunner !== 'function') {
+  const runner = typeof options.aiReviewRunner === 'function'
+    ? options.aiReviewRunner
+    : defaultAiReviewRunner;
+  if (!modelProfile) {
     analysisPack.analysis.ai_provider_status = 'model_unavailable';
     analysisPack.analysis.review_errors = [{
       code: 'model_unavailable',
@@ -2854,7 +2996,7 @@ async function applyAiRoundReview(analysisPack, context, options = {}) {
   const evidenceBundle = buildAiEvidenceBundle(context);
   let payload = null;
   try {
-    payload = await options.aiReviewRunner({
+    payload = await runner({
       modelProfile,
       evidenceBundle,
       draftAnalysis: analysisPack.analysis,
@@ -2906,6 +3048,12 @@ async function applyAiRoundReview(analysisPack, context, options = {}) {
     ai_review_status: 'completed'
   };
   return analysisPack;
+}
+
+async function isHumanApprovalSatisfied(runDir) {
+  const humanTasks = await readJsonIfExists(path.join(runDir, ARTIFACTS.human_tasks));
+  const items = Array.isArray(humanTasks?.items) ? humanTasks.items : [];
+  return items.length > 0 && items.every((item) => ['completed', 'approved', 'resolved'].includes(item.status));
 }
 
 async function setV3RunLifecycleStatus(runId, action, body = {}, options = {}) {
@@ -3147,7 +3295,7 @@ async function continueNextRound(runId, body = {}, options = {}) {
   const { runDir, manifest } = await readManifest(runId, options);
   const inputConfig = await readJsonIfExists(path.join(runDir, ARTIFACTS.input_config)) || {};
   const nextRoundPlan = await readJsonRequired(path.join(runDir, ARTIFACTS.next_round_plan), 'next_round_plan 缺失。');
-  const approved = body.approved === true || body.decision === 'approve';
+  const approved = body.approved === true || body.decision === 'approve' || await isHumanApprovalSatisfied(runDir);
   const blocker = resolveNextRoundBlocker(nextRoundPlan, { approved });
   if (blocker) {
     const saved = await updateRunStatus(

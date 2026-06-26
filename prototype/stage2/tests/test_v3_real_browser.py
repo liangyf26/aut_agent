@@ -215,3 +215,57 @@ def test_menu_discovery_artifacts_capture_success_failure_permission_and_evidenc
     ] == ["业务办理", "线上备案申请"]
     assert bundle["menu_traversal_log"][2]["screenshot_ref"] == "menu_m5_expand_failed"
     assert bundle["screenshots_index"]["screenshots"][1]["stage"] == "menu_discovery"
+
+
+def test_menu_discovery_artifacts_tolerate_self_referential_expanded_parent() -> None:
+    bundle = build_menu_discovery_artifacts(
+        start_url="https://example.test/index",
+        menu_candidates=[
+            {
+                "discovery_id": "menu_4",
+                "text": "备案管理",
+                "level": 1,
+                "expandable": True,
+                "locator": "[data-stage2-menu-id='menu_4']",
+                "screenshot_id": "menu_initial",
+            },
+            {
+                "discovery_id": "menu_4",
+                "parent_id": "menu_4",
+                "text": "备案管理 线上备案申请",
+                "level": 2,
+                "expandable": True,
+                "locator": "[data-stage2-menu-id='menu_4']",
+                "screenshot_id": "menu_4_after_expand",
+            },
+            {
+                "discovery_id": "menu_12",
+                "parent_id": "menu_4",
+                "text": "线上备案申请",
+                "level": 2,
+                "href": "/online/apply",
+                "locator": "[data-stage2-menu-id='menu_12']",
+                "screenshot_id": "menu_4_after_expand",
+            },
+        ],
+        traversal_events=[
+            {
+                "event": "expand",
+                "menu_id": "menu_4",
+                "status": "success",
+                "screenshot_ref": "menu_4_after_expand",
+            }
+        ],
+        screenshots=[
+            {"screenshot_id": "menu_initial", "relative_path": "screenshots/menu_initial.png"},
+            {
+                "screenshot_id": "menu_4_after_expand",
+                "relative_path": "screenshots/menu_4_after_expand.png",
+            },
+        ],
+    )
+
+    entries = bundle["menu_entries"]
+    assert any(entry["text"] == "线上备案申请" for entry in entries)
+    assert bundle["menu_tree"]["root_count"] == 1
+    assert bundle["menu_tree"]["nodes"][0]["children"][0]["text"] == "线上备案申请"

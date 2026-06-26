@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -124,6 +125,45 @@ def test_v3_run_can_consume_existing_discovery_paths() -> None:
         assert features[0]["feature_type"] == "query"
         assert cases[0]["auto_allowed"] is True
         assert next_round_plan["status"] == "ready"
+
+
+def test_v3_cli_accepts_model_profile_argument() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        run_id = "cli_model_profile_contract"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "prototype.stage2.main",
+                "--run-v3",
+                "--v3-run-id",
+                run_id,
+                "--v3-artifact-root",
+                tmpdir,
+                "--v3-execution-mode",
+                "contract_only",
+                "--target-name",
+                "CLI 模型参数系统",
+                "--page-url",
+                "https://example.test/home",
+                "--cdp-url",
+                "http://localhost:9222",
+                "--v3-model-profile",
+                "local_ai",
+            ],
+            cwd=ROOT_DIR,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        payload = json.loads(completed.stdout)
+        run_dir = Path(payload["run_dir"])
+        run_state = _read_json(run_dir / "run_state.json")
+        assert run_state["metadata"]["selected_model_profile_ids"] == ["local_ai"]
+        assert run_state["model_name"] == "local_ai"
 
 
 def test_v3_run_records_missing_scope_target_without_marking_goal_complete() -> None:

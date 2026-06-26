@@ -1132,6 +1132,7 @@ async def run_v3_assessment_entrypoint(
     start_url: str,
     cdp_url: str,
     model_name: str | None,
+    model_profile_ids: list[str] | None,
     run_id: str,
     artifact_root: str,
     use_live_discovery: bool,
@@ -1153,6 +1154,8 @@ async def run_v3_assessment_entrypoint(
         if artifact_root
         else ROOT_DIR / "artifacts" / "stage2" / "v3_runs"
     )
+    selected_model_profile_ids = list(model_profile_ids or ())
+    effective_model_name = model_name or (selected_model_profile_ids[0] if selected_model_profile_ids else None)
     config = V3RunConfig(
         target_name=target_name or "第二阶段 v3 演示系统",
         start_url=start_url,
@@ -1161,7 +1164,7 @@ async def run_v3_assessment_entrypoint(
         safety_policy=safety_policy,
         allowed_side_effect_actions=tuple(allowed_side_effect_actions or ()),
         reuse_run_dir=reuse_run_dir,
-        model_name=model_name,
+        model_name=effective_model_name,
         run_id=run_id,
         artifact_root=artifact_root_path,
         use_live_discovery=bool(use_live_discovery and start_url),
@@ -1173,6 +1176,7 @@ async def run_v3_assessment_entrypoint(
             "scope": scope,
             "prioritized_targets": list(prioritized_targets or ()),
             "waived_targets": list(waived_targets or ()),
+            "selected_model_profile_ids": selected_model_profile_ids,
             "safety_policy": safety_policy,
             "allowed_side_effect_actions": list(allowed_side_effect_actions or ()),
         },
@@ -1416,6 +1420,12 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--v3-model-profile",
+        action="append",
+        default=[],
+        help="For --run-v3, selected model profile id. May be repeated.",
+    )
+    parser.add_argument(
         "--v3-reuse-run-dir",
         action="store_true",
         help="For --run-v3, write into an existing run directory instead of creating a suffixed directory.",
@@ -1639,6 +1649,7 @@ def main() -> None:
                         start_url=args.page_url,
                         cdp_url=args.cdp_url,
                         model_name=args.model or None,
+                        model_profile_ids=args.v3_model_profile,
                         run_id=args.v3_run_id,
                         artifact_root=args.v3_artifact_root,
                         use_live_discovery=args.v3_use_live_discovery,

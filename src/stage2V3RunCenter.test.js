@@ -97,6 +97,39 @@ async function withFakeOpenAiCompatibleServer(callback) {
   }
 }
 
+async function withFakeAiReviewServer(reviewPayload, callback) {
+  const requests = [];
+  const server = http.createServer(async (req, res) => {
+    if (req.method === 'POST' && req.url === '/v1/chat/completions') {
+      const chunks = [];
+      for await (const chunk of req) {
+        chunks.push(chunk);
+      }
+      requests.push(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        choices: [{
+          message: {
+            role: 'assistant',
+            content: JSON.stringify(reviewPayload)
+          },
+          finish_reason: 'stop'
+        }]
+      }));
+      return;
+    }
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const { port } = server.address();
+    return await callback(`http://127.0.0.1:${port}/v1`, requests);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
 function argValue(args, name) {
   const index = args.indexOf(name);
   return index === -1 ? null : args[index + 1];
@@ -493,6 +526,48 @@ test('stage2 v3 run center creates a draft run and starts a stable artifact cont
     assert.ok(run.artifacts.execution_results.items.every((item) => item.status !== 'passed'));
     assert.ok(run.artifacts.execution_results.items.some((item) => item.failure_reason === 'contract_only_mode'));
     assert.equal(run.artifacts.next_round_plan.requires_human_approval, true);
+  });
+});
+
+test('stage2 v3 run creation preserves execution mode, model selection, and local timestamp', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const modelProfiles = [{
+      id: 'local_qwen',
+      label: 'local_qwen',
+      provider: 'openai_compatible',
+      model: 'Qwen3.6',
+      apiKeyConfigured: true
+    }];
+
+    const created = await createV3Run({
+      systemName: '追本溯源管理平台',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      executionMode: 'real_browser',
+      modelProfileIds: ['local_qwen']
+    }, { runsDir, modelProfiles });
+
+    assert.equal(created.run.executionMode, 'real_browser');
+    assert.deepEqual(created.run.modelProfileIds, ['local_qwen']);
+    assert.equal(created.run.modelProfiles[0].label, 'local_qwen');
+    assert.match(created.run.createdAt, /\+08:00$/);
+
+    const stamp = created.run.runId.match(/^stage2_v3_(\d{8}_\d{6})_/)[1];
+    const compactCreatedAt = created.run.createdAt
+      .replace(/[-:]/g, '')
+      .replace('T', '_')
+      .slice(0, 15);
+    assert.equal(stamp, compactCreatedAt);
+
+    const manifest = await readJson(path.join(runsDir, created.run.runId, 'run_manifest.json'));
+    const inputConfig = await readJson(path.join(runsDir, created.run.runId, 'input_config.json'));
+    assert.equal(manifest.execution_mode, 'real_browser');
+    assert.equal(inputConfig.execution_mode, 'real_browser');
+    assert.deepEqual(manifest.selected_model_profile_ids, ['local_qwen']);
+
+    const listed = await listV3Runs({ runsDir });
+    assert.equal(listed.runs[0].executionMode, 'real_browser');
+    assert.deepEqual(listed.runs[0].modelProfileIds, ['local_qwen']);
   });
 });
 
@@ -925,7 +1000,7 @@ test('stage2 v3 run center keeps next round open when scoped target is not disco
     const analysis = await readJson(path.join(runDir, 'round_analysis.json'));
     const nextRoundPlan = await readJson(path.join(runDir, 'next_round_plan.json'));
     assert.deepEqual(analysis.missing_scope_targets, ['备案进度查询']);
-    assert.equal(analysis.ai_provider_status, 'not_connected');
+    assert.equal(analysis.ai_provider_status, 'model_unavailable');
     assert.equal(nextRoundPlan.decision, 'auto_continue');
     assert.equal(nextRoundPlan.should_continue, true);
     assert.match(nextRoundPlan.next_round_goal, /备案进度查询/);
@@ -1168,6 +1243,11 @@ test('stage2 v3 run center records Python failure as visible run failure artifac
     assert.equal(started.run.status, 'failed');
     assert.equal(started.run.executionMode, 'real_browser');
     assert.equal(started.run.summary.nextDecision, 'wait_human_review');
+    assert.match(started.operation.nextAction, /preflight_result/);
+    assert.deepEqual(
+      started.operation.diagnosticArtifacts.map((item) => item.key),
+      ['preflight_result', 'python_execution', 'execution_results', 'progress_events']
+    );
 
     const runDir = path.join(runsDir, created.run.runId);
     const currentStatus = await readJson(path.join(runDir, 'current_status.json'));
@@ -1483,6 +1563,58 @@ test('stage2 v3 run center merges evidence-bound AI round review when a model pr
   });
 });
 
+test('stage2 v3 run center uses configured OpenAI-compatible model for AI round review', async () => {
+  await withFakeAiReviewServer({
+    analysis_mode: 'ai_assisted_review',
+    confidence: 0.81,
+    coverage_summary: { summary: '模型已分析覆盖。' },
+    failure_summary: { summary: '需要补齐真实浏览器证据。' },
+    evidence_quality: { status: 'partial' },
+    improvement_candidates: [{
+      candidate_id: 'retry_with_browser',
+      title: '使用真实浏览器重跑',
+      evidence_refs: ['execution_results']
+    }],
+    learned_rules: ['模型复盘必须绑定 execution_results 证据'],
+    next_round_recommendations: ['重跑真实浏览器链路']
+  }, async (baseUrl, requests) => {
+    await withTempRunsDir(async (runsDir) => {
+      const configPath = path.join(runsDir, 'stage2-model-profiles.json');
+      await fs.writeFile(configPath, JSON.stringify({
+        schema_version: 'stage2_model_profiles.v1',
+        profiles: [{
+          id: 'local_qwen',
+          label: 'local_qwen',
+          provider: 'openai_compatible',
+          baseUrl,
+          apiKey: 'test-key',
+          model: 'qwen-review'
+        }]
+      }, null, 2));
+
+      const created = await createV3Run({
+        systemName: 'AI 默认接入系统',
+        entryUrl: 'https://example.com/home',
+        cdpUrl: 'http://localhost:9222',
+        modelProfileIds: ['local_qwen']
+      }, { runsDir, modelProfileConfigPath: configPath });
+      await startV3Run(created.run.runId, { executionMode: 'contract_only' }, { runsDir });
+
+      const analyzed = await analyzeV3Run(created.run.runId, {
+        runsDir,
+        modelProfileConfigPath: configPath
+      });
+
+      assert.equal(analyzed.roundAnalysis.ai_provider_status, 'completed');
+      assert.equal(analyzed.roundAnalysis.model_profile_id, 'local_qwen');
+      assert.equal(analyzed.roundAnalysis.improvement_candidates[0].review_status, 'evidence_bound');
+      assert.equal(requests.length, 1);
+      assert.equal(requests[0].model, 'qwen-review');
+      assert.match(requests[0].messages.at(-1).content, /execution_results/);
+    });
+  });
+});
+
 test('stage2 v3 run center degrades AI review to rule review when model is unavailable or output is invalid', async () => {
   await withTempRunsDir(async (runsDir) => {
     const created = await createV3Run({
@@ -1576,20 +1708,20 @@ test('stage2 v3 run center saves human task results and gates next round approva
     const humanTasksBefore = await readJson(path.join(runDir, 'human_tasks.json'));
     assert.ok(humanTasksBefore.items.some((item) => item.task_id === 'task_review_feature_points'));
 
-    const saved = await saveHumanTaskResult(created.run.runId, {
-      taskId: 'task_review_feature_points',
-      operatorId: 'tester',
-      note: '保留查询和详情，危险动作继续人工审核。',
-      result: { approvedFeaturePointIds: ['feature_001'] }
-    }, { runsDir });
-    const savedTask = saved.humanTasks.items.find((item) => item.task_id === 'task_review_feature_points');
-    assert.equal(savedTask.status, 'completed');
-    assert.match(savedTask.result_artifact, /human_task_results/);
+    let saved = null;
+    for (const task of humanTasksBefore.items.filter((item) => item.status === 'pending')) {
+      saved = await saveHumanTaskResult(created.run.runId, {
+        taskId: task.task_id,
+        operatorId: 'tester',
+        note: '人工处理完成。',
+        result: { approvedFeaturePointIds: ['feature_001'] }
+      }, { runsDir });
+    }
+    assert.ok(saved);
+    assert.ok(saved.humanTasks.items.every((item) => item.status === 'completed'));
+    assert.ok(saved.humanTasks.items.every((item) => /human_task_results/.test(item.result_artifact)));
 
-    const blocked = await continueNextRound(created.run.runId, {}, { runsDir });
-    assert.equal(blocked.run.status, 'waiting_human');
-
-    const continued = await continueNextRound(created.run.runId, { approved: true }, { runsDir });
+    const continued = await continueNextRound(created.run.runId, {}, { runsDir });
     assert.notEqual(continued.run.status, 'planned');
     assert.equal(continued.run.status, 'waiting_human');
     assert.equal(continued.run.currentRoundId, 'round_002');

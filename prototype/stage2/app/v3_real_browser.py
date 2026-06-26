@@ -274,6 +274,11 @@ async def _discover_menu_with_playwright(
 
     traversal_events: list[dict[str, Any]] = []
     seen_keys = {_menu_candidate_key(item) for item in candidates}
+    seen_ids = {
+        _text(item.get("discovery_id"))
+        for item in candidates
+        if _text(item.get("discovery_id"))
+    }
     expandable_roots = [
         item
         for item in candidates
@@ -313,9 +318,15 @@ async def _discover_menu_with_playwright(
             )
             new_children: list[dict[str, Any]] = []
             for item in after_candidates:
+                item_id = _text(item.get("discovery_id"))
+                if item_id == menu_id:
+                    continue
                 key = _menu_candidate_key(item)
                 if key in seen_keys:
                     continue
+                if item_id in seen_ids:
+                    item["discovery_id"] = _next_menu_discovery_id(seen_ids)
+                    item_id = _text(item.get("discovery_id"))
                 item["parent_id"] = menu_id
                 item["level"] = max(
                     _int_or_default(candidate.get("level"), 1) + 1,
@@ -323,6 +334,8 @@ async def _discover_menu_with_playwright(
                 )
                 item["screenshot_id"] = screenshot_id
                 seen_keys.add(key)
+                if item_id:
+                    seen_ids.add(item_id)
                 new_children.append(item)
             candidates.extend(new_children)
             traversal_events.append(
@@ -595,6 +608,15 @@ def _menu_candidate_key(item: dict[str, Any]) -> str:
     )
 
 
+def _next_menu_discovery_id(seen_ids: set[str]) -> str:
+    index = len(seen_ids) + 1
+    while True:
+        candidate_id = f"menu_{index}"
+        if candidate_id not in seen_ids:
+            return candidate_id
+        index += 1
+
+
 async def _safe_playwright_body_text(page: Any) -> str:
     with suppress(Exception):
         return await page.locator("body").inner_text(timeout=1200)
@@ -674,8 +696,10 @@ def _menu_candidate_scan_script() -> str:
           const key = `${label}|${href}|${cssPath(el)}`;
           if (seen.has(key)) return null;
           seen.add(key);
+          window.__stage2MenuSeq = Number(window.__stage2MenuSeq || 0);
           const existing = el.getAttribute('data-stage2-menu-id');
-          const id = existing || `menu_${index + 1}`;
+          if (!existing) window.__stage2MenuSeq += 1;
+          const id = existing || `menu_${window.__stage2MenuSeq}`;
           el.setAttribute('data-stage2-menu-id', id);
           return {
             discovery_id: id,
@@ -1550,11 +1574,22 @@ def _tree_node(
     entry: dict[str, Any],
     entry_by_id: dict[str, dict[str, Any]],
     children_by_parent: dict[str, list[dict[str, Any]]],
+    seen: set[str] | None = None,
 ) -> dict[str, Any]:
+    menu_id = _text(entry.get("menu_id"))
+    seen = set(seen or set())
+    if menu_id in seen:
+        return {
+            key: value
+            for key, value in {**entry, "cycle_detected": True}.items()
+            if value not in (None, [], "")
+        }
+    next_seen = {*seen, menu_id} if menu_id else seen
     children = [
-        _tree_node(entry_by_id[child["menu_id"]], entry_by_id, children_by_parent)
+        _tree_node(entry_by_id[child["menu_id"]], entry_by_id, children_by_parent, next_seen)
         for child in children_by_parent.get(entry["menu_id"], [])
         if child.get("menu_id") in entry_by_id
+        and _text(child.get("menu_id")) not in next_seen
     ]
     return {
         key: value
