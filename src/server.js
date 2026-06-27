@@ -24,6 +24,7 @@ const {
   checkStage2ModelProfiles,
   continueNextRound,
   createV3Run,
+  deleteV3Runs,
   generateV3Report,
   getV3Run,
   listV3Runs,
@@ -216,6 +217,16 @@ async function handleApi(req, res, pathname) {
     try {
       const body = await readJson(req);
       sendJson(res, 201, await createV3Run(body));
+    } catch (error) {
+      sendStage2V3Error(res, error);
+    }
+    return true;
+  }
+
+  if (req.method === 'POST' && pathname === '/api/stage2/v3/runs/delete') {
+    try {
+      const body = await readJson(req);
+      sendJson(res, 200, await deleteV3Runs(body));
     } catch (error) {
       sendStage2V3Error(res, error);
     }

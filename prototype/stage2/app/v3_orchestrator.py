@@ -29,6 +29,8 @@ class V3RunConfig:
     start_url: str = ""
     artifact_root: Path = Path("artifacts/stage2/v3_runs")
     run_id: str = ""
+    round_id: str = "round_001"
+    round_stage: str = "full_assessment"
     cdp_url: str = ""
     execution_mode: str = "contract_only"
     reuse_run_dir: bool = False
@@ -112,9 +114,12 @@ async def run_v3_assessment(
             "menu_discovery",
             "running",
             f"discovered {len(menu_artifacts['menu_entries'])} menu entries",
+            current_step="Playwright 菜单入口遍历",
+            current_executor="Playwright",
         )
 
-    pages = _build_pages(
+    menu_discovery_only = _is_menu_discovery_only_round(config)
+    pages = [] if menu_discovery_only else _build_pages(
         config,
         discovery_payload,
         real_browser_payload=real_browser_payload,
@@ -122,15 +127,23 @@ async def run_v3_assessment(
     )
     writer.write_json("pages.json", {"schema_version": V3_SCHEMA_VERSION, "pages": pages, "items": pages})
     writer.write_json("page_entries.json", {"schema_version": V3_SCHEMA_VERSION, "page_entries": pages, "items": pages})
-    page_exploration_log = _extract_page_exploration_log(
+    page_exploration_log = [] if menu_discovery_only else _extract_page_exploration_log(
         real_browser_payload,
         pages=pages,
         menu_entries=menu_artifacts["menu_entries"],
     )
     writer.write_jsonl("page_exploration_log.jsonl", page_exploration_log)
-    writer.update_state("feature_identification", "running", f"identified {len(pages)} page entries")
+    writer.update_state(
+        "menu_discovery" if menu_discovery_only else "feature_identification",
+        "running",
+        "第一轮仅遍历菜单入口树；页面入口和功能点详细测试将在第二轮开始。"
+        if menu_discovery_only
+        else f"identified {len(pages)} page entries",
+        current_step="Playwright 菜单入口遍历" if menu_discovery_only else "页面入口与功能点识别",
+        current_executor="Playwright",
+    )
 
-    features = _build_features(
+    features = [] if menu_discovery_only else _build_features(
         config,
         discovery_payload,
         pages,
@@ -141,17 +154,33 @@ async def run_v3_assessment(
         "feature_points.json",
         {"schema_version": V3_SCHEMA_VERSION, "feature_points": features, "items": features},
     )
-    writer.update_state("case_generation", "running", f"identified {len(features)} feature points")
+    writer.update_state(
+        "menu_discovery" if menu_discovery_only else "case_generation",
+        "running",
+        "第一轮不生成执行型测试用例。"
+        if menu_discovery_only
+        else f"identified {len(features)} feature points",
+        current_step="等待第二轮页面详细测试" if menu_discovery_only else "生成执行型测试用例",
+        current_executor="Playwright",
+    )
 
-    cases = _build_cases(features, config=config)
+    cases = [] if menu_discovery_only else _build_cases(features, config=config)
     writer.write_json("cases.json", {"schema_version": V3_SCHEMA_VERSION, "cases": cases, "items": cases})
     writer.write_json(
         "generated_test_cases.json",
         {"schema_version": V3_SCHEMA_VERSION, "test_cases": cases, "items": cases},
     )
-    writer.update_state("safe_execution", "running", f"generated {len(cases)} executable cases")
+    writer.update_state(
+        "menu_discovery" if menu_discovery_only else "safe_execution",
+        "running",
+        "第一轮不执行页面功能点测试。"
+        if menu_discovery_only
+        else f"generated {len(cases)} executable cases",
+        current_step="等待第二轮页面详细测试" if menu_discovery_only else "执行功能点测试",
+        current_executor="Playwright",
+    )
 
-    execution_results = _execute_cases(
+    execution_results = [] if menu_discovery_only else _execute_cases(
         cases,
         config=config,
         real_browser_payload=real_browser_payload,
@@ -292,6 +321,8 @@ class V3RunArtifactWriter:
             "run_id": self.run_id,
             "target_name": config.target_name,
             "start_url": config.start_url,
+            "round_id": config.round_id,
+            "round_stage": config.round_stage,
             "cdp_url": config.cdp_url,
             "execution_mode": _normalize_execution_mode(config.execution_mode),
             "safety_policy": _normalize_safety_policy(config.safety_policy),
@@ -345,16 +376,21 @@ class V3RunArtifactWriter:
         path.write_text(text, encoding="utf-8")
         return path
 
-    def update_state(self, phase: str, status: str, message: str) -> None:
+    def update_state(self, phase: str, status: str, message: str, **extra: Any) -> None:
         self._state.update(
             {
                 "current_phase": phase,
                 "overall_status": status,
                 "latest_message": message,
                 "updated_at": _now(),
+                **{key: value for key, value in extra.items() if value not in (None, "")},
             }
         )
         self.write_json("run_state.json", self._state)
+
+
+def _is_menu_discovery_only_round(config: V3RunConfig) -> bool:
+    return _text(config.round_stage) == "menu_discovery" or _text(config.round_id) in {"", "round_001"} and _text(config.round_stage) != "full_assessment"
 
 
 def _build_pages(
@@ -1077,6 +1113,20 @@ def _execute_real_browser_cases(
                     )
                 )
                 continue
+            execution_match = _take_case_execution_result_for_case(
+                case,
+                case_execution_results,
+                used_case_execution_result_indexes,
+            )
+            if execution_match:
+                results.append(
+                    _normalize_side_effect_case_execution_result(
+                        case,
+                        execution_match,
+                        execution_mode="real_browser",
+                    )
+                )
+                continue
             results.append(
                 {
                     "case_id": case["case_id"],
@@ -1168,6 +1218,30 @@ def _execute_real_browser_cases(
             }
         )
     return results
+
+
+def _normalize_side_effect_case_execution_result(
+    case: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    execution_mode: str,
+) -> dict[str, Any]:
+    normalized = _normalize_case_execution_result(
+        case,
+        result,
+        execution_mode=execution_mode,
+        default_status="side_effect_executed",
+        default_verdict="passed",
+        default_message="已通过接管执行器完成授权副作用流程，并记录页面反馈与截图证据。",
+    )
+    if normalized["status"] in {"passed", "real_passed"}:
+        normalized["status"] = "side_effect_executed"
+        normalized["verdict"] = "passed"
+    normalized["manual_confirmation_required"] = bool(
+        normalized.get("manual_confirmation_required")
+        and normalized.get("failure_reason")
+    )
+    return normalized
 
 
 def _take_side_effect_result_for_case(
@@ -2374,6 +2448,9 @@ def _is_page_visible_placeholder_feature(feature: dict[str, Any]) -> bool:
 def _is_shallow_playwright_target_feature(feature: dict[str, Any]) -> bool:
     feature_type = _text(feature.get("feature_type") or feature.get("type"))
     strategy = _text(feature.get("verification_strategy"))
+    source = _text(feature.get("source"))
+    if strategy == "side_effect_policy_gate" and source.startswith("playwright"):
+        return True
     return _is_page_visible_placeholder_feature(feature) or (
         strategy == "playwright_visible_control" and feature_type in {"view", "navigation"}
     )

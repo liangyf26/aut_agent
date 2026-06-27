@@ -91,6 +91,15 @@ function getRunDir(runId, options = {}) {
   return path.join(getRunsDir(options), safeRunId);
 }
 
+function ensureRunDirInsideRunsDir(runsDir, runDir) {
+  const root = path.resolve(runsDir);
+  const target = path.resolve(runDir);
+  const relative = path.relative(root, target);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new Stage2V3InputError('删除目标必须位于 v3 runs 目录内。');
+  }
+}
+
 function artifactPath(runDir, artifactKey) {
   const relativePath = ARTIFACTS[artifactKey];
   if (!relativePath) {
@@ -389,6 +398,24 @@ async function pathExists(targetPath) {
   } catch {
     return false;
   }
+}
+
+async function directorySize(targetPath) {
+  let total = 0;
+  const entries = await fs.readdir(targetPath, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    const entryPath = path.join(targetPath, entry.name);
+    if (entry.isDirectory()) {
+      total += await directorySize(entryPath);
+      continue;
+    }
+    if (!entry.isFile()) {
+      continue;
+    }
+    const stat = await fs.stat(entryPath).catch(() => null);
+    total += stat?.size || 0;
+  }
+  return total;
 }
 
 async function readJsonIfExists(filePath) {
@@ -1125,6 +1152,67 @@ async function listV3Runs(options = {}) {
   return { runs };
 }
 
+function normalizeDeleteRunIds(body = {}) {
+  const source = body.runIds
+    ?? body.run_ids
+    ?? body.ids
+    ?? body.runId
+    ?? body.run_id
+    ?? [];
+  const values = normalizeArray(source);
+  return [...new Set(values.map((value) => ensureSafeId(value, 'runId')))];
+}
+
+async function deleteV3Runs(body = {}, options = {}) {
+  const runsDir = getRunsDir(options);
+  await fs.mkdir(runsDir, { recursive: true });
+  const deleteAll = Boolean(body.all || body.deleteAll || body.delete_all);
+  const runIds = deleteAll
+    ? (await listV3Runs(options)).runs.map((run) => run.runId)
+    : normalizeDeleteRunIds(body);
+
+  if (!deleteAll && runIds.length === 0) {
+    throw new Stage2V3InputError('请选择要删除的 v3 run。');
+  }
+
+  const deletedRunIds = [];
+  const missingRunIds = [];
+  let freedBytes = 0;
+
+  for (const runId of runIds) {
+    const runDir = getRunDir(runId, options);
+    ensureRunDirInsideRunsDir(runsDir, runDir);
+    if (!(await pathExists(runDir))) {
+      missingRunIds.push(runId);
+      continue;
+    }
+    freedBytes += await directorySize(runDir);
+    await fs.rm(runDir, { recursive: true, force: true });
+    deletedRunIds.push(runId);
+  }
+
+  const listed = await listV3Runs(options);
+  return {
+    schema_version: 'stage2_v3_run_deletion.v1',
+    requestedRunIds: runIds,
+    deletedRunIds,
+    missingRunIds,
+    deletedCount: deletedRunIds.length,
+    freedBytes,
+    runs: listed.runs,
+    operation: {
+      schema_version: 'stage2_v3_operation_feedback.v1',
+      action: 'delete_runs',
+      status: 'succeeded',
+      tone: 'success',
+      message: `已删除 ${deletedRunIds.length} 个历史 run，释放 ${freedBytes} 字节。`,
+      nextAction: '刷新 run 列表或创建新的 run。',
+      diagnosticArtifacts: [],
+      error: null
+    }
+  };
+}
+
 async function getV3Run(runId, options = {}) {
   const { runDir, manifest } = await readManifest(runId, options);
   const artifacts = await loadRunArtifacts(runDir);
@@ -1557,6 +1645,10 @@ function isPageVisiblePlaceholderFeature(feature = {}) {
 function isShallowPlaywrightTargetFeature(feature = {}) {
   const featureType = String(feature.feature_type || feature.type || '').trim();
   const strategy = String(feature.verification_strategy || '').trim();
+  const source = String(feature.source || '').trim();
+  if (strategy === 'side_effect_policy_gate' && source.startsWith('playwright')) {
+    return true;
+  }
   return isPageVisiblePlaceholderFeature(feature)
     || (strategy === 'playwright_visible_control' && ['view', 'navigation'].includes(featureType));
 }
@@ -2089,6 +2181,10 @@ async function runPythonV3OrchestratorAttempt({ runId, runsDir, runDir, inputCon
     '--run-v3',
     '--v3-run-id',
     runId,
+    '--v3-round-id',
+    roundId,
+    '--v3-round-stage',
+    roundId === 'round_001' ? 'menu_discovery' : 'page_feature_verification',
     '--v3-artifact-root',
     artifactRoot,
     '--v3-execution-mode',
@@ -2546,6 +2642,32 @@ function normalizePythonHumanTasks(payload) {
   };
 }
 
+function currentExecutionContextFromRealBrowser(sourceRealBrowser = {}) {
+  const stack = sourceRealBrowser.executor_stack || sourceRealBrowser.executorStack || {};
+  const browserUse = stack.browser_use || stack.browserUse || {};
+  const playwright = stack.playwright || {};
+  const active = browserUse.status === 'used' ? browserUse : playwright;
+  const currentExecutor = active.current_executor
+    || active.currentExecutor
+    || active.current_skill
+    || active.currentSkill
+    || (browserUse.status === 'used' ? 'Browser Use' : 'Playwright');
+  const firstPage = (sourceRealBrowser.pages || sourceRealBrowser.page_entries || [])[0] || {};
+  return {
+    current_page: active.current_page
+      || active.currentPage
+      || firstPage.name
+      || firstPage.title
+      || null,
+    current_executor: currentExecutor,
+    current_skill: currentExecutor,
+    current_step: active.current_step
+      || active.currentStep
+      || (browserUse.status === 'used' ? '目标流程接管' : '页面入口探索'),
+    executor_stack: stack
+  };
+}
+
 function normalizePythonNextRoundPlan(payload, executionResults, roundId) {
   const hasBlockingEvidenceGap = (executionResults.items || []).some((item) => [
     'contract_only_mode',
@@ -2721,6 +2843,7 @@ async function persistRealBrowserFailure(runDir, manifest, inputConfig, processR
 
 async function persistRealBrowserArtifacts(runDir, manifest, inputConfig, processResult, roundId, options = {}) {
   const pyRunDir = await findPythonRunDir(processResult);
+  const sourceRealBrowser = await readPythonJson(pyRunDir, 'source_real_browser.json') || {};
   const pythonPreflight = await readPythonJson(pyRunDir, 'preflight_result.json');
   const menuTree = await readPythonJson(pyRunDir, 'menu_tree.json') || makeEmptyMenuArtifacts().menuTree;
   const menuEntries = await readPythonJson(pyRunDir, 'menu_entries.json') || makeEmptyMenuArtifacts().menuEntries;
@@ -2757,6 +2880,7 @@ async function persistRealBrowserArtifacts(runDir, manifest, inputConfig, proces
     screenshotsIndex,
     menuEntries
   });
+  analysisPack.currentStatusExtra = currentExecutionContextFromRealBrowser(sourceRealBrowser);
   const nodeNextRoundPlan = analysisPack.nextRoundPlan;
   analysisPack.nextRoundPlan = normalizePythonNextRoundPlan(pythonNextRoundPlan, executionResults, roundId);
   if (nodeNextRoundPlan.should_continue) {
@@ -2855,9 +2979,16 @@ async function startV3Run(runId, body = {}, options = {}) {
     runningManifest,
     executionMode === 'real_browser' ? 'real_browser_execution' : 'running_contract_pipeline',
     executionMode === 'real_browser'
-      ? '正在调用 Python v3 orchestrator 执行真实浏览器链路。'
+      ? (roundId === 'round_001'
+        ? '正在使用 Playwright 遍历第 1 轮菜单入口树。'
+        : '正在使用 Playwright 进入页面/功能点详细测试；必要时将由 Browser Use 接管。')
       : '正在生成 v3 run 稳定产物契约，本轮不会执行真实浏览器。',
-    { execution_mode: executionMode }
+    {
+      execution_mode: executionMode,
+      current_executor: executionMode === 'real_browser' ? 'Playwright' : 'contract_only',
+      current_skill: executionMode === 'real_browser' ? 'Playwright' : 'contract_only',
+      current_step: roundId === 'round_001' ? '菜单入口遍历' : '页面/功能点详细测试'
+    }
   ));
   await appendEvent(runDir, { type: 'run_started', run_id: runId, round_id: roundId, execution_mode: executionMode });
 
@@ -2933,7 +3064,11 @@ async function startV3Run(runId, body = {}, options = {}) {
     finalStatus,
     executionFailed ? 'real_browser_execution_failed' : 'round_analysis',
     finalMessage,
-    { decision: analysisPack.nextRoundPlan.decision, execution_mode: executionMode }
+    {
+      decision: analysisPack.nextRoundPlan.decision,
+      execution_mode: executionMode,
+      ...(analysisPack.currentStatusExtra || {})
+    }
   );
 
   const run = buildPublicRun(runDir, finalManifest, await loadRunArtifacts(runDir));
@@ -3882,6 +4017,7 @@ module.exports = {
   checkStage2ModelProfiles,
   continueNextRound,
   createV3Run,
+  deleteV3Runs,
   generateV3Report,
   getV3Run,
   listV3Runs,

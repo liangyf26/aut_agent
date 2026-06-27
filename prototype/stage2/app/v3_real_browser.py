@@ -201,6 +201,39 @@ async def _collect_with_playwright_menu_discovery(
             preflight = _preflight(True, "ok", config.cdp_url)
             preflight["checks"]["playwright"] = {"ok": True}
             preflight["browser_target_count"] = len(browser_targets)
+            if _is_menu_discovery_only_round(config):
+                return {
+                    "schema_version": V3_SCHEMA_VERSION,
+                    "status": "completed",
+                    "failure_reason": None,
+                    "message": "已通过 Playwright 连接真实浏览器完成第一轮菜单入口遍历；页面详细测试将在第二轮开始。",
+                    "source": "playwright.menu_discovery",
+                    "preflight_result": preflight,
+                    "executor_stack": {
+                        "playwright": {
+                            "status": "used",
+                            "cdp_url": config.cdp_url,
+                            "current_page": _text(await page.title()) or page.url,
+                            "current_skill": "Playwright",
+                            "current_step": "菜单入口遍历",
+                        },
+                        "browser_use": {
+                            "status": "not_invoked",
+                            "selected_model": config.model_name,
+                            "reason": "第 1 轮只做菜单入口树遍历，Browser Use 从第 2 轮页面/功能点详细测试开始按需接管。",
+                        },
+                        "raw_cdp": {"status": "diagnostic_only", "browser_target_count": len(browser_targets)},
+                    },
+                    "browser_targets": browser_targets,
+                    "menu_tree": menu_bundle["menu_tree"],
+                    "menu_entries": menu_bundle["menu_entries"],
+                    "menu_traversal_log": menu_bundle["menu_traversal_log"],
+                    "page_exploration_log": [],
+                    "pages": [],
+                    "features": [],
+                    "case_execution_results": [],
+                    "screenshots_index": menu_bundle["screenshots_index"],
+                }
             page_bundle = await _explore_menu_leaf_pages_with_playwright(
                 page,
                 menu_bundle["menu_entries"],
@@ -270,6 +303,10 @@ async def _collect_with_playwright_menu_discovery(
             }
         finally:
             await browser.close()
+
+
+def _is_menu_discovery_only_round(config: V3RunConfig) -> bool:
+    return _text(getattr(config, "round_stage", "")) == "menu_discovery"
 
 
 async def _resolve_playwright_target_page(browser: Any, start_url: str) -> Any:
@@ -640,6 +677,9 @@ def _target_handover_reasons(
 def _is_shallow_playwright_target_feature(feature: dict[str, Any]) -> bool:
     feature_type = _text(feature.get("feature_type") or feature.get("type"))
     strategy = _text(feature.get("verification_strategy"))
+    source = _text(feature.get("source"))
+    if strategy == "side_effect_policy_gate" and source.startswith("playwright"):
+        return True
     return strategy in {"playwright_page_visible", "playwright_visible_control"} and feature_type in {
         "view",
         "navigation",
@@ -736,15 +776,200 @@ async def _run_browser_use_target_handover(
         browser = Browser(cdp_url=config.cdp_url)
         tools = Tools()
 
+        async def current_browser_page() -> Any:
+            with suppress(Exception):
+                current_page = await browser.get_current_page()
+                if current_page:
+                    return current_page
+            return page
+
         @tools.action(description="获取当前页面标题、URL 和可见文本摘要。")
         async def get_page_feedback() -> str:
-            body_text = await _safe_playwright_body_text(page)
+            target_page = await current_browser_page()
+            body_text = await _safe_playwright_body_text(target_page)
             title = ""
             with suppress(Exception):
-                title = await page.title()
+                title = await target_page.title()
             return json.dumps(
-                {"title": title, "url": page.url, "visible_text": body_text[:2000]},
+                {"title": title, "url": target_page.url, "visible_text": body_text[:2000]},
                 ensure_ascii=False,
+            )
+
+        @tools.action(description="[脚本内部工具] 关闭所有弹窗、遮罩、日期选择器和提示层。Agent 不需要传参数。")
+        async def script_close_popups() -> str:
+            target_page = await current_browser_page()
+            return await target_page.evaluate(
+                r"""() => {
+                    let count = 0;
+                    document.querySelectorAll(
+                      '.el-overlay,.el-picker-panel,.el-select-dropdown,.el-calendar,.el-popover,.el-message-box,.el-loading-mask,.el-dialog,.el-message,.el-notification'
+                    ).forEach((el) => {
+                      if (el.offsetHeight > 0 || el.offsetWidth > 0) {
+                        el.style.display = 'none';
+                        count += 1;
+                      }
+                    });
+                    return `已关闭 ${count} 个弹窗`;
+                }"""
+            )
+
+        @tools.action(description="[脚本内部工具] 预填写当前页面所有可见表单字段并勾选协议 checkbox。Agent 不需要传参数。")
+        async def script_prefill_form() -> str:
+            target_page = await current_browser_page()
+            return await target_page.evaluate(
+                r"""() => {
+                    const results = { filled: 0, checked: 0, skipped: 0, errors: [] };
+                    const testValues = {
+                      text: '测试数据',
+                      number: '100',
+                      email: 'test@test.com',
+                      tel: '13800138000',
+                      date: '2026-01-01',
+                      url: 'https://test.com',
+                      search: '测试'
+                    };
+                    const fire = (el, type) => el.dispatchEvent(new Event(type, { bubbles: true, cancelable: true }));
+                    const setNativeValue = (el, value) => {
+                      const prototype = Object.getPrototypeOf(el);
+                      const descriptor = Object.getOwnPropertyDescriptor(prototype, 'value')
+                        || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')
+                        || Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
+                      if (descriptor && descriptor.set) {
+                        descriptor.set.call(el, value);
+                      } else {
+                        el.value = value;
+                      }
+                    };
+                    const fields = document.querySelectorAll(
+                      'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=checkbox]):not([type=radio]), textarea, select'
+                    );
+                    fields.forEach((el) => {
+                      if (el.disabled || el.readOnly || !el.offsetParent) {
+                        results.skipped += 1;
+                        return;
+                      }
+                      const type = (el.type || 'text').toLowerCase();
+                      const value = testValues[type] || '测试数据';
+                      try {
+                        el.focus && el.focus();
+                        setNativeValue(el, value);
+                        fire(el, 'input');
+                        fire(el, 'change');
+                        fire(el, 'blur');
+                        el.dispatchEvent(new CustomEvent('el-input-change', { bubbles: true }));
+                        el.dispatchEvent(new CustomEvent('el-input-input', { bubbles: true }));
+                        results.filled += 1;
+                      } catch (error) {
+                        results.errors.push(error && error.message ? error.message : String(error));
+                      }
+                    });
+                    document.querySelectorAll('input[type=checkbox]').forEach((el) => {
+                      if (!el.checked && !el.disabled && el.offsetParent) {
+                        el.click();
+                        fire(el, 'change');
+                        fire(el, 'input');
+                        results.checked += 1;
+                      }
+                    });
+                    window.scrollTo(0, document.body.scrollHeight);
+                    return JSON.stringify(results);
+                }"""
+            )
+
+        @tools.action(description="[脚本内部工具] 选择备案申请表中的必填下拉项：备案品种 plantId 与备案类型 registerType。Agent 不需要传参数。")
+        async def script_select_required_dropdowns() -> str:
+            target_page = await current_browser_page()
+            return await target_page.evaluate(
+                r"""async () => {
+                    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+                    const visible = (el) => {
+                      if (!el) return false;
+                      const rect = el.getBoundingClientRect();
+                      const style = window.getComputedStyle(el);
+                      return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+                    const textOf = (el) => (el && (el.innerText || el.textContent || el.value || '') || '').trim();
+                    const click = (el) => {
+                      el.scrollIntoView({ block: 'center', inline: 'center' });
+                      el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                      el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                      el.click();
+                    };
+                    const labels = Array.from(document.querySelectorAll('.el-form-item,label,.el-form-item__label,span,div'))
+                      .filter(visible);
+                    const optionSelector = [
+                      '.el-select-dropdown:not([style*="display: none"]) .el-select-dropdown__item:not(.is-disabled)',
+                      '.el-select-dropdown__item:not(.is-disabled)',
+                      '[role="option"]:not(.is-disabled)',
+                      '.el-cascader-node:not(.is-disabled)'
+                    ].join(',');
+                    async function chooseByLabel(pattern, fallbackIndex, preferredPattern, avoidPattern) {
+                      const label = labels.find((el) => pattern.test(textOf(el)));
+                      const container = label ? (label.closest('.el-form-item') || label.parentElement) : document;
+                      const trigger = container && (
+                        container.querySelector('[role="combobox"]')
+                        || container.querySelector('.el-select__wrapper')
+                        || container.querySelector('.el-select')
+                        || container.querySelector('input[readonly]')
+                        || container.querySelector('.el-input')
+                      );
+                      if (!trigger) {
+                        return { ok: false, reason: 'trigger_not_found', label: pattern.source };
+                      }
+                      click(trigger);
+                      await sleep(400);
+                      const options = Array.from(document.querySelectorAll(optionSelector))
+                        .filter(visible)
+                        .filter((el) => textOf(el) && !/请选择|全部/.test(textOf(el)));
+                      const option = (preferredPattern && options.find((el) => preferredPattern.test(textOf(el))))
+                        || (avoidPattern && options.find((el) => !avoidPattern.test(textOf(el))))
+                        || options[fallbackIndex]
+                        || options[0];
+                      if (!option) {
+                        return { ok: false, reason: 'option_not_found', label: pattern.source };
+                      }
+                      const selectedText = textOf(option);
+                      click(option);
+                      await sleep(300);
+                      return { ok: true, selected: selectedText, label: pattern.source };
+                    }
+                    const plant = await chooseByLabel(/备案品种|品种|plantId/i, 0);
+                    const registerType = await chooseByLabel(/备案类型|类型|registerType/i, 0);
+                    const seedlingMethod = await chooseByLabel(
+                      /育苗方式|繁殖方式|育苗|seedling|breeding/i,
+                      0,
+                      /分蘗繁殖|分蘖繁殖|炼苗|其他|扦插|分株|组培|组织培养/i,
+                      /种子繁殖|种子/i
+                    );
+                    return JSON.stringify({ plantId: plant, registerType, seedlingMethod });
+                }"""
+            )
+
+        @tools.action(description="[脚本内部工具] 提交当前表单，优先点击包含“纳入、提交、确定”的按钮。Agent 不需要传参数。")
+        async def script_submit_form() -> str:
+            target_page = await current_browser_page()
+            return await target_page.evaluate(
+                r"""() => {
+                    document.querySelectorAll('.el-overlay,.el-picker-panel,.el-select-dropdown,.el-calendar,.el-popover,.el-message-box')
+                      .forEach((el) => el.remove());
+                    window.scrollTo(0, document.body.scrollHeight);
+                    const buttons = Array.from(document.querySelectorAll('button,[role=button],input[type=submit]'));
+                    for (const button of buttons) {
+                      const text = (button.textContent || button.value || '').trim();
+                      if (text && (text.includes('纳入') || text.includes('提交') || text.includes('确定'))) {
+                        button.click();
+                        return `已点击提交按钮: ${text}`;
+                      }
+                    }
+                    for (const form of Array.from(document.querySelectorAll('form'))) {
+                      const submit = form.querySelector('button[type=submit],input[type=submit]');
+                      if (submit) {
+                        submit.click();
+                        return '已点击表单提交';
+                      }
+                    }
+                    return '未找到提交按钮';
+                }"""
             )
 
         llm = ChatOpenAI(
@@ -758,7 +983,7 @@ async def _run_browser_use_target_handover(
             browser=browser,
             tools=tools,
             use_vision=True,
-            max_steps=12,
+            max_steps=30,
             max_actions_per_step=1,
         )
         history = await agent.run()
@@ -886,7 +1111,7 @@ def _browser_use_handover_task(
     handover_reasons: list[dict[str, Any]],
 ) -> str:
     allowed_actions = "、".join(config.allowed_side_effect_actions) or "无"
-    return f"""你是第二阶段 Browser Use 目标接管 Agent。
+    return f"""你是第二阶段 Browser Use 目标接管 Agent，执行「线上备案申请」全流程测试。
 目标：优先进入并验证这些页面/流程：{'、'.join(targets)}。
 入口 URL：{config.start_url}
 安全策略：{config.safety_policy}
@@ -894,12 +1119,16 @@ def _browser_use_handover_task(
 接管原因：{json.dumps(handover_reasons, ensure_ascii=False)}
 
 要求：
-1. 先恢复到可用页面，关闭明显弹窗或遮罩。
-2. 找到目标菜单或页面入口并进入。
-3. 识别页面上的主要按钮、表单、表格或反馈。
-4. 如果没有副作用授权，只做导航、展开、查看、截图前的低风险探索。
-5. 如果已经授权提交/保存/新增等动作，也必须只在测试环境上下文中执行，并报告动作与页面反馈。
-6. 最后用可读文本总结是否到达目标、执行了哪些动作、页面反馈和失败原因。
+1. 先调用 script_close_popups，关闭明显弹窗或遮罩。
+2. 导航或点击进入“线上备案申请”菜单/页面。
+3. 找到“我要申请备案”“申请备案”或“新增”按钮并点击，进入申请表单。
+4. 如果安全策略是 test_env_full_access 且允许 create/submit/save，必须调用 script_prefill_form 预填表单。
+5. 预填后必须调用 script_select_required_dropdowns 选择备案品种 plantId 与备案类型 registerType，不要直接用输入框赋值代替下拉选择。
+6. 如果页面出现“育苗方式”下拉框，测试数据默认走低前置数据分支：不要选择“种子繁殖”，因为它会要求填写“种子采集许可证号”；优先选择“分蘗繁殖”“分蘖繁殖”“炼苗”或“其他”等不需要许可证的选项。
+7. 下拉项选择完成后必须调用 script_submit_form，最终提交一次备案申请；不要停在只看见按钮或只打开表单。
+8. 如果提交后出现 plantId/registerType required 或其它校验错误，先调用 script_select_required_dropdowns，再调用 script_submit_form 重试一次。
+9. 每次关键动作后调用 get_page_feedback，记录 URL、页面文本、错误信息和成功反馈。
+10. 最后用可读文本总结：是否进入目标页面、是否点击“我要申请备案”、填写字段数量、提交次数、最终页面反馈和失败原因。
 """
 
 
@@ -2327,14 +2556,14 @@ def _infer_feature_type(text: str, tag: str, input_type: str) -> str:
         return "save"
     if any(word in lowered for word in ("submit", "提交")):
         return "submit"
+    if tag == "a" and not any(word in lowered for word in ("我要", "add", "new", "create", "新增", "新建")):
+        return "navigation"
     if any(word in lowered for word in ("add", "new", "create", "新增", "新建", "申请", "申报")):
         return "create"
     if any(word in lowered for word in ("edit", "修改", "编辑")):
         return "edit"
     if any(word in lowered for word in ("search", "query", "查询", "检索")) or input_type in {"search", "text"}:
         return "query"
-    if tag == "a":
-        return "navigation"
     return "view"
 
 

@@ -13,6 +13,7 @@ from prototype.stage2.app.v3_real_browser import (  # noqa: E402
     TEST_ENV_FULL_ACCESS_POLICY,
     build_menu_discovery_artifacts,
     _dedupe_page_exploration,
+    _browser_use_handover_task,
     _infer_feature_type,
     _merge_browser_use_handover,
     _normalize_page_url,
@@ -163,7 +164,8 @@ def test_side_effect_feature_type_inference_keeps_distinct_actions() -> None:
     assert _infer_feature_type("提交", "button", "") == "submit"
     assert _infer_feature_type("删除", "button", "") == "delete"
     assert _infer_feature_type("我要申请备案", "button", "") == "create"
-    assert _infer_feature_type("申请备案", "a", "") == "create"
+    assert _infer_feature_type("申请备案", "button", "") == "create"
+    assert _infer_feature_type("线上备案申请", "a", "") == "navigation"
 
 
 def test_menu_discovery_artifacts_capture_success_failure_permission_and_evidence() -> None:
@@ -509,6 +511,86 @@ def test_visible_target_control_does_not_suppress_browser_use_handover() -> None
         "matched_page_ids": ["menu_page_002"],
         "matched_feature_ids": ["feature_online_apply_label"],
     }]
+
+
+def test_side_effect_policy_gate_target_feature_does_not_suppress_browser_use_handover() -> None:
+    config = V3RunConfig(metadata={"prioritized_targets": ["线上备案申请"]})
+
+    reasons = _target_handover_reasons(
+        config,
+        menu_entries=[{
+            "menu_id": "menu_online_apply",
+            "text": "线上备案申请",
+            "menu_path": ["备案管理", "线上备案申请"],
+            "is_leaf": True,
+            "status": "discovered",
+        }],
+        pages=[{
+            "page_id": "menu_page_002",
+            "name": "线上备案申请",
+            "status": "reachable",
+            "url": "https://example.test/record/online",
+        }],
+        features=[{
+            "feature_id": "feature_online_apply_label",
+            "page_id": "menu_page_002",
+            "name": "线上备案申请",
+            "feature_type": "create",
+            "verification_strategy": "side_effect_policy_gate",
+            "source": "playwright.light_interaction",
+        }, {
+            "feature_id": "feature_apply_button",
+            "page_id": "menu_page_002",
+            "name": "我要申请备案",
+            "feature_type": "create",
+            "verification_strategy": "side_effect_policy_gate",
+            "source": "playwright.light_interaction",
+        }],
+    )
+
+    assert reasons == [{
+        "target": "线上备案申请",
+        "reason": "target_page_uncovered",
+        "matched_menu_entry_ids": ["menu_online_apply"],
+        "matched_page_ids": ["menu_page_002"],
+        "matched_feature_ids": ["feature_online_apply_label"],
+    }]
+
+
+def test_browser_use_handover_task_instructs_full_online_apply_submission() -> None:
+    config = V3RunConfig(
+        start_url="https://www.zbsykj.com:19096/index",
+        safety_policy=TEST_ENV_FULL_ACCESS_POLICY,
+        allowed_side_effect_actions=["create", "submit", "save"],
+    )
+
+    task = _browser_use_handover_task(
+        config,
+        ["线上备案申请"],
+        [{"target": "线上备案申请", "reason": "target_page_uncovered"}],
+    )
+
+    assert "script_prefill_form" in task
+    assert "script_select_required_dropdowns" in task
+    assert "script_submit_form" in task
+    assert "最终提交一次备案申请" in task
+
+
+def test_browser_use_handover_task_avoids_seed_propagation_license_branch() -> None:
+    task = _browser_use_handover_task(
+        V3RunConfig(
+            start_url="https://www.zbsykj.com:19096/index",
+            safety_policy=TEST_ENV_FULL_ACCESS_POLICY,
+            allowed_side_effect_actions=["create", "submit", "save"],
+        ),
+        ["线上备案申请"],
+        [{"target": "线上备案申请", "reason": "target_page_uncovered"}],
+    )
+
+    assert "育苗方式" in task
+    assert "不要选择“种子繁殖”" in task
+    assert "种子采集许可证号" in task
+    assert "分蘗繁殖" in task or "炼苗" in task or "其他" in task
 
 
 def test_browser_use_handover_payload_merges_into_unified_artifacts() -> None:

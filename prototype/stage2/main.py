@@ -1134,6 +1134,8 @@ async def run_v3_assessment_entrypoint(
     model_name: str | None,
     model_profile_ids: list[str] | None,
     run_id: str,
+    round_id: str,
+    round_stage: str,
     artifact_root: str,
     use_live_discovery: bool,
     execution_mode: str,
@@ -1166,6 +1168,8 @@ async def run_v3_assessment_entrypoint(
         reuse_run_dir=reuse_run_dir,
         model_name=effective_model_name,
         run_id=run_id,
+        round_id=round_id,
+        round_stage=round_stage,
         artifact_root=artifact_root_path,
         use_live_discovery=bool(use_live_discovery and start_url),
         max_pages=max_pages,
@@ -1173,6 +1177,8 @@ async def run_v3_assessment_entrypoint(
         metadata={
             "entrypoint": "prototype.stage2.main --run-v3",
             "template_name": template_name,
+            "round_id": round_id,
+            "round_stage": round_stage,
             "scope": scope,
             "prioritized_targets": list(prioritized_targets or ()),
             "waived_targets": list(waived_targets or ()),
@@ -1375,6 +1381,17 @@ def main() -> None:
         "--v3-artifact-root",
         default="",
         help="Optional artifact root for --run-v3. Defaults to artifacts/stage2/v3_runs.",
+    )
+    parser.add_argument(
+        "--v3-round-id",
+        default="round_001",
+        help="For --run-v3, current run round id, e.g. round_001 or round_002.",
+    )
+    parser.add_argument(
+        "--v3-round-stage",
+        choices=("menu_discovery", "page_feature_verification", "full_assessment"),
+        default="full_assessment",
+        help="For --run-v3, select which stage this round should execute.",
     )
     parser.add_argument(
         "--v3-use-live-discovery",
@@ -1651,6 +1668,8 @@ def main() -> None:
                         model_name=args.model or None,
                         model_profile_ids=args.v3_model_profile,
                         run_id=args.v3_run_id,
+                        round_id=args.v3_round_id,
+                        round_stage=args.v3_round_stage,
                         artifact_root=args.v3_artifact_root,
                         use_live_discovery=args.v3_use_live_discovery,
                         execution_mode=args.v3_execution_mode,

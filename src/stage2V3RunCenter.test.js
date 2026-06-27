@@ -11,6 +11,7 @@ const {
   checkStage2ModelProfiles,
   continueNextRound,
   createV3Run,
+  deleteV3Runs,
   generateV3Report,
   getV3Run,
   listV3Runs,
@@ -295,6 +296,25 @@ async function writeFakePythonV3Artifacts(artifactRoot, runId, overrides = {}) {
     schema_version: 'stage2_human_tasks.v3',
     items: []
   }, null, 2));
+  await fs.writeFile(path.join(pythonRunDir, 'source_real_browser.json'), JSON.stringify(
+    overrides.sourceRealBrowser || {
+      schema_version: 'stage2_v3_run.v1',
+      executor_stack: {
+        playwright: {
+          status: 'used',
+          current_page: '首页',
+          current_skill: 'Playwright',
+          current_step: '页面入口探索'
+        },
+        browser_use: {
+          status: 'not_invoked',
+          reason: 'Playwright 已覆盖当前目标。'
+        }
+      }
+    },
+    null,
+    2
+  ));
   return pythonRunDir;
 }
 
@@ -571,6 +591,65 @@ test('stage2 v3 run creation preserves execution mode, model selection, and loca
   });
 });
 
+test('stage2 v3 run center deletes selected runs and their artifact directories', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const first = await createV3Run({
+      systemName: '待删除系统',
+      entryUrl: 'https://example.com/delete-me',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+    const second = await createV3Run({
+      systemName: '保留系统',
+      entryUrl: 'https://example.com/keep-me',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+    const evidenceDir = path.join(runsDir, first.run.runId, 'screenshots');
+    await fs.mkdir(evidenceDir, { recursive: true });
+    await fs.writeFile(path.join(evidenceDir, 'evidence.png'), Buffer.from('fake screenshot evidence'));
+
+    const deleted = await deleteV3Runs({ runIds: [first.run.runId] }, { runsDir });
+
+    assert.equal(deleted.deletedCount, 1);
+    assert.deepEqual(deleted.deletedRunIds, [first.run.runId]);
+    assert.ok(deleted.freedBytes > 0);
+    await assert.rejects(fs.access(path.join(runsDir, first.run.runId)));
+    await assert.doesNotReject(fs.access(path.join(runsDir, second.run.runId)));
+
+    const listed = await listV3Runs({ runsDir });
+    assert.deepEqual(listed.runs.map((run) => run.runId), [second.run.runId]);
+  });
+});
+
+test('stage2 v3 run center deletes all listed runs when requested', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const first = await createV3Run({
+      systemName: '全选删除系统 A',
+      entryUrl: 'https://example.com/a',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+    const second = await createV3Run({
+      systemName: '全选删除系统 B',
+      entryUrl: 'https://example.com/b',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+
+    const deleted = await deleteV3Runs({ all: true }, { runsDir });
+
+    assert.equal(deleted.deletedCount, 2);
+    assert.deepEqual(new Set(deleted.deletedRunIds), new Set([first.run.runId, second.run.runId]));
+    assert.equal((await listV3Runs({ runsDir })).runs.length, 0);
+  });
+});
+
+test('stage2 v3 run center rejects unsafe run ids during deletion', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    await assert.rejects(
+      () => deleteV3Runs({ runIds: ['../outside'] }, { runsDir }),
+      /runId/
+    );
+  });
+});
+
 test('stage2 v3 run center exposes first-round menu discovery separately from browser targets', async () => {
   await withTempRunsDir(async (runsDir) => {
     const created = await createV3Run({
@@ -607,6 +686,55 @@ test('stage2 v3 run center exposes first-round menu discovery separately from br
     assert.match(run.artifacts.menu_traversal_log, /menu_business_after_expand/);
     assert.match(run.artifacts.page_exploration_log, /enter_menu_leaf/);
     assert.match(run.run.summary.countExplanation.menu_leaf_vs_page_entries, /menu leaves attempted/);
+  });
+});
+
+test('stage2 v3 run center surfaces current page and executor from real browser artifacts', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      executionMode: 'real_browser',
+      scope: '优先完成“线上备案申请”页面'
+    }, { runsDir });
+
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          sourceRealBrowser: {
+            schema_version: 'stage2_v3_run.v1',
+            executor_stack: {
+              playwright: {
+                status: 'used',
+                current_page: '线上备案申请',
+                current_skill: 'Playwright',
+                current_step: '页面入口探索'
+              },
+              browser_use: {
+                status: 'used',
+                selected_model: 'local_qwen',
+                reason: 'Playwright 模板无法完成提交，Browser Use 接管。',
+                current_page: '线上备案申请',
+                current_skill: 'Browser Use',
+                current_step: '目标流程接管'
+              }
+            }
+          }
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    const currentStatus = await readJson(path.join(runsDir, created.run.runId, 'current_status.json'));
+    assert.equal(currentStatus.current_page, '线上备案申请');
+    assert.equal(currentStatus.current_executor, 'Browser Use');
+    assert.equal(currentStatus.current_step, '目标流程接管');
   });
 });
 

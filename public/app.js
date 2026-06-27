@@ -159,6 +159,7 @@ const state = {
   stage2Runs: [],
   stage2RunDetails: {},
   stage2LocalRuns: loadStage2LocalRuns(),
+  selectedStage2RunIds: [],
   stage2ActionLog: [],
   selectedStage2ModelProfileIds: [],
   stage2BrowserPreflight: { status: 'unknown', ok: false, message: '浏览器连接状态待检查。' },
@@ -403,6 +404,7 @@ function syncSelectedSession() {
 
 function syncSelectedRun() {
   const runs = getStage2Runs();
+  pruneStage2RunSelection();
   if (runs.length === 0) {
     state.selectedRunId = null;
     return;
@@ -960,6 +962,102 @@ async function refreshStage2Runs() {
   }
 }
 
+function getSelectedStage2RunIds() {
+  return Array.isArray(state.selectedStage2RunIds) ? state.selectedStage2RunIds : [];
+}
+
+function pruneStage2RunSelection() {
+  const validRunIds = new Set(getStage2Runs().map((run) => getRunId(run)).filter(Boolean));
+  state.selectedStage2RunIds = getSelectedStage2RunIds().filter((runId) => validRunIds.has(runId));
+}
+
+function setStage2RunSelected(runId, selected) {
+  const safeRunId = String(runId || '').trim();
+  if (!safeRunId) {
+    return;
+  }
+  const selectedRunIds = new Set(getSelectedStage2RunIds());
+  if (selected) {
+    selectedRunIds.add(safeRunId);
+  } else {
+    selectedRunIds.delete(safeRunId);
+  }
+  state.selectedStage2RunIds = Array.from(selectedRunIds);
+}
+
+function selectAllStage2Runs() {
+  state.selectedStage2RunIds = getStage2Runs().map((run) => getRunId(run)).filter(Boolean);
+  pushStage2ActionLog(`已选择 ${state.selectedStage2RunIds.length} 个 run。`, 'success');
+  renderStage2Overview();
+}
+
+function formatBytes(value) {
+  const bytes = Math.max(0, Number(value) || 0);
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let size = bytes / 1024;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+  return `${size.toFixed(size >= 10 ? 1 : 2)} ${units[unitIndex]}`;
+}
+
+async function deleteSelectedStage2Runs() {
+  pruneStage2RunSelection();
+  const runIds = getSelectedStage2RunIds();
+  if (runIds.length === 0) {
+    pushStage2ActionLog('请先勾选要删除的历史 run。', 'warning');
+    renderStage2Overview();
+    return;
+  }
+  const confirmed = window.confirm(`确认删除 ${runIds.length} 个历史 run？删除会移除该 run 下的所有日志、截图和记录。`);
+  if (!confirmed) {
+    return;
+  }
+
+  const localRunIds = runIds.filter((runId) => runId.startsWith('draft_'));
+  const remoteRunIds = runIds.filter((runId) => !runId.startsWith('draft_'));
+  state.pendingAction = 'stage2-delete-runs';
+  pushStage2ActionLog(`正在删除 ${runIds.length} 个历史 run...`);
+  renderStage2Overview();
+
+  try {
+    let deletedCount = 0;
+    let freedBytes = 0;
+    if (remoteRunIds.length) {
+      const result = await api('/api/stage2/v3/runs/delete', {
+        method: 'POST',
+        body: JSON.stringify({ runIds: remoteRunIds })
+      });
+      deletedCount += Number(result.deletedCount || result.deletedRunIds?.length || 0);
+      freedBytes += Number(result.freedBytes || 0);
+    }
+    if (localRunIds.length) {
+      state.stage2LocalRuns = state.stage2LocalRuns.filter((run) => !localRunIds.includes(getRunId(run)));
+      saveStage2LocalRuns();
+      deletedCount += localRunIds.length;
+    }
+    runIds.forEach((runId) => {
+      delete state.stage2RunDetails[runId];
+    });
+    if (runIds.includes(state.selectedRunId)) {
+      state.selectedRunId = null;
+    }
+    state.selectedStage2RunIds = [];
+    await loadDashboardData();
+    pushStage2ActionLog(`已删除 ${deletedCount} 个历史 run，释放约 ${formatBytes(freedBytes)}。`, 'success');
+  } catch (error) {
+    pushStage2ActionLog(`删除历史 run 失败：${error.message}`, 'error');
+  } finally {
+    state.pendingAction = null;
+    renderStage2Overview();
+  }
+}
+
 async function selectStage2Run(runId) {
   state.selectedRunId = runId;
   syncSelectedSession();
@@ -1453,6 +1551,8 @@ function normalizeStage2Run(run = {}, source = 'v3') {
     currentPhaseLabel: run.currentPhaseLabel || run.current_phase_label || stageLabel(run.currentPhase || run.current_phase || run.status || ''),
     currentStepLabel: run.currentStepLabel || run.current_step_label || run.current_status?.current_step || '',
     currentTargetLabel: run.currentTargetLabel || run.current_target_label || run.current_status?.current_target || '',
+    currentPageLabel: run.currentPageLabel || run.current_page_label || run.currentStatus?.current_page || run.current_status?.current_page || '',
+    currentExecutorLabel: run.currentExecutorLabel || run.current_executor_label || run.currentStatus?.current_executor || run.current_status?.current_executor || run.current_status?.current_skill || '',
     nextAction: run.nextAction || run.next_action || run.current_status?.next_action || '',
     nextDecision: stats.nextDecision || stats.next_decision || run.nextDecision || run.next_decision || run.next_round_plan?.decision || '',
     shouldContinue: stats.shouldContinue ?? stats.should_continue ?? run.shouldContinue ?? run.should_continue ?? run.next_round_plan?.should_continue,
@@ -1693,6 +1793,8 @@ function renderStage2Overview() {
 
 function renderStage2V3Shell() {
   const runs = getStage2Runs();
+  pruneStage2RunSelection();
+  const selectedRunIds = new Set(getSelectedStage2RunIds());
   const run = getSelectedStage2Run();
   const summaryNode = document.querySelector('#stage2Summary');
   const runTitle = document.querySelector('#stage2RunTitle');
@@ -1746,22 +1848,31 @@ function renderStage2V3Shell() {
     const executionMode = getStage2ExecutionMode(item);
     const safetyPolicy = getStage2SafetyPolicy(item);
     const modelLabel = getStage2ModelLabel(item);
+    const selected = selectedRunIds.has(id);
     return `
-      <button class="stage2-run-card ${id === state.selectedRunId ? 'active' : ''}" data-run-id="${escapeHtml(id)}" type="button">
-        <span class="tag ${verdictClass(getRunStatus(item))}">${escapeHtml(statusLabel(getRunStatus(item)))}</span>
-        <span class="tag ${escapeHtml(runKind.tone)}">${escapeHtml(runKind.label)}</span>
-        <span class="tag ${executionMode === 'real_browser' ? 'manual' : 'warning'}">${escapeHtml(executionModeLabel(executionMode))}</span>
-        <span class="tag ${escapeHtml(safetyPolicyTone(safetyPolicy))}">${escapeHtml(safetyPolicyLabel(safetyPolicy))}</span>
-        <span class="tag">${escapeHtml(modelLabel)}</span>
-        <strong>${escapeHtml(item.systemName || id)}</strong>
-        <small>${escapeHtml(id)}</small>
-        <p>${escapeHtml(item.latestMessage || item.currentPhaseLabel || item.entryUrl || runKind.reason || '暂无运行摘要')}</p>
-        <div class="stage2-run-card-stats">
-          <span>${escapeHtml(String(item.counts?.pages || 0))} 入口</span>
-          <span>${escapeHtml(String(item.counts?.features || 0))} 功能点</span>
-          <span>${escapeHtml(String(item.counts?.executed || 0))} 已执行</span>
-        </div>
-      </button>
+      <article class="stage2-run-card ${id === state.selectedRunId ? 'active' : ''} ${selected ? 'selected' : ''}">
+        <label class="stage2-run-select">
+          <input data-stage2-run-select="${escapeHtml(id)}" type="checkbox" ${selected ? 'checked' : ''} aria-label="选择 run ${escapeHtml(id)}">
+          <span>选择</span>
+        </label>
+        <button class="stage2-run-open" data-run-id="${escapeHtml(id)}" type="button">
+          <span class="tag-row">
+            <span class="tag ${verdictClass(getRunStatus(item))}">${escapeHtml(statusLabel(getRunStatus(item)))}</span>
+            <span class="tag ${escapeHtml(runKind.tone)}">${escapeHtml(runKind.label)}</span>
+            <span class="tag ${executionMode === 'real_browser' ? 'manual' : 'warning'}">${escapeHtml(executionModeLabel(executionMode))}</span>
+            <span class="tag ${escapeHtml(safetyPolicyTone(safetyPolicy))}">${escapeHtml(safetyPolicyLabel(safetyPolicy))}</span>
+            <span class="tag">${escapeHtml(modelLabel)}</span>
+          </span>
+          <strong>${escapeHtml(item.systemName || id)}</strong>
+          <small>${escapeHtml(id)}</small>
+          <span class="stage2-run-card-summary">${escapeHtml(item.latestMessage || item.currentPhaseLabel || item.entryUrl || runKind.reason || '暂无运行摘要')}</span>
+          <span class="stage2-run-card-stats">
+            <span>${escapeHtml(String(item.counts?.pages || 0))} 入口</span>
+            <span>${escapeHtml(String(item.counts?.features || 0))} 功能点</span>
+            <span>${escapeHtml(String(item.counts?.executed || 0))} 已执行</span>
+          </span>
+        </button>
+      </article>
     `;
   }).join('');
 }
@@ -1868,6 +1979,8 @@ function renderStage2Monitor(run) {
   const fields = [
     ['当前轮次', stage2RoundLabel(run)],
     ['当前阶段', run?.currentPhaseLabel || stageLabel(run?.currentPhase || '-')],
+    ['当前页面', run?.currentPageLabel || '-'],
+    ['执行器', run?.currentExecutorLabel || '-'],
     ['当前步骤', run?.currentStepLabel || '-'],
     ['当前对象', run?.currentTargetLabel || '-'],
     ['下一步动作', run?.nextAction || nextPlan.next_round_goal || nextPlan.nextRoundGoal || '-'],
@@ -3821,6 +3934,18 @@ document.querySelector('#stage2Cockpit')?.addEventListener('click', (event) => {
     return;
   }
 
+  const selectAllRunsButton = event.target.closest('[data-stage2-action="select-all-runs"]');
+  if (selectAllRunsButton) {
+    selectAllStage2Runs();
+    return;
+  }
+
+  const deleteSelectedRunsButton = event.target.closest('[data-stage2-action="delete-selected-runs"]');
+  if (deleteSelectedRunsButton) {
+    deleteSelectedStage2Runs();
+    return;
+  }
+
   const refreshModelsButton = event.target.closest('#refreshStage2ModelProfilesButton');
   if (refreshModelsButton) {
     captureStage2ModelProfileSelection();
@@ -3966,6 +4091,14 @@ document.querySelector('#stage2HumanTab')?.addEventListener('click', (event) => 
 });
 
 stage2RunList?.addEventListener('click', (event) => {
+  const checkbox = event.target.closest('[data-stage2-run-select]');
+  if (checkbox) {
+    event.stopPropagation();
+    setStage2RunSelected(checkbox.dataset.stage2RunSelect, checkbox.checked);
+    renderStage2Overview();
+    return;
+  }
+
   const button = event.target.closest('[data-run-id]');
   if (button) {
     selectStage2Run(button.dataset.runId).catch((error) => {

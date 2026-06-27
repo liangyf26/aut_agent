@@ -847,7 +847,7 @@ textarea:focus {
   background: #f8fafc;
   color: var(--text);
   text-align: left;
-  cursor: pointer;
+  cursor: default;
 }
 
 .stage2-run-card.active {
@@ -856,14 +856,51 @@ textarea:focus {
   box-shadow: inset 3px 0 0 var(--accent);
 }
 
+.stage2-run-card.selected {
+  border-color: #fca5a5;
+  background: #fff7f7;
+}
+
+.stage2-run-select {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  width: fit-content;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.stage2-run-select input {
+  width: 16px;
+  min-width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: #dc2626;
+}
+
+.stage2-run-open {
+  display: grid;
+  gap: 7px;
+  width: 100%;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
 .stage2-run-card strong,
 .stage2-run-card small,
-.stage2-run-card p {
+.stage2-run-card-summary {
   min-width: 0;
   overflow-wrap: anywhere;
 }
 
-.stage2-run-card p {
+.stage2-run-card-summary {
+  display: block;
   margin: 0;
   color: var(--muted);
   font-size: 13px;
@@ -881,6 +918,17 @@ textarea:focus {
 
 .stage2-run-actions {
   justify-content: flex-end;
+}
+
+.danger-action {
+  border-color: #fecaca;
+  color: #b91c1c;
+}
+
+.danger-action:hover,
+.danger-action:focus-visible {
+  border-color: #fca5a5;
+  background: #fff1f2;
 }
 
 .stage2-mode-select {
