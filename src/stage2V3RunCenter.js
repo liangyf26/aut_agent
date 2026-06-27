@@ -12,7 +12,7 @@ const DEFAULT_MODEL_PROFILES_PATH = path.join(ROOT_DIR, 'config', 'stage2-model-
 const SAFE_ID_PATTERN = /^[A-Za-z0-9_-]{1,120}$/;
 const LOCAL_CDP_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
 const DEFAULT_PYTHON_COMMAND = process.env.STAGE2_PYTHON || process.env.PYTHON || 'python';
-const DEFAULT_PYTHON_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_PYTHON_TIMEOUT_MS = 30 * 60 * 1000;
 const SAFETY_POLICY_LOW_RISK_ONLY = 'low_risk_only';
 const SAFETY_POLICY_TEST_ENV_FULL_ACCESS = 'test_env_full_access';
 const DEFAULT_FULL_ACCESS_ACTIONS = ['create', 'edit', 'submit', 'delete', 'approve', 'save', 'remove'];
@@ -45,6 +45,7 @@ const ARTIFACTS = {
   promotion_candidates: 'promotion_candidates.json',
   model_comparison: 'model_comparison.json',
   python_execution: 'python_execution.json',
+  browser_use_tool_timings: 'browser_use_tool_timings.jsonl',
   run_report_json: path.join('reports', 'run_report.json'),
   run_report_md: path.join('reports', 'run_report.md')
 };
@@ -884,6 +885,10 @@ function buildPublicRun(runDir, manifest, artifacts = {}) {
     startedAt: manifest.started_at,
     finishedAt: manifest.finished_at,
     currentStatus,
+    currentPageLabel: currentStatus.current_page || null,
+    currentExecutorLabel: currentStatus.current_executor || currentStatus.current_skill || null,
+    currentStepLabel: currentStatus.current_step || null,
+    currentTargetLabel: currentStatus.current_target || null,
     latestMessage: currentStatus.message || null,
     recentEvents,
     operability: makeRunOperability(manifest, artifacts, currentStatus),
@@ -1027,7 +1032,7 @@ function diagnosticArtifactsForRun(run) {
   if (!run || run.status !== 'failed') {
     return [];
   }
-  return ['preflight_result', 'python_execution', 'execution_results', 'progress_events']
+  return ['preflight_result', 'python_execution', 'execution_results', 'progress_events', 'browser_use_tool_timings']
     .map((key) => ({
       key,
       label: key,
@@ -2255,7 +2260,21 @@ async function runPythonV3OrchestratorAttempt({ runId, runsDir, runDir, inputCon
     }
   } catch (error) {
     const stderr = String(error.stderr || error.message || '');
-    const failureReason = error.code === 'ENOENT' ? 'python_executor_unavailable' : 'python_v3_orchestrator_failed';
+    const finishedAt = nowIso();
+    const isTimeout = Boolean(
+      error.killed
+      || error.signal === 'SIGTERM'
+      || /timed?\s*out|timeout/i.test(error.message || '')
+    );
+    const failureReason = error.code === 'ENOENT'
+      ? 'python_executor_unavailable'
+      : isTimeout
+        ? 'python_v3_orchestrator_timeout'
+        : 'python_v3_orchestrator_failed';
+    const timeoutMessage = isTimeout
+      ? `Python v3 orchestrator 超过 ${formatDurationMinutes(timeoutMs)} 执行上限，平台已终止本轮真实浏览器执行。`
+      : null;
+    const timeoutDiagnostics = isTimeout ? summarizePythonExecutionLog(stderr) : null;
     return {
       ok: false,
       failureReason,
@@ -2263,11 +2282,13 @@ async function runPythonV3OrchestratorAttempt({ runId, runsDir, runDir, inputCon
       args,
       artifactRoot,
       startedAt,
-      finishedAt: nowIso(),
+      finishedAt,
       exitCode: typeof error.code === 'number' ? error.code : null,
       stdout: String(error.stdout || ''),
       stderr,
-      error: error.message || stderr || failureReason
+      error: timeoutMessage || error.message || stderr || failureReason,
+      timeoutMs: isTimeout ? timeoutMs : null,
+      timeoutDiagnostics
     };
   }
 
@@ -2407,6 +2428,41 @@ function elapsedMs(startedAt, finishedAt) {
   return Number.isFinite(start) && Number.isFinite(finish) && start > 0 && finish >= start
     ? finish - start
     : null;
+}
+
+function formatDurationMinutes(ms) {
+  const minutes = Math.max(1, Math.round((Number(ms) || 0) / 60000));
+  return `${minutes} 分钟`;
+}
+
+function stripAnsi(text) {
+  return String(text || '').replace(/\u001b\[[0-9;]*m/g, '');
+}
+
+function summarizePythonExecutionLog(stderr = '') {
+  const text = stripAnsi(stderr).replace(/\r/g, '');
+  const steps = [...text.matchAll(/Step\s+(\d+):/g)].map((match) => Number(match[1])).filter(Number.isFinite);
+  const goals = [...text.matchAll(/Next goal:\s*(.+)/g)].map((match) => match[1].trim()).filter(Boolean);
+  const toolErrors = [...text.matchAll(/Action '([^']+)' failed with error:\s*(.+)/g)]
+    .map((match) => ({
+      action: match[1],
+      error: match[2].trim()
+    }));
+  const actionLines = text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => /\b(script_[a-zA-Z0-9_]+|click|type|done)\b/.test(line));
+  const lastToolError = toolErrors.at(-1) || null;
+  return {
+    observed_step_count: steps.length,
+    last_step: steps.length ? Math.max(...steps) : null,
+    last_goal: goals.at(-1) || null,
+    last_action_line: actionLines.at(-1) || null,
+    last_tool_error: lastToolError,
+    repeated_last_tool_error_count: lastToolError
+      ? toolErrors.filter((item) => item.action === lastToolError.action && item.error === lastToolError.error).length
+      : 0
+  };
 }
 
 function evidenceQualityForAttempt(executionResults, roundAnalysis = {}) {
@@ -2642,6 +2698,45 @@ function normalizePythonHumanTasks(payload) {
   };
 }
 
+function artifactHasItems(payload, ...keys) {
+  return artifactItems(payload, ...keys).length > 0;
+}
+
+async function readPriorRealBrowserDiscovery(runDir, inputConfig, manifest) {
+  const sourceRealBrowser = await readJsonIfExists(path.join(runDir, 'source_real_browser.json')) || {};
+  const existingMenuTree = await readJsonIfExists(path.join(runDir, ARTIFACTS.menu_tree));
+  const existingMenuEntries = await readJsonIfExists(path.join(runDir, ARTIFACTS.menu_entries));
+  const existingPageEntries = await readJsonIfExists(path.join(runDir, ARTIFACTS.page_entries));
+  const existingFeaturePoints = await readJsonIfExists(path.join(runDir, ARTIFACTS.feature_points));
+  const existingScreenshotsIndex = await readJsonIfExists(path.join(runDir, ARTIFACTS.screenshots_index));
+  const seededDiscovery = makeDiscoveryArtifacts(manifest, inputConfig);
+  const emptyMenu = makeEmptyMenuArtifacts('failed');
+  const menuEntries = artifactHasItems(existingMenuEntries, 'items', 'menu_entries')
+    ? existingMenuEntries
+    : artifactHasItems(sourceRealBrowser.menu_entries, 'items', 'menu_entries')
+      ? normalizeMenuEntries(sourceRealBrowser.menu_entries)
+      : emptyMenu.menuEntries;
+  return {
+    systemMap: seededDiscovery.systemMap,
+    navigationTree: seededDiscovery.navigationTree,
+    menuTree: existingMenuTree || sourceRealBrowser.menu_tree || emptyMenu.menuTree,
+    menuEntries,
+    menuTraversalLog: await readTextIfExists(path.join(runDir, ARTIFACTS.menu_traversal_log))
+      || (Array.isArray(sourceRealBrowser.menu_traversal_log)
+        ? sourceRealBrowser.menu_traversal_log.map((item) => JSON.stringify(item)).join('\n')
+        : emptyMenu.menuTraversalLog),
+    pageEntries: artifactHasItems(existingPageEntries, 'items')
+      ? existingPageEntries
+      : seededDiscovery.pageEntries,
+    featurePoints: artifactHasItems(existingFeaturePoints, 'items')
+      ? existingFeaturePoints
+      : makeFeatureArtifacts(inputConfig),
+    screenshotsIndex: artifactHasItems(existingScreenshotsIndex, 'items', 'screenshots')
+      ? existingScreenshotsIndex
+      : makeScreenshotsIndex()
+  };
+}
+
 function currentExecutionContextFromRealBrowser(sourceRealBrowser = {}) {
   const stack = sourceRealBrowser.executor_stack || sourceRealBrowser.executorStack || {};
   const browserUse = stack.browser_use || stack.browserUse || {};
@@ -2768,6 +2863,7 @@ async function persistContractOnlyArtifacts(runDir, manifest, inputConfig, execu
 }
 
 async function persistRealBrowserFailure(runDir, manifest, inputConfig, processResult, roundId) {
+  const priorDiscovery = await readPriorRealBrowserDiscovery(runDir, inputConfig, manifest);
   const preflightResult = {
     schema_version: 'stage2_preflight_result.v3',
     run_id: manifest.run_id,
@@ -2779,16 +2875,15 @@ async function persistRealBrowserFailure(runDir, manifest, inputConfig, processR
       python_orchestrator: {
         ok: false,
         reason: processResult.error || processResult.stderr || processResult.failureReason,
-        failure_reason: processResult.failureReason
+        failure_reason: processResult.failureReason,
+        timeout_diagnostics: processResult.timeoutDiagnostics || null
       }
     },
     command: { executable: processResult.command, args: processResult.args },
     started_at: processResult.startedAt,
     finished_at: processResult.finishedAt
   };
-  const { systemMap, navigationTree, pageEntries } = makeDiscoveryArtifacts(manifest, inputConfig);
-  const { menuTree, menuEntries, menuTraversalLog } = makeEmptyMenuArtifacts('failed');
-  const featurePoints = makeFeatureArtifacts(inputConfig);
+  const { systemMap, navigationTree, pageEntries, featurePoints, menuTree, menuEntries, menuTraversalLog } = priorDiscovery;
   const discoveryReview = makeDiscoveryReview(featurePoints);
   const testCases = makeGeneratedTestCases(featurePoints);
   const executionResults = {
@@ -2808,7 +2903,7 @@ async function persistRealBrowserFailure(runDir, manifest, inputConfig, processR
       execution_mode: 'real_browser'
     }))
   };
-  const screenshotsIndex = makeScreenshotsIndex();
+  const screenshotsIndex = priorDiscovery.screenshotsIndex;
   const analysisPack = makeRoundAnalysis({
     manifest,
     inputConfig,
@@ -2817,12 +2912,22 @@ async function persistRealBrowserFailure(runDir, manifest, inputConfig, processR
     testCases,
     executionResults,
     screenshotsIndex,
-    menuEntries: makeEmptyMenuArtifacts().menuEntries
+    menuEntries
   });
   analysisPack.nextRoundPlan.current_round_id = roundId;
   analysisPack.nextRoundPlan.decision = 'wait_human_review';
   analysisPack.nextRoundPlan.requires_human_approval = true;
   analysisPack.nextRoundPlan.next_round_goal = '修复真实浏览器执行环境后重新启动本轮低风险执行。';
+  analysisPack.finalMessage = processResult.error || '真实浏览器执行失败，已写入可读错误和阻塞产物。';
+  analysisPack.currentStatusExtra = {
+    failure_reason: processResult.failureReason,
+    timeout_ms: processResult.timeoutMs || null,
+    timeout_diagnostics: processResult.timeoutDiagnostics || null,
+    current_step: processResult.timeoutDiagnostics?.last_step
+      ? `Browser Use Step ${processResult.timeoutDiagnostics.last_step}`
+      : null,
+    current_target: processResult.timeoutDiagnostics?.last_goal || null
+  };
 
   await writeJson(path.join(runDir, ARTIFACTS.python_execution), processResult);
   await writeJson(path.join(runDir, ARTIFACTS.preflight_result), preflightResult);
@@ -3051,7 +3156,7 @@ async function startV3Run(runId, body = {}, options = {}) {
     ? 'failed'
     : analysisPack.nextRoundPlan.requires_human_approval ? 'waiting_human' : 'completed';
   const finalMessage = executionFailed
-    ? '真实浏览器执行失败，已写入可读错误和阻塞产物。'
+    ? (analysisPack.finalMessage || '真实浏览器执行失败，已写入可读错误和阻塞产物。')
     : analysisPack.nextRoundPlan.requires_human_approval
       ? '首轮产物已生成，等待运行中心人工确认下一步。'
       : '首轮真实浏览器执行产物已生成。';

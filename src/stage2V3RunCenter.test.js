@@ -1708,7 +1708,7 @@ test('stage2 v3 run center records Python failure as visible run failure artifac
     assert.match(started.operation.nextAction, /preflight_result/);
     assert.deepEqual(
       started.operation.diagnosticArtifacts.map((item) => item.key),
-      ['preflight_result', 'python_execution', 'execution_results', 'progress_events']
+      ['preflight_result', 'python_execution', 'execution_results', 'progress_events', 'browser_use_tool_timings']
     );
 
     const runDir = path.join(runsDir, created.run.runId);
@@ -1716,9 +1716,105 @@ test('stage2 v3 run center records Python failure as visible run failure artifac
     const executionResults = await readJson(path.join(runDir, 'execution_results.json'));
     const humanTasks = await readJson(path.join(runDir, 'human_tasks.json'));
     assert.equal(currentStatus.phase, 'real_browser_execution_failed');
-    assert.match(currentStatus.message, /真实浏览器执行失败/);
+    assert.match(currentStatus.message, /CDP connection refused/);
+    assert.equal(currentStatus.failure_reason, 'python_v3_orchestrator_failed');
     assert.ok(executionResults.items.every((item) => item.failure_reason === 'python_v3_orchestrator_failed'));
     assert.ok(humanTasks.items.some((item) => item.task_id === 'task_connect_executor_or_confirm_plan'));
+  });
+});
+
+test('stage2 v3 run center classifies Python orchestrator timeout and exposes it in current status', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理平台',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      executionMode: 'real_browser'
+    }, { runsDir });
+
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ timeoutMs }) => {
+        const error = new Error('Command failed because execution timed out.');
+        error.killed = true;
+        error.signal = 'SIGTERM';
+        error.stderr = [
+          'INFO     [Agent] Step 22:',
+          'INFO     [Agent] Next goal: Fill 育苗地点 cascader.',
+          "ERROR    [tools] Action 'script_prefill_form' failed with error: Error executing action script_prefill_form: timeout",
+          'INFO     [Agent] Step 23:',
+          'INFO     [Agent] Next goal: Retry submitting the online filing form.'
+        ].join('\n');
+        error.stdout = '';
+        error.timeoutMs = timeoutMs;
+        throw error;
+      }
+    });
+
+    const pythonExecution = await readJson(path.join(runsDir, created.run.runId, 'python_execution.json'));
+    const currentStatus = await readJson(path.join(runsDir, created.run.runId, 'current_status.json'));
+
+    assert.equal(pythonExecution.failureReason, 'python_v3_orchestrator_timeout');
+    assert.equal(pythonExecution.timeoutMs, 30 * 60 * 1000);
+    assert.equal(pythonExecution.timeoutDiagnostics.last_step, 23);
+    assert.match(pythonExecution.timeoutDiagnostics.last_goal, /Retry submitting/);
+    assert.match(currentStatus.message, /超过 30 分钟/);
+    assert.equal(currentStatus.failure_reason, 'python_v3_orchestrator_timeout');
+    assert.equal(currentStatus.timeout_diagnostics.last_step, 23);
+  });
+});
+
+test('stage2 v3 run center preserves prior menu discovery artifacts when Python times out', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理平台',
+      entryUrl: 'https://www.zbsykj.com:19096/index',
+      cdpUrl: 'http://localhost:9222',
+      executionMode: 'real_browser',
+      prioritizedTargets: ['线上备案申请']
+    }, { runsDir });
+    const runDir = path.join(runsDir, created.run.runId);
+    await fs.writeFile(path.join(runDir, 'menu_entries.json'), JSON.stringify({
+      schema_version: 'stage2_menu_entries.v1',
+      items: [{
+        menu_id: 'menu_5',
+        text: '线上备案申请',
+        is_leaf: true,
+        route_hint: 'https://www.zbsykj.com:19096/record/online',
+        menu_path: ['备案管理', '线上备案申请'],
+        status: 'discovered'
+      }],
+      menu_entries: [{
+        menu_id: 'menu_5',
+        text: '线上备案申请',
+        is_leaf: true,
+        route_hint: 'https://www.zbsykj.com:19096/record/online',
+        menu_path: ['备案管理', '线上备案申请'],
+        status: 'discovered'
+      }]
+    }, null, 2));
+
+    await startV3Run(created.run.runId, {
+      executionMode: 'real_browser',
+      roundId: 'round_002'
+    }, {
+      runsDir,
+      pythonRunner: async () => {
+        const error = new Error('Command failed because execution timed out.');
+        error.killed = true;
+        error.signal = 'SIGTERM';
+        error.stderr = 'INFO     [Agent] Step 9:\nINFO     [Agent] Next goal: Call script_prefill_form.';
+        error.stdout = '';
+        throw error;
+      }
+    });
+
+    const menuEntries = await readJson(path.join(runDir, 'menu_entries.json'));
+    const roundAnalysis = await readJson(path.join(runDir, 'round_analysis.json'));
+    assert.equal(menuEntries.items.length, 1);
+    assert.equal(menuEntries.items[0].text, '线上备案申请');
+    assert.notEqual(roundAnalysis.target_tracking[0].missed_reason, 'not_found_in_menu_or_page_artifacts');
+    assert.deepEqual(roundAnalysis.target_tracking[0].matched_menu_entry_ids, ['menu_5']);
   });
 });
 

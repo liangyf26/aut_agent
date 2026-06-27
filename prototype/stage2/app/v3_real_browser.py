@@ -4,10 +4,12 @@ import asyncio
 import base64
 import json
 import os
+import re
 import struct
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 from urllib.error import URLError
 from urllib.parse import quote, urljoin, urlparse
@@ -776,58 +778,251 @@ async def _run_browser_use_target_handover(
         browser = Browser(cdp_url=config.cdp_url)
         tools = Tools()
 
+        def append_tool_timing(action: str, status: str, started: float, detail: dict[str, Any] | None = None) -> None:
+            record = {
+                "at": datetime.now().isoformat(timespec="seconds"),
+                "action": action,
+                "status": status,
+                "duration_ms": round((perf_counter() - started) * 1000),
+                "detail": detail or {},
+            }
+            with suppress(Exception):
+                with (run_dir / "browser_use_tool_timings.jsonl").open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        async def timed_tool(action: str, factory: Any) -> Any:
+            started = perf_counter()
+            try:
+                result = await factory()
+                append_tool_timing(action, "completed", started, {"result_preview": _text(result)[:240]})
+                return result
+            except Exception as exc:
+                append_tool_timing(
+                    action,
+                    "failed",
+                    started,
+                    {"error": f"{type(exc).__name__}: {exc}"},
+                )
+                raise
+
         async def current_browser_page() -> Any:
             with suppress(Exception):
                 current_page = await browser.get_current_page()
-                if current_page:
+                if current_page and hasattr(current_page, "locator"):
                     return current_page
             return page
 
         @tools.action(description="获取当前页面标题、URL 和可见文本摘要。")
         async def get_page_feedback() -> str:
-            target_page = await current_browser_page()
-            body_text = await _safe_playwright_body_text(target_page)
-            title = ""
-            with suppress(Exception):
-                title = await target_page.title()
-            return json.dumps(
-                {"title": title, "url": target_page.url, "visible_text": body_text[:2000]},
-                ensure_ascii=False,
-            )
+            async def run() -> str:
+                target_page = await current_browser_page()
+                body_text = await _safe_playwright_body_text(target_page)
+                title = ""
+                with suppress(Exception):
+                    title = await target_page.title()
+                return json.dumps(
+                    {"title": title, "url": target_page.url, "visible_text": body_text[:2000]},
+                    ensure_ascii=False,
+                )
+
+            return await timed_tool("get_page_feedback", run)
 
         @tools.action(description="[脚本内部工具] 关闭所有弹窗、遮罩、日期选择器和提示层。Agent 不需要传参数。")
         async def script_close_popups() -> str:
-            target_page = await current_browser_page()
-            return await target_page.evaluate(
-                r"""() => {
-                    let count = 0;
-                    document.querySelectorAll(
-                      '.el-overlay,.el-picker-panel,.el-select-dropdown,.el-calendar,.el-popover,.el-message-box,.el-loading-mask,.el-dialog,.el-message,.el-notification'
-                    ).forEach((el) => {
-                      if (el.offsetHeight > 0 || el.offsetWidth > 0) {
-                        el.style.display = 'none';
-                        count += 1;
-                      }
-                    });
-                    return `已关闭 ${count} 个弹窗`;
-                }"""
-            )
+            async def run() -> str:
+                target_page = await current_browser_page()
+                return await target_page.evaluate(
+                    r"""() => {
+                        let count = 0;
+                        document.querySelectorAll(
+                          '.el-overlay,.el-picker-panel,.el-select-dropdown,.el-calendar,.el-popover,.el-message-box,.el-loading-mask,.el-dialog,.el-message,.el-notification'
+                        ).forEach((el) => {
+                          if (el.offsetHeight > 0 || el.offsetWidth > 0) {
+                            el.style.display = 'none';
+                            count += 1;
+                          }
+                        });
+                        return `已关闭 ${count} 个弹窗`;
+                    }"""
+                )
 
-        @tools.action(description="[脚本内部工具] 预填写当前页面所有可见表单字段并勾选协议 checkbox。Agent 不需要传参数。")
-        async def script_prefill_form() -> str:
-            target_page = await current_browser_page()
-            return await target_page.evaluate(
+            return await timed_tool("script_close_popups", run)
+
+        async def select_required_online_apply_dropdowns(target_page: Any) -> dict[str, Any]:
+            async def visible_text(locator: Any) -> str:
+                with suppress(Exception):
+                    return _text(await locator.inner_text(timeout=800))
+                return ""
+
+            async def is_visible(locator: Any) -> bool:
+                with suppress(Exception):
+                    return bool(await locator.is_visible(timeout=800))
+                return False
+
+            async def click_first_visible(container: Any, selectors: list[str]) -> bool:
+                for selector in selectors:
+                    locator = container.locator(selector).first
+                    if await locator.count() and await is_visible(locator):
+                        await locator.scroll_into_view_if_needed(timeout=1500)
+                        await locator.click(timeout=2500)
+                        return True
+                return False
+
+            async def choose_dropdown(
+                label_patterns: list[re.Pattern[str]],
+                *,
+                preferred: list[re.Pattern[str]] | None = None,
+                avoid: list[re.Pattern[str]] | None = None,
+            ) -> dict[str, Any]:
+                form_items = target_page.locator(".el-form-item")
+                count = await form_items.count()
+                matched_item = None
+                matched_label = ""
+                for index in range(count):
+                    item = form_items.nth(index)
+                    text = await visible_text(item)
+                    if text and any(pattern.search(text) for pattern in label_patterns):
+                        matched_item = item
+                        matched_label = text
+                        break
+                if matched_item is None:
+                    return {"ok": False, "reason": "form_item_not_found"}
+
+                clicked = await click_first_visible(
+                    matched_item,
+                    [
+                        "[role=combobox]",
+                        ".el-select__wrapper",
+                        ".el-select",
+                        "input[readonly]",
+                        ".el-input__wrapper",
+                        ".el-input",
+                    ],
+                )
+                if not clicked:
+                    return {"ok": False, "reason": "trigger_not_found", "label_text": matched_label}
+
+                await target_page.wait_for_timeout(350)
+                options = target_page.locator(
+                    ".el-select-dropdown .el-select-dropdown__item:not(.is-disabled), "
+                    "[role=option]:not(.is-disabled), "
+                    ".el-cascader-node:not(.is-disabled)"
+                )
+                option_count = await options.count()
+                candidates: list[tuple[Any, str]] = []
+                for index in range(option_count):
+                    option = options.nth(index)
+                    text = await visible_text(option)
+                    if await is_visible(option) and text and not re.search(r"请选择|全部", text):
+                        candidates.append((option, text))
+                if not candidates:
+                    return {"ok": False, "reason": "option_not_found", "label_text": matched_label}
+
+                preferred = preferred or []
+                avoid = avoid or []
+                selected = None
+                for option, text in candidates:
+                    if any(pattern.search(text) for pattern in preferred):
+                        selected = (option, text)
+                        break
+                if selected is None:
+                    for option, text in candidates:
+                        if not any(pattern.search(text) for pattern in avoid):
+                            selected = (option, text)
+                            break
+                selected = selected or candidates[0]
+                await selected[0].scroll_into_view_if_needed(timeout=1500)
+                await selected[0].click(timeout=2500)
+                await target_page.wait_for_timeout(350)
+                return {"ok": True, "selected": selected[1], "label_text": matched_label[:120]}
+
+            async def choose_cascader(
+                label_patterns: list[re.Pattern[str]],
+                *,
+                max_depth: int = 3,
+            ) -> dict[str, Any]:
+                form_items = target_page.locator(".el-form-item")
+                count = await form_items.count()
+                matched_item = None
+                matched_label = ""
+                for index in range(count):
+                    item = form_items.nth(index)
+                    text = await visible_text(item)
+                    if text and any(pattern.search(text) for pattern in label_patterns):
+                        matched_item = item
+                        matched_label = text
+                        break
+                if matched_item is None:
+                    return {"ok": False, "reason": "form_item_not_found"}
+                clicked = await click_first_visible(
+                    matched_item,
+                    [
+                        ".el-cascader",
+                        ".el-cascader__label",
+                        "input[readonly]",
+                        ".el-input__wrapper",
+                        ".el-input",
+                    ],
+                )
+                if not clicked:
+                    return {"ok": False, "reason": "trigger_not_found", "label_text": matched_label}
+                await target_page.wait_for_timeout(400)
+                selected_path: list[str] = []
+                for depth in range(max_depth):
+                    menus = target_page.locator(".el-cascader-panel .el-cascader-menu")
+                    menu_count = await menus.count()
+                    visible_menus = [menus.nth(index) for index in range(menu_count) if await is_visible(menus.nth(index))]
+                    if depth >= len(visible_menus):
+                        break
+                    nodes = visible_menus[depth].locator(".el-cascader-node:not(.is-disabled)")
+                    node_count = await nodes.count()
+                    chosen = None
+                    chosen_text = ""
+                    for node_index in range(node_count):
+                        node = nodes.nth(node_index)
+                        text = await visible_text(node)
+                        if await is_visible(node) and text and not re.search(r"请选择|全部", text):
+                            chosen = node
+                            chosen_text = text
+                            break
+                    if chosen is None:
+                        break
+                    await chosen.scroll_into_view_if_needed(timeout=1500)
+                    await chosen.click(timeout=2500)
+                    selected_path.append(chosen_text)
+                    await target_page.wait_for_timeout(400)
+                    panel_visible = await is_visible(target_page.locator(".el-cascader-panel").first)
+                    if not panel_visible:
+                        break
+                return {
+                    "ok": bool(selected_path),
+                    "selected_path": selected_path,
+                    "label_text": matched_label[:120],
+                    "reason": None if selected_path else "option_not_found",
+                }
+
+            with suppress(Exception):
+                await target_page.keyboard.press("Escape")
+            return {
+                "plantId": await choose_dropdown([re.compile(r"备案品种|品种|plantId", re.I)]),
+                "registerType": await choose_dropdown([re.compile(r"备案类型|类型|registerType", re.I)]),
+                "seedlingMethod": await choose_dropdown(
+                    [re.compile(r"育苗方式|繁殖方式|育苗|seedling|breeding", re.I)],
+                    preferred=[
+                        re.compile(r"分蘗繁殖|分蘖繁殖|炼苗|其他|扦插|分株|组培|组织培养", re.I),
+                    ],
+                    avoid=[re.compile(r"种子繁殖|种子", re.I)],
+                ),
+                "seedlingPurpose": await choose_dropdown([re.compile(r"育苗目的|目的|purpose", re.I)]),
+                "seedlingLocation": await choose_cascader(
+                    [re.compile(r"育苗地点|育苗区域|育苗地址|种植地点|育苗.*地区|location|area", re.I)]
+                ),
+            }
+
+        async def prefill_visible_online_apply_fields(target_page: Any) -> dict[str, Any]:
+            fill_result = await target_page.evaluate(
                 r"""() => {
                     const results = { filled: 0, checked: 0, skipped: 0, errors: [] };
-                    const testValues = {
-                      text: '测试数据',
-                      number: '100',
-                      email: 'test@test.com',
-                      tel: '13800138000',
-                      date: '2026-01-01',
-                      url: 'https://test.com',
-                      search: '测试'
-                    };
                     const fire = (el, type) => el.dispatchEvent(new Event(type, { bubbles: true, cancelable: true }));
                     const setNativeValue = (el, value) => {
                       const prototype = Object.getPrototypeOf(el);
@@ -840,19 +1035,34 @@ async def _run_browser_use_target_handover(
                         el.value = value;
                       }
                     };
+                    const labelText = (el) => {
+                      const item = el.closest('.el-form-item');
+                      return (item && (item.innerText || item.textContent) || '').trim();
+                    };
+                    const valueFor = (el) => {
+                      const label = labelText(el);
+                      const type = (el.type || 'text').toLowerCase();
+                      if (/日期|时间|date/i.test(label) || type === 'date') return '2026-06-01';
+                      if (/面积|数量|株数|重量|亩|number|amount|count|area/i.test(label) || type === 'number') return '100';
+                      if (/电话|手机|联系方式|tel|phone/i.test(label) || type === 'tel') return '13800138000';
+                      if (/邮箱|email/i.test(label) || type === 'email') return 'test@test.com';
+                      if (/监管单位|检疫|单位/i.test(label)) return '测试监管单位';
+                      if (/联系人|人员|姓名/i.test(label)) return '测试人员';
+                      if (/生产地点|地址|详细地址/i.test(label)) return '测试生产地点';
+                      return '测试数据';
+                    };
                     const fields = document.querySelectorAll(
-                      'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=checkbox]):not([type=radio]), textarea, select'
+                      'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=checkbox]):not([type=radio]), textarea'
                     );
                     fields.forEach((el) => {
-                      if (el.disabled || el.readOnly || !el.offsetParent) {
+                      const isWidgetInput = Boolean(el.closest('.el-select,.el-cascader'));
+                      const isDateInput = Boolean(el.closest('.el-date-editor'));
+                      if (el.disabled || !el.offsetParent || isWidgetInput || (el.readOnly && !isDateInput)) {
                         results.skipped += 1;
                         return;
                       }
-                      const type = (el.type || 'text').toLowerCase();
-                      const value = testValues[type] || '测试数据';
                       try {
-                        el.focus && el.focus();
-                        setNativeValue(el, value);
+                        setNativeValue(el, valueFor(el));
                         fire(el, 'input');
                         fire(el, 'change');
                         fire(el, 'blur');
@@ -875,102 +1085,63 @@ async def _run_browser_use_target_handover(
                     return JSON.stringify(results);
                 }"""
             )
+            return json.loads(fill_result) if isinstance(fill_result, str) else fill_result
 
-        @tools.action(description="[脚本内部工具] 选择备案申请表中的必填下拉项：备案品种 plantId 与备案类型 registerType。Agent 不需要传参数。")
+        @tools.action(description="[脚本内部工具] 预填写表单、勾选协议，并用 Playwright 直接点击必填下拉列表项。Agent 不需要传参数。")
+        async def script_prefill_form() -> str:
+            async def run() -> str:
+                target_page = await current_browser_page()
+                first_fill_result = await prefill_visible_online_apply_fields(target_page)
+                dropdown_result = await select_required_online_apply_dropdowns(target_page)
+                second_fill_result = await prefill_visible_online_apply_fields(target_page)
+                return json.dumps(
+                    {
+                        "prefill": first_fill_result,
+                        "dropdowns": dropdown_result,
+                        "expanded_prefill": second_fill_result,
+                    },
+                    ensure_ascii=False,
+                )
+
+            return await timed_tool("script_prefill_form", run)
+
+        @tools.action(description="[脚本内部工具] 用 Playwright 直接点击备案申请表必填下拉项：备案品种、备案类型、育苗方式。Agent 不需要传参数。")
         async def script_select_required_dropdowns() -> str:
-            target_page = await current_browser_page()
-            return await target_page.evaluate(
-                r"""async () => {
-                    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-                    const visible = (el) => {
-                      if (!el) return false;
-                      const rect = el.getBoundingClientRect();
-                      const style = window.getComputedStyle(el);
-                      return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-                    };
-                    const textOf = (el) => (el && (el.innerText || el.textContent || el.value || '') || '').trim();
-                    const click = (el) => {
-                      el.scrollIntoView({ block: 'center', inline: 'center' });
-                      el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
-                      el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
-                      el.click();
-                    };
-                    const labels = Array.from(document.querySelectorAll('.el-form-item,label,.el-form-item__label,span,div'))
-                      .filter(visible);
-                    const optionSelector = [
-                      '.el-select-dropdown:not([style*="display: none"]) .el-select-dropdown__item:not(.is-disabled)',
-                      '.el-select-dropdown__item:not(.is-disabled)',
-                      '[role="option"]:not(.is-disabled)',
-                      '.el-cascader-node:not(.is-disabled)'
-                    ].join(',');
-                    async function chooseByLabel(pattern, fallbackIndex, preferredPattern, avoidPattern) {
-                      const label = labels.find((el) => pattern.test(textOf(el)));
-                      const container = label ? (label.closest('.el-form-item') || label.parentElement) : document;
-                      const trigger = container && (
-                        container.querySelector('[role="combobox"]')
-                        || container.querySelector('.el-select__wrapper')
-                        || container.querySelector('.el-select')
-                        || container.querySelector('input[readonly]')
-                        || container.querySelector('.el-input')
-                      );
-                      if (!trigger) {
-                        return { ok: false, reason: 'trigger_not_found', label: pattern.source };
-                      }
-                      click(trigger);
-                      await sleep(400);
-                      const options = Array.from(document.querySelectorAll(optionSelector))
-                        .filter(visible)
-                        .filter((el) => textOf(el) && !/请选择|全部/.test(textOf(el)));
-                      const option = (preferredPattern && options.find((el) => preferredPattern.test(textOf(el))))
-                        || (avoidPattern && options.find((el) => !avoidPattern.test(textOf(el))))
-                        || options[fallbackIndex]
-                        || options[0];
-                      if (!option) {
-                        return { ok: false, reason: 'option_not_found', label: pattern.source };
-                      }
-                      const selectedText = textOf(option);
-                      click(option);
-                      await sleep(300);
-                      return { ok: true, selected: selectedText, label: pattern.source };
-                    }
-                    const plant = await chooseByLabel(/备案品种|品种|plantId/i, 0);
-                    const registerType = await chooseByLabel(/备案类型|类型|registerType/i, 0);
-                    const seedlingMethod = await chooseByLabel(
-                      /育苗方式|繁殖方式|育苗|seedling|breeding/i,
-                      0,
-                      /分蘗繁殖|分蘖繁殖|炼苗|其他|扦插|分株|组培|组织培养/i,
-                      /种子繁殖|种子/i
-                    );
-                    return JSON.stringify({ plantId: plant, registerType, seedlingMethod });
-                }"""
-            )
+            async def run() -> str:
+                target_page = await current_browser_page()
+                return json.dumps(await select_required_online_apply_dropdowns(target_page), ensure_ascii=False)
+
+            return await timed_tool("script_select_required_dropdowns", run)
 
         @tools.action(description="[脚本内部工具] 提交当前表单，优先点击包含“纳入、提交、确定”的按钮。Agent 不需要传参数。")
         async def script_submit_form() -> str:
-            target_page = await current_browser_page()
-            return await target_page.evaluate(
-                r"""() => {
-                    document.querySelectorAll('.el-overlay,.el-picker-panel,.el-select-dropdown,.el-calendar,.el-popover,.el-message-box')
-                      .forEach((el) => el.remove());
-                    window.scrollTo(0, document.body.scrollHeight);
-                    const buttons = Array.from(document.querySelectorAll('button,[role=button],input[type=submit]'));
-                    for (const button of buttons) {
-                      const text = (button.textContent || button.value || '').trim();
-                      if (text && (text.includes('纳入') || text.includes('提交') || text.includes('确定'))) {
-                        button.click();
-                        return `已点击提交按钮: ${text}`;
-                      }
-                    }
-                    for (const form of Array.from(document.querySelectorAll('form'))) {
-                      const submit = form.querySelector('button[type=submit],input[type=submit]');
-                      if (submit) {
-                        submit.click();
-                        return '已点击表单提交';
-                      }
-                    }
-                    return '未找到提交按钮';
-                }"""
-            )
+            async def run() -> str:
+                target_page = await current_browser_page()
+                return await target_page.evaluate(
+                    r"""() => {
+                        document.querySelectorAll('.el-overlay,.el-picker-panel,.el-select-dropdown,.el-calendar,.el-popover,.el-message-box')
+                          .forEach((el) => el.remove());
+                        window.scrollTo(0, document.body.scrollHeight);
+                        const buttons = Array.from(document.querySelectorAll('button,[role=button],input[type=submit]'));
+                        for (const button of buttons) {
+                          const text = (button.textContent || button.value || '').trim();
+                          if (text && (text.includes('纳入') || text.includes('提交') || text.includes('确定'))) {
+                            button.click();
+                            return `已点击提交按钮: ${text}`;
+                          }
+                        }
+                        for (const form of Array.from(document.querySelectorAll('form'))) {
+                          const submit = form.querySelector('button[type=submit],input[type=submit]');
+                          if (submit) {
+                            submit.click();
+                            return '已点击表单提交';
+                          }
+                        }
+                        return '未找到提交按钮';
+                    }"""
+                )
+
+            return await timed_tool("script_submit_form", run)
 
         llm = ChatOpenAI(
             model=profile["model"],
@@ -1122,9 +1293,9 @@ def _browser_use_handover_task(
 1. 先调用 script_close_popups，关闭明显弹窗或遮罩。
 2. 导航或点击进入“线上备案申请”菜单/页面。
 3. 找到“我要申请备案”“申请备案”或“新增”按钮并点击，进入申请表单。
-4. 如果安全策略是 test_env_full_access 且允许 create/submit/save，必须调用 script_prefill_form 预填表单。
-5. 预填后必须调用 script_select_required_dropdowns 选择备案品种 plantId 与备案类型 registerType，不要直接用输入框赋值代替下拉选择。
-6. 如果页面出现“育苗方式”下拉框，测试数据默认走低前置数据分支：不要选择“种子繁殖”，因为它会要求填写“种子采集许可证号”；优先选择“分蘗繁殖”“分蘖繁殖”“炼苗”或“其他”等不需要许可证的选项。
+4. 如果安全策略是 test_env_full_access 且允许 create/submit/save，必须调用 script_prefill_form；这个工具会预填文本字段、勾选协议，并用 Playwright 直接点击下拉列表项和“育苗地点”三级 cascader。
+5. script_prefill_form 已经会选择备案品种 plantId、备案类型 registerType、育苗目的、可见的育苗方式和育苗地点；如果提交后仍提示下拉必填，再调用 script_select_required_dropdowns 重试。不要用 evaluate/JS 直接给下拉输入框赋值。
+6. 如果页面出现“育苗方式”下拉框，测试数据默认走低前置数据分支：不要选择“种子繁殖”，因为它会要求填写“种子采集许可证号”；优先选择“分蘗繁殖”“分蘖繁殖”“炼苗”或“其他”等不需要许可证的选项。遇到“育苗地点”这类城市/城区/社区三级控件时，不要手工逐项尝试，直接依赖 script_prefill_form 内置的 Playwright cascader 选择。
 7. 下拉项选择完成后必须调用 script_submit_form，最终提交一次备案申请；不要停在只看见按钮或只打开表单。
 8. 如果提交后出现 plantId/registerType required 或其它校验错误，先调用 script_select_required_dropdowns，再调用 script_submit_form 重试一次。
 9. 每次关键动作后调用 get_page_feedback，记录 URL、页面文本、错误信息和成功反馈。

@@ -588,8 +588,11 @@ def test_browser_use_handover_task_avoids_seed_propagation_license_branch() -> N
     )
 
     assert "育苗方式" in task
+    assert "育苗地点" in task
+    assert "三级 cascader" in task
     assert "不要选择“种子繁殖”" in task
     assert "种子采集许可证号" in task
+    assert "不要用 evaluate/JS 直接给下拉输入框赋值" in task
     assert "分蘗繁殖" in task or "炼苗" in task or "其他" in task
 
 

@@ -1976,6 +1976,7 @@ function renderStage2MetricCards(run) {
 
 function renderStage2Monitor(run) {
   const nextPlan = getRunNextRoundPlan(run || {});
+  const timeoutDiagnostics = run?.currentStatus?.timeout_diagnostics || run?.current_status?.timeout_diagnostics || {};
   const fields = [
     ['当前轮次', stage2RoundLabel(run)],
     ['当前阶段', run?.currentPhaseLabel || stageLabel(run?.currentPhase || '-')],
@@ -1983,9 +1984,11 @@ function renderStage2Monitor(run) {
     ['执行器', run?.currentExecutorLabel || '-'],
     ['当前步骤', run?.currentStepLabel || '-'],
     ['当前对象', run?.currentTargetLabel || '-'],
+    ['超时最后步骤', timeoutDiagnostics.last_step ? `Browser Use Step ${timeoutDiagnostics.last_step}` : ''],
+    ['超时最后目标', timeoutDiagnostics.last_goal || ''],
     ['下一步动作', run?.nextAction || nextPlan.next_round_goal || nextPlan.nextRoundGoal || '-'],
     ['阻塞原因', run?.blockedReason || run?.waitingReason || nextPlan.decision || '-']
-  ];
+  ].filter(([, value]) => value !== '');
   return fields.map(([label, value]) => `
     <article class="stage2-monitor-item">
       <span>${escapeHtml(label)}</span>
