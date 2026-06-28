@@ -1764,6 +1764,66 @@ test('stage2 v3 run center classifies Python orchestrator timeout and exposes it
   });
 });
 
+test('stage2 v3 run center records orchestrator timeout as blocked cases instead of feature failures', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理平台',
+      entryUrl: 'https://www.zbsykj.com:19096/index',
+      cdpUrl: 'http://localhost:9222',
+      executionMode: 'real_browser',
+      prioritizedTargets: ['线上备案申请']
+    }, { runsDir });
+    const runDir = path.join(runsDir, created.run.runId);
+    await fs.writeFile(path.join(runDir, 'feature_points.json'), JSON.stringify({
+      schema_version: 'stage2_feature_points.v3',
+      items: [{
+        feature_point_id: 'feature_online_apply_create',
+        page_entry_id: 'page_online_apply',
+        name: '线上备案申请新增',
+        feature_type: 'create',
+        risk_level: 'medium',
+        auto_verifiable: true,
+        review_status: 'auto_included'
+      }]
+    }, null, 2));
+    await fs.writeFile(path.join(runDir, 'generated_test_cases.json'), JSON.stringify({
+      schema_version: 'stage2_generated_test_cases.v3',
+      items: [{
+        test_case_id: 'case_online_apply_create',
+        feature_point_id: 'feature_online_apply_create',
+        title: '线上备案申请新增 - 最小执行路径',
+        requires_human_confirmation: false
+      }]
+    }, null, 2));
+
+    await startV3Run(created.run.runId, {
+      executionMode: 'real_browser',
+      roundId: 'round_003'
+    }, {
+      runsDir,
+      pythonRunner: async () => {
+        const error = new Error('Command failed because execution timed out.');
+        error.killed = true;
+        error.signal = 'SIGTERM';
+        error.stderr = 'INFO     [Agent] Step 42:\nINFO     [Agent] Next goal: Fill remark field.';
+        error.stdout = '';
+        throw error;
+      }
+    });
+
+    const executionResults = await readJson(path.join(runDir, 'execution_results.json'));
+    const summary = (await getV3Run(created.run.runId, { runsDir })).run.summary.execution;
+    assert.equal(executionResults.items.length, 1);
+    assert.equal(executionResults.items[0].test_case_id, 'case_online_apply_create');
+    assert.equal(executionResults.items[0].feature_point_id, 'feature_online_apply_create');
+    assert.equal(executionResults.items[0].status, 'blocked_by_executor');
+    assert.equal(executionResults.items[0].failure_reason, 'python_v3_orchestrator_timeout');
+    assert.match(executionResults.items[0].verdict, /未形成单功能点结论/);
+    assert.equal(summary.failed, 0);
+    assert.equal(summary.blocked, 1);
+  });
+});
+
 test('stage2 v3 run center preserves prior menu discovery artifacts when Python times out', async () => {
   await withTempRunsDir(async (runsDir) => {
     const created = await createV3Run({
@@ -2218,6 +2278,48 @@ test('stage2 v3 run center degrades AI review to rule review when model is unava
     assert.equal(failed.roundAnalysis.ai_provider_status, 'ai_review_failed');
     assert.match(failed.roundAnalysis.review_errors[0].message, /fetch failed/);
     assert.match(failed.roundAnalysis.review_errors[0].message, /ETIMEDOUT/);
+  });
+});
+
+test('stage2 v3 run center can AI-review a failed real browser run and persist downgrade reasons', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: 'AI 失败复盘系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      executionMode: 'real_browser',
+      modelProfileIds: ['reviewer']
+    }, { runsDir, modelProfiles: [{
+      id: 'reviewer',
+      label: 'Reviewer',
+      provider: 'openai_compatible',
+      model: 'review-model',
+      apiKeyEnv: 'REVIEWER_API_KEY'
+    }] });
+
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async () => {
+        const error = new Error('Command failed because execution timed out.');
+        error.killed = true;
+        error.signal = 'SIGTERM';
+        error.stderr = 'INFO     [Agent] Step 42:\nINFO     [Agent] Next goal: Fill remark field.';
+        throw error;
+      }
+    });
+
+    const analyzed = await analyzeV3Run(created.run.runId, {
+      runsDir,
+      aiReviewRunner: async () => {
+        throw new Error('review model unavailable');
+      }
+    });
+    const roundAnalysis = await readJson(path.join(runsDir, created.run.runId, 'round_analysis.json'));
+
+    assert.equal(analyzed.operation.message, '规则复盘产物已生成；AI 复盘不可用或已降级。');
+    assert.equal(roundAnalysis.ai_provider_status, 'ai_review_failed');
+    assert.equal(roundAnalysis.review_errors[0].code, 'ai_review_failed');
+    assert.match(roundAnalysis.review_errors[0].message, /review model unavailable/);
   });
 });
 

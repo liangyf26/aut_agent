@@ -778,9 +778,11 @@ function summarizeExecution(items = []) {
   const skipped = (byStatus.skipped || 0)
     + (byStatus.skipped_no_executor || 0)
     + (byStatus.skipped_not_observed || 0)
-    + (byStatus.skipped_by_policy || 0);
+    + (byStatus.skipped_by_policy || 0)
+    + (byStatus.blocked_by_executor || 0);
   const blocked = (byStatus.blocked_by_policy || 0)
-    + (byStatus.skipped_by_policy || 0);
+    + (byStatus.skipped_by_policy || 0)
+    + (byStatus.blocked_by_executor || 0);
   const recentEvidence = items
     .filter((item) => {
       const screenshots = Array.isArray(item.screenshot_refs) ? item.screenshot_refs : [];
@@ -1714,6 +1716,7 @@ function buildHumanTasks(featurePoints, executionResults, nextRoundPlan = null) 
     'contract_only_mode',
     'python_v3_executor_not_connected',
     'python_v3_orchestrator_failed',
+    'python_v3_orchestrator_timeout',
     'python_executor_unavailable',
     'python_returned_safe_placeholder'
   ].includes(item.failure_reason));
@@ -1836,6 +1839,10 @@ function makeRoundAnalysis({
     ],
     analysis_mode: 'deterministic_rule_review',
     ai_provider_status: 'not_connected',
+    review_errors: [{
+      code: 'ai_review_not_attempted',
+      message: '本产物由规则复盘生成，尚未完成可追踪的 AI 复盘模型调用。'
+    }],
     scope_targets: extractScopeTargets(inputConfig),
     missing_scope_targets: missingScopeTargets,
     uncovered_scope_targets: uncoveredScopeTargets,
@@ -2708,6 +2715,7 @@ async function readPriorRealBrowserDiscovery(runDir, inputConfig, manifest) {
   const existingMenuEntries = await readJsonIfExists(path.join(runDir, ARTIFACTS.menu_entries));
   const existingPageEntries = await readJsonIfExists(path.join(runDir, ARTIFACTS.page_entries));
   const existingFeaturePoints = await readJsonIfExists(path.join(runDir, ARTIFACTS.feature_points));
+  const existingTestCases = await readJsonIfExists(path.join(runDir, ARTIFACTS.generated_test_cases));
   const existingScreenshotsIndex = await readJsonIfExists(path.join(runDir, ARTIFACTS.screenshots_index));
   const seededDiscovery = makeDiscoveryArtifacts(manifest, inputConfig);
   const emptyMenu = makeEmptyMenuArtifacts('failed');
@@ -2731,6 +2739,9 @@ async function readPriorRealBrowserDiscovery(runDir, inputConfig, manifest) {
     featurePoints: artifactHasItems(existingFeaturePoints, 'items')
       ? existingFeaturePoints
       : makeFeatureArtifacts(inputConfig),
+    testCases: artifactHasItems(existingTestCases, 'items')
+      ? existingTestCases
+      : null,
     screenshotsIndex: artifactHasItems(existingScreenshotsIndex, 'items', 'screenshots')
       ? existingScreenshotsIndex
       : makeScreenshotsIndex()
@@ -2885,13 +2896,21 @@ async function persistRealBrowserFailure(runDir, manifest, inputConfig, processR
   };
   const { systemMap, navigationTree, pageEntries, featurePoints, menuTree, menuEntries, menuTraversalLog } = priorDiscovery;
   const discoveryReview = makeDiscoveryReview(featurePoints);
-  const testCases = makeGeneratedTestCases(featurePoints);
+  const testCases = priorDiscovery.testCases || makeGeneratedTestCases(featurePoints);
+  const blockedStatus = processResult.failureReason === 'python_v3_orchestrator_timeout'
+    ? 'blocked_by_executor'
+    : 'failed';
   const executionResults = {
     schema_version: 'stage2_execution_results.v3',
     items: testCases.items.map((testCase) => ({
       test_case_id: testCase.test_case_id,
-      status: 'failed',
-      verdict: `真实浏览器执行未完成：${processResult.error || processResult.failureReason}`,
+      feature_point_id: testCase.feature_point_id || null,
+      title: testCase.title || testCase.name || testCase.test_case_id,
+      name: testCase.title || testCase.name || testCase.test_case_id,
+      status: blockedStatus,
+      verdict: blockedStatus === 'blocked_by_executor'
+        ? `真实浏览器编排超时，本用例未形成单功能点结论：${processResult.error || processResult.failureReason}`
+        : `真实浏览器执行未完成：${processResult.error || processResult.failureReason}`,
       started_at: processResult.startedAt,
       finished_at: processResult.finishedAt,
       actions: [],

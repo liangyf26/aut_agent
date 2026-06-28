@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 import sys
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from prototype.stage2.app.v3_orchestrator import V3RunConfig  # noqa: E402
 from prototype.stage2.app.v3_real_browser import (  # noqa: E402
     TEST_ENV_FULL_ACCESS_POLICY,
     build_menu_discovery_artifacts,
+    _ensure_online_apply_upload_samples,
     _dedupe_page_exploration,
     _browser_use_handover_task,
     _infer_feature_type,
@@ -571,6 +573,7 @@ def test_browser_use_handover_task_instructs_full_online_apply_submission() -> N
     )
 
     assert "script_prefill_form" in task
+    assert "script_upload_sample_files" in task
     assert "script_select_required_dropdowns" in task
     assert "script_submit_form" in task
     assert "最终提交一次备案申请" in task
@@ -594,6 +597,62 @@ def test_browser_use_handover_task_avoids_seed_propagation_license_branch() -> N
     assert "种子采集许可证号" in task
     assert "不要用 evaluate/JS 直接给下拉输入框赋值" in task
     assert "分蘗繁殖" in task or "炼苗" in task or "其他" in task
+
+
+def test_browser_use_handover_task_tells_agent_not_to_repeat_manual_cascader_clicks() -> None:
+    task = _browser_use_handover_task(
+        V3RunConfig(
+            start_url="https://www.zbsykj.com:19096/index",
+            safety_policy=TEST_ENV_FULL_ACCESS_POLICY,
+            allowed_side_effect_actions=["create", "submit", "save"],
+        ),
+        ["线上备案申请"],
+        [{"target": "线上备案申请", "reason": "target_page_uncovered"}],
+    )
+
+    assert "不要反复手工点击 cascader" in task
+    assert "script_prefill_form" in task
+
+
+def test_prefill_script_clears_element_plus_message_boxes_before_dropdown_clicks() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    prefill_block = source[source.index("async def script_prefill_form") : source.index("async def script_select_required_dropdowns")]
+
+    assert "clear_blocking_overlays" in prefill_block
+    assert ".el-message-box__wrapper" in source
+
+
+def test_prefill_dropdown_selection_prefers_active_form_and_enabled_widgets() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dropdown_block = source[source.index("async def select_required_online_apply_dropdowns") : source.index("async def prefill_visible_online_apply_fields")]
+
+    assert "active_form_root" in dropdown_block
+    assert "item_has_enabled_widget" in dropdown_block
+    assert ".el-dialog:not([style*='display: none']), .el-drawer__wrapper:not([style*='display: none'])" in source
+
+
+def test_online_apply_upload_samples_are_real_named_files() -> None:
+    tmp_dir = ROOT_DIR / "prototype" / "stage2" / "tests" / "_tmp_upload_samples"
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    try:
+        samples = _ensure_online_apply_upload_samples(tmp_dir)
+
+        assert samples["personnel"].name == "人员信息表.xlsx"
+        assert samples["image"].name == "备案图片.jpg"
+        assert samples["acceptance"].name == "验收文件.pdf"
+        assert samples["personnel"].read_bytes().startswith(b"PK")
+        assert samples["image"].read_bytes().startswith(b"\xff\xd8\xff")
+        assert samples["acceptance"].read_bytes().startswith(b"%PDF")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_browser_use_handover_defines_deterministic_upload_tool() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+
+    assert "async def script_upload_sample_files" in source
+    assert "set_input_files" in source
+    assert "input[type=file]" in source
 
 
 def test_browser_use_handover_payload_merges_into_unified_artifacts() -> None:

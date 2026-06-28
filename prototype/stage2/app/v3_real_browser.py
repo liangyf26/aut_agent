@@ -6,6 +6,7 @@ import json
 import os
 import re
 import struct
+import zipfile
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,73 @@ TEST_ENV_FULL_ACCESS_POLICY = "test_env_full_access"
 SIDE_EFFECT_ACTION_TYPES = {"submit", "save", "approve", "delete", "create", "edit"}
 DEFAULT_SIDE_EFFECT_TOTAL_LIMIT = 4
 DEFAULT_SIDE_EFFECT_PER_TYPE_LIMIT = 1
+
+
+def _ensure_online_apply_upload_samples(run_dir: Path) -> dict[str, Path]:
+    samples_dir = run_dir / "upload_samples"
+    samples_dir.mkdir(parents=True, exist_ok=True)
+    files = {
+        "personnel": samples_dir / "人员信息表.xlsx",
+        "image": samples_dir / "备案图片.jpg",
+        "acceptance": samples_dir / "验收文件.pdf",
+    }
+    if not files["personnel"].exists():
+        with zipfile.ZipFile(files["personnel"], "w", compression=zipfile.ZIP_DEFLATED) as workbook:
+            workbook.writestr(
+                "[Content_Types].xml",
+                """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>""",
+            )
+            workbook.writestr(
+                "_rels/.rels",
+                """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>""",
+            )
+            workbook.writestr(
+                "xl/workbook.xml",
+                """<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="人员信息" sheetId="1" r:id="rId1"/></sheets>
+</workbook>""",
+            )
+            workbook.writestr(
+                "xl/_rels/workbook.xml.rels",
+                """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>""",
+            )
+            workbook.writestr(
+                "xl/worksheets/sheet1.xml",
+                """<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1"><c r="A1" t="inlineStr"><is><t>姓名</t></is></c></row>
+    <row r="2"><c r="A2" t="inlineStr"><is><t>测试人员</t></is></c></row>
+  </sheetData>
+</worksheet>""",
+            )
+    if not files["image"].exists():
+        files["image"].write_bytes(
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00\x01\x00\x01\x00\x00"
+            b"\xff\xdb\x00C\x00" + bytes([8] * 64) + b"\xff\xd9"
+        )
+    if not files["acceptance"].exists():
+        files["acceptance"].write_bytes(
+            b"%PDF-1.4\n"
+            b"1 0 obj<<>>endobj\n"
+            b"2 0 obj<< /Length 0 >>stream\nendstream\nendobj\n"
+            b"trailer<<>>\n%%EOF\n"
+        )
+    return files
 
 
 def build_menu_discovery_artifacts(
@@ -812,6 +880,22 @@ async def _run_browser_use_target_handover(
                     return current_page
             return page
 
+        async def clear_blocking_overlays(target_page: Any) -> str:
+            return await target_page.evaluate(
+                r"""() => {
+                    let count = 0;
+                    document.querySelectorAll(
+                      '.el-overlay,.el-picker-panel,.el-select-dropdown,.el-calendar,.el-popover,.el-message-box,.el-message-box__wrapper,.el-loading-mask,.el-dialog,.el-message,.el-notification'
+                    ).forEach((el) => {
+                      if (el.offsetHeight > 0 || el.offsetWidth > 0) {
+                        el.style.display = 'none';
+                        count += 1;
+                      }
+                    });
+                    return `已关闭 ${count} 个弹窗`;
+                }"""
+            )
+
         @tools.action(description="获取当前页面标题、URL 和可见文本摘要。")
         async def get_page_feedback() -> str:
             async def run() -> str:
@@ -831,20 +915,7 @@ async def _run_browser_use_target_handover(
         async def script_close_popups() -> str:
             async def run() -> str:
                 target_page = await current_browser_page()
-                return await target_page.evaluate(
-                    r"""() => {
-                        let count = 0;
-                        document.querySelectorAll(
-                          '.el-overlay,.el-picker-panel,.el-select-dropdown,.el-calendar,.el-popover,.el-message-box,.el-loading-mask,.el-dialog,.el-message,.el-notification'
-                        ).forEach((el) => {
-                          if (el.offsetHeight > 0 || el.offsetWidth > 0) {
-                            el.style.display = 'none';
-                            count += 1;
-                          }
-                        });
-                        return `已关闭 ${count} 个弹窗`;
-                    }"""
-                )
+                return await clear_blocking_overlays(target_page)
 
             return await timed_tool("script_close_popups", run)
 
@@ -868,20 +939,42 @@ async def _run_browser_use_target_handover(
                         return True
                 return False
 
+            async def active_form_root() -> Any:
+                roots = target_page.locator(
+                    ".el-dialog:not([style*='display: none']), .el-drawer__wrapper:not([style*='display: none'])"
+                )
+                count = await roots.count()
+                for index in range(count - 1, -1, -1):
+                    root = roots.nth(index)
+                    if await is_visible(root) and await root.locator(".el-form-item").count():
+                        return root
+                return target_page
+
+            async def item_has_enabled_widget(item: Any) -> bool:
+                widgets = item.locator(".el-select,.el-cascader,[role=combobox],input[readonly]")
+                count = await widgets.count()
+                for index in range(count):
+                    widget = widgets.nth(index)
+                    with suppress(Exception):
+                        disabled_count = await widget.locator("[disabled],.is-disabled,[aria-disabled='true']").count()
+                        if await is_visible(widget) and disabled_count == 0:
+                            return True
+                return False
+
             async def choose_dropdown(
                 label_patterns: list[re.Pattern[str]],
                 *,
                 preferred: list[re.Pattern[str]] | None = None,
                 avoid: list[re.Pattern[str]] | None = None,
             ) -> dict[str, Any]:
-                form_items = target_page.locator(".el-form-item")
+                form_items = (await active_form_root()).locator(".el-form-item")
                 count = await form_items.count()
                 matched_item = None
                 matched_label = ""
                 for index in range(count):
                     item = form_items.nth(index)
                     text = await visible_text(item)
-                    if text and any(pattern.search(text) for pattern in label_patterns):
+                    if text and any(pattern.search(text) for pattern in label_patterns) and await item_has_enabled_widget(item):
                         matched_item = item
                         matched_label = text
                         break
@@ -941,14 +1034,14 @@ async def _run_browser_use_target_handover(
                 *,
                 max_depth: int = 3,
             ) -> dict[str, Any]:
-                form_items = target_page.locator(".el-form-item")
+                form_items = (await active_form_root()).locator(".el-form-item")
                 count = await form_items.count()
                 matched_item = None
                 matched_label = ""
                 for index in range(count):
                     item = form_items.nth(index)
                     text = await visible_text(item)
-                    if text and any(pattern.search(text) for pattern in label_patterns):
+                    if text and any(pattern.search(text) for pattern in label_patterns) and await item_has_enabled_widget(item):
                         matched_item = item
                         matched_label = text
                         break
@@ -1003,6 +1096,8 @@ async def _run_browser_use_target_handover(
 
             with suppress(Exception):
                 await target_page.keyboard.press("Escape")
+            with suppress(Exception):
+                await clear_blocking_overlays(target_page)
             return {
                 "plantId": await choose_dropdown([re.compile(r"备案品种|品种|plantId", re.I)]),
                 "registerType": await choose_dropdown([re.compile(r"备案类型|类型|registerType", re.I)]),
@@ -1091,8 +1186,12 @@ async def _run_browser_use_target_handover(
         async def script_prefill_form() -> str:
             async def run() -> str:
                 target_page = await current_browser_page()
+                with suppress(Exception):
+                    await clear_blocking_overlays(target_page)
                 first_fill_result = await prefill_visible_online_apply_fields(target_page)
                 dropdown_result = await select_required_online_apply_dropdowns(target_page)
+                with suppress(Exception):
+                    await clear_blocking_overlays(target_page)
                 second_fill_result = await prefill_visible_online_apply_fields(target_page)
                 return json.dumps(
                     {
@@ -1109,14 +1208,51 @@ async def _run_browser_use_target_handover(
         async def script_select_required_dropdowns() -> str:
             async def run() -> str:
                 target_page = await current_browser_page()
+                with suppress(Exception):
+                    await clear_blocking_overlays(target_page)
                 return json.dumps(await select_required_online_apply_dropdowns(target_page), ensure_ascii=False)
 
             return await timed_tool("script_select_required_dropdowns", run)
+
+        @tools.action(description="[脚本内部工具] 上传线上备案申请所需样本文件：人员信息表 xlsx、备案图片 jpg、验收文件 pdf。Agent 不需要传参数。")
+        async def script_upload_sample_files() -> str:
+            async def run() -> str:
+                target_page = await current_browser_page()
+                samples = _ensure_online_apply_upload_samples(run_dir)
+                with suppress(Exception):
+                    await clear_blocking_overlays(target_page)
+                inputs = target_page.locator("input[type=file]")
+                input_count = await inputs.count()
+                if input_count <= 0:
+                    return json.dumps(
+                        {"ok": False, "reason": "file_inputs_not_found", "uploaded": [], "input_count": 0},
+                        ensure_ascii=False,
+                    )
+
+                ordered_samples = [
+                    ("personnel", samples["personnel"]),
+                    ("image", samples["image"]),
+                    ("acceptance", samples["acceptance"]),
+                ]
+                uploaded: list[dict[str, Any]] = []
+                for index, (kind, sample_path) in enumerate(ordered_samples[:input_count]):
+                    file_input = inputs.nth(index)
+                    await file_input.set_input_files(str(sample_path), timeout=8000)
+                    uploaded.append({"kind": kind, "file_name": sample_path.name, "input_index": index})
+                    await target_page.wait_for_timeout(500)
+                return json.dumps(
+                    {"ok": len(uploaded) == len(ordered_samples), "uploaded": uploaded, "input_count": input_count},
+                    ensure_ascii=False,
+                )
+
+            return await timed_tool("script_upload_sample_files", run)
 
         @tools.action(description="[脚本内部工具] 提交当前表单，优先点击包含“纳入、提交、确定”的按钮。Agent 不需要传参数。")
         async def script_submit_form() -> str:
             async def run() -> str:
                 target_page = await current_browser_page()
+                with suppress(Exception):
+                    await clear_blocking_overlays(target_page)
                 return await target_page.evaluate(
                     r"""() => {
                         document.querySelectorAll('.el-overlay,.el-picker-panel,.el-select-dropdown,.el-calendar,.el-popover,.el-message-box')
@@ -1293,13 +1429,14 @@ def _browser_use_handover_task(
 1. 先调用 script_close_popups，关闭明显弹窗或遮罩。
 2. 导航或点击进入“线上备案申请”菜单/页面。
 3. 找到“我要申请备案”“申请备案”或“新增”按钮并点击，进入申请表单。
-4. 如果安全策略是 test_env_full_access 且允许 create/submit/save，必须调用 script_prefill_form；这个工具会预填文本字段、勾选协议，并用 Playwright 直接点击下拉列表项和“育苗地点”三级 cascader。
+4. 如果安全策略是 test_env_full_access 且允许 create/submit/save，必须按顺序调用 script_prefill_form、script_upload_sample_files、script_submit_form；script_prefill_form 会预填文本字段、勾选协议，并用 Playwright 直接点击下拉列表项和“育苗地点”三级 cascader。
 5. script_prefill_form 已经会选择备案品种 plantId、备案类型 registerType、育苗目的、可见的育苗方式和育苗地点；如果提交后仍提示下拉必填，再调用 script_select_required_dropdowns 重试。不要用 evaluate/JS 直接给下拉输入框赋值。
-6. 如果页面出现“育苗方式”下拉框，测试数据默认走低前置数据分支：不要选择“种子繁殖”，因为它会要求填写“种子采集许可证号”；优先选择“分蘗繁殖”“分蘖繁殖”“炼苗”或“其他”等不需要许可证的选项。遇到“育苗地点”这类城市/城区/社区三级控件时，不要手工逐项尝试，直接依赖 script_prefill_form 内置的 Playwright cascader 选择。
-7. 下拉项选择完成后必须调用 script_submit_form，最终提交一次备案申请；不要停在只看见按钮或只打开表单。
-8. 如果提交后出现 plantId/registerType required 或其它校验错误，先调用 script_select_required_dropdowns，再调用 script_submit_form 重试一次。
-9. 每次关键动作后调用 get_page_feedback，记录 URL、页面文本、错误信息和成功反馈。
-10. 最后用可读文本总结：是否进入目标页面、是否点击“我要申请备案”、填写字段数量、提交次数、最终页面反馈和失败原因。
+6. 如果页面出现“育苗方式”下拉框，测试数据默认走低前置数据分支：不要选择“种子繁殖”，因为它会要求填写“种子采集许可证号”；优先选择“分蘗繁殖”“分蘖繁殖”“炼苗”或“其他”等不需要许可证的选项。遇到“育苗地点”这类城市/城区/社区三级控件时，不要手工逐项尝试，不要反复手工点击 cascader，直接依赖 script_prefill_form 内置的 Playwright cascader 选择。
+7. 文件上传必须调用 script_upload_sample_files，它会上传真实样本文件：人员信息表 xlsx、备案图片 jpg、验收文件 pdf。不要用 evaluate/JS 构造 File 对象，不要反复尝试手工文件上传。
+8. 下拉项和文件上传完成后必须调用 script_submit_form，最终提交一次备案申请；不要停在只看见按钮或只打开表单。
+9. 如果提交后出现 plantId/registerType required 或其它校验错误，先调用 script_select_required_dropdowns，再调用 script_submit_form 重试一次。
+10. 每次关键动作后调用 get_page_feedback，记录 URL、页面文本、错误信息和成功反馈。
+11. 最后用可读文本总结：是否进入目标页面、是否点击“我要申请备案”、填写字段数量、上传文件数量、提交次数、最终页面反馈和失败原因。
 """
 
 
