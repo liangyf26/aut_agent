@@ -857,6 +857,11 @@ function buildPublicRun(runDir, manifest, artifacts = {}) {
     numberOrZero(artifacts.menu_entries?.leaf_count),
     materializedPageEntryCount
   );
+  const countExplanation = artifacts.round_analysis?.count_explanation || {
+    menu_leaf_vs_page_entries: `${menuLeafCount} menu leaves attempted; ${materializedPageEntryCount} page entries recorded.`,
+    candidate_page_entries: `${candidatePageEntryCount} candidate page entries are available from menu leaves; ${materializedPageEntryCount} have been materialized as page_entries records.`,
+    page_entries_vs_candidates: `${materializedPageEntryCount} materialized page entries out of ${candidatePageEntryCount} candidate page entries.`
+  };
   const targetTracking = normalizeTargetTracking(artifacts.round_analysis?.target_tracking);
   const executionMode = artifacts.current_status?.execution_mode || manifest.execution_mode || null;
   const currentStatus = artifacts.current_status || buildCurrentStatus(
@@ -912,7 +917,7 @@ function buildPublicRun(runDir, manifest, artifacts = {}) {
         artifacts.preflight_result?.browser_target_count
         || artifacts.round_analysis?.coverage?.browser_target_count
       ),
-      pageEntries: materializedPageEntryCount,
+      pageEntries: candidatePageEntryCount,
       featurePoints: summarizeItems(artifacts.feature_points?.items),
       generatedTestCases: summarizeItems(artifacts.generated_test_cases?.items),
       execution: summarizeExecution(executionItems),
@@ -926,7 +931,7 @@ function buildPublicRun(runDir, manifest, artifacts = {}) {
       nextDecision: artifacts.next_round_plan?.decision || null,
       executionMode,
       safetyPolicy: manifest.safety_policy || artifacts.input_config?.safety_policy || SAFETY_POLICY_LOW_RISK_ONLY,
-      countExplanation: artifacts.round_analysis?.count_explanation || {},
+      countExplanation,
       modelComparison: summarizeModelComparison(artifacts.model_comparison)
     },
     modelComparison: artifacts.model_comparison || null,
@@ -3275,15 +3280,245 @@ async function persistAnalysisPack(runDir, analysisPack) {
   await writeJson(path.join(runDir, ARTIFACTS.promotion_candidates), makePromotionCandidates());
 }
 
-function buildAiEvidenceBundle({ inputConfig, pageEntries, featurePoints, testCases, executionResults, screenshotsIndex, menuEntries }) {
+const AI_EVIDENCE_SAMPLE_LIMIT = 8;
+const AI_EVIDENCE_ISSUE_LIMIT = 12;
+
+function compactText(value, limit = 180) {
+  const text = normalizeOptionalText(value);
+  if (!text) {
+    return null;
+  }
+  return text.length > limit ? `${text.slice(0, limit)}...` : text;
+}
+
+function compactArray(values, limit = 3, mapper = (item) => item) {
+  return Array.isArray(values)
+    ? values.slice(0, limit).map(mapper).filter((item) => item !== null && item !== undefined)
+    : [];
+}
+
+function compactInputConfigForAi(inputConfig = {}) {
   return {
-    input_config: inputConfig,
-    page_entries: pageEntries.items || [],
-    feature_points: featurePoints.items || [],
-    generated_test_cases: testCases.items || [],
-    execution_results: executionResults.items || [],
-    screenshots: screenshotsIndex.items || screenshotsIndex.screenshots || [],
-    menu_entries: artifactItems(menuEntries, 'items', 'menu_entries'),
+    system_name: inputConfig.system_name || null,
+    entry_url: inputConfig.entry_url || null,
+    execution_mode: inputConfig.execution_mode || null,
+    safety_policy: inputConfig.safety_policy || null,
+    prioritized_targets: compactArray(inputConfig.prioritized_targets, 10, (item) => compactText(item, 80)),
+    waived_targets: compactArray(inputConfig.waived_targets, 10, (item) => compactText(item, 80)),
+    selected_model_profile_ids: compactArray(inputConfig.selected_model_profile_ids, 5, (item) => compactText(item, 80)),
+    max_pages: inputConfig.max_pages || null,
+    max_features_per_page: inputConfig.max_features_per_page || null
+  };
+}
+
+function compactPageEntryForAi(item = {}) {
+  return {
+    page_entry_id: item.page_entry_id || item.id || null,
+    name: compactText(item.name || item.title || item.text, 100),
+    url: compactText(item.url || item.route_hint, 160),
+    menu_path: compactArray(item.menu_path, 5, (part) => compactText(part, 60)),
+    page_type: item.page_type || null,
+    status: item.status || null,
+    source: item.source || null,
+    failure_reason: compactText(item.failure_reason, 120),
+    screenshot_refs: compactArray(item.screenshot_refs, 3, (ref) => compactText(ref, 120))
+  };
+}
+
+function compactFeaturePointForAi(item = {}) {
+  return {
+    feature_point_id: item.feature_point_id || item.feature_id || item.id || null,
+    page_entry_id: item.page_entry_id || null,
+    name: compactText(item.name || item.title || item.text, 100),
+    feature_type: item.feature_type || item.type_template || null,
+    risk_level: item.risk_level || null,
+    auto_verifiable: item.auto_verifiable,
+    verification_strategy: compactText(item.verification_strategy, 120),
+    source: item.source || null,
+    confidence: item.confidence ?? null,
+    review_status: item.review_status || null
+  };
+}
+
+function compactTestCaseForAi(item = {}) {
+  return {
+    test_case_id: item.test_case_id || item.case_id || null,
+    feature_point_id: item.feature_point_id || item.feature_id || null,
+    title: compactText(item.title || item.name, 120),
+    type_template: item.type_template || null,
+    risk_policy: item.risk_policy || null,
+    step_count: Array.isArray(item.steps) ? item.steps.length : 0,
+    expected_feedback_count: Array.isArray(item.expected_feedback) ? item.expected_feedback.length : 0,
+    assertion_count: Array.isArray(item.assertions) ? item.assertions.length : 0,
+    requires_human_confirmation: Boolean(item.requires_human_confirmation)
+  };
+}
+
+function compactExecutionResultForAi(item = {}) {
+  return {
+    test_case_id: item.test_case_id || item.case_id || null,
+    feature_point_id: item.feature_point_id || item.feature_id || null,
+    title: compactText(item.title || item.name, 120),
+    status: item.status || 'unknown',
+    verdict: compactText(item.verdict || item.message, 160),
+    execution_mode: item.execution_mode || null,
+    action_count: Array.isArray(item.actions) ? item.actions.length : 0,
+    page_feedback: compactArray(item.page_feedback, 3, (feedback) => compactText(feedback, 120)),
+    screenshot_refs: compactArray(item.screenshot_refs, 4, (ref) => compactText(ref, 120)),
+    network_ref_count: Array.isArray(item.network_refs) ? item.network_refs.length : 0,
+    failure_reason: compactText(item.failure_reason, 120),
+    manual_confirmation_required: Boolean(item.manual_confirmation_required)
+  };
+}
+
+function compactMenuEntryForAi(item = {}) {
+  return {
+    menu_id: item.menu_id || item.menu_entry_id || item.id || null,
+    text: compactText(item.text || item.name || item.title, 100),
+    level: item.level ?? null,
+    parent_id: item.parent_id || null,
+    menu_path: compactArray(item.menu_path, 5, (part) => compactText(part, 60)),
+    is_leaf: Boolean(item.is_leaf),
+    status: item.status || null,
+    route_hint: compactText(item.route_hint || item.url_after || item.url, 160),
+    failure_reason: compactText(item.failure_reason, 120),
+    screenshot_refs: compactArray(item.screenshot_refs, 3, (ref) => compactText(ref, 120))
+  };
+}
+
+function compactScreenshotForAi(item = {}) {
+  return {
+    screenshot_id: item.screenshot_id || item.id || null,
+    label: compactText(item.label || item.name || item.stage, 120),
+    path: compactText(item.path || item.relative_path || item.file, 160)
+  };
+}
+
+function compactDraftAnalysisForAi(draftAnalysis = {}) {
+  return {
+    schema_version: draftAnalysis.schema_version || null,
+    round_id: draftAnalysis.round_id || null,
+    goal: compactText(draftAnalysis.goal, 200),
+    coverage_summary: draftAnalysis.coverage_summary || {},
+    failure_summary: draftAnalysis.failure_summary || {},
+    not_executed_reasons: compactArray(draftAnalysis.not_executed_reasons, 10, (item) => compactText(item, 100)),
+    evidence_quality: draftAnalysis.evidence_quality || {},
+    human_tasks: compactArray(draftAnalysis.human_tasks, 10, (item) => compactText(item, 100)),
+    improvement_candidates: compactArray(draftAnalysis.improvement_candidates, 10, (item) => ({
+      candidate_id: item.candidate_id || null,
+      scope: item.scope || null,
+      title: compactText(item.title, 140),
+      confidence: item.confidence ?? null,
+      evidence_refs: compactArray(item.evidence_refs, 6, (ref) => compactText(ref, 80))
+    })),
+    scope_targets: compactArray(draftAnalysis.scope_targets, 10, (item) => compactText(item, 100)),
+    missing_scope_targets: compactArray(draftAnalysis.missing_scope_targets, 10, (item) => compactText(item, 100)),
+    uncovered_scope_targets: compactArray(draftAnalysis.uncovered_scope_targets, 10, (item) => compactText(item, 100)),
+    target_tracking: compactArray(draftAnalysis.target_tracking, 10, (item) => ({
+      target: compactText(item.target, 100),
+      status: item.status || null,
+      waived: Boolean(item.waived),
+      evidence_quality: item.evidence_quality || null,
+      missed_reason: compactText(item.missed_reason, 120)
+    })),
+    count_explanation: draftAnalysis.count_explanation || {},
+    confidence: draftAnalysis.confidence ?? null
+  };
+}
+
+function summarizeFailureGroupsForAi(executionItems = []) {
+  const groups = new Map();
+  for (const item of executionItems) {
+    const status = item.status || 'unknown';
+    const reason = item.failure_reason || (
+      ['passed', 'real_passed', 'side_effect_executed'].includes(status)
+        ? null
+        : status
+    );
+    if (!reason && !item.manual_confirmation_required) {
+      continue;
+    }
+    const key = reason || 'manual_confirmation_required';
+    const group = groups.get(key) || {
+      reason: key,
+      count: 0,
+      statuses: {},
+      test_case_ids: [],
+      feature_point_ids: []
+    };
+    group.count += 1;
+    group.statuses[status] = (group.statuses[status] || 0) + 1;
+    if (group.test_case_ids.length < 8 && item.test_case_id) {
+      group.test_case_ids.push(item.test_case_id);
+    }
+    if (group.feature_point_ids.length < 8 && (item.feature_point_id || item.feature_id)) {
+      group.feature_point_ids.push(item.feature_point_id || item.feature_id);
+    }
+    groups.set(key, group);
+  }
+  return [...groups.values()]
+    .sort((a, b) => b.count - a.count)
+    .slice(0, AI_EVIDENCE_ISSUE_LIMIT);
+}
+
+function pickExecutionSamplesForAi(executionItems = []) {
+  const priority = executionItems.filter((item) => {
+    const status = item.status || '';
+    return item.failure_reason
+      || item.manual_confirmation_required
+      || /failed|skipped|blocked|review|timeout|error/i.test(status);
+  });
+  const seen = new Set();
+  return priority.concat(executionItems)
+    .filter((item) => {
+      const id = item.test_case_id || item.case_id || `${item.feature_point_id || ''}:${item.title || item.name || ''}`;
+      if (seen.has(id)) {
+        return false;
+      }
+      seen.add(id);
+      return true;
+    })
+    .slice(0, AI_EVIDENCE_SAMPLE_LIMIT)
+    .map(compactExecutionResultForAi);
+}
+
+function buildAiEvidenceBundle({ inputConfig, pageEntries, featurePoints, testCases, executionResults, screenshotsIndex, menuEntries }) {
+  const pageEntryItems = pageEntries.items || [];
+  const featureItems = featurePoints.items || [];
+  const testCaseItems = testCases.items || [];
+  const executionItems = executionResults.items || [];
+  const screenshotItems = screenshotsIndex.items || screenshotsIndex.screenshots || [];
+  const menuEntryItems = artifactItems(menuEntries, 'items', 'menu_entries');
+  return {
+    evidence_summary: {
+      input_config: compactInputConfigForAi(inputConfig),
+      counts: {
+        page_entries: pageEntryItems.length,
+        feature_points: featureItems.length,
+        generated_test_cases: testCaseItems.length,
+        execution_results: executionItems.length,
+        screenshots: screenshotItems.length,
+        menu_entries: menuEntryItems.length
+      },
+      execution: summarizeExecution(executionItems),
+      failure_groups: summarizeFailureGroupsForAi(executionItems)
+    },
+    page_entries: pageEntryItems.slice(0, AI_EVIDENCE_SAMPLE_LIMIT).map(compactPageEntryForAi),
+    feature_points: featureItems.slice(0, AI_EVIDENCE_SAMPLE_LIMIT).map(compactFeaturePointForAi),
+    generated_test_cases: testCaseItems.slice(0, AI_EVIDENCE_SAMPLE_LIMIT).map(compactTestCaseForAi),
+    execution_results: pickExecutionSamplesForAi(executionItems),
+    screenshots: screenshotItems.slice(0, AI_EVIDENCE_SAMPLE_LIMIT).map(compactScreenshotForAi),
+    menu_entries: menuEntryItems.slice(0, AI_EVIDENCE_SAMPLE_LIMIT).map(compactMenuEntryForAi),
+    artifact_refs: [
+      { key: 'input_config', artifact: 'input_config.json' },
+      { key: 'page_entries', artifact: 'page_entries.json' },
+      { key: 'feature_points', artifact: 'feature_points.json' },
+      { key: 'generated_test_cases', artifact: 'generated_test_cases.json' },
+      { key: 'execution_results', artifact: 'execution_results.json' },
+      { key: 'screenshots_index', artifact: 'screenshots_index.json' },
+      { key: 'menu_entries', artifact: 'menu_entries.json' },
+      { key: 'page_exploration_log', artifact: 'page_exploration_log.jsonl' }
+    ],
     allowed_evidence_refs: [
       'input_config',
       'page_entries',
@@ -3388,7 +3623,7 @@ async function defaultAiReviewRunner({ modelProfile, evidenceBundle, draftAnalys
               next_round_recommendations: ['string']
             },
             evidence_bundle: evidenceBundle,
-            draft_analysis: draftAnalysis,
+            draft_analysis: compactDraftAnalysisForAi(draftAnalysis),
             draft_next_round_plan: draftNextRoundPlan
           })
         }]
@@ -3581,6 +3816,9 @@ async function analyzeV3Run(runId, options = {}) {
   await persistAnalysisPack(runDir, analysisPack);
   const aiAssisted = analysisPack.analysis.analysis_mode === 'ai_assisted_review'
     && analysisPack.analysis.ai_provider_status === 'completed';
+  const aiReviewErrorMessage = !aiAssisted
+    ? normalizeOptionalText((analysisPack.analysis.review_errors || [])[0]?.message)
+    : '';
   const saved = await updateRunStatus(
     runDir,
     manifest,
@@ -3588,7 +3826,7 @@ async function analyzeV3Run(runId, options = {}) {
     aiAssisted ? 'ai_round_analysis' : 'rule_round_analysis',
     aiAssisted
       ? 'AI 复盘产物已生成，并已绑定支持证据。'
-      : '规则复盘产物已生成；AI 复盘不可用或已降级。',
+      : `规则复盘产物已生成；AI 复盘不可用或已降级${aiReviewErrorMessage ? `：${aiReviewErrorMessage}` : '。'}`,
     { decision: analysisPack.nextRoundPlan.decision }
   );
   const run = buildPublicRun(runDir, saved, await loadRunArtifacts(runDir));

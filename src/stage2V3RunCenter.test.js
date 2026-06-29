@@ -680,7 +680,7 @@ test('stage2 v3 run center exposes first-round menu discovery separately from br
     assert.equal(started.run.summary.materializedPageEntries, 1);
     assert.equal(started.run.summary.menuRoots, 3);
     assert.equal(started.run.summary.browserTargets, 0);
-    assert.equal(started.run.summary.pageEntries, 1);
+    assert.equal(started.run.summary.pageEntries, 2);
 
     const run = await getV3Run(created.run.runId, { runsDir });
     assert.equal(run.artifacts.menu_tree.root_count, 3);
@@ -734,9 +734,50 @@ test('stage2 v3 run center explains menu leaf candidates when Python times out b
     assert.equal(publicRun.run.summary.menuLeaves, 7);
     assert.equal(publicRun.run.summary.candidatePageEntries, 7);
     assert.equal(publicRun.run.summary.materializedPageEntries, 1);
-    assert.equal(publicRun.run.summary.pageEntries, 1);
+    assert.equal(publicRun.run.summary.pageEntries, 7);
     assert.match(publicRun.run.summary.countExplanation.candidate_page_entries, /7 candidate page entries/);
     assert.match(publicRun.run.summary.countExplanation.page_entries_vs_candidates, /1 materialized page entries/);
+  });
+});
+
+test('stage2 v3 public summary shows menu leaf page candidates during first-round discovery', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理平台',
+      entryUrl: 'https://www.zbsykj.com:19096/index',
+      cdpUrl: 'http://localhost:9222',
+      executionMode: 'real_browser',
+      prioritizedTargets: ['线上备案申请']
+    }, { runsDir });
+    const runDir = path.join(runsDir, created.run.runId);
+    await fs.writeFile(path.join(runDir, 'menu_entries.json'), JSON.stringify({
+      schema_version: 'stage2_menu_entries.v1',
+      leaf_count: 7,
+      items: [
+        { menu_id: 'menu_home', text: '首页', level: 1, is_leaf: true, route_hint: 'https://www.zbsykj.com:19096/index' },
+        { menu_id: 'menu_apply', text: '线上备案申请', level: 2, is_leaf: true, route_hint: 'https://www.zbsykj.com:19096/record/online' },
+        { menu_id: 'menu_purchase', text: '收购溯源', level: 2, is_leaf: true, route_hint: 'https://www.zbsykj.com:19096/traceability/purchase' },
+        { menu_id: 'menu_production', text: '饮片生产', level: 2, is_leaf: true, route_hint: 'https://www.zbsykj.com:19096/traceability/production' },
+        { menu_id: 'menu_sale', text: '销售溯源', level: 2, is_leaf: true, route_hint: 'https://www.zbsykj.com:19096/traceability/sale' },
+        { menu_id: 'menu_bonsai', text: '盆景溯源', level: 2, is_leaf: true, route_hint: 'https://www.zbsykj.com:19096/traceability/bonsai' },
+        { menu_id: 'menu_notice', text: '通知列表', level: 2, is_leaf: true, route_hint: 'https://www.zbsykj.com:19096/zwsy/notice/noticeItem' },
+        { menu_id: 'menu_notice_root', text: '通知公告管理', level: 1, is_leaf: false },
+        { menu_id: 'menu_trace_root', text: '溯源管理', level: 1, is_leaf: false },
+        { menu_id: 'menu_apply_root', text: '备案管理', level: 1, is_leaf: false }
+      ]
+    }, null, 2));
+    await fs.writeFile(path.join(runDir, 'page_entries.json'), JSON.stringify({
+      schema_version: 'stage2_page_entries.v3',
+      items: []
+    }, null, 2));
+
+    const publicRun = await getV3Run(created.run.runId, { runsDir });
+    assert.equal(publicRun.run.summary.menuEntries, 10);
+    assert.equal(publicRun.run.summary.menuLeaves, 7);
+    assert.equal(publicRun.run.summary.candidatePageEntries, 7);
+    assert.equal(publicRun.run.summary.materializedPageEntries, 0);
+    assert.equal(publicRun.run.summary.pageEntries, 7);
+    assert.match(publicRun.run.summary.countExplanation.candidate_page_entries, /7 candidate page entries/);
   });
 });
 
@@ -2465,6 +2506,156 @@ test('stage2 v3 run center uses configured OpenAI-compatible model for AI round 
   });
 });
 
+test('stage2 v3 AI round review sends compact artifact-backed evidence for large runs', async () => {
+  await withFakeAiReviewServer({
+    analysis_mode: 'ai_assisted_review',
+    confidence: 0.84,
+    coverage_summary: { summary: '模型已基于摘要证据完成复盘。' },
+    failure_summary: { summary: '仅少量跳过项需要人工复核。' },
+    evidence_quality: { status: 'partial' },
+    improvement_candidates: [{
+      candidate_id: 'trim_review_payload',
+      title: '复盘请求应使用摘要证据和 artifact 引用',
+      evidence_refs: ['execution_results']
+    }],
+    learned_rules: ['AI 复盘应引用 artifact，而不是接收完整大数组。'],
+    next_round_recommendations: ['继续观察跳过项']
+  }, async (baseUrl, requests) => {
+    await withTempRunsDir(async (runsDir) => {
+      const configPath = path.join(runsDir, 'stage2-model-profiles.json');
+      await fs.writeFile(configPath, JSON.stringify({
+        schema_version: 'stage2_model_profiles.v1',
+        profiles: [{
+          id: 'local_qwen',
+          label: 'local_qwen',
+          provider: 'openai_compatible',
+          baseUrl,
+          apiKey: 'test-key',
+          model: 'qwen-review'
+        }]
+      }, null, 2));
+
+      const created = await createV3Run({
+        systemName: 'AI 大证据复盘系统',
+        entryUrl: 'https://example.com/home',
+        cdpUrl: 'http://localhost:9222',
+        modelProfileIds: ['local_qwen']
+      }, { runsDir, modelProfileConfigPath: configPath });
+      await startV3Run(created.run.runId, { executionMode: 'contract_only' }, { runsDir });
+
+      const runDir = path.join(runsDir, created.run.runId);
+      const pageItems = Array.from({ length: 7 }, (_, index) => ({
+        page_entry_id: `page_${String(index + 1).padStart(3, '0')}`,
+        name: `页面 ${index + 1}`,
+        url: `https://example.com/page/${index + 1}`,
+        menu_path: ['业务菜单', `页面 ${index + 1}`],
+        page_type: 'query_list',
+        status: 'reachable',
+        source: 'playwright.page_exploration',
+        screenshot_refs: [`page_${index + 1}_entry`]
+      }));
+      const featureItems = Array.from({ length: 70 }, (_, index) => {
+        const id = String(index + 1).padStart(3, '0');
+        return {
+          feature_point_id: `feature_${id}`,
+          page_entry_id: pageItems[index % pageItems.length].page_entry_id,
+          name: `功能点 ${id}`,
+          feature_type: index % 10 === 0 ? 'create' : 'navigation',
+          risk_level: index % 10 === 0 ? 'medium' : 'low',
+          auto_verifiable: true,
+          verification_strategy: 'default_visible_or_light_interaction',
+          locator_candidates: [{
+            selector: `[data-test="feature-${id}"]`,
+            raw_dom_debug: `raw_dom_payload_${id}_${'x'.repeat(1200)}`
+          }],
+          source: 'playwright.dom_scan',
+          confidence: 0.8,
+          review_status: 'auto_included'
+        };
+      });
+      const caseItems = featureItems.map((feature, index) => {
+        const id = String(index + 1).padStart(3, '0');
+        return {
+          test_case_id: `case_${id}`,
+          feature_point_id: feature.feature_point_id,
+          title: `验证 ${feature.name}`,
+          type_template: feature.feature_type,
+          preconditions: ['已登录'],
+          steps: [{
+            action: 'click',
+            target: feature.name,
+            raw_instruction_debug: `case_raw_payload_${id}_${'y'.repeat(1000)}`
+          }],
+          expected_feedback: ['入口可见或流程可走通'],
+          risk_policy: 'safe_auto',
+          assertions: ['visible'],
+          requires_human_confirmation: false
+        };
+      });
+      const executionItems = caseItems.map((testCase, index) => {
+        const id = String(index + 1).padStart(3, '0');
+        return {
+          test_case_id: testCase.test_case_id,
+          feature_point_id: testCase.feature_point_id,
+          title: testCase.title,
+          status: index === 18 || index === 49 || index === 65 ? 'skipped_not_observed' : 'real_passed',
+          verdict: '基础路径可走通',
+          actions: [{
+            action: 'click',
+            target: testCase.title,
+            debug_trace: `execution_raw_payload_${id}_${'z'.repeat(1000)}`
+          }],
+          page_feedback: ['功能点入口可见。'],
+          screenshot_refs: ['menu_initial', `case_${id}_after_action`],
+          failure_reason: index === 18 || index === 49 || index === 65 ? 'not_observed' : null,
+          manual_confirmation_required: false,
+          execution_mode: 'real_browser'
+        };
+      });
+
+      await fs.writeFile(path.join(runDir, 'page_entries.json'), JSON.stringify({
+        schema_version: 'stage2_page_entries.v3',
+        items: pageItems
+      }, null, 2));
+      await fs.writeFile(path.join(runDir, 'feature_points.json'), JSON.stringify({
+        schema_version: 'stage2_feature_points.v3',
+        items: featureItems
+      }, null, 2));
+      await fs.writeFile(path.join(runDir, 'generated_test_cases.json'), JSON.stringify({
+        schema_version: 'stage2_generated_test_cases.v3',
+        items: caseItems
+      }, null, 2));
+      await fs.writeFile(path.join(runDir, 'execution_results.json'), JSON.stringify({
+        schema_version: 'stage2_execution_results.v3',
+        items: executionItems
+      }, null, 2));
+      await fs.writeFile(path.join(runDir, 'screenshots_index.json'), JSON.stringify({
+        schema_version: 'stage2_screenshots_index.v3',
+        items: Array.from({ length: 17 }, (_, index) => ({
+          screenshot_id: `shot_${String(index + 1).padStart(3, '0')}`,
+          label: `截图 ${index + 1}`,
+          path: `screenshots/shot_${index + 1}.png`
+        }))
+      }, null, 2));
+
+      await analyzeV3Run(created.run.runId, {
+        runsDir,
+        modelProfileConfigPath: configPath
+      });
+
+      assert.equal(requests.length, 1);
+      const prompt = requests[0].messages.at(-1).content;
+      assert.ok(prompt.length < 60000, `AI review prompt should stay compact, got ${prompt.length} chars`);
+      assert.match(prompt, /evidence_summary/);
+      assert.match(prompt, /artifact_refs/);
+      assert.match(prompt, /execution_results/);
+      assert.doesNotMatch(prompt, /raw_dom_payload_070/);
+      assert.doesNotMatch(prompt, /case_raw_payload_070/);
+      assert.doesNotMatch(prompt, /execution_raw_payload_070/);
+    });
+  });
+});
+
 test('stage2 v3 run center degrades AI review to rule review when model is unavailable or output is invalid', async () => {
   await withTempRunsDir(async (runsDir) => {
     const created = await createV3Run({
@@ -2548,7 +2739,7 @@ test('stage2 v3 run center can AI-review a failed real browser run and persist d
     });
     const roundAnalysis = await readJson(path.join(runsDir, created.run.runId, 'round_analysis.json'));
 
-    assert.equal(analyzed.operation.message, '规则复盘产物已生成；AI 复盘不可用或已降级。');
+    assert.equal(analyzed.operation.message, '规则复盘产物已生成；AI 复盘不可用或已降级：review model unavailable');
     assert.equal(roundAnalysis.ai_provider_status, 'ai_review_failed');
     assert.equal(roundAnalysis.review_errors[0].code, 'ai_review_failed');
     assert.match(roundAnalysis.review_errors[0].message, /review model unavailable/);

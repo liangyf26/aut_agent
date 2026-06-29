@@ -146,6 +146,10 @@ _Avoid_: 只看首页表单、只看浏览器窗口、把 run 产物散落在多
 人工录制会话在候选模板草稿之外额外生成的审阅型结构化产物，当前原型对应 `candidate_template_review.json`。它面向项目实施者确认字段映射、alias 草案、候选定位器和项目字段上下文，而不是直接拿来执行。
 _Avoid_: 最终模板、直接执行脚本、只看草稿不看映射确认
 
+**控件原生交互优先 (Native Control Interaction First)**:
+真实浏览器执行表单时，对下拉列表、日期选择器、多级下拉/cascader、上传控件等复合控件，必须优先通过控件本身的点击、展开、选择、上传流程完成。通用文本预填只能作用于普通输入框；复合控件不能先写入“测试数据”等自由文本，因为最终校验通常要求值来自控件选项或上传状态。
+_Avoid_: 文本硬填下拉值、直接写日期字符串、中间层 cascader 当作完成、按帮助说明而非字段 label 选择上传文件
+
 **模板 bootstrap 草稿 (Template Bootstrap Scaffold)**:
 第二阶段为具体目标页面收敛模板时提供的最小骨架。当前通过 `python -m prototype.stage2.main --bootstrap-template ...` 生成，自动创建 `template.json`、`baseline.json`、`data_schema.json`、`locator_hints.json`，通常在系统地图探索之后使用，用于把已选页面正式收敛为模板。
 _Avoid_: 最终模板、完整自动生成模板、一步到位的回归脚本

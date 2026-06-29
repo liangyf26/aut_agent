@@ -1577,7 +1577,9 @@ function normalizeStage2Run(run = {}, source = 'v3') {
       menuLeaves: Number(stats.menuLeaves ?? stats.menu_leaves ?? run.menuLeafCount ?? run.menu_leaf_count ?? 0),
       menuRoots: Number(stats.menuRoots ?? stats.menu_roots ?? run.menuRootCount ?? run.menu_root_count ?? 0),
       browserTargets: Number(stats.browserTargets ?? stats.browser_targets ?? run.browserTargetCount ?? run.browser_target_count ?? 0),
-      pages: Number(stats.pageEntries ?? stats.pages ?? run.pageCount ?? run.page_count ?? toArrayItems(run.pageEntries || run.page_entries).length ?? 0),
+      candidatePages: Number(stats.candidatePageEntries ?? stats.candidate_page_entries ?? stats.pageEntries ?? stats.pages ?? run.pageCount ?? run.page_count ?? toArrayItems(run.pageEntries || run.page_entries).length ?? 0),
+      materializedPages: Number(stats.materializedPageEntries ?? stats.materialized_page_entries ?? stats.pageEntries ?? stats.pages ?? run.pageCount ?? run.page_count ?? toArrayItems(run.pageEntries || run.page_entries).length ?? 0),
+      pages: Number(stats.candidatePageEntries ?? stats.candidate_page_entries ?? stats.pageEntries ?? stats.pages ?? run.pageCount ?? run.page_count ?? toArrayItems(run.pageEntries || run.page_entries).length ?? 0),
       features: Number(stats.featurePoints ?? stats.features ?? run.featureCount ?? run.feature_count ?? toArrayItems(run.featurePoints || run.feature_points).length ?? 0),
       cases: Number(stats.testCases ?? stats.cases ?? run.caseCount ?? run.case_count ?? toArrayItems(run.generatedTestCases || run.generated_test_cases).length ?? 0),
       executed: Number(executionStats.total ?? stats.executed ?? stats.executedCount ?? stats.executionCount ?? run.executedCount ?? 0),
@@ -1956,9 +1958,12 @@ function renderStage2MetricCards(run) {
   const counts = run?.counts || {};
   const executionTotal = Number(counts.executed || 0);
   const passRate = executionTotal ? `${Math.round((Number(counts.passed || 0) / executionTotal) * 100)}%` : '-';
+  const materializedNote = Number(counts.candidatePages || 0) > Number(counts.materializedPages || 0)
+    ? `已物化 ${counts.materializedPages || 0} / 浏览器 target ${counts.browserTargets || 0}`
+    : `浏览器 target ${counts.browserTargets || 0}`;
   const items = [
     ['菜单入口', counts.menus || 0, `${counts.menuRoots || 0} 一级 / ${counts.menuLeaves || 0} 叶子`],
-    ['页面入口', counts.pages || 0, `浏览器 target ${counts.browserTargets || 0}`],
+    ['页面入口', counts.pages || 0, materializedNote],
     ['功能点', counts.features || 0, '可测交互目标'],
     ['执行用例', counts.cases || 0, '按类型生成'],
     ['已执行', executionTotal || 0, `${counts.failed || 0} 失败 / ${counts.skipped || 0} 跳过`],

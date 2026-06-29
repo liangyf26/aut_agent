@@ -638,15 +638,17 @@ def test_online_apply_upload_samples_are_real_named_files() -> None:
     try:
         samples = _ensure_online_apply_upload_samples(tmp_dir)
 
-        assert set(samples) == {"personnel", "image", "attachment", "acceptance"}
+        assert set(samples) == {"personnel", "image", "attachment", "acceptance", "application"}
         assert samples["personnel"].name == "人员信息表1.xls"
         assert samples["image"].name == "备案图片01.jpg"
         assert samples["attachment"].name == "附件11.doc"
         assert samples["acceptance"].name == "验收文件00.pdf"
+        assert samples["application"].name == "备案申请表.pdf"
         assert samples["personnel"].read_bytes().startswith(b"PK")
         assert samples["image"].read_bytes().startswith(b"\xff\xd8")
         assert samples["attachment"].read_bytes().startswith(b"PK")
         assert samples["acceptance"].read_bytes().startswith(b"%PDF")
+        assert samples["application"].read_bytes().startswith(b"%PDF")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -719,6 +721,16 @@ def test_online_apply_prefill_avoids_text_filling_for_dropdown_date_and_cascader
     assert "const isWidgetInput = Boolean(el.closest('.el-select,.el-cascader'))" in prefill_block
 
 
+def test_online_apply_prefill_avoids_unknown_text_for_labeled_dropdown_controls() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    prefill_block = source[source.index("async def prefill_visible_online_apply_fields") : source.index("@tools.action(description=\"[脚本内部工具] 预填写表单")]
+
+    assert "const looksLikeChoiceField" in prefill_block
+    assert "验收监管单位" in prefill_block
+    assert "备案品种" in prefill_block
+    assert "if (el.disabled || !el.offsetParent || isWidgetInput || isDateInput || isChoiceField || el.readOnly)" in prefill_block
+
+
 def test_online_apply_date_repair_uses_picker_selection_instead_of_text_fill() -> None:
     source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
     repair_block = source[source.index("async def repair_online_apply_required_fields") : source.index("async def prefill_visible_online_apply_fields")]
@@ -730,6 +742,15 @@ def test_online_apply_date_repair_uses_picker_selection_instead_of_text_fill() -
     assert "setItemInput([/验收日期/], '2026-06-15', 'dates');" not in repair_block
     assert ".el-picker-panel" in repair_block
     assert "await day_cell.click(timeout=2500)" in repair_block
+
+
+def test_online_apply_date_repair_skips_dates_that_already_have_values() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    repair_block = source[source.index("async def repair_online_apply_required_fields") : source.index("async def prefill_visible_online_apply_fields")]
+
+    assert "existing_value = _text(await input_locator.input_value(timeout=800))" in repair_block
+    assert '"skipped": "already_selected"' in repair_block
+    assert "if existing_value:" in repair_block
 
 
 def test_online_apply_repair_block_defines_its_own_visible_text_helper() -> None:
@@ -778,6 +799,26 @@ def test_browser_use_handover_mentions_four_upload_slots_with_matching_files() -
     assert "备案图片 jpg" in task
     assert "附件 doc" in task
     assert "验收文件 pdf" in task
+
+
+def test_browser_use_handover_defines_final_record_dialog_tool_without_native_file_picker() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    task = _browser_use_handover_task(
+        V3RunConfig(
+            start_url="https://www.zbsykj.com:19096/index",
+            safety_policy=TEST_ENV_FULL_ACCESS_POLICY,
+            allowed_side_effect_actions=["create", "submit", "save"],
+        ),
+        ["线上备案申请"],
+        [{"target": "线上备案申请", "reason": "target_page_uncovered"}],
+    )
+
+    assert "async def script_complete_final_record_dialog" in source
+    assert "complete_online_apply_final_record_dialog" in source
+    assert "备案申请表.pdf" in source
+    assert "set_input_files" in source
+    assert "不要点击弹窗里的“上传文件”按钮" in task
+    assert "script_complete_final_record_dialog" in task
 
 
 def test_online_apply_upload_mapping_prefers_pdf_for_acceptance_and_doc_for_attachment() -> None:

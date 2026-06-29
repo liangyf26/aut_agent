@@ -35,6 +35,7 @@ def _ensure_online_apply_upload_samples(run_dir: Path) -> dict[str, Path]:
         "image": samples_dir / "备案图片01.jpg",
         "attachment": samples_dir / "附件11.doc",
         "acceptance": samples_dir / "验收文件00.pdf",
+        "application": samples_dir / "备案申请表.pdf",
     }
     if not files["personnel"].exists():
         with zipfile.ZipFile(files["personnel"], "w", compression=zipfile.ZIP_DEFLATED) as workbook:
@@ -114,6 +115,13 @@ def _ensure_online_apply_upload_samples(run_dir: Path) -> dict[str, Path]:
             )
     if not files["acceptance"].exists():
         files["acceptance"].write_bytes(
+            b"%PDF-1.4\n"
+            b"1 0 obj<<>>endobj\n"
+            b"2 0 obj<< /Length 0 >>stream\nendstream\nendobj\n"
+            b"trailer<<>>\n%%EOF\n"
+        )
+    if not files["application"].exists():
+        files["application"].write_bytes(
             b"%PDF-1.4\n"
             b"1 0 obj<<>>endobj\n"
             b"2 0 obj<< /Length 0 >>stream\nendstream\nendobj\n"
@@ -1258,6 +1266,17 @@ async def _run_browser_use_target_handover(
                         repaired.append({"label": label, "ok": False, "reason": "date_input_not_found"})
                         continue
                     try:
+                        existing_value = _text(await input_locator.input_value(timeout=800))
+                        if existing_value:
+                            repaired.append(
+                                {
+                                    "label": label,
+                                    "ok": True,
+                                    "value": existing_value,
+                                    "skipped": "already_selected",
+                                }
+                            )
+                            continue
                         await input_locator.scroll_into_view_if_needed(timeout=1500)
                         await input_locator.click(timeout=2500)
                         await target_page.wait_for_timeout(300)
@@ -1325,6 +1344,20 @@ async def _run_browser_use_target_handover(
                       const item = el.closest('.el-form-item');
                       return (item && (item.innerText || item.textContent) || '').trim();
                     };
+                    const looksLikeChoiceField = (el) => {
+                      const label = labelText(el);
+                      const placeholder = (el.getAttribute('placeholder') || '').trim();
+                      const classText = [
+                        el.className || '',
+                        el.parentElement && el.parentElement.className || '',
+                        el.closest('.el-form-item') && el.closest('.el-form-item').className || ''
+                      ].join(' ');
+                      return /验收监管单位|监管单位|备案品种|备案类型|育苗方式|育苗目的|育苗地址|育苗地点/.test(label)
+                        || /请选择|选择|下拉/.test(placeholder)
+                        || /\bel-select\b|\bel-cascader\b|select|cascader/i.test(classText)
+                        || el.getAttribute('role') === 'combobox'
+                        || el.getAttribute('aria-haspopup') === 'listbox';
+                    };
                     const valueFor = (el) => {
                       const label = labelText(el);
                       const type = (el.type || 'text').toLowerCase();
@@ -1340,7 +1373,8 @@ async def _run_browser_use_target_handover(
                     fields.forEach((el) => {
                       const isWidgetInput = Boolean(el.closest('.el-select,.el-cascader'));
                       const isDateInput = Boolean(el.closest('.el-date-editor'));
-                      if (el.disabled || !el.offsetParent || isWidgetInput || isDateInput || el.readOnly) {
+                      const isChoiceField = looksLikeChoiceField(el);
+                      if (el.disabled || !el.offsetParent || isWidgetInput || isDateInput || isChoiceField || el.readOnly) {
                         results.skipped += 1;
                         return;
                       }
@@ -1521,6 +1555,83 @@ async def _run_browser_use_target_handover(
                 "input_count": input_count,
             }
 
+        async def complete_online_apply_final_record_dialog(target_page: Any) -> dict[str, Any]:
+            samples = _ensure_online_apply_upload_samples(run_dir)
+            dialog = target_page.locator(
+                ".el-message-box__wrapper:visible, .el-dialog:visible, "
+                ".el-overlay:visible .el-dialog"
+            ).last
+            if not await dialog.count():
+                return {"ok": False, "reason": "final_dialog_not_found"}
+
+            async def dialog_text() -> str:
+                with suppress(Exception):
+                    return _text(await dialog.inner_text(timeout=800))
+                return ""
+
+            text = await dialog_text()
+            if text and not re.search(r"备案登记|监管单位|申请表|提交备案", text):
+                return {"ok": False, "reason": "not_final_record_dialog", "dialog_text": text[:120]}
+
+            unit_result: dict[str, Any] = {"ok": False, "reason": "unit_field_not_found"}
+            with suppress(Exception):
+                select_trigger = dialog.locator(
+                    "[role=combobox], input[placeholder*='请选择'], "
+                    ".el-select .el-input__wrapper, .el-select"
+                ).first
+                if await select_trigger.count():
+                    await select_trigger.scroll_into_view_if_needed(timeout=1500)
+                    await select_trigger.click(timeout=2500)
+                    await target_page.wait_for_timeout(350)
+                    options = target_page.locator(
+                        ".el-select-dropdown .el-select-dropdown__item:not(.is-disabled), "
+                        "[role=option]:not(.is-disabled)"
+                    )
+                    option_count = await options.count()
+                    for index in range(option_count):
+                        option = options.nth(index)
+                        option_text = _text(await option.inner_text(timeout=800))
+                        if option_text and not re.search(r"请选择|全部", option_text):
+                            await option.scroll_into_view_if_needed(timeout=1500)
+                            await option.click(timeout=2500)
+                            unit_result = {"ok": True, "selected": option_text}
+                            await target_page.wait_for_timeout(300)
+                            break
+                    if not unit_result.get("ok"):
+                        unit_result = {"ok": False, "reason": "unit_option_not_found"}
+
+            file_inputs = dialog.locator("input[type=file]")
+            file_input_count = await file_inputs.count()
+            upload_result: dict[str, Any] = {"ok": False, "reason": "file_input_not_found", "input_count": file_input_count}
+            if file_input_count:
+                file_input = file_inputs.first
+                await file_input.set_input_files(str(samples["application"]), timeout=8000)
+                upload_result = {
+                    "ok": True,
+                    "file_name": samples["application"].name,
+                    "input_count": file_input_count,
+                }
+
+            submit_result: dict[str, Any] = {"ok": False, "reason": "submit_button_not_found"}
+            buttons = dialog.locator("button,[role=button],input[type=submit]")
+            button_count = await buttons.count()
+            for index in range(button_count):
+                button = buttons.nth(index)
+                button_text = _text(await button.inner_text(timeout=800))
+                if button_text and re.search(r"提交备案|提交|确定", button_text):
+                    await button.scroll_into_view_if_needed(timeout=1500)
+                    await button.click(timeout=2500)
+                    submit_result = {"ok": True, "clicked": button_text}
+                    await target_page.wait_for_timeout(500)
+                    break
+
+            return {
+                "ok": bool(unit_result.get("ok") and upload_result.get("ok") and submit_result.get("ok")),
+                "unit": unit_result,
+                "upload": upload_result,
+                "submit": submit_result,
+            }
+
         @tools.action(description="[脚本内部工具] 上传线上备案申请 4 处所需样本文件：人员信息表 xls、备案图片 jpg、附件 doc、验收文件 pdf。Agent 不需要传参数。")
         async def script_upload_sample_files() -> str:
             async def run() -> str:
@@ -1536,6 +1647,14 @@ async def _run_browser_use_target_handover(
                 return json.dumps(await repair_online_apply_required_fields(target_page), ensure_ascii=False)
 
             return await timed_tool("script_repair_required_fields", run)
+
+        @tools.action(description="[脚本内部工具] 完成最终备案提交弹窗：选择备案登记/监管单位、用 set_input_files 上传备案申请表.pdf 并点击提交备案。Agent 不需要传参数。")
+        async def script_complete_final_record_dialog() -> str:
+            async def run() -> str:
+                target_page = await current_browser_page()
+                return json.dumps(await complete_online_apply_final_record_dialog(target_page), ensure_ascii=False)
+
+            return await timed_tool("script_complete_final_record_dialog", run)
 
         @tools.action(description="[脚本内部工具] 提交当前表单，优先点击包含“纳入、提交、确定”的按钮。Agent 不需要传参数。")
         async def script_submit_form() -> str:
@@ -1724,9 +1843,10 @@ def _browser_use_handover_task(
 6. 如果页面出现“育苗方式”下拉框，测试数据默认走低前置数据分支：不要选择“种子繁殖”，因为它会要求填写“种子采集许可证号”；优先选择“分蘗繁殖”“分蘖繁殖”“炼苗”或“其他”等不需要许可证的选项。遇到“育苗地点”这类城市/城区/社区三级控件时，不要手工逐项尝试，不要反复手工点击 cascader，直接依赖 script_prefill_form 内置的 Playwright cascader 选择。
 7. 文件上传必须调用 script_upload_sample_files，它会按控件附近的标签完成 4 处上传，分别使用真实样本文件：人员信息表 xls、备案图片 jpg、附件 doc、验收文件 pdf。不要用 evaluate/JS 构造 File 对象，不要反复尝试手工文件上传；同一上传位已有文件时不要重复上传。
 8. 下拉项和文件上传完成后必须调用 script_submit_form，最终提交一次备案申请；不要停在只看见按钮或只打开表单。
-9. 如果提交后出现“育苗开始日期、验收监管单位、验收日期、验收文件”等红字必填错误，调用 script_repair_required_fields 修复一次，再调用 script_submit_form 重试一次；如果仍有红字必填错误，记录失败原因并结束本轮，不要再自行编写 evaluate/JS 或 write_file 脚本，不要进入重复兜底循环。
-10. 每次关键动作后调用 get_page_feedback，记录 URL、页面文本、错误信息和成功反馈。
-11. 最后用可读文本总结：是否进入目标页面、是否点击“我要申请备案”、填写字段数量、上传文件数量、提交次数、最终页面反馈和失败原因。
+9. 如果 script_submit_form 后弹出要求选择“备案登记/监管单位”并上传申请表的最终提交弹窗，必须调用 script_complete_final_record_dialog；不要点击弹窗里的“上传文件”按钮，不要打开原生文件选择窗口，不要用 evaluate/JS 构造 File 对象。
+10. 如果提交后出现“育苗开始日期、验收监管单位、验收日期、验收文件”等红字必填错误，调用 script_repair_required_fields 修复一次，再调用 script_submit_form 重试一次；如果仍有红字必填错误，记录失败原因并结束本轮，不要再自行编写 evaluate/JS 或 write_file 脚本，不要进入重复兜底循环。
+11. 每次关键动作后调用 get_page_feedback，记录 URL、页面文本、错误信息和成功反馈。
+12. 最后用可读文本总结：是否进入目标页面、是否点击“我要申请备案”、填写字段数量、上传文件数量、提交次数、最终页面反馈和失败原因。
 """
 
 
