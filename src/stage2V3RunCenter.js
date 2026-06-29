@@ -134,6 +134,14 @@ function normalizeOptionalText(value) {
   return text || null;
 }
 
+function roundDisplayName(roundId) {
+  const match = String(roundId || '').match(/(\d+)$/);
+  if (!match) {
+    return '本轮';
+  }
+  return `第 ${Number(match[1])} 轮`;
+}
+
 function formatErrorWithCause(error) {
   const message = error?.message || String(error || 'unknown error');
   const cause = error?.cause;
@@ -2678,6 +2686,14 @@ function normalizePythonExecutionResults(payload, testCases = { items: [] }, fea
         failureReason = failureReason || 'required_fields_unresolved';
         manualConfirmationRequired = true;
       }
+      const feedbackText = Array.isArray(pageFeedback) ? pageFeedback.join('\n') : String(pageFeedback || '');
+      const browserUseFailed = result.execution_mode === 'browser_use_takeover'
+        && /Judge Verdict:\s*(?:❌\s*)?FAIL|测试未能成功提交|未能成功提交|仍为空|红框错误|validation errors?|Failure Reason:|form_item_not_found/i.test(feedbackText);
+      if (browserUseFailed && ['passed', 'real_passed', 'side_effect_executed'].includes(status)) {
+        status = 'failed';
+        failureReason = failureReason || 'browser_use_handover_failed';
+        manualConfirmationRequired = true;
+      }
       return {
         test_case_id: testCaseId,
         feature_point_id: featurePointId,
@@ -3245,11 +3261,12 @@ async function startV3Run(runId, body = {}, options = {}) {
   const finalStatus = executionFailed
     ? 'failed'
     : analysisPack.nextRoundPlan.requires_human_approval ? 'waiting_human' : 'completed';
+  const roundName = roundDisplayName(roundId);
   const finalMessage = executionFailed
     ? (analysisPack.finalMessage || '真实浏览器执行失败，已写入可读错误和阻塞产物。')
     : analysisPack.nextRoundPlan.requires_human_approval
-      ? '首轮产物已生成，等待运行中心人工确认下一步。'
-      : '首轮真实浏览器执行产物已生成。';
+      ? `${roundName}产物已生成，等待运行中心人工确认下一步。`
+      : `${roundName}真实浏览器执行产物已生成。`;
   const finalManifest = await updateRunStatus(
     runDir,
     {

@@ -1023,6 +1023,34 @@ async def _run_browser_use_target_handover(
                             return value
                 return None
 
+            async def collect_form_item_diagnostics(
+                label_patterns: list[re.Pattern[str]],
+                label_texts: list[str] | None = None,
+            ) -> dict[str, Any]:
+                form_items = (await active_form_root()).locator(".el-form-item")
+                count = await form_items.count()
+                expected_labels = [text.strip() for text in (label_texts or []) if text and text.strip()]
+                candidate_labels: list[dict[str, Any]] = []
+                widget_labels: list[dict[str, Any]] = []
+                for index in range(count):
+                    item = form_items.nth(index)
+                    label_only = await item_label_text(item)
+                    text = label_only or await visible_text(item)
+                    if not text:
+                        continue
+                    entry = {"index": index, "label_text": text[:180]}
+                    if len(candidate_labels) < 40:
+                        candidate_labels.append(entry)
+                    if await item_has_enabled_widget(item) and len(widget_labels) < 40:
+                        widget_labels.append(entry)
+                return {
+                    "expected_labels": expected_labels,
+                    "label_patterns": [pattern.pattern for pattern in label_patterns],
+                    "form_item_count": count,
+                    "candidate_labels": candidate_labels,
+                    "widget_labels": widget_labels,
+                }
+
             async def choose_dropdown(
                 label_patterns: list[re.Pattern[str]],
                 *,
@@ -1050,7 +1078,11 @@ async def _run_browser_use_target_handover(
                         matched_label = text
                         break
                 if matched_item is None:
-                    return {"ok": False, "reason": "form_item_not_found"}
+                    return {
+                        "ok": False,
+                        "reason": "form_item_not_found",
+                        "diagnostics": await collect_form_item_diagnostics(label_patterns, label_texts),
+                    }
 
                 existing_value = await already_has_selected_value(matched_item)
                 if existing_value:
@@ -1109,13 +1141,20 @@ async def _run_browser_use_target_handover(
                 await selected[0].scroll_into_view_if_needed(timeout=1500)
                 await selected[0].click(timeout=2500)
                 await target_page.wait_for_timeout(350)
-                return {"ok": True, "selected": selected[1], "label_text": matched_label[:120]}
+                committed_value = await already_has_selected_value(matched_item)
+                return {
+                    "ok": bool(committed_value),
+                    "selected": selected[1],
+                    "selected_value": committed_value,
+                    "label_text": matched_label[:120],
+                    "reason": None if committed_value else "value_not_committed",
+                }
 
             async def choose_cascader(
                 label_patterns: list[re.Pattern[str]],
                 *,
                 label_texts: list[str] | None = None,
-                max_depth: int = 3,
+                max_depth: int = 4,
             ) -> dict[str, Any]:
                 form_items = (await active_form_root()).locator(".el-form-item")
                 count = await form_items.count()
@@ -1137,7 +1176,11 @@ async def _run_browser_use_target_handover(
                         matched_label = text
                         break
                 if matched_item is None:
-                    return {"ok": False, "reason": "form_item_not_found"}
+                    return {
+                        "ok": False,
+                        "reason": "form_item_not_found",
+                        "diagnostics": await collect_form_item_diagnostics(label_patterns, label_texts),
+                    }
                 existing_value = await already_has_selected_value(matched_item)
                 if existing_value:
                     return {
@@ -1184,6 +1227,9 @@ async def _run_browser_use_target_handover(
                     await chosen.click(timeout=2500)
                     selected_path.append(chosen_text)
                     await target_page.wait_for_timeout(400)
+                    committed_after_click = await already_has_selected_value(matched_item)
+                    if committed_after_click:
+                        break
                     next_menu = target_page.locator(".el-cascader-panel .el-cascader-menu").nth(depth + 1)
                     if depth < max_depth - 1 and not await next_menu.count():
                         return {
@@ -1195,11 +1241,13 @@ async def _run_browser_use_target_handover(
                     panel_visible = await is_visible(target_page.locator(".el-cascader-panel").first)
                     if not panel_visible:
                         break
+                committed_value = await already_has_selected_value(matched_item)
                 return {
-                    "ok": len(selected_path) >= max_depth,
+                    "ok": bool(committed_value),
                     "selected_path": selected_path,
+                    "selected_value": committed_value,
                     "label_text": matched_label[:120],
-                    "reason": None if len(selected_path) >= max_depth else "option_not_found",
+                    "reason": None if committed_value else "option_not_found",
                 }
 
             with suppress(Exception):
@@ -1503,6 +1551,7 @@ async def _run_browser_use_target_handover(
 
             uploaded: list[dict[str, Any]] = []
             skipped: list[dict[str, Any]] = []
+            seen_kinds: set[str] = set()
             for index in range(input_count):
                 file_input = inputs.nth(index)
                 label = await label_text_for_file_input(file_input)
@@ -1512,6 +1561,7 @@ async def _run_browser_use_target_handover(
                 kind, sample_path = sample_for(label, accept, index)
                 existing_name = await already_uploaded_file_name(file_input)
                 if existing_name:
+                    seen_kinds.add(kind)
                     skipped.append({
                         "kind": kind,
                         "input_index": index,
@@ -1521,8 +1571,18 @@ async def _run_browser_use_target_handover(
                         "existing_file_name": existing_name,
                     })
                     continue
+                if kind in seen_kinds:
+                    skipped.append({
+                        "kind": kind,
+                        "input_index": index,
+                        "label_text": label[:120],
+                        "accept": accept,
+                        "skipped": "duplicate_upload_slot",
+                    })
+                    continue
                 try:
                     await file_input.set_input_files(str(sample_path), timeout=8000)
+                    seen_kinds.add(kind)
                     uploaded.append({
                         "kind": kind,
                         "file_name": sample_path.name,
@@ -1712,16 +1772,23 @@ async def _run_browser_use_target_handover(
             )
         )
         feedback = _text(history)
+        history_result = _browser_use_history_result(feedback)
         current_url = page.url or config.start_url
         page_id = "browser_use_target_001"
         feature_id = "browser_use_target_001_flow"
         screenshot_refs = [item["screenshot_id"] for item in screenshots if item.get("screenshot_id")]
+        handover_status = "completed" if history_result["status"] == "passed" else "failed"
         return {
             "schema_version": V3_SCHEMA_VERSION,
-            "status": "completed",
+            "status": handover_status,
             "targets": targets,
             "handover_reasons": handover_reasons,
-            "message": "Browser Use 已接管优先目标并返回执行历史。",
+            "message": (
+                "Browser Use 已接管优先目标并返回执行历史。"
+                if history_result["status"] == "passed"
+                else "Browser Use 接管已结束，但最终裁判为失败。"
+            ),
+            "failure_reason": history_result["failure_reason"],
             "pages": [{
                 "page_id": page_id,
                 "page_entry_id": page_id,
@@ -1756,24 +1823,34 @@ async def _run_browser_use_target_handover(
                 "test_case_id": "browser_use_target_001_flow_case",
                 "feature_id": feature_id,
                 "feature_point_id": feature_id,
-                "status": "passed",
-                "verdict": "passed",
+                "status": history_result["status"],
+                "verdict": history_result["verdict"],
                 "execution_mode": "browser_use_takeover",
                 "started_at": _now(),
                 "finished_at": _now(),
-                "actions": [{"source": "browser_use", "action": "agent_run", "target": "、".join(targets), "status": "completed"}],
+                "actions": [{
+                    "source": "browser_use",
+                    "action": "agent_run",
+                    "target": "、".join(targets),
+                    "status": handover_status,
+                }],
                 "page_feedback": [feedback[:4000]] if feedback else [],
                 "screenshot_refs": screenshot_refs,
-                "failure_reason": None,
-                "manual_confirmation_required": False,
-                "message": "Browser Use 接管已完成，执行历史和截图已落盘。",
+                "failure_reason": history_result["failure_reason"],
+                "manual_confirmation_required": history_result["manual_confirmation_required"],
+                "message": (
+                    "Browser Use 接管已完成，执行历史和截图已落盘。"
+                    if history_result["status"] == "passed"
+                    else "Browser Use 接管失败，执行历史和截图已落盘。"
+                ),
             }],
             "page_exploration_log": [{
                 "event": "browser_use_handover",
-                "status": "completed",
+                "status": handover_status,
                 "targets": targets,
                 "reasons": handover_reasons,
                 "url": current_url,
+                "failure_reason": history_result["failure_reason"],
             }],
             "screenshots_index": _menu_screenshots_index(
                 [{**item, "stage": "browser_use_handover", "source": "browser_use.semantic_recovery"} for item in screenshots]
@@ -3040,6 +3117,50 @@ def _blocked(reason: str, message: str, *, cdp_url: str = "") -> dict[str, Any]:
         "pages": [],
         "features": [],
         "screenshots_index": _screenshots_index([]),
+    }
+
+
+def _browser_use_history_result(feedback: str) -> dict[str, Any]:
+    text = _text(feedback)
+    failure_patterns = [
+        r"Judge Verdict:\s*(?:❌\s*)?FAIL",
+        r"success\s*[:=]\s*False",
+        r"测试未能成功提交",
+        r"未能成功提交",
+        r"仍为空",
+        r"红框错误",
+        r"验证错误",
+        r"validation errors?",
+        r"Failure Reason:",
+        r"form_item_not_found",
+        r"required field",
+        r"不能为空",
+    ]
+    if any(re.search(pattern, text, re.I) for pattern in failure_patterns):
+        return {
+            "status": "failed",
+            "verdict": "failed",
+            "failure_reason": "browser_use_handover_failed",
+            "manual_confirmation_required": True,
+        }
+    success_patterns = [
+        r"Judge Verdict:\s*(?:✅\s*)?PASS",
+        r"success\s*[:=]\s*True",
+        r"成功提交",
+        r"提交成功",
+    ]
+    if any(re.search(pattern, text, re.I) for pattern in success_patterns):
+        return {
+            "status": "passed",
+            "verdict": "passed",
+            "failure_reason": None,
+            "manual_confirmation_required": False,
+        }
+    return {
+        "status": "needs_review",
+        "verdict": "needs_review",
+        "failure_reason": "browser_use_handover_unverified",
+        "manual_confirmation_required": True,
     }
 
 

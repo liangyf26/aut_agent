@@ -903,6 +903,63 @@ test('stage2 v3 run center does not count unfinished browser-use form submission
   });
 });
 
+test('stage2 v3 run center does not count browser-use judge failure as successful handover', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理平台',
+      entryUrl: 'https://www.zbsykj.com:19096/index',
+      cdpUrl: 'http://localhost:9222',
+      executionMode: 'real_browser',
+      prioritizedTargets: ['线上备案申请']
+    }, { runsDir });
+
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          executionItems: [{
+            test_case_id: 'browser_use_target_001_flow_case',
+            feature_point_id: 'browser_use_target_001_flow',
+            status: 'passed',
+            verdict: 'passed',
+            actions: [{ source: 'browser_use', action: 'agent_run', status: 'completed' }],
+            page_feedback: [
+              'Final Result: 测试未能成功提交备案申请。失败原因：验收监管单位仍为空，育苗地点有红框错误。Judge Verdict: FAIL'
+            ],
+            screenshot_refs: ['browser_use_handover_final'],
+            failure_reason: null,
+            manual_confirmation_required: false,
+            execution_mode: 'browser_use_takeover'
+          }],
+          featureItems: [{
+            feature_point_id: 'browser_use_target_001_flow',
+            page_entry_id: 'browser_use_target_001',
+            name: '线上备案申请目标接管流程',
+            feature_type: 'create',
+            risk_level: 'high',
+            auto_verifiable: true,
+            review_status: 'auto_included'
+          }]
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    const publicRun = await getV3Run(created.run.runId, { runsDir });
+    const executionResults = await readJson(path.join(runsDir, created.run.runId, 'execution_results.json'));
+
+    assert.equal(executionResults.items[0].status, 'failed');
+    assert.equal(executionResults.items[0].failure_reason, 'browser_use_handover_failed');
+    assert.equal(executionResults.items[0].manual_confirmation_required, true);
+    assert.equal(publicRun.run.summary.execution.passed, 0);
+    assert.equal(publicRun.run.summary.execution.failed, 1);
+  });
+});
+
 test('stage2 v3 run center surfaces current page and executor from real browser artifacts', async () => {
   await withTempRunsDir(async (runsDir) => {
     const created = await createV3Run({
@@ -1715,6 +1772,42 @@ test('stage2 v3 continue next round starts execution instead of ending in planne
   });
 });
 
+test('stage2 v3 second round completion feedback names the actual round', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '下一轮文案系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      scope: '优先完成“备案进度查询”页面'
+    }, { runsDir });
+    const pythonRunner = async ({ args, artifactRoot }) => {
+      const runId = argValue(args, '--v3-run-id');
+      const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId);
+      return {
+        stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+        stderr: ''
+      };
+    };
+
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, { runsDir, pythonRunner });
+    await continueNextRound(created.run.runId, {}, { runsDir, pythonRunner });
+
+    const events = (await fs.readFile(path.join(runsDir, created.run.runId, 'progress_events.jsonl'), 'utf8'))
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    const secondRoundEvent = events.find((event) => (
+      event.type === 'status_changed'
+      && event.phase === 'round_analysis'
+      && /第 2 轮|第2轮/.test(event.message || '')
+    ));
+
+    assert.ok(secondRoundEvent);
+    assert.doesNotMatch(secondRoundEvent.message, /首轮/);
+  });
+});
+
 test('stage2 v3 continue next round returns precise blockers for unmet prerequisites', async () => {
   await withTempRunsDir(async (runsDir) => {
     const created = await createV3Run({
@@ -2310,6 +2403,51 @@ test('stage2 v3 report organizes structured artifacts and skipped areas', async 
     assert.match(reportMd, /## 覆盖与结果矩阵/);
     assert.match(reportMd, /policy_denied/);
     assert.ok(reportMd.includes('screenshots/home_entry.png'));
+  });
+});
+
+test('stage2 v3 report generation preserves waiting-human run status', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '报告状态系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          executionItems: [{
+            test_case_id: 'case_waiting_human',
+            status: 'failed',
+            verdict: 'failed',
+            execution_mode: 'real_browser',
+            actions: [{ action: 'submit', status: 'failed' }],
+            page_feedback: ['验收监管单位仍为空'],
+            screenshot_refs: [],
+            failure_reason: 'required_fields_unresolved',
+            manual_confirmation_required: true
+          }]
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    const beforeReport = await getV3Run(created.run.runId, { runsDir });
+    assert.equal(beforeReport.run.status, 'waiting_human');
+
+    const reported = await generateV3Report(created.run.runId, { runsDir });
+    const manifest = await readJson(path.join(runsDir, created.run.runId, 'run_manifest.json'));
+    const currentStatus = await readJson(path.join(runsDir, created.run.runId, 'current_status.json'));
+
+    assert.equal(reported.run.status, 'waiting_human');
+    assert.equal(manifest.status, 'waiting_human');
+    assert.equal(currentStatus.status, 'waiting_human');
+    assert.equal(currentStatus.phase, 'reporting');
   });
 });
 

@@ -14,6 +14,7 @@ from prototype.stage2.app.v3_real_browser import (  # noqa: E402
     TEST_ENV_FULL_ACCESS_POLICY,
     build_menu_discovery_artifacts,
     _ensure_online_apply_upload_samples,
+    _browser_use_history_result,
     _dedupe_page_exploration,
     _browser_use_handover_task,
     _infer_feature_type,
@@ -768,10 +769,15 @@ def test_online_apply_seedling_address_uses_exact_cascader_selection() -> None:
     assert "label_texts: list[str] | None = None" in dropdown_block
     assert 'label_texts=["育苗地址", "育苗地点"]' in dropdown_block
     assert 're.compile(r"育苗地点|育苗区域|育苗地址|种植地点|育苗.*地区|location|area", re.I)' not in dropdown_block
-    assert "max_depth: int = 3" in dropdown_block
+    assert "max_depth: int = 4" in dropdown_block
     assert ".el-cascader-panel .el-cascader-menu" in dropdown_block
     assert "if depth < max_depth - 1 and not await next_menu.count():" in dropdown_block
     assert '"reason": "terminal_level_not_reached"' in dropdown_block
+    assert "committed_after_click = await already_has_selected_value(matched_item)" in dropdown_block
+    assert "if committed_after_click:" in dropdown_block
+    assert "committed_value = await already_has_selected_value(matched_item)" in dropdown_block
+    assert '"selected_value": committed_value' in dropdown_block
+    assert '"reason": None if committed_value else "option_not_found"' in dropdown_block
 
 
 def test_online_apply_acceptance_unit_uses_exact_dropdown_label_and_select_triggers() -> None:
@@ -781,6 +787,11 @@ def test_online_apply_acceptance_unit_uses_exact_dropdown_label_and_select_trigg
     assert 'label_texts=["验收监管单位"]' in dropdown_block
     assert "input[placeholder*='请选择']" in dropdown_block
     assert '.el-select .el-input__wrapper' in dropdown_block
+    assert "async def collect_form_item_diagnostics" in dropdown_block
+    assert '"diagnostics": await collect_form_item_diagnostics' in dropdown_block
+    assert '"candidate_labels"' in dropdown_block
+    assert '"widget_labels"' in dropdown_block
+    assert '"expected_labels"' in dropdown_block
 
 
 def test_browser_use_handover_mentions_four_upload_slots_with_matching_files() -> None:
@@ -890,6 +901,37 @@ def test_browser_use_handover_payload_merges_into_unified_artifacts() -> None:
     assert merged["case_execution_results"][0]["case_id"] == "browser_use_target_001_flow_case"
     assert merged["page_exploration_log"][0]["event"] == "browser_use_handover"
     assert merged["screenshots_index"]["items"][0]["screenshot_id"] == "browser_use_target_001"
+
+
+def test_browser_use_history_failure_is_not_imported_as_passed() -> None:
+    feedback = """
+    Final Result:
+    ## 线上备案申请全流程测试总结
+    失败原因：
+    1. 验收监管单位仍为空（form_item_not_found）
+    2. 育苗地点有红框错误
+    结论：测试未能成功提交备案申请。
+    Judge Verdict: FAIL
+    Failure Reason: The final form still shows validation errors.
+    """
+
+    result = _browser_use_history_result(feedback)
+
+    assert result["status"] == "failed"
+    assert result["verdict"] == "failed"
+    assert result["failure_reason"] == "browser_use_handover_failed"
+    assert result["manual_confirmation_required"] is True
+
+
+def test_browser_use_history_success_requires_positive_done_signal() -> None:
+    feedback = "Final Result: 已成功提交备案申请。Judge Verdict: PASS"
+
+    result = _browser_use_history_result(feedback)
+
+    assert result["status"] == "passed"
+    assert result["verdict"] == "passed"
+    assert result["failure_reason"] is None
+    assert result["manual_confirmation_required"] is False
 
 
 def test_login_residual_text_does_not_block_when_menu_evidence_exists() -> None:
