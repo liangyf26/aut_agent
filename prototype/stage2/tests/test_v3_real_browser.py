@@ -574,6 +574,7 @@ def test_browser_use_handover_task_instructs_full_online_apply_submission() -> N
 
     assert "script_prefill_form" in task
     assert "script_upload_sample_files" in task
+    assert "script_repair_required_fields" in task
     assert "script_select_required_dropdowns" in task
     assert "script_submit_form" in task
     assert "最终提交一次备案申请" in task
@@ -637,11 +638,14 @@ def test_online_apply_upload_samples_are_real_named_files() -> None:
     try:
         samples = _ensure_online_apply_upload_samples(tmp_dir)
 
-        assert samples["personnel"].name == "人员信息表.xlsx"
-        assert samples["image"].name == "备案图片.jpg"
-        assert samples["acceptance"].name == "验收文件.pdf"
+        assert set(samples) == {"personnel", "image", "attachment", "acceptance"}
+        assert samples["personnel"].name == "人员信息表1.xls"
+        assert samples["image"].name == "备案图片01.jpg"
+        assert samples["attachment"].name == "附件11.doc"
+        assert samples["acceptance"].name == "验收文件00.pdf"
         assert samples["personnel"].read_bytes().startswith(b"PK")
-        assert samples["image"].read_bytes().startswith(b"\xff\xd8\xff")
+        assert samples["image"].read_bytes().startswith(b"\xff\xd8")
+        assert samples["attachment"].read_bytes().startswith(b"PK")
         assert samples["acceptance"].read_bytes().startswith(b"%PDF")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -653,6 +657,159 @@ def test_browser_use_handover_defines_deterministic_upload_tool() -> None:
     assert "async def script_upload_sample_files" in source
     assert "set_input_files" in source
     assert "input[type=file]" in source
+    assert "label_text_for_file_input" in source
+    assert "育苗人员信息表|人员信息表|人员" in source
+    assert "备案图片|图片|照片" in source
+    assert "附件|doc|docx|word" in source
+    assert "验收文件|验收文件00|验收" in source
+    assert '("attachment", samples["attachment"])' in source
+    assert "already_uploaded_file_name" in source
+    assert '{"personnel", "image", "attachment", "acceptance"}' in source
+    assert "input_count" in source
+
+
+def test_browser_use_handover_defines_required_field_repair_tool() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    task = _browser_use_handover_task(
+        V3RunConfig(
+            start_url="https://www.zbsykj.com:19096/index",
+            safety_policy=TEST_ENV_FULL_ACCESS_POLICY,
+            allowed_side_effect_actions=["create", "submit", "save"],
+        ),
+        ["线上备案申请"],
+        [{"target": "线上备案申请", "reason": "target_page_uncovered"}],
+    )
+
+    assert "async def script_repair_required_fields" in source
+    assert "repair_online_apply_required_fields" in source
+    assert "育苗开始日期" in source
+    assert "验收日期" in source
+    assert "验收监管单位" in source
+    assert "验收文件" in source
+    assert "不要再自行编写 evaluate/JS" in task
+
+
+def test_online_apply_dropdown_prefill_skips_already_selected_controls() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dropdown_block = source[source.index("async def select_required_online_apply_dropdowns") : source.index("async def prefill_visible_online_apply_fields")]
+
+    assert "already_has_selected_value" in dropdown_block
+    assert "already_selected" in dropdown_block
+
+
+def test_online_apply_required_field_repair_targets_acceptance_unit_not_record_unit() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    repair_block = source[source.index("async def repair_online_apply_required_fields") : source.index("async def prefill_visible_online_apply_fields")]
+
+    assert "/备案监管单位/" not in repair_block
+    assert "setItemInput([/验收监管单位/]" not in repair_block
+    assert '"acceptanceUnit": await choose_dropdown(' in source
+    assert 'label_texts=["验收监管单位"]' in source
+    assert 'label_texts: list[str] | None = None' in source
+
+
+def test_online_apply_prefill_avoids_text_filling_for_dropdown_date_and_cascader_fields() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    prefill_block = source[source.index("async def prefill_visible_online_apply_fields") : source.index("@tools.action(description=\"[脚本内部工具] 预填写表单")]
+
+    assert "return '测试监管单位'" not in prefill_block
+    assert "return '2026-06-01'" not in prefill_block
+    assert "生产地点|地址|详细地址" not in prefill_block
+    assert "const isDateInput = Boolean(el.closest('.el-date-editor'))" in prefill_block
+    assert "const isWidgetInput = Boolean(el.closest('.el-select,.el-cascader'))" in prefill_block
+
+
+def test_online_apply_date_repair_uses_picker_selection_instead_of_text_fill() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    repair_block = source[source.index("async def repair_online_apply_required_fields") : source.index("async def prefill_visible_online_apply_fields")]
+
+    assert "async def repair_required_dates" in repair_block
+    assert "await input_locator.fill(value" not in repair_block
+    assert "await input_locator.type(value" not in repair_block
+    assert "setItemInput([/育苗开始日期/, /开始日期/], '2026-06-01', 'dates');" not in repair_block
+    assert "setItemInput([/验收日期/], '2026-06-15', 'dates');" not in repair_block
+    assert ".el-picker-panel" in repair_block
+    assert "await day_cell.click(timeout=2500)" in repair_block
+
+
+def test_online_apply_repair_block_defines_its_own_visible_text_helper() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    repair_block = source[source.index("async def repair_online_apply_required_fields") : source.index("async def prefill_visible_online_apply_fields")]
+
+    assert "async def visible_text(locator: Any) -> str:" in repair_block
+    assert "return _text(await locator.inner_text(timeout=800))" in repair_block
+
+
+def test_online_apply_seedling_address_uses_exact_cascader_selection() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dropdown_block = source[source.index("async def select_required_online_apply_dropdowns") : source.index("async def repair_online_apply_required_fields")]
+
+    assert "label_texts: list[str] | None = None" in dropdown_block
+    assert 'label_texts=["育苗地址", "育苗地点"]' in dropdown_block
+    assert 're.compile(r"育苗地点|育苗区域|育苗地址|种植地点|育苗.*地区|location|area", re.I)' not in dropdown_block
+    assert "max_depth: int = 3" in dropdown_block
+    assert ".el-cascader-panel .el-cascader-menu" in dropdown_block
+    assert "if depth < max_depth - 1 and not await next_menu.count():" in dropdown_block
+    assert '"reason": "terminal_level_not_reached"' in dropdown_block
+
+
+def test_online_apply_acceptance_unit_uses_exact_dropdown_label_and_select_triggers() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dropdown_block = source[source.index("async def select_required_online_apply_dropdowns") : source.index("async def repair_online_apply_required_fields")]
+
+    assert 'label_texts=["验收监管单位"]' in dropdown_block
+    assert "input[placeholder*='请选择']" in dropdown_block
+    assert '.el-select .el-input__wrapper' in dropdown_block
+
+
+def test_browser_use_handover_mentions_four_upload_slots_with_matching_files() -> None:
+    task = _browser_use_handover_task(
+        V3RunConfig(
+            start_url="https://www.zbsykj.com:19096/index",
+            safety_policy=TEST_ENV_FULL_ACCESS_POLICY,
+            allowed_side_effect_actions=["create", "submit", "save"],
+        ),
+        ["线上备案申请"],
+        [{"target": "线上备案申请", "reason": "target_page_uncovered"}],
+    )
+
+    assert "4 处上传" in task
+    assert "人员信息表 xls" in task
+    assert "备案图片 jpg" in task
+    assert "附件 doc" in task
+    assert "验收文件 pdf" in task
+
+
+def test_online_apply_upload_mapping_prefers_pdf_for_acceptance_and_doc_for_attachment() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    upload_block = source[source.index("async def upload_online_apply_sample_files") : source.index("@tools.action(description=\"[脚本内部工具] 上传线上备案申请 4 处所需样本文件")]
+
+    assert 'return "attachment", samples["attachment"]' in upload_block
+    assert 'return "acceptance", samples["acceptance"]' in upload_block
+    assert 're.search(r"附件|doc|docx|word", hint, re.I)' in upload_block
+    assert 're.search(r"验收文件|验收文件00|验收", hint, re.I)' in upload_block
+    assert '("attachment", samples["attachment"])' in upload_block
+    assert '("acceptance", samples["acceptance"])' in upload_block
+
+
+def test_online_apply_upload_mapping_checks_acceptance_before_generic_attachment_tokens() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    upload_block = source[source.index("def sample_for(") : source.index("uploaded: list[dict[str, Any]] = []")]
+
+    acceptance_pos = upload_block.index('if re.search(r"验收文件|验收文件00|验收", hint, re.I):')
+    attachment_pos = upload_block.index('if re.search(r"附件|doc|docx|word", hint, re.I):')
+    personnel_pos = upload_block.index('if re.search(r"育苗人员信息表|人员信息表|人员|xls|xlsx|excel|表格", hint, re.I):')
+    assert acceptance_pos < attachment_pos
+    assert attachment_pos < personnel_pos
+
+
+def test_online_apply_upload_label_extraction_prefers_field_label_over_helper_text() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    upload_block = source[source.index("async def upload_online_apply_sample_files") : source.index("@tools.action(description=\"[脚本内部工具] 上传线上备案申请 4 处所需样本文件")]
+
+    assert "querySelector('.el-form-item__label')" in upload_block
+    assert "querySelector('.title')" in upload_block
+    assert "querySelector('.el-upload__text')" not in upload_block
 
 
 def test_browser_use_handover_payload_merges_into_unified_artifacts() -> None:

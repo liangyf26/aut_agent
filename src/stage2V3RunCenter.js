@@ -850,6 +850,13 @@ function normalizeTargetTracking(payload) {
 function buildPublicRun(runDir, manifest, artifacts = {}) {
   const executionItems = artifacts.execution_results?.items || [];
   const menuEntryItems = artifactItems(artifacts.menu_entries, 'menu_entries');
+  const menuLeafCount = menuEntryItems.filter((item) => item && item.is_leaf).length;
+  const materializedPageEntryCount = summarizeItems(artifacts.page_entries?.items);
+  const candidatePageEntryCount = Math.max(
+    menuLeafCount,
+    numberOrZero(artifacts.menu_entries?.leaf_count),
+    materializedPageEntryCount
+  );
   const targetTracking = normalizeTargetTracking(artifacts.round_analysis?.target_tracking);
   const executionMode = artifacts.current_status?.execution_mode || manifest.execution_mode || null;
   const currentStatus = artifacts.current_status || buildCurrentStatus(
@@ -897,13 +904,15 @@ function buildPublicRun(runDir, manifest, artifacts = {}) {
     rounds: manifest.rounds || [],
     summary: {
       menuEntries: summarizeItems(menuEntryItems),
-      menuLeaves: menuEntryItems.filter((item) => item && item.is_leaf).length,
+      menuLeaves: menuLeafCount,
+      candidatePageEntries: candidatePageEntryCount,
+      materializedPageEntries: materializedPageEntryCount,
       menuRoots: numberOrZero(artifacts.menu_tree?.root_count),
       browserTargets: numberOrZero(
         artifacts.preflight_result?.browser_target_count
         || artifacts.round_analysis?.coverage?.browser_target_count
       ),
-      pageEntries: summarizeItems(artifacts.page_entries?.items),
+      pageEntries: materializedPageEntryCount,
       featurePoints: summarizeItems(artifacts.feature_points?.items),
       generatedTestCases: summarizeItems(artifacts.generated_test_cases?.items),
       execution: summarizeExecution(executionItems),
@@ -1773,6 +1782,12 @@ function makeRoundAnalysis({
   const continuationTargets = [...new Set([...missingScopeTargets, ...uncoveredScopeTargets])];
   const menuItems = artifactItems(menuEntries, 'items', 'menu_entries');
   const menuLeafCount = menuItems.filter((item) => item && item.is_leaf).length;
+  const materializedPageEntryCount = summarizeItems(pageEntries.items);
+  const candidatePageEntryCount = Math.max(
+    menuLeafCount,
+    numberOrZero(menuEntries.leaf_count),
+    materializedPageEntryCount
+  );
   const browserTargetCount = numberOrZero(executionResults.browser_target_count || 0);
   if (missingScopeTargets.length) {
     failureClusters.push({
@@ -1848,8 +1863,10 @@ function makeRoundAnalysis({
     uncovered_scope_targets: uncoveredScopeTargets,
     target_tracking: targetTracking,
     count_explanation: {
-      menu_leaf_vs_page_entries: `${menuLeafCount} menu leaves attempted; ${summarizeItems(pageEntries.items)} page entries recorded.`,
-      page_entries_vs_feature_points: `${summarizeItems(pageEntries.items)} page entries yielded ${summarizeItems(featurePoints.items)} feature points after default-visible and light-interaction scanning.`,
+      menu_leaf_vs_page_entries: `${menuLeafCount} menu leaves attempted; ${materializedPageEntryCount} page entries recorded.`,
+      candidate_page_entries: `${candidatePageEntryCount} candidate page entries are available from menu leaves; ${materializedPageEntryCount} have been materialized as page_entries records.`,
+      page_entries_vs_candidates: `${materializedPageEntryCount} materialized page entries out of ${candidatePageEntryCount} candidate page entries.`,
+      page_entries_vs_feature_points: `${materializedPageEntryCount} page entries yielded ${summarizeItems(featurePoints.items)} feature points after default-visible and light-interaction scanning.`,
       browser_targets: `${browserTargetCount} browser targets are diagnostic CDP targets, not discovered business pages.`
     },
     confidence: 0.72
@@ -2540,7 +2557,9 @@ function normalizePythonPageEntries(payload, inputConfig) {
   if (payload?.schema_version === 'stage2_page_entries.v3' && Array.isArray(payload.items)) {
     return payload;
   }
-  const pages = payload?.pages || payload?.page_entries || payload?.items || [];
+  const pages = Array.isArray(payload)
+    ? payload
+    : payload?.pages || payload?.page_entries || payload?.items || [];
   return {
     schema_version: 'stage2_page_entries.v3',
     items: pages.map((page, index) => ({
@@ -2646,6 +2665,14 @@ function normalizePythonExecutionResults(payload, testCases = { items: [] }, fea
       } else if (status === 'side_effect_failed') {
         failureReason = failureReason || 'side_effect_failed';
       }
+      const pageFeedback = result.page_feedback || [result.visible_feedback].filter(Boolean);
+      const unresolvedRequiredFields = Array.isArray(pageFeedback)
+        && pageFeedback.some((item) => /不能为空/.test(String(item || '')));
+      if (unresolvedRequiredFields && ['passed', 'real_passed', 'side_effect_executed'].includes(status)) {
+        status = 'failed';
+        failureReason = failureReason || 'required_fields_unresolved';
+        manualConfirmationRequired = true;
+      }
       return {
         test_case_id: testCaseId,
         feature_point_id: featurePointId,
@@ -2661,7 +2688,7 @@ function normalizePythonExecutionResults(payload, testCases = { items: [] }, fea
           target: result.control_label || '',
           policy_decision: result.policy_decision || null
         }] : []),
-        page_feedback: result.page_feedback || [result.visible_feedback].filter(Boolean),
+        page_feedback: pageFeedback,
         screenshot_refs: result.screenshot_refs || result.evidence || [
           result.before_screenshot_ref,
           result.after_screenshot_ref
@@ -2709,6 +2736,36 @@ function artifactHasItems(payload, ...keys) {
   return artifactItems(payload, ...keys).length > 0;
 }
 
+function isSeededPendingPageEntries(payload) {
+  const items = artifactItems(payload, 'items');
+  if (items.length !== 1) {
+    return false;
+  }
+  const [page] = items;
+  return page?.page_entry_id === 'page_home'
+    && page?.status === 'pending_executor'
+    && page?.source === 'run_center_v3.input_config';
+}
+
+function materializePageEntriesFromMenuEntries(menuEntries, inputConfig) {
+  const items = artifactItems(menuEntries, 'menu_entries')
+    .filter((item) => item && item.is_leaf && item.route_hint);
+  return {
+    schema_version: 'stage2_page_entries.v3',
+    items: items.map((item, index) => ({
+      page_entry_id: item.page_entry_id || item.page_id || `menu_page_${String(item.menu_id || index + 1).replace(/^menu_/, '').padStart(3, '0')}`,
+      name: item.text || item.name || `${inputConfig.system_name}页面${index + 1}`,
+      url: item.route_hint || item.url || inputConfig.entry_url,
+      menu_path: item.menu_path || [item.text || inputConfig.system_name],
+      page_type: item.page_type || 'menu_leaf',
+      discovery_depth: Array.isArray(item.menu_path) ? Math.max(item.menu_path.length - 1, 0) : 1,
+      status: 'discovered_from_menu',
+      source: item.source || 'playwright.menu_discovery',
+      screenshot_refs: item.screenshot_refs || []
+    }))
+  };
+}
+
 async function readPriorRealBrowserDiscovery(runDir, inputConfig, manifest) {
   const sourceRealBrowser = await readJsonIfExists(path.join(runDir, 'source_real_browser.json')) || {};
   const existingMenuTree = await readJsonIfExists(path.join(runDir, ARTIFACTS.menu_tree));
@@ -2724,6 +2781,11 @@ async function readPriorRealBrowserDiscovery(runDir, inputConfig, manifest) {
     : artifactHasItems(sourceRealBrowser.menu_entries, 'items', 'menu_entries')
       ? normalizeMenuEntries(sourceRealBrowser.menu_entries)
       : emptyMenu.menuEntries;
+  const menuMaterializedPageEntries = materializePageEntriesFromMenuEntries(menuEntries, inputConfig);
+  const sourcePageEntries = normalizePythonPageEntries(
+    sourceRealBrowser.page_entries || sourceRealBrowser.pages || sourceRealBrowser.pageEntries || null,
+    inputConfig
+  );
   return {
     systemMap: seededDiscovery.systemMap,
     navigationTree: seededDiscovery.navigationTree,
@@ -2733,9 +2795,13 @@ async function readPriorRealBrowserDiscovery(runDir, inputConfig, manifest) {
       || (Array.isArray(sourceRealBrowser.menu_traversal_log)
         ? sourceRealBrowser.menu_traversal_log.map((item) => JSON.stringify(item)).join('\n')
         : emptyMenu.menuTraversalLog),
-    pageEntries: artifactHasItems(existingPageEntries, 'items')
+    pageEntries: artifactHasItems(existingPageEntries, 'items') && !isSeededPendingPageEntries(existingPageEntries)
       ? existingPageEntries
-      : seededDiscovery.pageEntries,
+      : artifactHasItems(sourcePageEntries, 'items')
+        ? sourcePageEntries
+        : artifactHasItems(menuMaterializedPageEntries, 'items')
+          ? menuMaterializedPageEntries
+        : seededDiscovery.pageEntries,
     featurePoints: artifactHasItems(existingFeaturePoints, 'items')
       ? existingFeaturePoints
       : makeFeatureArtifacts(inputConfig),

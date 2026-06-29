@@ -676,6 +676,8 @@ test('stage2 v3 run center exposes first-round menu discovery separately from br
     assert.ok(started.run.artifacts.page_exploration_log.href.includes('/artifacts/page_exploration_log'));
     assert.equal(started.run.summary.menuEntries, 4);
     assert.equal(started.run.summary.menuLeaves, 2);
+    assert.equal(started.run.summary.candidatePageEntries, 2);
+    assert.equal(started.run.summary.materializedPageEntries, 1);
     assert.equal(started.run.summary.menuRoots, 3);
     assert.equal(started.run.summary.browserTargets, 0);
     assert.equal(started.run.summary.pageEntries, 1);
@@ -686,6 +688,177 @@ test('stage2 v3 run center exposes first-round menu discovery separately from br
     assert.match(run.artifacts.menu_traversal_log, /menu_business_after_expand/);
     assert.match(run.artifacts.page_exploration_log, /enter_menu_leaf/);
     assert.match(run.run.summary.countExplanation.menu_leaf_vs_page_entries, /menu leaves attempted/);
+    assert.match(run.run.summary.countExplanation.candidate_page_entries, /candidate page entries/);
+  });
+});
+
+test('stage2 v3 run center explains menu leaf candidates when Python times out before page materialization', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理平台',
+      entryUrl: 'https://www.zbsykj.com:19096/index',
+      cdpUrl: 'http://localhost:9222',
+      executionMode: 'real_browser',
+      prioritizedTargets: ['线上备案申请']
+    }, { runsDir });
+    const runDir = path.join(runsDir, created.run.runId);
+    await fs.writeFile(path.join(runDir, 'menu_entries.json'), JSON.stringify({
+      schema_version: 'stage2_menu_entries.v1',
+      items: [
+        { menu_id: 'menu_home', text: '首页', level: 1, is_leaf: true },
+        { menu_id: 'menu_apply_root', text: '备案管理', level: 1, is_leaf: false },
+        { menu_id: 'menu_apply', text: '线上备案申请', level: 2, parent_id: 'menu_apply_root', is_leaf: true },
+        { menu_id: 'menu_purchase', text: '收购溯源', level: 2, is_leaf: true },
+        { menu_id: 'menu_production', text: '饮片生产', level: 2, is_leaf: true },
+        { menu_id: 'menu_sale', text: '销售溯源', level: 2, is_leaf: true },
+        { menu_id: 'menu_bonsai', text: '盆景溯源', level: 2, is_leaf: true },
+        { menu_id: 'menu_notice', text: '通知列表', level: 2, is_leaf: true },
+        { menu_id: 'menu_notice_root', text: '通知公告管理', level: 1, is_leaf: false },
+        { menu_id: 'menu_trace_root', text: '溯源管理', level: 1, is_leaf: false }
+      ]
+    }, null, 2));
+
+    await startV3Run(created.run.runId, { executionMode: 'real_browser', roundId: 'round_002' }, {
+      runsDir,
+      pythonRunner: async () => {
+        const error = new Error('Command failed because execution timed out.');
+        error.killed = true;
+        error.signal = 'SIGTERM';
+        error.stderr = 'INFO     [Agent] Step 63:\nINFO     [Agent] Next goal: Repair remaining required fields.';
+        throw error;
+      }
+    });
+
+    const publicRun = await getV3Run(created.run.runId, { runsDir });
+    assert.equal(publicRun.run.summary.menuEntries, 10);
+    assert.equal(publicRun.run.summary.menuLeaves, 7);
+    assert.equal(publicRun.run.summary.candidatePageEntries, 7);
+    assert.equal(publicRun.run.summary.materializedPageEntries, 1);
+    assert.equal(publicRun.run.summary.pageEntries, 1);
+    assert.match(publicRun.run.summary.countExplanation.candidate_page_entries, /7 candidate page entries/);
+    assert.match(publicRun.run.summary.countExplanation.page_entries_vs_candidates, /1 materialized page entries/);
+  });
+});
+
+test('stage2 v3 run center materializes first-round menu leaf candidates into page entries when source has route hints only', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理平台',
+      entryUrl: 'https://www.zbsykj.com:19096/index',
+      cdpUrl: 'http://localhost:9222',
+      executionMode: 'real_browser',
+      prioritizedTargets: ['线上备案申请']
+    }, { runsDir });
+    const runDir = path.join(runsDir, created.run.runId);
+
+    await fs.writeFile(path.join(runDir, 'source_real_browser.json'), JSON.stringify({
+      schema_version: 'stage2_v3_run.v1',
+      status: 'completed',
+      menu_entries: {
+        schema_version: 'stage2_menu_entries.v1',
+        items: [{
+          menu_id: 'menu_9',
+          text: '线上备案申请',
+          level: 2,
+          parent_id: 'menu_3',
+          menu_path: ['备案管理', '线上备案申请'],
+          is_leaf: true,
+          route_hint: 'https://www.zbsykj.com:19096/record/online',
+          status: 'discovered',
+          source: 'playwright.menu_discovery'
+        }]
+      }
+    }, null, 2));
+
+    await startV3Run(created.run.runId, {
+      executionMode: 'real_browser',
+      roundId: 'round_002'
+    }, {
+      runsDir,
+      pythonRunner: async () => {
+        const error = new Error('Command failed because execution timed out.');
+        error.killed = true;
+        error.signal = 'SIGTERM';
+        error.stderr = 'INFO     [Agent] Step 9:\nINFO     [Agent] Next goal: Call script_prefill_form.';
+        error.stdout = '';
+        throw error;
+      }
+    });
+
+    const pageEntries = await readJson(path.join(runDir, 'page_entries.json'));
+    assert.equal(pageEntries.items.length, 1);
+    assert.equal(pageEntries.items[0].page_entry_id, 'menu_page_009');
+    assert.equal(pageEntries.items[0].name, '线上备案申请');
+    assert.equal(pageEntries.items[0].url, 'https://www.zbsykj.com:19096/record/online');
+    assert.equal(pageEntries.items[0].status, 'discovered_from_menu');
+  });
+});
+
+test('stage2 v3 run center does not count unfinished browser-use form submission as successful side effect execution', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理平台',
+      entryUrl: 'https://www.zbsykj.com:19096/index',
+      cdpUrl: 'http://localhost:9222',
+      executionMode: 'real_browser',
+      prioritizedTargets: ['线上备案申请']
+    }, { runsDir });
+
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          executionItems: [{
+            test_case_id: 'case_online_apply_create',
+            feature_point_id: 'browser_use_target_001_flow',
+            status: 'side_effect_executed',
+            verdict: 'form submitted',
+            started_at: '2026-06-29T00:40:00.000Z',
+            finished_at: '2026-06-29T00:41:00.000Z',
+            actions: [{ action: 'submit', ok: true }],
+            page_feedback: ['开始日期不能为空', '验收监管单位不能为空', '验收日期不能为空', '验收文件不能为空'],
+            screenshot_refs: [],
+            network_refs: [],
+            failure_reason: null,
+            manual_confirmation_required: false,
+            execution_mode: 'real_browser'
+          }],
+          featureItems: [{
+            feature_point_id: 'browser_use_target_001_flow',
+            page_entry_id: 'browser_use_target_001',
+            name: '线上备案申请目标接管流程',
+            feature_type: 'create',
+            risk_level: 'medium',
+            auto_verifiable: true,
+            review_status: 'auto_included'
+          }],
+          sourceRealBrowser: {
+            schema_version: 'stage2_v3_run.v1',
+            executor_stack: {
+              browser_use: {
+                status: 'used',
+                current_page: '线上备案申请',
+                current_skill: 'Browser Use',
+                current_step: '表单提交流程'
+              }
+            }
+          }
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    const publicRun = await getV3Run(created.run.runId, { runsDir });
+    const executionResults = await readJson(path.join(runsDir, created.run.runId, 'execution_results.json'));
+
+    assert.equal(executionResults.items[0].status, 'failed');
+    assert.equal(executionResults.items[0].failure_reason, 'required_fields_unresolved');
+    assert.equal(publicRun.run.summary.execution.passed, 0);
+    assert.equal(publicRun.run.summary.execution.failed, 1);
   });
 });
 
@@ -1875,6 +2048,65 @@ test('stage2 v3 run center preserves prior menu discovery artifacts when Python 
     assert.equal(menuEntries.items[0].text, '线上备案申请');
     assert.notEqual(roundAnalysis.target_tracking[0].missed_reason, 'not_found_in_menu_or_page_artifacts');
     assert.deepEqual(roundAnalysis.target_tracking[0].matched_menu_entry_ids, ['menu_5']);
+  });
+});
+
+test('stage2 v3 run center keeps first-round real page entries on timeout instead of reverting to page_home seed', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理平台',
+      entryUrl: 'https://www.zbsykj.com:19096/index',
+      cdpUrl: 'http://localhost:9222',
+      executionMode: 'real_browser',
+      prioritizedTargets: ['线上备案申请']
+    }, { runsDir });
+    const runDir = path.join(runsDir, created.run.runId);
+    await fs.writeFile(path.join(runDir, 'source_real_browser.json'), JSON.stringify({
+      schema_version: 'stage2_v3_run.v1',
+      status: 'completed',
+      page_entries: [{
+        page_entry_id: 'menu_page_002',
+        name: '线上备案申请',
+        url: 'https://www.zbsykj.com:19096/record/online',
+        menu_path: ['备案管理', '线上备案申请'],
+        page_type: 'form',
+        discovery_depth: 1,
+        status: 'reachable',
+        source: 'browser_use'
+      }],
+      menu_entries: {
+        schema_version: 'stage2_menu_entries.v1',
+        items: [{
+          menu_id: 'menu_5',
+          text: '线上备案申请',
+          is_leaf: true,
+          route_hint: 'https://www.zbsykj.com:19096/record/online',
+          menu_path: ['备案管理', '线上备案申请'],
+          status: 'discovered'
+        }]
+      }
+    }, null, 2));
+
+    await startV3Run(created.run.runId, {
+      executionMode: 'real_browser',
+      roundId: 'round_002'
+    }, {
+      runsDir,
+      pythonRunner: async () => {
+        const error = new Error('Command failed because execution timed out.');
+        error.killed = true;
+        error.signal = 'SIGTERM';
+        error.stderr = 'INFO     [Agent] Step 49:\nINFO     [Agent] Next goal: Retry submit.';
+        error.stdout = '';
+        throw error;
+      }
+    });
+
+    const pageEntries = await readJson(path.join(runDir, 'page_entries.json'));
+    assert.equal(pageEntries.items.length, 1);
+    assert.equal(pageEntries.items[0].page_entry_id, 'menu_page_002');
+    assert.equal(pageEntries.items[0].url, 'https://www.zbsykj.com:19096/record/online');
+    assert.equal(pageEntries.items[0].status, 'reachable');
   });
 });
 

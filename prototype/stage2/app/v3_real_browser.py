@@ -31,9 +31,10 @@ def _ensure_online_apply_upload_samples(run_dir: Path) -> dict[str, Path]:
     samples_dir = run_dir / "upload_samples"
     samples_dir.mkdir(parents=True, exist_ok=True)
     files = {
-        "personnel": samples_dir / "人员信息表.xlsx",
-        "image": samples_dir / "备案图片.jpg",
-        "acceptance": samples_dir / "验收文件.pdf",
+        "personnel": samples_dir / "人员信息表1.xls",
+        "image": samples_dir / "备案图片01.jpg",
+        "attachment": samples_dir / "附件11.doc",
+        "acceptance": samples_dir / "验收文件00.pdf",
     }
     if not files["personnel"].exists():
         with zipfile.ZipFile(files["personnel"], "w", compression=zipfile.ZIP_DEFLATED) as workbook:
@@ -84,6 +85,33 @@ def _ensure_online_apply_upload_samples(run_dir: Path) -> dict[str, Path]:
             b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00\x01\x00\x01\x00\x00"
             b"\xff\xdb\x00C\x00" + bytes([8] * 64) + b"\xff\xd9"
         )
+    if not files["attachment"].exists():
+        with zipfile.ZipFile(files["attachment"], "w", compression=zipfile.ZIP_DEFLATED) as document:
+            document.writestr(
+                "[Content_Types].xml",
+                """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>""",
+            )
+            document.writestr(
+                "_rels/.rels",
+                """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>""",
+            )
+            document.writestr(
+                "word/document.xml",
+                """<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>附件11 测试文档</w:t></w:r></w:p>
+  </w:body>
+</w:document>""",
+            )
     if not files["acceptance"].exists():
         files["acceptance"].write_bytes(
             b"%PDF-1.4\n"
@@ -885,7 +913,7 @@ async def _run_browser_use_target_handover(
                 r"""() => {
                     let count = 0;
                     document.querySelectorAll(
-                      '.el-overlay,.el-picker-panel,.el-select-dropdown,.el-calendar,.el-popover,.el-message-box,.el-message-box__wrapper,.el-loading-mask,.el-dialog,.el-message,.el-notification'
+                      '.v-modal,.el-picker-panel,.el-select-dropdown,.el-calendar,.el-popover,.el-message-box,.el-message-box__wrapper,.el-loading-mask,.el-message,.el-notification'
                     ).forEach((el) => {
                       if (el.offsetHeight > 0 || el.offsetWidth > 0) {
                         el.style.display = 'none';
@@ -951,7 +979,10 @@ async def _run_browser_use_target_handover(
                 return target_page
 
             async def item_has_enabled_widget(item: Any) -> bool:
-                widgets = item.locator(".el-select,.el-cascader,[role=combobox],input[readonly]")
+                widgets = item.locator(
+                    ".el-select,.el-cascader,[role=combobox],input[readonly],"
+                    "input[placeholder*='请选择'],.el-select .el-input__wrapper,.el-cascader .el-input__wrapper"
+                )
                 count = await widgets.count()
                 for index in range(count):
                     widget = widgets.nth(index)
@@ -961,9 +992,33 @@ async def _run_browser_use_target_handover(
                             return True
                 return False
 
+            async def item_label_text(item: Any) -> str:
+                for selector in [".el-form-item__label", ".el-form-item__label-wrap", ".title", "label"]:
+                    locator = item.locator(selector).first
+                    if await locator.count():
+                        text = await visible_text(locator)
+                        if text:
+                            return text
+                return await visible_text(item)
+
+            async def already_has_selected_value(item: Any) -> str | None:
+                inputs = item.locator(".el-select input,.el-cascader input,input[readonly]")
+                count = await inputs.count()
+                for index in range(count):
+                    input_locator = inputs.nth(index)
+                    with suppress(Exception):
+                        if not await is_visible(input_locator):
+                            continue
+                        value = _text(await input_locator.input_value(timeout=500))
+                        placeholder = _text(await input_locator.get_attribute("placeholder") or "")
+                        if value and value != placeholder and not re.search(r"请选择|全部", value):
+                            return value
+                return None
+
             async def choose_dropdown(
                 label_patterns: list[re.Pattern[str]],
                 *,
+                label_texts: list[str] | None = None,
                 preferred: list[re.Pattern[str]] | None = None,
                 avoid: list[re.Pattern[str]] | None = None,
             ) -> dict[str, Any]:
@@ -971,20 +1026,39 @@ async def _run_browser_use_target_handover(
                 count = await form_items.count()
                 matched_item = None
                 matched_label = ""
+                expected_labels = [text.strip() for text in (label_texts or []) if text and text.strip()]
                 for index in range(count):
                     item = form_items.nth(index)
-                    text = await visible_text(item)
-                    if text and any(pattern.search(text) for pattern in label_patterns) and await item_has_enabled_widget(item):
+                    label_only = await item_label_text(item)
+                    text = label_only or await visible_text(item)
+                    label_match = bool(
+                        text and (
+                            any(expected_label in text for expected_label in expected_labels)
+                            or any(pattern.search(text) for pattern in label_patterns)
+                        )
+                    )
+                    if label_match and await item_has_enabled_widget(item):
                         matched_item = item
                         matched_label = text
                         break
                 if matched_item is None:
                     return {"ok": False, "reason": "form_item_not_found"}
 
+                existing_value = await already_has_selected_value(matched_item)
+                if existing_value:
+                    return {
+                        "ok": True,
+                        "selected": existing_value,
+                        "skipped": "already_selected",
+                        "label_text": matched_label[:120],
+                    }
+
                 clicked = await click_first_visible(
                     matched_item,
                     [
                         "[role=combobox]",
+                        "input[placeholder*='请选择']",
+                        ".el-select .el-input__wrapper",
                         ".el-select__wrapper",
                         ".el-select",
                         "input[readonly]",
@@ -1032,26 +1106,44 @@ async def _run_browser_use_target_handover(
             async def choose_cascader(
                 label_patterns: list[re.Pattern[str]],
                 *,
+                label_texts: list[str] | None = None,
                 max_depth: int = 3,
             ) -> dict[str, Any]:
                 form_items = (await active_form_root()).locator(".el-form-item")
                 count = await form_items.count()
                 matched_item = None
                 matched_label = ""
+                expected_labels = [text.strip() for text in (label_texts or []) if text and text.strip()]
                 for index in range(count):
                     item = form_items.nth(index)
-                    text = await visible_text(item)
-                    if text and any(pattern.search(text) for pattern in label_patterns) and await item_has_enabled_widget(item):
+                    label_only = await item_label_text(item)
+                    text = label_only or await visible_text(item)
+                    label_match = bool(
+                        text and (
+                            any(expected_label in text for expected_label in expected_labels)
+                            or any(pattern.search(text) for pattern in label_patterns)
+                        )
+                    )
+                    if label_match and await item_has_enabled_widget(item):
                         matched_item = item
                         matched_label = text
                         break
                 if matched_item is None:
                     return {"ok": False, "reason": "form_item_not_found"}
+                existing_value = await already_has_selected_value(matched_item)
+                if existing_value:
+                    return {
+                        "ok": True,
+                        "selected_path": [existing_value],
+                        "skipped": "already_selected",
+                        "label_text": matched_label[:120],
+                    }
                 clicked = await click_first_visible(
                     matched_item,
                     [
                         ".el-cascader",
                         ".el-cascader__label",
+                        ".el-cascader .el-input__wrapper",
                         "input[readonly]",
                         ".el-input__wrapper",
                         ".el-input",
@@ -1084,14 +1176,22 @@ async def _run_browser_use_target_handover(
                     await chosen.click(timeout=2500)
                     selected_path.append(chosen_text)
                     await target_page.wait_for_timeout(400)
+                    next_menu = target_page.locator(".el-cascader-panel .el-cascader-menu").nth(depth + 1)
+                    if depth < max_depth - 1 and not await next_menu.count():
+                        return {
+                            "ok": False,
+                            "selected_path": selected_path,
+                            "label_text": matched_label[:120],
+                            "reason": "terminal_level_not_reached",
+                        }
                     panel_visible = await is_visible(target_page.locator(".el-cascader-panel").first)
                     if not panel_visible:
                         break
                 return {
-                    "ok": bool(selected_path),
+                    "ok": len(selected_path) >= max_depth,
                     "selected_path": selected_path,
                     "label_text": matched_label[:120],
-                    "reason": None if selected_path else "option_not_found",
+                    "reason": None if len(selected_path) >= max_depth else "option_not_found",
                 }
 
             with suppress(Exception):
@@ -1109,9 +1209,100 @@ async def _run_browser_use_target_handover(
                     avoid=[re.compile(r"种子繁殖|种子", re.I)],
                 ),
                 "seedlingPurpose": await choose_dropdown([re.compile(r"育苗目的|目的|purpose", re.I)]),
-                "seedlingLocation": await choose_cascader(
-                    [re.compile(r"育苗地点|育苗区域|育苗地址|种植地点|育苗.*地区|location|area", re.I)]
+                "acceptanceUnit": await choose_dropdown(
+                    [],
+                    label_texts=["验收监管单位"],
                 ),
+                "seedlingLocation": await choose_cascader(
+                    [],
+                    label_texts=["育苗地址", "育苗地点"],
+                ),
+            }
+
+        async def repair_online_apply_required_fields(target_page: Any) -> dict[str, Any]:
+            with suppress(Exception):
+                await clear_blocking_overlays(target_page)
+
+            async def visible_text(locator: Any) -> str:
+                with suppress(Exception):
+                    return _text(await locator.inner_text(timeout=800))
+                return ""
+
+            async def repair_required_dates() -> list[dict[str, Any]]:
+                desired_dates = [
+                    "育苗开始日期",
+                    "验收日期",
+                ]
+                repaired: list[dict[str, Any]] = []
+                active_form = target_page.locator(
+                    ".el-dialog:not([style*='display: none']) .el-form-item, "
+                    ".el-drawer__wrapper:not([style*='display: none']) .el-form-item"
+                )
+                form_items = active_form if await active_form.count() else target_page.locator(".el-form-item")
+                item_count = await form_items.count()
+                for label in desired_dates:
+                    matched_item = None
+                    for index in range(item_count):
+                        item = form_items.nth(index)
+                        text = await visible_text(item)
+                        if text and label in text:
+                            matched_item = item
+                            break
+                    if matched_item is None:
+                        repaired.append({"label": label, "ok": False, "reason": "form_item_not_found"})
+                        continue
+                    input_locator = matched_item.locator(
+                        ".el-date-editor input:not([type=hidden]), input[type=date], input[placeholder*='日期'], input[placeholder*='date']"
+                    ).first
+                    if not await input_locator.count():
+                        repaired.append({"label": label, "ok": False, "reason": "date_input_not_found"})
+                        continue
+                    try:
+                        await input_locator.scroll_into_view_if_needed(timeout=1500)
+                        await input_locator.click(timeout=2500)
+                        await target_page.wait_for_timeout(300)
+                        picker = target_page.locator(".el-picker-panel:visible,.el-date-picker:visible").last
+                        if not await picker.count():
+                            repaired.append({"label": label, "ok": False, "reason": "date_picker_not_opened"})
+                            continue
+                        day_cells = picker.locator(
+                            "td.available:not(.disabled):not(.today) .cell, "
+                            "td.available:not(.disabled):not(.today)"
+                        )
+                        if not await day_cells.count():
+                            repaired.append({"label": label, "ok": False, "reason": "date_option_not_found"})
+                            continue
+                        day_cell = day_cells.first
+                        await day_cell.scroll_into_view_if_needed(timeout=1500)
+                        await day_cell.click(timeout=2500)
+                        await target_page.wait_for_timeout(300)
+                        with suppress(Exception):
+                            await input_locator.dispatch_event("change")
+                            await input_locator.dispatch_event("blur")
+                        selected_value = _text(await input_locator.input_value(timeout=800))
+                        repaired.append({"label": label, "ok": bool(selected_value), "value": selected_value or None})
+                    except Exception as exc:
+                        repaired.append(
+                            {"label": label, "ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+                        )
+                return repaired
+
+            fill_summary = {"dates": [], "text_fields": [], "errors": [], "skipped": "date_text_prefill_disabled"}
+            date_summary = await repair_required_dates()
+            dropdown_summary = await select_required_online_apply_dropdowns(target_page)
+            upload_summary = await upload_online_apply_sample_files(target_page)
+            validation_errors = await target_page.evaluate(
+                r"""() => Array.from(document.querySelectorAll('.el-form-item__error,.el-message,.el-notification'))
+                  .map((el) => (el.innerText || el.textContent || '').trim())
+                  .filter(Boolean)"""
+            )
+            return {
+                "ok": True,
+                "filled": fill_summary,
+                "date_repairs": date_summary,
+                "dropdowns": dropdown_summary,
+                "uploads": upload_summary,
+                "validation_errors": validation_errors,
             }
 
         async def prefill_visible_online_apply_fields(target_page: Any) -> dict[str, Any]:
@@ -1137,13 +1328,10 @@ async def _run_browser_use_target_handover(
                     const valueFor = (el) => {
                       const label = labelText(el);
                       const type = (el.type || 'text').toLowerCase();
-                      if (/日期|时间|date/i.test(label) || type === 'date') return '2026-06-01';
                       if (/面积|数量|株数|重量|亩|number|amount|count|area/i.test(label) || type === 'number') return '100';
                       if (/电话|手机|联系方式|tel|phone/i.test(label) || type === 'tel') return '13800138000';
                       if (/邮箱|email/i.test(label) || type === 'email') return 'test@test.com';
-                      if (/监管单位|检疫|单位/i.test(label)) return '测试监管单位';
                       if (/联系人|人员|姓名/i.test(label)) return '测试人员';
-                      if (/生产地点|地址|详细地址/i.test(label)) return '测试生产地点';
                       return '测试数据';
                     };
                     const fields = document.querySelectorAll(
@@ -1152,7 +1340,7 @@ async def _run_browser_use_target_handover(
                     fields.forEach((el) => {
                       const isWidgetInput = Boolean(el.closest('.el-select,.el-cascader'));
                       const isDateInput = Boolean(el.closest('.el-date-editor'));
-                      if (el.disabled || !el.offsetParent || isWidgetInput || (el.readOnly && !isDateInput)) {
+                      if (el.disabled || !el.offsetParent || isWidgetInput || isDateInput || el.readOnly) {
                         results.skipped += 1;
                         return;
                       }
@@ -1214,38 +1402,140 @@ async def _run_browser_use_target_handover(
 
             return await timed_tool("script_select_required_dropdowns", run)
 
-        @tools.action(description="[脚本内部工具] 上传线上备案申请所需样本文件：人员信息表 xlsx、备案图片 jpg、验收文件 pdf。Agent 不需要传参数。")
+        async def upload_online_apply_sample_files(target_page: Any) -> dict[str, Any]:
+            samples = _ensure_online_apply_upload_samples(run_dir)
+            with suppress(Exception):
+                await clear_blocking_overlays(target_page)
+            inputs = target_page.locator("input[type=file]")
+            input_count = await inputs.count()
+            if input_count <= 0:
+                return {"ok": False, "reason": "file_inputs_not_found", "uploaded": [], "input_count": 0}
+
+            async def label_text_for_file_input(file_input: Any) -> str:
+                with suppress(Exception):
+                    label = await file_input.evaluate(
+                        r"""(input) => {
+                            const upload = input.closest('.el-upload,.el-upload-dragger,[class*=upload]');
+                            const item = input.closest('.el-form-item') || (upload && upload.closest('.el-form-item'));
+                            const labelNode = item && (
+                              item.querySelector('.el-form-item__label')
+                              || item.querySelector('.el-form-item__label-wrap')
+                              || item.querySelector('.title')
+                              || item.querySelector('label')
+                            );
+                            const labelText = ((labelNode && (labelNode.innerText || labelNode.textContent)) || '').trim();
+                            if (labelText) return labelText;
+                            const parent = item || upload || input.parentElement;
+                            const rawText = ((parent && (parent.innerText || parent.textContent)) || '').trim();
+                            const lines = rawText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+                            return lines[0] || rawText;
+                        }"""
+                    )
+                    return _text(label)
+                return ""
+
+            async def already_uploaded_file_name(file_input: Any) -> str:
+                with suppress(Exception):
+                    uploaded_name = await file_input.evaluate(
+                        r"""(input) => {
+                            const upload = input.closest('.el-upload,.el-upload-dragger,[class*=upload]');
+                            const item = input.closest('.el-form-item') || (upload && upload.closest('.el-form-item'));
+                            const parent = item || upload || input.parentElement;
+                            const text = ((parent && (parent.innerText || parent.textContent)) || '').trim();
+                            const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+                            return lines.find((line) => /\.[A-Za-z0-9]{2,5}(?:_\d+)?$/.test(line)) || "";
+                        }"""
+                    )
+                    return _text(uploaded_name)
+                return ""
+
+            def sample_for(label: str, accept: str, index: int) -> tuple[str, Path]:
+                hint = f"{label} {accept}"
+                if re.search(r"验收文件|验收文件00|验收", hint, re.I):
+                    return "acceptance", samples["acceptance"]
+                if re.search(r"附件|doc|docx|word", hint, re.I):
+                    return "attachment", samples["attachment"]
+                if re.search(r"育苗人员信息表|人员信息表|人员|xls|xlsx|excel|表格", hint, re.I):
+                    return "personnel", samples["personnel"]
+                if re.search(r"备案图片|图片|照片|图像|image|jpg|jpeg|png", hint, re.I):
+                    return "image", samples["image"]
+                fallback = [
+                    ("personnel", samples["personnel"]),
+                    ("image", samples["image"]),
+                    ("attachment", samples["attachment"]),
+                    ("acceptance", samples["acceptance"]),
+                ]
+                return fallback[index] if index < len(fallback) else ("acceptance", samples["acceptance"])
+
+            uploaded: list[dict[str, Any]] = []
+            skipped: list[dict[str, Any]] = []
+            for index in range(input_count):
+                file_input = inputs.nth(index)
+                label = await label_text_for_file_input(file_input)
+                accept = ""
+                with suppress(Exception):
+                    accept = _text(await file_input.get_attribute("accept") or "")
+                kind, sample_path = sample_for(label, accept, index)
+                existing_name = await already_uploaded_file_name(file_input)
+                if existing_name:
+                    skipped.append({
+                        "kind": kind,
+                        "input_index": index,
+                        "label_text": label[:120],
+                        "accept": accept,
+                        "skipped": "already_uploaded",
+                        "existing_file_name": existing_name,
+                    })
+                    continue
+                try:
+                    await file_input.set_input_files(str(sample_path), timeout=8000)
+                    uploaded.append({
+                        "kind": kind,
+                        "file_name": sample_path.name,
+                        "input_index": index,
+                        "label_text": label[:120],
+                        "accept": accept,
+                    })
+                    await target_page.wait_for_timeout(250)
+                except Exception as exc:
+                    skipped.append({
+                        "kind": kind,
+                        "input_index": index,
+                        "label_text": label[:120],
+                        "accept": accept,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    })
+
+            uploaded_kinds = {item["kind"] for item in uploaded}
+            preserved_kinds = {
+                item["kind"]
+                for item in skipped
+                if item.get("skipped") == "already_uploaded"
+            }
+            return {
+                "ok": {"personnel", "image", "attachment", "acceptance"}.issubset(
+                    uploaded_kinds | preserved_kinds
+                ),
+                "uploaded": uploaded,
+                "skipped": skipped,
+                "input_count": input_count,
+            }
+
+        @tools.action(description="[脚本内部工具] 上传线上备案申请 4 处所需样本文件：人员信息表 xls、备案图片 jpg、附件 doc、验收文件 pdf。Agent 不需要传参数。")
         async def script_upload_sample_files() -> str:
             async def run() -> str:
                 target_page = await current_browser_page()
-                samples = _ensure_online_apply_upload_samples(run_dir)
-                with suppress(Exception):
-                    await clear_blocking_overlays(target_page)
-                inputs = target_page.locator("input[type=file]")
-                input_count = await inputs.count()
-                if input_count <= 0:
-                    return json.dumps(
-                        {"ok": False, "reason": "file_inputs_not_found", "uploaded": [], "input_count": 0},
-                        ensure_ascii=False,
-                    )
-
-                ordered_samples = [
-                    ("personnel", samples["personnel"]),
-                    ("image", samples["image"]),
-                    ("acceptance", samples["acceptance"]),
-                ]
-                uploaded: list[dict[str, Any]] = []
-                for index, (kind, sample_path) in enumerate(ordered_samples[:input_count]):
-                    file_input = inputs.nth(index)
-                    await file_input.set_input_files(str(sample_path), timeout=8000)
-                    uploaded.append({"kind": kind, "file_name": sample_path.name, "input_index": index})
-                    await target_page.wait_for_timeout(500)
-                return json.dumps(
-                    {"ok": len(uploaded) == len(ordered_samples), "uploaded": uploaded, "input_count": input_count},
-                    ensure_ascii=False,
-                )
+                return json.dumps(await upload_online_apply_sample_files(target_page), ensure_ascii=False)
 
             return await timed_tool("script_upload_sample_files", run)
+
+        @tools.action(description="[脚本内部工具] 修复线上备案申请提交后仍红字提示的必填项：育苗开始日期、验收日期、验收监管单位、验收文件。Agent 不需要传参数。")
+        async def script_repair_required_fields() -> str:
+            async def run() -> str:
+                target_page = await current_browser_page()
+                return json.dumps(await repair_online_apply_required_fields(target_page), ensure_ascii=False)
+
+            return await timed_tool("script_repair_required_fields", run)
 
         @tools.action(description="[脚本内部工具] 提交当前表单，优先点击包含“纳入、提交、确定”的按钮。Agent 不需要传参数。")
         async def script_submit_form() -> str:
@@ -1430,11 +1720,11 @@ def _browser_use_handover_task(
 2. 导航或点击进入“线上备案申请”菜单/页面。
 3. 找到“我要申请备案”“申请备案”或“新增”按钮并点击，进入申请表单。
 4. 如果安全策略是 test_env_full_access 且允许 create/submit/save，必须按顺序调用 script_prefill_form、script_upload_sample_files、script_submit_form；script_prefill_form 会预填文本字段、勾选协议，并用 Playwright 直接点击下拉列表项和“育苗地点”三级 cascader。
-5. script_prefill_form 已经会选择备案品种 plantId、备案类型 registerType、育苗目的、可见的育苗方式和育苗地点；如果提交后仍提示下拉必填，再调用 script_select_required_dropdowns 重试。不要用 evaluate/JS 直接给下拉输入框赋值。
+5. script_prefill_form 已经会选择备案品种 plantId、备案类型 registerType、育苗目的、可见的育苗方式、验收监管单位和育苗地点；如果提交后仍提示下拉必填，再调用 script_select_required_dropdowns 重试。不要用 evaluate/JS 直接给下拉输入框赋值。
 6. 如果页面出现“育苗方式”下拉框，测试数据默认走低前置数据分支：不要选择“种子繁殖”，因为它会要求填写“种子采集许可证号”；优先选择“分蘗繁殖”“分蘖繁殖”“炼苗”或“其他”等不需要许可证的选项。遇到“育苗地点”这类城市/城区/社区三级控件时，不要手工逐项尝试，不要反复手工点击 cascader，直接依赖 script_prefill_form 内置的 Playwright cascader 选择。
-7. 文件上传必须调用 script_upload_sample_files，它会上传真实样本文件：人员信息表 xlsx、备案图片 jpg、验收文件 pdf。不要用 evaluate/JS 构造 File 对象，不要反复尝试手工文件上传。
+7. 文件上传必须调用 script_upload_sample_files，它会按控件附近的标签完成 4 处上传，分别使用真实样本文件：人员信息表 xls、备案图片 jpg、附件 doc、验收文件 pdf。不要用 evaluate/JS 构造 File 对象，不要反复尝试手工文件上传；同一上传位已有文件时不要重复上传。
 8. 下拉项和文件上传完成后必须调用 script_submit_form，最终提交一次备案申请；不要停在只看见按钮或只打开表单。
-9. 如果提交后出现 plantId/registerType required 或其它校验错误，先调用 script_select_required_dropdowns，再调用 script_submit_form 重试一次。
+9. 如果提交后出现“育苗开始日期、验收监管单位、验收日期、验收文件”等红字必填错误，调用 script_repair_required_fields 修复一次，再调用 script_submit_form 重试一次；如果仍有红字必填错误，记录失败原因并结束本轮，不要再自行编写 evaluate/JS 或 write_file 脚本，不要进入重复兜底循环。
 10. 每次关键动作后调用 get_page_feedback，记录 URL、页面文本、错误信息和成功反馈。
 11. 最后用可读文本总结：是否进入目标页面、是否点击“我要申请备案”、填写字段数量、上传文件数量、提交次数、最终页面反馈和失败原因。
 """
