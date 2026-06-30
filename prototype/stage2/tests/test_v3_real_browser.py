@@ -921,6 +921,24 @@ def test_online_apply_acceptance_unit_uses_exact_dropdown_label_and_select_trigg
     assert "find_labeled_form_item" in dropdown_block
     assert "find_field_by_placeholder" in dropdown_block
     assert 'placeholder_texts=["请选择验收监管单位"]' in dropdown_block
+    assert ".el-select__wrapper" in dropdown_block
+    assert ".el-select__placeholder" in dropdown_block
+    assert ".el-select__selected-item" in dropdown_block
+
+
+def test_final_record_dialog_uses_element_plus_select_triggers_and_diagnostics() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dialog_block = source[
+        source.index("async def complete_online_apply_final_record_dialog")
+        : source.index("@tools.action(description=\"[脚本内部工具] 上传线上备案申请 4 处所需样本文件")
+    ]
+
+    assert ".el-select__wrapper" in dialog_block
+    assert ".el-select__placeholder" in dialog_block
+    assert "collect_dialog_select_diagnostics" in dialog_block
+    assert '"trigger_candidates"' in dialog_block
+    assert '"option_candidates"' in dialog_block
+    assert '"dialog_text"' in dialog_block
 
 
 def test_browser_use_handover_mentions_four_upload_slots_with_matching_files() -> None:

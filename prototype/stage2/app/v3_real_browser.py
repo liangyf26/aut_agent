@@ -1026,7 +1026,8 @@ async def _run_browser_use_target_handover(
             async def item_has_enabled_widget(item: Any) -> bool:
                 widgets = item.locator(
                     ".el-select,.el-cascader,[role=combobox],input[readonly],"
-                    "input[placeholder*='请选择'],.el-select .el-input__wrapper,.el-cascader .el-input__wrapper"
+                    "input[placeholder*='请选择'],.el-select .el-input__wrapper,.el-cascader .el-input__wrapper,"
+                    ".el-select__wrapper,.el-select__placeholder,.el-select__selected-item"
                 )
                 count = await widgets.count()
                 for index in range(count):
@@ -1070,6 +1071,16 @@ async def _run_browser_use_target_handover(
                         selected_value = await native_control_selected_value(input_locator)
                         if selected_value:
                             return selected_value
+                selected_items = item.locator(".el-select__selected-item,.el-select__placeholder")
+                selected_count = await selected_items.count()
+                for index in range(selected_count):
+                    selected_item = selected_items.nth(index)
+                    with suppress(Exception):
+                        if not await is_visible(selected_item):
+                            continue
+                        selected_text = await visible_text(selected_item)
+                        if selected_text and not re.search(r"请选择|全部", selected_text):
+                            return selected_text
                 return None
 
             async def collect_form_item_diagnostics(
@@ -1204,6 +1215,8 @@ async def _run_browser_use_target_handover(
                             "input[placeholder*='请选择']",
                             ".el-select .el-input__wrapper",
                             ".el-select__wrapper",
+                            ".el-select__placeholder",
+                            ".el-select__selected-item",
                             ".el-select",
                             "input[readonly]",
                             ".el-input__wrapper",
@@ -1813,10 +1826,60 @@ async def _run_browser_use_target_handover(
                 return {"ok": False, "reason": "not_final_record_dialog", "dialog_text": text[:120]}
 
             unit_result: dict[str, Any] = {"ok": False, "reason": "unit_field_not_found"}
+
+            async def visible_text(locator: Any) -> str:
+                with suppress(Exception):
+                    return _text(await locator.inner_text(timeout=800))
+                return ""
+
+            async def is_visible(locator: Any) -> bool:
+                with suppress(Exception):
+                    return bool(await locator.is_visible(timeout=800))
+                return False
+
+            async def collect_dialog_select_diagnostics() -> dict[str, Any]:
+                trigger_candidates: list[dict[str, Any]] = []
+                triggers = dialog.locator(
+                    "[role=combobox], input[placeholder*='请选择'], "
+                    ".el-select .el-input__wrapper, .el-select__wrapper, "
+                    ".el-select__placeholder, .el-select__selected-item, .el-select"
+                )
+                trigger_count = await triggers.count()
+                for index in range(min(trigger_count, 20)):
+                    trigger = triggers.nth(index)
+                    trigger_candidates.append(
+                        {
+                            "index": index,
+                            "text": (await visible_text(trigger))[:120],
+                            "visible": await is_visible(trigger),
+                        }
+                    )
+                option_candidates: list[dict[str, Any]] = []
+                options = target_page.locator(
+                    ".el-select-dropdown .el-select-dropdown__item:not(.is-disabled), "
+                    "[role=option]:not(.is-disabled)"
+                )
+                option_count = await options.count()
+                for index in range(min(option_count, 30)):
+                    option = options.nth(index)
+                    option_candidates.append(
+                        {
+                            "index": index,
+                            "text": (await visible_text(option))[:120],
+                            "visible": await is_visible(option),
+                        }
+                    )
+                return {
+                    "dialog_text": text[:300],
+                    "trigger_candidates": trigger_candidates,
+                    "option_candidates": option_candidates,
+                }
+
             with suppress(Exception):
                 select_trigger = dialog.locator(
                     "[role=combobox], input[placeholder*='请选择'], "
-                    ".el-select .el-input__wrapper, .el-select"
+                    ".el-select .el-input__wrapper, .el-select__wrapper, "
+                    ".el-select__placeholder, .el-select__selected-item, .el-select"
                 ).first
                 if await select_trigger.count():
                     await select_trigger.scroll_into_view_if_needed(timeout=1500)
@@ -1837,7 +1900,17 @@ async def _run_browser_use_target_handover(
                             await target_page.wait_for_timeout(300)
                             break
                     if not unit_result.get("ok"):
-                        unit_result = {"ok": False, "reason": "unit_option_not_found"}
+                        unit_result = {
+                            "ok": False,
+                            "reason": "unit_option_not_found",
+                            "diagnostics": await collect_dialog_select_diagnostics(),
+                        }
+                else:
+                    unit_result = {
+                        "ok": False,
+                        "reason": "unit_field_not_found",
+                        "diagnostics": await collect_dialog_select_diagnostics(),
+                    }
 
             file_inputs = dialog.locator("input[type=file]")
             file_input_count = await file_inputs.count()
