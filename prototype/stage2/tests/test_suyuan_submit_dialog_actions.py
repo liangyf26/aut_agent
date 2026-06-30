@@ -11,6 +11,8 @@ if str(ROOT_DIR) not in sys.path:
 from prototype.stage2.app.verification.suyuan_submit_dialog_actions import (  # noqa: E402
     _resolve_generated_file,
     register_suyuan_submit_dialog_actions,
+    upload_drawer_required_files,
+    upload_submit_dialog_apply_file,
 )
 from prototype.stage2.app.verification.template_runtime import TemplateRuntimeData  # noqa: E402
 
@@ -25,6 +27,51 @@ class _FakeRegistry:
 
 class _FakePage:
     pass
+
+
+class _FakeUploadInput:
+    def __init__(self, existing_name: str = "") -> None:
+        self.existing_name = existing_name
+        self.set_files: list[str] = []
+
+    async def evaluate(self, script: str) -> str:
+        return self.existing_name
+
+    async def count(self) -> int:
+        return 1
+
+    async def set_input_files(self, file_path: str) -> None:
+        self.set_files.append(file_path)
+
+
+class _FakeInputCollection:
+    def __init__(self, inputs: list[_FakeUploadInput]) -> None:
+        self.inputs = inputs
+
+    async def count(self) -> int:
+        return len(self.inputs)
+
+    def nth(self, index: int) -> _FakeUploadInput:
+        return self.inputs[index]
+
+    @property
+    def first(self) -> _FakeUploadInput:
+        return self.inputs[0]
+
+
+class _FakeUploadPage:
+    def __init__(self, inputs: list[_FakeUploadInput]) -> None:
+        self.inputs = _FakeInputCollection(inputs)
+        self.waits: list[int] = []
+
+    def locator(self, selector: str) -> _FakeInputCollection:
+        return self.inputs
+
+    async def wait_for_timeout(self, timeout: int) -> None:
+        self.waits.append(timeout)
+
+    async def evaluate(self, script: str) -> dict[str, object]:
+        return {}
 
 
 def test_register_suyuan_submit_dialog_actions_registers_expected_actions() -> None:
@@ -224,6 +271,43 @@ def test_upload_handlers_support_custom_runtime_file_bundle_refs(monkeypatch, tm
 
     assert drawer_calls == [(tmp_path / "personnel.pdf", tmp_path / "acceptance.pdf")]
     assert apply_calls == [tmp_path / "apply.pdf"]
+
+
+def test_upload_drawer_required_files_skips_slots_that_already_have_files(tmp_path: Path) -> None:
+    inputs = [
+        _FakeUploadInput("人员信息表1.xls"),
+        _FakeUploadInput(),
+        _FakeUploadInput(),
+        _FakeUploadInput("验收文件00.pdf"),
+    ]
+    page = _FakeUploadPage(inputs)
+
+    result = asyncio.run(
+        upload_drawer_required_files(
+            page,
+            tmp_path / "personnel.xls",
+            tmp_path / "acceptance.pdf",
+        )
+    )
+
+    assert result["ok"] is True
+    assert [item.get("skipped") for item in result["uploads"]] == ["already_uploaded", "already_uploaded"]
+    assert inputs[0].set_files == []
+    assert inputs[3].set_files == []
+    assert page.waits == []
+
+
+def test_upload_submit_dialog_apply_file_skips_existing_dialog_file(tmp_path: Path) -> None:
+    input_loc = _FakeUploadInput("备案申请表.pdf")
+    page = _FakeUploadPage([input_loc])
+
+    result = asyncio.run(upload_submit_dialog_apply_file(page, tmp_path / "备案申请表.pdf"))
+
+    assert result["ok"] is True
+    assert result["skipped"] == "already_uploaded"
+    assert result["existing_file_name"] == "备案申请表.pdf"
+    assert input_loc.set_files == []
+    assert page.waits == []
 
 
 def test_select_and_submit_handlers_support_runtime_ref_and_custom_submit(monkeypatch) -> None:

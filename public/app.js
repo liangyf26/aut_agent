@@ -1,6 +1,7 @@
 const STAGE2_ONBOARDING_FORM_KEY = 'stage2_new_system_onboarding_form';
 const STAGE2_ONBOARDING_RESULTS_KEY = 'stage2_new_system_onboarding_results';
 const STAGE2_LOCAL_RUNS_KEY = 'stage2_v3_local_runs';
+const STAGE2_ACTION_LOG_LIMIT = 200;
 const WORKSPACE_VIEW = window.location.pathname.replace(/\/+$/, '') === '/stage2' ? 'stage2' : 'stage1';
 
 const stage2OnboardingDefaults = {
@@ -161,6 +162,7 @@ const state = {
   stage2LocalRuns: loadStage2LocalRuns(),
   selectedStage2RunIds: [],
   stage2ActionLog: [],
+  stage2ActionLogsByRunId: {},
   selectedStage2ModelProfileIds: [],
   stage2BrowserPreflight: { status: 'unknown', ok: false, message: '浏览器连接状态待检查。' },
   stage2ModelPreflight: { status: 'unknown', profiles: [], message: '模型预检状态待检查。' },
@@ -496,7 +498,11 @@ function pushStage2ActionLog(message, tone = 'info') {
     message,
     tone
   };
-  state.stage2ActionLog = [...state.stage2ActionLog, entry].slice(-12);
+  const runId = state.selectedRunId || '__stage2_global__';
+  const existing = state.stage2ActionLogsByRunId[runId] || state.stage2ActionLog || [];
+  const nextLog = [...existing, entry].slice(-STAGE2_ACTION_LOG_LIMIT);
+  state.stage2ActionLogsByRunId[runId] = nextLog;
+  state.stage2ActionLog = nextLog;
   saveState.textContent = message;
 }
 
@@ -910,7 +916,9 @@ async function createStage2Run(event) {
   }
 
   state.pendingAction = 'create-stage2-run';
+  state.selectedRunId = null;
   state.stage2ActionLog = [];
+  state.stage2ActionLogsByRunId.__stage2_global__ = [];
   pushStage2ActionLog(`新 run 开始：正在创建 v3 run，执行模式：${executionModeLabel(payload.executionMode)}，安全策略：${safetyPolicyLabel(payload.safetyPolicy)}。`);
   render();
 
@@ -921,6 +929,11 @@ async function createStage2Run(event) {
     });
     const run = normalizeStage2Run(result.run || result);
     state.selectedRunId = getRunId(run);
+    state.stage2ActionLogsByRunId[state.selectedRunId] = [
+      ...(state.stage2ActionLogsByRunId.__stage2_global__ || state.stage2ActionLog || [])
+    ].slice(-STAGE2_ACTION_LOG_LIMIT);
+    state.stage2ActionLog = state.stage2ActionLogsByRunId[state.selectedRunId];
+    delete state.stage2ActionLogsByRunId.__stage2_global__;
     delete state.stage2RunDetails[state.selectedRunId];
     pushStage2OperationFeedback(result.operation, `已创建 v3 run：${state.selectedRunId}`);
     showStage2RunCreatedDialog(run);
@@ -1930,10 +1943,11 @@ function renderStage2ActionFeedback() {
   const selectedMode = selected
     ? `${selectedKind.label} · ${executionModeLabel(getStage2ExecutionMode(selected))} · ${safetyPolicyLabel(getStage2SafetyPolicy(selected))}。${selectedKind.reason}`
     : '创建或选择 run 后，这里会显示操作反馈。';
-  const logs = state.stage2ActionLog.length
-    ? state.stage2ActionLog.map((item) => `
+  const currentRunLog = state.stage2ActionLogsByRunId[state.selectedRunId || '__stage2_global__'] || state.stage2ActionLog || [];
+  const logs = currentRunLog.length
+    ? currentRunLog.map((item) => `
       <li class="${escapeHtml(item.tone)}">
-        <span>${escapeHtml(formatDate(item.at))}</span>
+        <span>${escapeHtml(formatDate(item.at, true, true))}</span>
         <strong>${escapeHtml(item.message)}</strong>
       </li>
     `).join('')
@@ -3870,11 +3884,11 @@ function formatDuration(ms) {
   return `${(ms / 1000).toFixed(1)} s`;
 }
 
-function formatDate(value, includeYear = false) {
+function formatDate(value, includeYear = false, includeSeconds = false) {
   if (!value) {
     return '-';
   }
-  return new Date(value).toLocaleString('zh-CN', includeYear ? {
+  const options = includeYear ? {
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
@@ -3885,7 +3899,11 @@ function formatDate(value, includeYear = false) {
     day: '2-digit',
     hour: '2-digit',
     minute: '2-digit'
-  });
+  };
+  if (includeSeconds) {
+    options.second = '2-digit';
+  }
+  return new Date(value).toLocaleString('zh-CN', options);
 }
 
 function escapeHtml(value = '') {

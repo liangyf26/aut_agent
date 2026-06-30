@@ -1126,11 +1126,15 @@ textarea:focus {
 
 .stage2-action-feedback {
   display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   gap: 8px;
+  max-height: 280px;
+  min-height: 118px;
   padding: 12px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #f8fafc;
+  overflow: hidden;
 }
 
 .stage2-feedback-head {
@@ -1155,10 +1159,14 @@ textarea:focus {
 
 .stage2-action-feedback ul {
   display: grid;
+  align-content: start;
   gap: 6px;
   margin: 0;
   padding: 0;
   list-style: none;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 4px;
 }
 
 .stage2-action-feedback li {

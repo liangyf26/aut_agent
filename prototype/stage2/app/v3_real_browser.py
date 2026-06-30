@@ -17,6 +17,11 @@ from urllib.parse import quote, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 from prototype.stage2.app.v3_orchestrator import V3RunConfig
+from prototype.stage2.app.verification.native_control_skills import (
+    native_button_is_disabled,
+    native_control_selected_value,
+    native_upload_existing_file_name,
+)
 
 
 V3_SCHEMA_VERSION = "stage2_v3_run.v1"
@@ -25,6 +30,30 @@ TEST_ENV_FULL_ACCESS_POLICY = "test_env_full_access"
 SIDE_EFFECT_ACTION_TYPES = {"submit", "save", "approve", "delete", "create", "edit"}
 DEFAULT_SIDE_EFFECT_TOTAL_LIMIT = 4
 DEFAULT_SIDE_EFFECT_PER_TYPE_LIMIT = 1
+BROWSER_USE_DETERMINISTIC_TOOL_FIRST_MAX_STEPS = 20
+BROWSER_USE_TOOL_RESULT_PREVIEW_LIMIT = 4000
+
+
+def _online_apply_repair_plan(validation_errors: list[str]) -> dict[str, Any]:
+    text = "\n".join(_text(item) for item in validation_errors if _text(item))
+    if not text:
+        return {
+            "dates": True,
+            "dropdowns": True,
+            "uploads": True,
+            "reason": "no_validation_errors_available",
+        }
+    return {
+        "dates": bool(re.search(r"日期|育苗开始日期|验收日期", text)),
+        "dropdowns": bool(
+            re.search(
+                r"验收监管单位|备案品种|备案类型|育苗方式|育苗目的|育苗地点|育苗地址|请选择",
+                text,
+            )
+        ),
+        "uploads": bool(re.search(r"验收文件|上传|附件|图片|人员信息表|文件", text)),
+        "reason": "validation_error_labels",
+    }
 
 
 def _ensure_online_apply_upload_samples(run_dir: Path) -> dict[str, Path]:
@@ -881,6 +910,7 @@ async def _run_browser_use_target_handover(
     try:
         browser = Browser(cdp_url=config.cdp_url)
         tools = Tools()
+        uploaded_kinds_in_session: set[str] = set()
 
         def append_tool_timing(action: str, status: str, started: float, detail: dict[str, Any] | None = None) -> None:
             record = {
@@ -898,7 +928,12 @@ async def _run_browser_use_target_handover(
             started = perf_counter()
             try:
                 result = await factory()
-                append_tool_timing(action, "completed", started, {"result_preview": _text(result)[:240]})
+                append_tool_timing(
+                    action,
+                    "completed",
+                    started,
+                    {"result_preview": _text(result)[:BROWSER_USE_TOOL_RESULT_PREVIEW_LIMIT]},
+                )
                 return result
             except Exception as exc:
                 append_tool_timing(
@@ -916,20 +951,22 @@ async def _run_browser_use_target_handover(
                     return current_page
             return page
 
-        async def clear_blocking_overlays(target_page: Any) -> str:
+        async def clear_blocking_overlays(target_page: Any, *, preserve_business_dialogs: bool = False) -> str:
             return await target_page.evaluate(
-                r"""() => {
+                r"""(preserveBusinessDialogs) => {
                     let count = 0;
-                    document.querySelectorAll(
-                      '.v-modal,.el-picker-panel,.el-select-dropdown,.el-calendar,.el-popover,.el-message-box,.el-message-box__wrapper,.el-loading-mask,.el-message,.el-notification'
-                    ).forEach((el) => {
+                    const selector = preserveBusinessDialogs
+                      ? '.el-picker-panel,.el-select-dropdown,.el-calendar,.el-popover,.el-loading-mask,.el-message,.el-notification'
+                      : '.v-modal,.el-picker-panel,.el-select-dropdown,.el-calendar,.el-popover,.el-message-box,.el-message-box__wrapper,.el-loading-mask,.el-message,.el-notification';
+                    document.querySelectorAll(selector).forEach((el) => {
                       if (el.offsetHeight > 0 || el.offsetWidth > 0) {
                         el.style.display = 'none';
                         count += 1;
                       }
                     });
                     return `已关闭 ${count} 个弹窗`;
-                }"""
+                }""",
+                preserve_business_dialogs,
             )
 
         @tools.action(description="获取当前页面标题、URL 和可见文本摘要。")
@@ -995,9 +1032,22 @@ async def _run_browser_use_target_handover(
                 for index in range(count):
                     widget = widgets.nth(index)
                     with suppress(Exception):
-                        disabled_count = await widget.locator("[disabled],.is-disabled,[aria-disabled='true']").count()
-                        if await is_visible(widget) and disabled_count == 0:
+                        if await is_visible(widget) and not await widget_is_disabled(widget):
                             return True
+                return False
+
+            async def widget_is_disabled(widget: Any) -> bool:
+                with suppress(Exception):
+                    return bool(
+                        await widget.evaluate(
+                            r"""(el) => Boolean(
+                              el.disabled ||
+                              el.getAttribute('aria-disabled') === 'true' ||
+                              el.classList.contains('is-disabled') ||
+                              el.closest('.is-disabled')
+                            )"""
+                        )
+                    )
                 return False
 
             async def item_label_text(item: Any) -> str:
@@ -1017,10 +1067,9 @@ async def _run_browser_use_target_handover(
                     with suppress(Exception):
                         if not await is_visible(input_locator):
                             continue
-                        value = _text(await input_locator.input_value(timeout=500))
-                        placeholder = _text(await input_locator.get_attribute("placeholder") or "")
-                        if value and value != placeholder and not re.search(r"请选择|全部", value):
-                            return value
+                        selected_value = await native_control_selected_value(input_locator)
+                        if selected_value:
+                            return selected_value
                 return None
 
             async def collect_form_item_diagnostics(
@@ -1051,18 +1100,13 @@ async def _run_browser_use_target_handover(
                     "widget_labels": widget_labels,
                 }
 
-            async def choose_dropdown(
-                label_patterns: list[re.Pattern[str]],
+            async def find_labeled_form_item(
+                form_items: Any,
+                count: int,
                 *,
-                label_texts: list[str] | None = None,
-                preferred: list[re.Pattern[str]] | None = None,
-                avoid: list[re.Pattern[str]] | None = None,
-            ) -> dict[str, Any]:
-                form_items = (await active_form_root()).locator(".el-form-item")
-                count = await form_items.count()
-                matched_item = None
-                matched_label = ""
-                expected_labels = [text.strip() for text in (label_texts or []) if text and text.strip()]
+                label_patterns: list[re.Pattern[str]],
+                expected_labels: list[str],
+            ) -> tuple[Any | None, str]:
                 for index in range(count):
                     item = form_items.nth(index)
                     label_only = await item_label_text(item)
@@ -1073,18 +1117,72 @@ async def _run_browser_use_target_handover(
                             or any(pattern.search(text) for pattern in label_patterns)
                         )
                     )
-                    if label_match and await item_has_enabled_widget(item):
-                        matched_item = item
-                        matched_label = text
-                        break
-                if matched_item is None:
-                    return {
-                        "ok": False,
-                        "reason": "form_item_not_found",
-                        "diagnostics": await collect_form_item_diagnostics(label_patterns, label_texts),
-                    }
+                    if not label_match:
+                        continue
+                    if await item_has_enabled_widget(item):
+                        return item, text
+                    neighbor_form_items = [
+                        form_items.nth(neighbor_index)
+                        for neighbor_index in range(index + 1, min(count, index + 3))
+                    ]
+                    for neighbor in neighbor_form_items:
+                        if await item_has_enabled_widget(neighbor):
+                            return neighbor, text
+                return None, ""
 
-                existing_value = await already_has_selected_value(matched_item)
+            async def choose_dropdown(
+                label_patterns: list[re.Pattern[str]],
+                *,
+                label_texts: list[str] | None = None,
+                placeholder_texts: list[str] | None = None,
+                preferred: list[re.Pattern[str]] | None = None,
+                avoid: list[re.Pattern[str]] | None = None,
+            ) -> dict[str, Any]:
+                form_items = (await active_form_root()).locator(".el-form-item")
+                count = await form_items.count()
+                expected_labels = [text.strip() for text in (label_texts or []) if text and text.strip()]
+                expected_placeholders = [text.strip() for text in (placeholder_texts or []) if text and text.strip()]
+                matched_item, matched_label = await find_labeled_form_item(
+                    form_items,
+                    count,
+                    label_patterns=label_patterns,
+                    expected_labels=expected_labels,
+                )
+                matched_trigger = None
+
+                async def find_field_by_placeholder() -> tuple[Any | None, str, Any | None]:
+                    for placeholder in expected_placeholders:
+                        triggers = target_page.locator(
+                            f"input[placeholder*='{placeholder}'],textarea[placeholder*='{placeholder}'],"
+                            f"[role=combobox][placeholder*='{placeholder}']"
+                        )
+                        trigger_count = await triggers.count()
+                        for trigger_index in range(trigger_count):
+                            trigger = triggers.nth(trigger_index)
+                            if not await is_visible(trigger) or await widget_is_disabled(trigger):
+                                continue
+                            container = trigger.locator(
+                                "xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' el-form-item ')][1]"
+                            )
+                            if await container.count():
+                                return container, placeholder, trigger
+                            return trigger.locator("xpath=.."), placeholder, trigger
+                    return None, "", None
+
+                if matched_item is None:
+                    matched_item, matched_label, matched_trigger = await find_field_by_placeholder()
+                    if matched_item is None:
+                        return {
+                            "ok": False,
+                            "reason": "form_item_not_found",
+                            "diagnostics": await collect_form_item_diagnostics(label_patterns, label_texts),
+                        }
+
+                existing_value = (
+                    await native_control_selected_value(matched_trigger)
+                    if matched_trigger is not None
+                    else await already_has_selected_value(matched_item)
+                )
                 if existing_value:
                     return {
                         "ok": True,
@@ -1093,19 +1191,25 @@ async def _run_browser_use_target_handover(
                         "label_text": matched_label[:120],
                     }
 
-                clicked = await click_first_visible(
-                    matched_item,
-                    [
-                        "[role=combobox]",
-                        "input[placeholder*='请选择']",
-                        ".el-select .el-input__wrapper",
-                        ".el-select__wrapper",
-                        ".el-select",
-                        "input[readonly]",
-                        ".el-input__wrapper",
-                        ".el-input",
-                    ],
-                )
+                clicked = False
+                if matched_trigger is not None:
+                    await matched_trigger.scroll_into_view_if_needed(timeout=1500)
+                    await matched_trigger.click(timeout=2500)
+                    clicked = True
+                else:
+                    clicked = await click_first_visible(
+                        matched_item,
+                        [
+                            "[role=combobox]",
+                            "input[placeholder*='请选择']",
+                            ".el-select .el-input__wrapper",
+                            ".el-select__wrapper",
+                            ".el-select",
+                            "input[readonly]",
+                            ".el-input__wrapper",
+                            ".el-input",
+                        ],
+                    )
                 if not clicked:
                     return {"ok": False, "reason": "trigger_not_found", "label_text": matched_label}
 
@@ -1141,7 +1245,11 @@ async def _run_browser_use_target_handover(
                 await selected[0].scroll_into_view_if_needed(timeout=1500)
                 await selected[0].click(timeout=2500)
                 await target_page.wait_for_timeout(350)
-                committed_value = await already_has_selected_value(matched_item)
+                committed_value = (
+                    await native_control_selected_value(matched_trigger)
+                    if matched_trigger is not None
+                    else await already_has_selected_value(matched_item)
+                )
                 return {
                     "ok": bool(committed_value),
                     "selected": selected[1],
@@ -1258,7 +1366,8 @@ async def _run_browser_use_target_handover(
                 "plantId": await choose_dropdown([re.compile(r"备案品种|品种|plantId", re.I)]),
                 "registerType": await choose_dropdown([re.compile(r"备案类型|类型|registerType", re.I)]),
                 "seedlingMethod": await choose_dropdown(
-                    [re.compile(r"育苗方式|繁殖方式|育苗|seedling|breeding", re.I)],
+                    [re.compile(r"育苗方式|繁殖方式|seedling|breeding", re.I)],
+                    label_texts=["育苗方式"],
                     preferred=[
                         re.compile(r"分蘗繁殖|分蘖繁殖|炼苗|其他|扦插|分株|组培|组织培养", re.I),
                     ],
@@ -1268,6 +1377,7 @@ async def _run_browser_use_target_handover(
                 "acceptanceUnit": await choose_dropdown(
                     [],
                     label_texts=["验收监管单位"],
+                    placeholder_texts=["请选择验收监管单位"],
                 ),
                 "seedlingLocation": await choose_cascader(
                     [],
@@ -1354,18 +1464,38 @@ async def _run_browser_use_target_handover(
                         )
                 return repaired
 
+            async def collect_validation_errors() -> list[str]:
+                errors = await target_page.evaluate(
+                    r"""() => Array.from(document.querySelectorAll('.el-form-item__error,.el-message,.el-notification'))
+                      .map((el) => (el.innerText || el.textContent || '').trim())
+                      .filter(Boolean)"""
+                )
+                return [str(item) for item in errors] if isinstance(errors, list) else []
+
             fill_summary = {"dates": [], "text_fields": [], "errors": [], "skipped": "date_text_prefill_disabled"}
-            date_summary = await repair_required_dates()
-            dropdown_summary = await select_required_online_apply_dropdowns(target_page)
-            upload_summary = await upload_online_apply_sample_files(target_page)
-            validation_errors = await target_page.evaluate(
-                r"""() => Array.from(document.querySelectorAll('.el-form-item__error,.el-message,.el-notification'))
-                  .map((el) => (el.innerText || el.textContent || '').trim())
-                  .filter(Boolean)"""
+            validation_errors_before = await collect_validation_errors()
+            repair_plan = _online_apply_repair_plan(validation_errors_before)
+            date_summary = (
+                await repair_required_dates()
+                if repair_plan["dates"]
+                else [{"skipped": "not_requested_by_validation_errors"}]
             )
+            dropdown_summary = (
+                await select_required_online_apply_dropdowns(target_page)
+                if repair_plan["dropdowns"]
+                else {"ok": True, "skipped": "not_requested_by_validation_errors"}
+            )
+            upload_summary = (
+                await upload_online_apply_sample_files(target_page, trust_session_uploads=False)
+                if repair_plan["uploads"]
+                else {"ok": True, "skipped": "not_requested_by_validation_errors"}
+            )
+            validation_errors = await collect_validation_errors()
             return {
                 "ok": True,
                 "filled": fill_summary,
+                "repair_plan": repair_plan,
+                "validation_errors_before": validation_errors_before,
                 "date_repairs": date_summary,
                 "dropdowns": dropdown_summary,
                 "uploads": upload_summary,
@@ -1456,15 +1586,52 @@ async def _run_browser_use_target_handover(
         async def script_prefill_form() -> str:
             async def run() -> str:
                 target_page = await current_browser_page()
+                phases: list[dict[str, Any]] = []
+
+                async def run_prefill_phase(phase: str, factory: Any) -> Any:
+                    started = perf_counter()
+                    try:
+                        result = await factory()
+                        phases.append(
+                            {
+                                "phase": phase,
+                                "status": "completed",
+                                "duration_ms": round((perf_counter() - started) * 1000),
+                                "result": result,
+                            }
+                        )
+                        return result
+                    except Exception as exc:
+                        phases.append(
+                            {
+                                "phase": phase,
+                                "status": "failed",
+                                "duration_ms": round((perf_counter() - started) * 1000),
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }
+                        )
+                        raise
+
                 with suppress(Exception):
                     await clear_blocking_overlays(target_page)
-                first_fill_result = await prefill_visible_online_apply_fields(target_page)
-                dropdown_result = await select_required_online_apply_dropdowns(target_page)
+                first_fill_result = await run_prefill_phase(
+                    "plain_prefill_initial",
+                    lambda: prefill_visible_online_apply_fields(target_page),
+                )
+                dropdown_result = await run_prefill_phase(
+                    "native_controls",
+                    lambda: select_required_online_apply_dropdowns(target_page),
+                )
                 with suppress(Exception):
                     await clear_blocking_overlays(target_page)
-                second_fill_result = await prefill_visible_online_apply_fields(target_page)
+                second_fill_result = await run_prefill_phase(
+                    "plain_prefill_after_native_controls",
+                    lambda: prefill_visible_online_apply_fields(target_page),
+                )
                 return json.dumps(
                     {
+                        "ok": True,
+                        "phases": phases,
                         "prefill": first_fill_result,
                         "dropdowns": dropdown_result,
                         "expanded_prefill": second_fill_result,
@@ -1484,7 +1651,11 @@ async def _run_browser_use_target_handover(
 
             return await timed_tool("script_select_required_dropdowns", run)
 
-        async def upload_online_apply_sample_files(target_page: Any) -> dict[str, Any]:
+        async def upload_online_apply_sample_files(
+            target_page: Any,
+            *,
+            trust_session_uploads: bool = True,
+        ) -> dict[str, Any]:
             samples = _ensure_online_apply_upload_samples(run_dir)
             with suppress(Exception):
                 await clear_blocking_overlays(target_page)
@@ -1516,21 +1687,6 @@ async def _run_browser_use_target_handover(
                     return _text(label)
                 return ""
 
-            async def already_uploaded_file_name(file_input: Any) -> str:
-                with suppress(Exception):
-                    uploaded_name = await file_input.evaluate(
-                        r"""(input) => {
-                            const upload = input.closest('.el-upload,.el-upload-dragger,[class*=upload]');
-                            const item = input.closest('.el-form-item') || (upload && upload.closest('.el-form-item'));
-                            const parent = item || upload || input.parentElement;
-                            const text = ((parent && (parent.innerText || parent.textContent)) || '').trim();
-                            const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-                            return lines.find((line) => /\.[A-Za-z0-9]{2,5}(?:_\d+)?$/.test(line)) || "";
-                        }"""
-                    )
-                    return _text(uploaded_name)
-                return ""
-
             def sample_for(label: str, accept: str, index: int) -> tuple[str, Path]:
                 hint = f"{label} {accept}"
                 if re.search(r"验收文件|验收文件00|验收", hint, re.I):
@@ -1559,9 +1715,31 @@ async def _run_browser_use_target_handover(
                 with suppress(Exception):
                     accept = _text(await file_input.get_attribute("accept") or "")
                 kind, sample_path = sample_for(label, accept, index)
-                existing_name = await already_uploaded_file_name(file_input)
+                if kind in uploaded_kinds_in_session:
+                    if trust_session_uploads:
+                        seen_kinds.add(kind)
+                        skipped.append({
+                            "kind": kind,
+                            "input_index": index,
+                            "label_text": label[:120],
+                            "accept": accept,
+                            "skipped": "already_uploaded_in_session",
+                        })
+                        continue
+                existing_name = await native_upload_existing_file_name(file_input)
+                if existing_name == "__stage2_existing_upload_image__" and kind != "image":
+                    skipped.append({
+                        "kind": kind,
+                        "input_index": index,
+                        "label_text": label[:120],
+                        "accept": accept,
+                        "skipped": "ignored_thumbnail_sentinel_for_non_image_slot",
+                        "existing_file_name": existing_name,
+                    })
+                    existing_name = ""
                 if existing_name:
                     seen_kinds.add(kind)
+                    uploaded_kinds_in_session.add(kind)
                     skipped.append({
                         "kind": kind,
                         "input_index": index,
@@ -1583,6 +1761,7 @@ async def _run_browser_use_target_handover(
                 try:
                     await file_input.set_input_files(str(sample_path), timeout=8000)
                     seen_kinds.add(kind)
+                    uploaded_kinds_in_session.add(kind)
                     uploaded.append({
                         "kind": kind,
                         "file_name": sample_path.name,
@@ -1604,7 +1783,7 @@ async def _run_browser_use_target_handover(
             preserved_kinds = {
                 item["kind"]
                 for item in skipped
-                if item.get("skipped") == "already_uploaded"
+                if item.get("skipped") in {"already_uploaded", "already_uploaded_in_session"}
             }
             return {
                 "ok": {"personnel", "image", "attachment", "acceptance"}.issubset(
@@ -1665,25 +1844,46 @@ async def _run_browser_use_target_handover(
             upload_result: dict[str, Any] = {"ok": False, "reason": "file_input_not_found", "input_count": file_input_count}
             if file_input_count:
                 file_input = file_inputs.first
-                await file_input.set_input_files(str(samples["application"]), timeout=8000)
-                upload_result = {
-                    "ok": True,
-                    "file_name": samples["application"].name,
-                    "input_count": file_input_count,
-                }
+                existing_application_name = await native_upload_existing_file_name(file_input)
+                if existing_application_name:
+                    upload_result = {
+                        "ok": True,
+                        "file_name": samples["application"].name,
+                        "input_count": file_input_count,
+                        "skipped": "already_uploaded",
+                        "existing_file_name": existing_application_name,
+                    }
+                else:
+                    await file_input.set_input_files(str(samples["application"]), timeout=8000)
+                    upload_result = {
+                        "ok": True,
+                        "file_name": samples["application"].name,
+                        "input_count": file_input_count,
+                    }
 
+            submit_skipped: list[dict[str, Any]] = []
             submit_result: dict[str, Any] = {"ok": False, "reason": "submit_button_not_found"}
             buttons = dialog.locator("button,[role=button],input[type=submit]")
             button_count = await buttons.count()
             for index in range(button_count):
                 button = buttons.nth(index)
                 button_text = _text(await button.inner_text(timeout=800))
-                if button_text and re.search(r"提交备案|提交|确定", button_text):
-                    await button.scroll_into_view_if_needed(timeout=1500)
-                    await button.click(timeout=2500)
-                    submit_result = {"ok": True, "clicked": button_text}
-                    await target_page.wait_for_timeout(500)
-                    break
+                if not (button_text and re.search(r"提交备案|提交|确定", button_text)):
+                    continue
+                if await native_button_is_disabled(button):
+                    submit_skipped.append({"index": index, "text": button_text, "skipped": "disabled"})
+                    continue
+                await button.scroll_into_view_if_needed(timeout=1500)
+                await button.click(timeout=2500)
+                submit_result = {"ok": True, "clicked": button_text}
+                await target_page.wait_for_timeout(500)
+                break
+            if not submit_result.get("ok") and submit_skipped:
+                upload_result = {
+                    **upload_result,
+                    "submit_button_blocked": submit_skipped,
+                }
+                submit_result = {"ok": False, "reason": "submit_button_disabled", "skipped": submit_skipped}
 
             return {
                 "ok": bool(unit_result.get("ok") and upload_result.get("ok") and submit_result.get("ok")),
@@ -1716,24 +1916,50 @@ async def _run_browser_use_target_handover(
 
             return await timed_tool("script_complete_final_record_dialog", run)
 
-        @tools.action(description="[脚本内部工具] 提交当前表单，优先点击包含“纳入、提交、确定”的按钮。Agent 不需要传参数。")
+        @tools.action(description="[脚本内部工具] 提交当前表单，优先点击底部“信息纳入溯源系统”，再考虑其他提交/确定按钮。Agent 不需要传参数。")
         async def script_submit_form() -> str:
             async def run() -> str:
                 target_page = await current_browser_page()
                 with suppress(Exception):
-                    await clear_blocking_overlays(target_page)
+                    await clear_blocking_overlays(target_page, preserve_business_dialogs=True)
                 return await target_page.evaluate(
                     r"""() => {
-                        document.querySelectorAll('.el-overlay,.el-picker-panel,.el-select-dropdown,.el-calendar,.el-popover,.el-message-box')
+                        document.querySelectorAll('.el-picker-panel,.el-select-dropdown,.el-calendar,.el-popover')
                           .forEach((el) => el.remove());
                         window.scrollTo(0, document.body.scrollHeight);
                         const buttons = Array.from(document.querySelectorAll('button,[role=button],input[type=submit]'));
+                        const isVisible = (button) => {
+                          const rect = button.getBoundingClientRect();
+                          const style = window.getComputedStyle(button);
+                          return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                        };
+                        const isDisabled = (button) => Boolean(
+                          button.disabled
+                          || button.getAttribute('aria-disabled') === 'true'
+                          || button.classList.contains('is-disabled')
+                        );
+                        const buttonRank = (text) => {
+                          if (text.includes('信息纳入溯源系统')) return 0;
+                          if (text.includes('纳入溯源系统')) return 1;
+                          if (text.includes('纳入')) return 2;
+                          if (text.includes('提交备案')) return 3;
+                          if (text.includes('提交')) return 4;
+                          if (text.includes('确定')) return 5;
+                          return 99;
+                        };
+                        const candidates = [];
                         for (const button of buttons) {
                           const text = (button.textContent || button.value || '').trim();
-                          if (text && (text.includes('纳入') || text.includes('提交') || text.includes('确定'))) {
-                            button.click();
-                            return `已点击提交按钮: ${text}`;
+                          const rank = buttonRank(text);
+                          if (text && rank < 99 && isVisible(button) && !isDisabled(button)) {
+                            const rect = button.getBoundingClientRect();
+                            candidates.push({button, text, rank, y: rect.top + window.scrollY});
                           }
+                        }
+                        candidates.sort((left, right) => left.rank - right.rank || right.y - left.y);
+                        if (candidates.length) {
+                          candidates[0].button.click();
+                          return `已点击提交按钮: ${candidates[0].text}`;
                         }
                         for (const form of Array.from(document.querySelectorAll('form'))) {
                           const submit = form.querySelector('button[type=submit],input[type=submit]');
@@ -1759,7 +1985,7 @@ async def _run_browser_use_target_handover(
             browser=browser,
             tools=tools,
             use_vision=True,
-            max_steps=30,
+            max_steps=BROWSER_USE_DETERMINISTIC_TOOL_FIRST_MAX_STEPS,
             max_actions_per_step=1,
         )
         history = await agent.run()
@@ -1904,6 +2130,25 @@ def _browser_use_handover_task(
     handover_reasons: list[dict[str, Any]],
 ) -> str:
     allowed_actions = "、".join(config.allowed_side_effect_actions) or "无"
+    can_submit = (
+        config.safety_policy == TEST_ENV_FULL_ACCESS_POLICY
+        and {"create", "submit", "save"}.issubset(set(config.allowed_side_effect_actions))
+    )
+    execution_goal = (
+        "如果安全策略是 test_env_full_access 且允许 create/submit/save，必须按顺序调用 "
+        "script_prefill_form、script_upload_sample_files、script_submit_form；下拉项和文件上传完成后必须调用 "
+        "script_submit_form，最终提交一次备案申请；不要停在只看见按钮或只打开表单。"
+        if can_submit
+        else "当前安全策略未同时允许 create/submit/save，只验证进入目标页、打开申请表单、读取页面反馈和前端校验状态；"
+        "不要调用 script_submit_form、script_complete_final_record_dialog 或任何最终提交动作。"
+    )
+    repair_goal = (
+        "如果提交后出现“育苗开始日期、验收监管单位、验收日期、验收文件”等红字必填错误，调用 "
+        "script_repair_required_fields 修复一次，再调用 script_submit_form 重试一次；如果仍有红字必填错误，记录失败原因并结束本轮，"
+        "不要再自行编写 evaluate/JS 或 write_file 脚本，不要进入重复兜底循环。"
+        if can_submit
+        else "如果表单出现红字必填错误，只调用 get_page_feedback 记录校验反馈并结束本轮；不要为了修复校验而提交或重试提交。"
+    )
     return f"""你是第二阶段 Browser Use 目标接管 Agent，执行「线上备案申请」全流程测试。
 目标：优先进入并验证这些页面/流程：{'、'.join(targets)}。
 入口 URL：{config.start_url}
@@ -1912,17 +2157,17 @@ def _browser_use_handover_task(
 接管原因：{json.dumps(handover_reasons, ensure_ascii=False)}
 
 要求：
-1. 先调用 script_close_popups，关闭明显弹窗或遮罩。
+1. 确定性 script_* 工具优先；先调用 script_close_popups，关闭明显弹窗或遮罩。
 2. 导航或点击进入“线上备案申请”菜单/页面。
 3. 找到“我要申请备案”“申请备案”或“新增”按钮并点击，进入申请表单。
-4. 如果安全策略是 test_env_full_access 且允许 create/submit/save，必须按顺序调用 script_prefill_form、script_upload_sample_files、script_submit_form；script_prefill_form 会预填文本字段、勾选协议，并用 Playwright 直接点击下拉列表项和“育苗地点”三级 cascader。
-5. script_prefill_form 已经会选择备案品种 plantId、备案类型 registerType、育苗目的、可见的育苗方式、验收监管单位和育苗地点；如果提交后仍提示下拉必填，再调用 script_select_required_dropdowns 重试。不要用 evaluate/JS 直接给下拉输入框赋值。
-6. 如果页面出现“育苗方式”下拉框，测试数据默认走低前置数据分支：不要选择“种子繁殖”，因为它会要求填写“种子采集许可证号”；优先选择“分蘗繁殖”“分蘖繁殖”“炼苗”或“其他”等不需要许可证的选项。遇到“育苗地点”这类城市/城区/社区三级控件时，不要手工逐项尝试，不要反复手工点击 cascader，直接依赖 script_prefill_form 内置的 Playwright cascader 选择。
-7. 文件上传必须调用 script_upload_sample_files，它会按控件附近的标签完成 4 处上传，分别使用真实样本文件：人员信息表 xls、备案图片 jpg、附件 doc、验收文件 pdf。不要用 evaluate/JS 构造 File 对象，不要反复尝试手工文件上传；同一上传位已有文件时不要重复上传。
-8. 下拉项和文件上传完成后必须调用 script_submit_form，最终提交一次备案申请；不要停在只看见按钮或只打开表单。
+4. {execution_goal}
+5. 每个 script_* 工具最多调用一次，只有 script_repair_required_fields 后允许再调用一次 script_submit_form 作为修复重试。
+6. script_prefill_form 会预填文本字段、勾选协议，并用 Playwright 直接点击备案品种 plantId、备案类型 registerType、育苗目的、可见的育苗方式、验收监管单位和“育苗地点”三级 cascader；如果提交后仍提示下拉必填，再调用 script_select_required_dropdowns 重试。不要用 evaluate/JS 直接给下拉输入框赋值。
+7. 如果页面出现“育苗方式”下拉框，测试数据默认走低前置数据分支：不要选择“种子繁殖”，因为它会要求填写“种子采集许可证号”；优先选择“分蘗繁殖”“分蘖繁殖”“炼苗”或“其他”等不需要许可证的选项。遇到“育苗地点”这类城市/城区/社区三级控件时，不要手工逐项尝试，不要反复手工点击 cascader，直接依赖 script_prefill_form 内置的 Playwright cascader 选择。
+8. 文件上传必须调用 script_upload_sample_files，它会按控件附近的标签完成 4 处上传，分别使用真实样本文件：人员信息表 xls、备案图片 jpg、附件 doc、验收文件 pdf。不要用 evaluate/JS 构造 File 对象，不要反复尝试手工文件上传；同一上传位已有文件时不要重复上传。
 9. 如果 script_submit_form 后弹出要求选择“备案登记/监管单位”并上传申请表的最终提交弹窗，必须调用 script_complete_final_record_dialog；不要点击弹窗里的“上传文件”按钮，不要打开原生文件选择窗口，不要用 evaluate/JS 构造 File 对象。
-10. 如果提交后出现“育苗开始日期、验收监管单位、验收日期、验收文件”等红字必填错误，调用 script_repair_required_fields 修复一次，再调用 script_submit_form 重试一次；如果仍有红字必填错误，记录失败原因并结束本轮，不要再自行编写 evaluate/JS 或 write_file 脚本，不要进入重复兜底循环。
-11. 每次关键动作后调用 get_page_feedback，记录 URL、页面文本、错误信息和成功反馈。
+10. {repair_goal}
+11. get_page_feedback 只在失败、最终确认或本轮结束时调用，避免每个确定性工具后都等待页面摘要。
 12. 最后用可读文本总结：是否进入目标页面、是否点击“我要申请备案”、填写字段数量、上传文件数量、提交次数、最终页面反馈和失败原因。
 """
 

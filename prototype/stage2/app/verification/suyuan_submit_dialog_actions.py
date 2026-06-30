@@ -9,6 +9,7 @@ from prototype.stage2.app.runtime.artifacts import ArtifactWriter
 
 from .template_executor import ActionHandler, TemplateActionRegistry
 from .template_runtime import TemplateRuntimeData
+from .native_control_skills import native_upload_existing_file_name
 
 
 async def upload_drawer_required_files(
@@ -25,12 +26,22 @@ async def upload_drawer_required_files(
         result["ok"] = False
         result["reason"] = "expected-at-least-4-file-inputs"
         return result
-    await inputs.nth(0).set_input_files(str(personnel_file))
-    await page.wait_for_timeout(2500)
-    result["uploads"].append({"index": 0, "file": str(personnel_file)})
-    await inputs.nth(3).set_input_files(str(acceptance_file))
-    await page.wait_for_timeout(2500)
-    result["uploads"].append({"index": 3, "file": str(acceptance_file)})
+    for index, file_path in ((0, personnel_file), (3, acceptance_file)):
+        input_loc = inputs.nth(index)
+        existing_name = await native_upload_existing_file_name(input_loc)
+        if existing_name:
+            result["uploads"].append(
+                {
+                    "index": index,
+                    "file": str(file_path),
+                    "skipped": "already_uploaded",
+                    "existing_file_name": existing_name,
+                }
+            )
+            continue
+        await input_loc.set_input_files(str(file_path))
+        await page.wait_for_timeout(2500)
+        result["uploads"].append({"index": index, "file": str(file_path)})
     state = await page.evaluate(
         """
         () => {
@@ -115,8 +126,11 @@ async def upload_submit_dialog_apply_file(page: Page, apply_file: Path) -> dict[
     input_loc = page.locator(".el-dialog:visible input[type=file]").first
     if not await input_loc.count():
         return {"ok": False, "reason": "file-input-not-found", "file": str(apply_file)}
-    await input_loc.set_input_files(str(apply_file))
-    await page.wait_for_timeout(3000)
+    existing_name = await native_upload_existing_file_name(input_loc)
+    skipped = bool(existing_name)
+    if not skipped:
+        await input_loc.set_input_files(str(apply_file))
+        await page.wait_for_timeout(3000)
     state = await page.evaluate(
         """
         () => {
@@ -135,8 +149,12 @@ async def upload_submit_dialog_apply_file(page: Page, apply_file: Path) -> dict[
         }
         """
     )
-    return {"ok": True, "file": str(apply_file), "state": state}
-
+    return {
+        "ok": True,
+        "file": str(apply_file),
+        "state": state,
+        **({"skipped": "already_uploaded", "existing_file_name": existing_name} if skipped else {}),
+    }
 
 async def submit_filing_dialog(page: Page) -> dict[str, Any]:
     submit = page.get_by_role("button", name="提交备案")
