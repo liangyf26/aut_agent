@@ -615,7 +615,7 @@ def test_browser_use_handover_task_avoids_seed_propagation_license_branch() -> N
 
     assert "育苗方式" in task
     assert "育苗地点" in task
-    assert "三级 cascader" in task
+    assert "多级 cascader（最多四级）" in task
     assert "不要选择“种子繁殖”" in task
     assert "种子采集许可证号" in task
     assert "不要用 evaluate/JS 直接给下拉输入框赋值" in task
@@ -639,6 +639,7 @@ def test_browser_use_handover_task_tells_agent_not_to_repeat_manual_cascader_cli
 
 def test_browser_use_handover_caps_steps_and_limits_feedback_calls() -> None:
     source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    agent_block = source[source.index("agent = Agent(") : source.index("screenshots.append(")]
     task = _browser_use_handover_task(
         V3RunConfig(
             start_url="https://www.zbsykj.com:19096/index",
@@ -649,8 +650,9 @@ def test_browser_use_handover_caps_steps_and_limits_feedback_calls() -> None:
         [{"target": "线上备案申请", "reason": "target_page_uncovered"}],
     )
 
-    assert BROWSER_USE_DETERMINISTIC_TOOL_FIRST_MAX_STEPS == 20
-    assert "max_steps=BROWSER_USE_DETERMINISTIC_TOOL_FIRST_MAX_STEPS" in source
+    assert BROWSER_USE_DETERMINISTIC_TOOL_FIRST_MAX_STEPS == 30
+    assert "agent.run(max_steps=BROWSER_USE_DETERMINISTIC_TOOL_FIRST_MAX_STEPS)" in source
+    assert "max_steps=BROWSER_USE_DETERMINISTIC_TOOL_FIRST_MAX_STEPS" not in agent_block
     assert "确定性 script_* 工具优先" in task
     assert "每个 script_* 工具最多调用一次" in task
     assert "get_page_feedback 只在失败、最终确认或本轮结束时调用" in task
@@ -814,23 +816,57 @@ def test_online_apply_prefill_avoids_unknown_text_for_labeled_dropdown_controls(
 def test_online_apply_date_repair_uses_picker_selection_instead_of_text_fill() -> None:
     source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
     repair_block = source[source.index("async def repair_online_apply_required_fields") : source.index("async def prefill_visible_online_apply_fields")]
+    date_skill_block = source[
+        source.index("async def select_required_online_apply_dates")
+        : source.index("async def repair_online_apply_required_fields")
+    ]
 
     assert "async def repair_required_dates" in repair_block
-    assert "await input_locator.fill(value" not in repair_block
-    assert "await input_locator.type(value" not in repair_block
-    assert "setItemInput([/育苗开始日期/, /开始日期/], '2026-06-01', 'dates');" not in repair_block
-    assert "setItemInput([/验收日期/], '2026-06-15', 'dates');" not in repair_block
-    assert ".el-picker-panel" in repair_block
-    assert "await day_cell.click(timeout=2500)" in repair_block
+    assert "return await select_required_online_apply_dates(target_page)" in repair_block
+    assert "await input_locator.fill(value" not in date_skill_block
+    assert "await input_locator.type(value" not in date_skill_block
+    assert "setItemInput([/育苗开始日期/, /开始日期/], '2026-06-01', 'dates');" not in date_skill_block
+    assert "setItemInput([/验收日期/], '2026-06-15', 'dates');" not in date_skill_block
+    assert ".el-picker-panel" in date_skill_block
+    assert "await day_cell.click(timeout=2500)" in date_skill_block
 
 
 def test_online_apply_date_repair_skips_dates_that_already_have_values() -> None:
     source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
-    repair_block = source[source.index("async def repair_online_apply_required_fields") : source.index("async def prefill_visible_online_apply_fields")]
+    date_skill_block = source[
+        source.index("async def select_required_online_apply_dates")
+        : source.index("async def repair_online_apply_required_fields")
+    ]
 
-    assert "existing_value = _text(await input_locator.input_value(timeout=800))" in repair_block
-    assert '"skipped": "already_selected"' in repair_block
-    assert "if existing_value:" in repair_block
+    assert "existing_value = _text(await input_locator.input_value(timeout=800))" in date_skill_block
+    assert '"skipped": "already_selected"' in date_skill_block
+    assert "if existing_value:" in date_skill_block
+
+
+def test_online_apply_prefill_selects_required_dates_before_first_submit() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    prefill_tool_block = source[source.index("async def script_prefill_form") : source.index("@tools.action(description=\"[脚本内部工具] 用 Playwright 直接点击备案申请表必填下拉项")]
+
+    assert "native_date_controls" in prefill_tool_block
+    assert "select_required_online_apply_dates(target_page)" in prefill_tool_block
+    assert '"dates": date_result' in prefill_tool_block
+
+
+def test_online_apply_date_skill_is_reusable_for_prefill_and_repair() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+
+    assert "async def select_required_online_apply_dates(target_page: Any) -> list[dict[str, Any]]:" in source
+    date_skill_block = source[
+        source.index("async def select_required_online_apply_dates")
+        : source.index("async def repair_online_apply_required_fields")
+    ]
+    assert '"育苗开始日期"' in date_skill_block
+    assert '"验收日期"' in date_skill_block
+    assert ".el-picker-panel:visible,.el-date-picker:visible" in date_skill_block
+    assert "await day_cell.click(timeout=2500)" in date_skill_block
+    assert '"skipped": "already_selected"' in date_skill_block
+    assert "await input_locator.fill(value" not in date_skill_block
+    assert "await input_locator.type(value" not in date_skill_block
 
 
 def test_online_apply_repair_block_defines_its_own_visible_text_helper() -> None:
@@ -845,6 +881,7 @@ def test_online_apply_repair_plan_targets_only_reported_validation_categories() 
     date_only = _online_apply_repair_plan(["育苗开始日期不能为空", "验收日期不能为空"])
     upload_only = _online_apply_repair_plan(["验收文件不能为空"])
     dropdown_only = _online_apply_repair_plan(["验收监管单位不能为空", "育苗地点请选择"])
+    generic_location = _online_apply_repair_plan(["地点不能为空"])
 
     assert date_only == {
         "dates": True,
@@ -859,6 +896,12 @@ def test_online_apply_repair_plan_targets_only_reported_validation_categories() 
         "reason": "validation_error_labels",
     }
     assert dropdown_only == {
+        "dates": False,
+        "dropdowns": True,
+        "uploads": False,
+        "reason": "validation_error_labels",
+    }
+    assert generic_location == {
         "dates": False,
         "dropdowns": True,
         "uploads": False,
@@ -896,8 +939,11 @@ def test_online_apply_seedling_address_uses_exact_cascader_selection() -> None:
     assert 're.compile(r"育苗地点|育苗区域|育苗地址|种植地点|育苗.*地区|location|area", re.I)' not in dropdown_block
     assert "max_depth: int = 4" in dropdown_block
     assert ".el-cascader-panel .el-cascader-menu" in dropdown_block
-    assert "if depth < max_depth - 1 and not await next_menu.count():" in dropdown_block
+    assert "wait_for_visible_cascader_menu_count" in dropdown_block
+    assert "timeout_ms: int = 2500" in dropdown_block
+    assert "next_menu_visible" in dropdown_block
     assert '"reason": "terminal_level_not_reached"' in dropdown_block
+    assert '"trace": trace' in dropdown_block
     assert "committed_after_click = await already_has_selected_value(matched_item)" in dropdown_block
     assert "if committed_after_click:" in dropdown_block
     assert "committed_value = await already_has_selected_value(matched_item)" in dropdown_block
@@ -926,6 +972,68 @@ def test_online_apply_acceptance_unit_uses_exact_dropdown_label_and_select_trigg
     assert ".el-select__selected-item" in dropdown_block
 
 
+def test_online_apply_acceptance_unit_supports_vue_treeselect_controls() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dropdown_block = source[source.index("async def select_required_online_apply_dropdowns") : source.index("async def repair_online_apply_required_fields")]
+
+    assert ".vue-treeselect" in dropdown_block
+    assert ".vue-treeselect__control" in dropdown_block
+    assert ".vue-treeselect__placeholder" in dropdown_block
+    assert ".vue-treeselect__input" in dropdown_block
+    assert ".vue-treeselect__single-value" in dropdown_block
+    assert ".vue-treeselect__option:not(.vue-treeselect__option--disabled)" in dropdown_block
+    assert ".vue-treeselect__label-container" in dropdown_block
+    assert "广西壮族自治区林业局|林业局|监管" in dropdown_block
+
+
+def test_online_apply_acceptance_unit_can_find_visible_placeholder_text_trigger() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dropdown_block = source[source.index("async def select_required_online_apply_dropdowns") : source.index("async def repair_online_apply_required_fields")]
+
+    assert "visible_placeholder_triggers" in dropdown_block
+    assert ".el-select__placeholder" in dropdown_block
+    assert ".el-select__selected-item" in dropdown_block
+    assert "contains(normalize-space(.), '{placeholder}')" in dropdown_block
+    assert "matched_trigger_is_value_reader" in dropdown_block
+    assert "await already_has_selected_value(matched_item)" in dropdown_block
+
+
+def test_online_apply_dropdown_failure_diagnostics_include_matched_label_details() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dropdown_block = source[source.index("async def select_required_online_apply_dropdowns") : source.index("async def repair_online_apply_required_fields")]
+
+    assert '"matched_label_diagnostics"' in dropdown_block
+    assert '"selector_counts"' in dropdown_block
+    assert '"trigger_candidates"' in dropdown_block
+    assert '"placeholder_candidates"' in dropdown_block
+    assert '"outer_html_preview"' in dropdown_block
+
+
+def test_online_apply_handover_forbids_manual_evaluate_after_dropdown_tools_fail() -> None:
+    task = _browser_use_handover_task(
+        V3RunConfig(
+            start_url="https://www.zbsykj.com:19096/index",
+            safety_policy=TEST_ENV_FULL_ACCESS_POLICY,
+            allowed_side_effect_actions=["create", "submit", "save"],
+        ),
+        ["线上备案申请"],
+        [{"target": "线上备案申请", "reason": "target_page_uncovered"}],
+    )
+
+    assert "vue-treeselect" in task
+    assert "如果验收监管单位仍未提交成功，立即结束并报告失败" in task
+    assert "不要再尝试 evaluate" in task
+
+
+def test_online_apply_dropdown_option_not_found_returns_diagnostics() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dropdown_block = source[source.index("async def select_required_online_apply_dropdowns") : source.index("async def repair_online_apply_required_fields")]
+
+    assert '"reason": "option_not_found"' in dropdown_block
+    assert '"diagnostics": await collect_form_item_diagnostics(' in dropdown_block
+    assert "placeholder_texts," in dropdown_block
+
+
 def test_final_record_dialog_uses_element_plus_select_triggers_and_diagnostics() -> None:
     source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
     dialog_block = source[
@@ -939,6 +1047,20 @@ def test_final_record_dialog_uses_element_plus_select_triggers_and_diagnostics()
     assert '"trigger_candidates"' in dialog_block
     assert '"option_candidates"' in dialog_block
     assert '"dialog_text"' in dialog_block
+
+
+def test_final_record_dialog_can_find_visible_placeholder_text_trigger() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dialog_block = source[
+        source.index("async def complete_online_apply_final_record_dialog")
+        : source.index("@tools.action(description=\"[脚本内部工具] 上传线上备案申请 4 处所需样本文件")
+    ]
+
+    assert "dialog_select_trigger_selectors" in dialog_block
+    assert "visible_placeholder_triggers" in dialog_block
+    assert "contains(normalize-space(.), '请选择备案登记/监管单位')" in dialog_block
+    assert "click_dialog_select_trigger" in dialog_block
+    assert ".el-input" in dialog_block
 
 
 def test_browser_use_handover_mentions_four_upload_slots_with_matching_files() -> None:

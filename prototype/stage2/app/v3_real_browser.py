@@ -30,7 +30,7 @@ TEST_ENV_FULL_ACCESS_POLICY = "test_env_full_access"
 SIDE_EFFECT_ACTION_TYPES = {"submit", "save", "approve", "delete", "create", "edit"}
 DEFAULT_SIDE_EFFECT_TOTAL_LIMIT = 4
 DEFAULT_SIDE_EFFECT_PER_TYPE_LIMIT = 1
-BROWSER_USE_DETERMINISTIC_TOOL_FIRST_MAX_STEPS = 20
+BROWSER_USE_DETERMINISTIC_TOOL_FIRST_MAX_STEPS = 30
 BROWSER_USE_TOOL_RESULT_PREVIEW_LIMIT = 4000
 
 
@@ -47,7 +47,7 @@ def _online_apply_repair_plan(validation_errors: list[str]) -> dict[str, Any]:
         "dates": bool(re.search(r"日期|育苗开始日期|验收日期", text)),
         "dropdowns": bool(
             re.search(
-                r"验收监管单位|备案品种|备案类型|育苗方式|育苗目的|育苗地点|育苗地址|请选择",
+                r"验收监管单位|备案品种|备案类型|育苗方式|育苗目的|育苗地点|育苗地址|地点不能为空|请选择",
                 text,
             )
         ),
@@ -1023,19 +1023,55 @@ async def _run_browser_use_target_handover(
                         return root
                 return target_page
 
+            dropdown_trigger_selectors = [
+                "[role=combobox]",
+                "input[placeholder*='请选择']",
+                ".el-select .el-input__wrapper",
+                ".el-select__wrapper",
+                ".el-select__placeholder",
+                ".el-select__selected-item",
+                ".el-select",
+                ".vue-treeselect__control",
+                ".vue-treeselect__placeholder",
+                ".vue-treeselect__single-value",
+                ".vue-treeselect__input",
+                ".vue-treeselect",
+                "input[readonly]",
+                ".el-input__wrapper",
+                ".el-input",
+            ]
+
+            diagnostic_selectors = [
+                ".el-select",
+                ".el-select__wrapper",
+                ".el-select__placeholder",
+                ".el-select__selected-item",
+                ".vue-treeselect",
+                ".vue-treeselect__control",
+                ".vue-treeselect__placeholder",
+                ".vue-treeselect__single-value",
+                ".vue-treeselect__input",
+                ".el-input__wrapper",
+                "input",
+                "[role=combobox]",
+                "[aria-haspopup]",
+                "[tabindex]",
+                "button",
+            ]
+
+            async def find_enabled_trigger(container: Any) -> Any | None:
+                for selector in dropdown_trigger_selectors:
+                    triggers = container.locator(selector)
+                    trigger_count = await triggers.count()
+                    for trigger_index in range(trigger_count):
+                        trigger = triggers.nth(trigger_index)
+                        with suppress(Exception):
+                            if await is_visible(trigger) and not await widget_is_disabled(trigger):
+                                return trigger
+                return None
+
             async def item_has_enabled_widget(item: Any) -> bool:
-                widgets = item.locator(
-                    ".el-select,.el-cascader,[role=combobox],input[readonly],"
-                    "input[placeholder*='请选择'],.el-select .el-input__wrapper,.el-cascader .el-input__wrapper,"
-                    ".el-select__wrapper,.el-select__placeholder,.el-select__selected-item"
-                )
-                count = await widgets.count()
-                for index in range(count):
-                    widget = widgets.nth(index)
-                    with suppress(Exception):
-                        if await is_visible(widget) and not await widget_is_disabled(widget):
-                            return True
-                return False
+                return await find_enabled_trigger(item) is not None
 
             async def widget_is_disabled(widget: Any) -> bool:
                 with suppress(Exception):
@@ -1061,7 +1097,7 @@ async def _run_browser_use_target_handover(
                 return await visible_text(item)
 
             async def already_has_selected_value(item: Any) -> str | None:
-                inputs = item.locator(".el-select input,.el-cascader input,input[readonly]")
+                inputs = item.locator(".el-select input,.el-cascader input,.vue-treeselect input,input[readonly]")
                 count = await inputs.count()
                 for index in range(count):
                     input_locator = inputs.nth(index)
@@ -1071,7 +1107,10 @@ async def _run_browser_use_target_handover(
                         selected_value = await native_control_selected_value(input_locator)
                         if selected_value:
                             return selected_value
-                selected_items = item.locator(".el-select__selected-item,.el-select__placeholder")
+                selected_items = item.locator(
+                    ".el-select__selected-item,.el-select__placeholder,"
+                    ".vue-treeselect__single-value,.vue-treeselect__placeholder"
+                )
                 selected_count = await selected_items.count()
                 for index in range(selected_count):
                     selected_item = selected_items.nth(index)
@@ -1086,29 +1125,109 @@ async def _run_browser_use_target_handover(
             async def collect_form_item_diagnostics(
                 label_patterns: list[re.Pattern[str]],
                 label_texts: list[str] | None = None,
+                placeholder_texts: list[str] | None = None,
             ) -> dict[str, Any]:
                 form_items = (await active_form_root()).locator(".el-form-item")
                 count = await form_items.count()
                 expected_labels = [text.strip() for text in (label_texts or []) if text and text.strip()]
+                expected_placeholders = [text.strip() for text in (placeholder_texts or []) if text and text.strip()]
                 candidate_labels: list[dict[str, Any]] = []
                 widget_labels: list[dict[str, Any]] = []
+                matched_label_diagnostics: list[dict[str, Any]] = []
+
+                async def selector_counts(item: Any) -> dict[str, int]:
+                    counts: dict[str, int] = {}
+                    for selector in diagnostic_selectors:
+                        with suppress(Exception):
+                            counts[selector] = await item.locator(selector).count()
+                    return counts
+
+                async def trigger_candidates(item: Any) -> list[dict[str, Any]]:
+                    candidates: list[dict[str, Any]] = []
+                    for selector in dropdown_trigger_selectors:
+                        triggers = item.locator(selector)
+                        trigger_count = await triggers.count()
+                        for trigger_index in range(min(trigger_count, 4)):
+                            trigger = triggers.nth(trigger_index)
+                            with suppress(Exception):
+                                candidates.append(
+                                    {
+                                        "selector": selector,
+                                        "index": trigger_index,
+                                        "visible": await is_visible(trigger),
+                                        "disabled": await widget_is_disabled(trigger),
+                                        "text": (await visible_text(trigger))[:120],
+                                    }
+                                )
+                            if len(candidates) >= 12:
+                                return candidates
+                    return candidates
+
+                async def item_diagnostic(index: int, item: Any, text: str) -> dict[str, Any]:
+                    class_name = ""
+                    outer_html = ""
+                    with suppress(Exception):
+                        class_name = _text(await item.evaluate("(el) => el.className || ''"))[:180]
+                    with suppress(Exception):
+                        outer_html = _text(await item.evaluate("(el) => el.outerHTML || ''"))[:900]
+                    return {
+                        "index": index,
+                        "label_text": text[:180],
+                        "class_name": class_name,
+                        "selector_counts": await selector_counts(item),
+                        "trigger_candidates": await trigger_candidates(item),
+                        "outer_html_preview": outer_html,
+                    }
+
                 for index in range(count):
                     item = form_items.nth(index)
                     label_only = await item_label_text(item)
                     text = label_only or await visible_text(item)
                     if not text:
                         continue
+                    label_match = bool(
+                        any(expected_label in text for expected_label in expected_labels)
+                        or any(pattern.search(text) for pattern in label_patterns)
+                    )
                     entry = {"index": index, "label_text": text[:180]}
                     if len(candidate_labels) < 40:
                         candidate_labels.append(entry)
                     if await item_has_enabled_widget(item) and len(widget_labels) < 40:
                         widget_labels.append(entry)
+                    if label_match and len(matched_label_diagnostics) < 5:
+                        matched_label_diagnostics.append(await item_diagnostic(index, item, text))
+
+                placeholder_candidates: list[dict[str, Any]] = []
+                for placeholder in expected_placeholders:
+                    visible_placeholder_triggers = target_page.locator(
+                        f"xpath=//*[contains(@class, 'el-select__placeholder') and contains(normalize-space(.), '{placeholder}')] | "
+                        f"//*[contains(@class, 'el-select__selected-item') and contains(normalize-space(.), '{placeholder}')] | "
+                        f"//*[contains(@class, 'vue-treeselect__placeholder') and contains(normalize-space(.), '{placeholder}')] | "
+                        f"//*[contains(@class, 'vue-treeselect__single-value') and contains(normalize-space(.), '{placeholder}')] | "
+                        f"//input[contains(@placeholder, '{placeholder}')]"
+                    )
+                    candidate_count = await visible_placeholder_triggers.count()
+                    for candidate_index in range(min(candidate_count, 8)):
+                        candidate = visible_placeholder_triggers.nth(candidate_index)
+                        with suppress(Exception):
+                            placeholder_candidates.append(
+                                {
+                                    "placeholder": placeholder,
+                                    "index": candidate_index,
+                                    "visible": await is_visible(candidate),
+                                    "disabled": await widget_is_disabled(candidate),
+                                    "text": (await visible_text(candidate))[:120],
+                                }
+                            )
                 return {
                     "expected_labels": expected_labels,
+                    "expected_placeholders": expected_placeholders,
                     "label_patterns": [pattern.pattern for pattern in label_patterns],
                     "form_item_count": count,
                     "candidate_labels": candidate_labels,
                     "widget_labels": widget_labels,
+                    "matched_label_diagnostics": matched_label_diagnostics,
+                    "placeholder_candidates": placeholder_candidates,
                 }
 
             async def find_labeled_form_item(
@@ -1160,8 +1279,22 @@ async def _run_browser_use_target_handover(
                     expected_labels=expected_labels,
                 )
                 matched_trigger = None
+                matched_trigger_is_value_reader = False
 
-                async def find_field_by_placeholder() -> tuple[Any | None, str, Any | None]:
+                async def find_field_by_placeholder() -> tuple[Any | None, str, Any | None, bool]:
+                    async def trigger_container(trigger: Any) -> Any:
+                        container = trigger.locator(
+                            "xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' el-form-item ')][1]"
+                        )
+                        if await container.count():
+                            return container
+                        select_container = trigger.locator(
+                            "xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' el-select ')][1]"
+                        )
+                        if await select_container.count():
+                            return select_container
+                        return trigger.locator("xpath=..")
+
                     for placeholder in expected_placeholders:
                         triggers = target_page.locator(
                             f"input[placeholder*='{placeholder}'],textarea[placeholder*='{placeholder}'],"
@@ -1172,26 +1305,37 @@ async def _run_browser_use_target_handover(
                             trigger = triggers.nth(trigger_index)
                             if not await is_visible(trigger) or await widget_is_disabled(trigger):
                                 continue
-                            container = trigger.locator(
-                                "xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' el-form-item ')][1]"
-                            )
-                            if await container.count():
-                                return container, placeholder, trigger
-                            return trigger.locator("xpath=.."), placeholder, trigger
-                    return None, "", None
+                            return await trigger_container(trigger), placeholder, trigger, True
+                        visible_placeholder_triggers = target_page.locator(
+                            f"xpath=//*[contains(@class, 'el-select__placeholder') and contains(normalize-space(.), '{placeholder}')] | "
+                            f"//*[contains(@class, 'el-select__selected-item') and contains(normalize-space(.), '{placeholder}')] | "
+                            f"//*[contains(@class, 'vue-treeselect__placeholder') and contains(normalize-space(.), '{placeholder}')] | "
+                            f"//*[contains(@class, 'vue-treeselect__single-value') and contains(normalize-space(.), '{placeholder}')]"
+                        )
+                        visible_placeholder_count = await visible_placeholder_triggers.count()
+                        for trigger_index in range(visible_placeholder_count):
+                            trigger = visible_placeholder_triggers.nth(trigger_index)
+                            if not await is_visible(trigger) or await widget_is_disabled(trigger):
+                                continue
+                            return await trigger_container(trigger), placeholder, trigger, False
+                    return None, "", None, False
 
                 if matched_item is None:
-                    matched_item, matched_label, matched_trigger = await find_field_by_placeholder()
+                    matched_item, matched_label, matched_trigger, matched_trigger_is_value_reader = await find_field_by_placeholder()
                     if matched_item is None:
                         return {
                             "ok": False,
                             "reason": "form_item_not_found",
-                            "diagnostics": await collect_form_item_diagnostics(label_patterns, label_texts),
+                            "diagnostics": await collect_form_item_diagnostics(
+                                label_patterns,
+                                label_texts,
+                                placeholder_texts,
+                            ),
                         }
 
                 existing_value = (
                     await native_control_selected_value(matched_trigger)
-                    if matched_trigger is not None
+                    if matched_trigger is not None and matched_trigger_is_value_reader
                     else await already_has_selected_value(matched_item)
                 )
                 if existing_value:
@@ -1210,18 +1354,7 @@ async def _run_browser_use_target_handover(
                 else:
                     clicked = await click_first_visible(
                         matched_item,
-                        [
-                            "[role=combobox]",
-                            "input[placeholder*='请选择']",
-                            ".el-select .el-input__wrapper",
-                            ".el-select__wrapper",
-                            ".el-select__placeholder",
-                            ".el-select__selected-item",
-                            ".el-select",
-                            "input[readonly]",
-                            ".el-input__wrapper",
-                            ".el-input",
-                        ],
+                        dropdown_trigger_selectors,
                     )
                 if not clicked:
                     return {"ok": False, "reason": "trigger_not_found", "label_text": matched_label}
@@ -1230,7 +1363,9 @@ async def _run_browser_use_target_handover(
                 options = target_page.locator(
                     ".el-select-dropdown .el-select-dropdown__item:not(.is-disabled), "
                     "[role=option]:not(.is-disabled), "
-                    ".el-cascader-node:not(.is-disabled)"
+                    ".el-cascader-node:not(.is-disabled), "
+                    ".vue-treeselect__option:not(.vue-treeselect__option--disabled), "
+                    ".vue-treeselect__label-container"
                 )
                 option_count = await options.count()
                 candidates: list[tuple[Any, str]] = []
@@ -1240,7 +1375,16 @@ async def _run_browser_use_target_handover(
                     if await is_visible(option) and text and not re.search(r"请选择|全部", text):
                         candidates.append((option, text))
                 if not candidates:
-                    return {"ok": False, "reason": "option_not_found", "label_text": matched_label}
+                    return {
+                        "ok": False,
+                        "reason": "option_not_found",
+                        "label_text": matched_label,
+                        "diagnostics": await collect_form_item_diagnostics(
+                            label_patterns,
+                            label_texts,
+                            placeholder_texts,
+                        ),
+                    }
 
                 preferred = preferred or []
                 avoid = avoid or []
@@ -1260,7 +1404,7 @@ async def _run_browser_use_target_handover(
                 await target_page.wait_for_timeout(350)
                 committed_value = (
                     await native_control_selected_value(matched_trigger)
-                    if matched_trigger is not None
+                    if matched_trigger is not None and matched_trigger_is_value_reader
                     else await already_has_selected_value(matched_item)
                 )
                 return {
@@ -1277,6 +1421,23 @@ async def _run_browser_use_target_handover(
                 label_texts: list[str] | None = None,
                 max_depth: int = 4,
             ) -> dict[str, Any]:
+                async def visible_cascader_menus() -> list[Any]:
+                    menus = target_page.locator(".el-cascader-panel .el-cascader-menu")
+                    menu_count = await menus.count()
+                    return [menus.nth(index) for index in range(menu_count) if await is_visible(menus.nth(index))]
+
+                async def wait_for_visible_cascader_menu_count(
+                    min_count: int,
+                    *,
+                    timeout_ms: int = 2500,
+                ) -> tuple[list[Any], bool]:
+                    deadline = perf_counter() + (timeout_ms / 1000)
+                    visible_menus = await visible_cascader_menus()
+                    while len(visible_menus) < min_count and perf_counter() < deadline:
+                        await target_page.wait_for_timeout(150)
+                        visible_menus = await visible_cascader_menus()
+                    return visible_menus, len(visible_menus) >= min_count
+
                 form_items = (await active_form_root()).locator(".el-form-item")
                 count = await form_items.count()
                 matched_item = None
@@ -1325,42 +1486,83 @@ async def _run_browser_use_target_handover(
                     return {"ok": False, "reason": "trigger_not_found", "label_text": matched_label}
                 await target_page.wait_for_timeout(400)
                 selected_path: list[str] = []
+                trace: list[dict[str, Any]] = []
                 for depth in range(max_depth):
-                    menus = target_page.locator(".el-cascader-panel .el-cascader-menu")
-                    menu_count = await menus.count()
-                    visible_menus = [menus.nth(index) for index in range(menu_count) if await is_visible(menus.nth(index))]
+                    visible_menus, _ = await wait_for_visible_cascader_menu_count(
+                        depth + 1,
+                        timeout_ms=2500,
+                    )
                     if depth >= len(visible_menus):
-                        break
+                        return {
+                            "ok": False,
+                            "selected_path": selected_path,
+                            "label_text": matched_label[:120],
+                            "reason": "cascader_menu_not_visible",
+                            "depth": depth,
+                            "visible_menu_count": len(visible_menus),
+                            "trace": trace,
+                        }
                     nodes = visible_menus[depth].locator(".el-cascader-node:not(.is-disabled)")
                     node_count = await nodes.count()
                     chosen = None
                     chosen_text = ""
+                    node_candidates: list[str] = []
                     for node_index in range(node_count):
                         node = nodes.nth(node_index)
                         text = await visible_text(node)
+                        if text and len(node_candidates) < 8:
+                            node_candidates.append(text)
                         if await is_visible(node) and text and not re.search(r"请选择|全部", text):
                             chosen = node
                             chosen_text = text
                             break
                     if chosen is None:
-                        break
+                        return {
+                            "ok": False,
+                            "selected_path": selected_path,
+                            "label_text": matched_label[:120],
+                            "reason": "cascader_option_not_found",
+                            "depth": depth,
+                            "visible_menu_count": len(visible_menus),
+                            "node_candidates": node_candidates,
+                            "trace": trace,
+                        }
                     await chosen.scroll_into_view_if_needed(timeout=1500)
                     await chosen.click(timeout=2500)
                     selected_path.append(chosen_text)
                     await target_page.wait_for_timeout(400)
+                    next_visible_menus, next_menu_visible = (
+                        await wait_for_visible_cascader_menu_count(depth + 2, timeout_ms=2500)
+                        if depth < max_depth - 1
+                        else (await visible_cascader_menus(), False)
+                    )
                     committed_after_click = await already_has_selected_value(matched_item)
-                    if committed_after_click:
+                    panel_visible = await is_visible(target_page.locator(".el-cascader-panel").first)
+                    trace.append(
+                        {
+                            "depth": depth,
+                            "selected": chosen_text,
+                            "visible_menu_count": len(next_visible_menus),
+                            "next_menu_visible": next_menu_visible,
+                            "panel_visible": panel_visible,
+                            "committed_value": committed_after_click,
+                        }
+                    )
+                    if next_menu_visible:
+                        continue
+                    if committed_after_click and not panel_visible:
                         break
-                    next_menu = target_page.locator(".el-cascader-panel .el-cascader-menu").nth(depth + 1)
-                    if depth < max_depth - 1 and not await next_menu.count():
+                    if depth < max_depth - 1:
                         return {
                             "ok": False,
                             "selected_path": selected_path,
                             "label_text": matched_label[:120],
                             "reason": "terminal_level_not_reached",
+                            "visible_menu_count": len(next_visible_menus),
+                            "committed_value": committed_after_click,
+                            "trace": trace,
                         }
-                    panel_visible = await is_visible(target_page.locator(".el-cascader-panel").first)
-                    if not panel_visible:
+                    if committed_after_click:
                         break
                 committed_value = await already_has_selected_value(matched_item)
                 return {
@@ -1369,6 +1571,7 @@ async def _run_browser_use_target_handover(
                     "selected_value": committed_value,
                     "label_text": matched_label[:120],
                     "reason": None if committed_value else "option_not_found",
+                    "trace": trace,
                 }
 
             with suppress(Exception):
@@ -1391,12 +1594,88 @@ async def _run_browser_use_target_handover(
                     [],
                     label_texts=["验收监管单位"],
                     placeholder_texts=["请选择验收监管单位"],
+                    preferred=[re.compile(r"广西壮族自治区林业局|林业局|监管", re.I)],
                 ),
                 "seedlingLocation": await choose_cascader(
                     [],
                     label_texts=["育苗地址", "育苗地点"],
                 ),
             }
+
+        async def select_required_online_apply_dates(target_page: Any) -> list[dict[str, Any]]:
+            async def visible_text(locator: Any) -> str:
+                with suppress(Exception):
+                    return _text(await locator.inner_text(timeout=800))
+                return ""
+
+            desired_dates = [
+                "育苗开始日期",
+                "验收日期",
+            ]
+            selected: list[dict[str, Any]] = []
+            active_form = target_page.locator(
+                ".el-dialog:not([style*='display: none']) .el-form-item, "
+                ".el-drawer__wrapper:not([style*='display: none']) .el-form-item"
+            )
+            form_items = active_form if await active_form.count() else target_page.locator(".el-form-item")
+            item_count = await form_items.count()
+            for label in desired_dates:
+                matched_item = None
+                for index in range(item_count):
+                    item = form_items.nth(index)
+                    text = await visible_text(item)
+                    if text and label in text:
+                        matched_item = item
+                        break
+                if matched_item is None:
+                    selected.append({"label": label, "ok": False, "reason": "form_item_not_found"})
+                    continue
+                input_locator = matched_item.locator(
+                    ".el-date-editor input:not([type=hidden]), input[type=date], input[placeholder*='日期'], input[placeholder*='date']"
+                ).first
+                if not await input_locator.count():
+                    selected.append({"label": label, "ok": False, "reason": "date_input_not_found"})
+                    continue
+                try:
+                    existing_value = _text(await input_locator.input_value(timeout=800))
+                    if existing_value:
+                        selected.append(
+                            {
+                                "label": label,
+                                "ok": True,
+                                "value": existing_value,
+                                "skipped": "already_selected",
+                            }
+                        )
+                        continue
+                    await input_locator.scroll_into_view_if_needed(timeout=1500)
+                    await input_locator.click(timeout=2500)
+                    await target_page.wait_for_timeout(300)
+                    picker = target_page.locator(".el-picker-panel:visible,.el-date-picker:visible").last
+                    if not await picker.count():
+                        selected.append({"label": label, "ok": False, "reason": "date_picker_not_opened"})
+                        continue
+                    day_cells = picker.locator(
+                        "td.available:not(.disabled):not(.today) .cell, "
+                        "td.available:not(.disabled):not(.today)"
+                    )
+                    if not await day_cells.count():
+                        selected.append({"label": label, "ok": False, "reason": "date_option_not_found"})
+                        continue
+                    day_cell = day_cells.first
+                    await day_cell.scroll_into_view_if_needed(timeout=1500)
+                    await day_cell.click(timeout=2500)
+                    await target_page.wait_for_timeout(300)
+                    with suppress(Exception):
+                        await input_locator.dispatch_event("change")
+                        await input_locator.dispatch_event("blur")
+                    selected_value = _text(await input_locator.input_value(timeout=800))
+                    selected.append({"label": label, "ok": bool(selected_value), "value": selected_value or None})
+                except Exception as exc:
+                    selected.append(
+                        {"label": label, "ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+                    )
+            return selected
 
         async def repair_online_apply_required_fields(target_page: Any) -> dict[str, Any]:
             with suppress(Exception):
@@ -1408,74 +1687,7 @@ async def _run_browser_use_target_handover(
                 return ""
 
             async def repair_required_dates() -> list[dict[str, Any]]:
-                desired_dates = [
-                    "育苗开始日期",
-                    "验收日期",
-                ]
-                repaired: list[dict[str, Any]] = []
-                active_form = target_page.locator(
-                    ".el-dialog:not([style*='display: none']) .el-form-item, "
-                    ".el-drawer__wrapper:not([style*='display: none']) .el-form-item"
-                )
-                form_items = active_form if await active_form.count() else target_page.locator(".el-form-item")
-                item_count = await form_items.count()
-                for label in desired_dates:
-                    matched_item = None
-                    for index in range(item_count):
-                        item = form_items.nth(index)
-                        text = await visible_text(item)
-                        if text and label in text:
-                            matched_item = item
-                            break
-                    if matched_item is None:
-                        repaired.append({"label": label, "ok": False, "reason": "form_item_not_found"})
-                        continue
-                    input_locator = matched_item.locator(
-                        ".el-date-editor input:not([type=hidden]), input[type=date], input[placeholder*='日期'], input[placeholder*='date']"
-                    ).first
-                    if not await input_locator.count():
-                        repaired.append({"label": label, "ok": False, "reason": "date_input_not_found"})
-                        continue
-                    try:
-                        existing_value = _text(await input_locator.input_value(timeout=800))
-                        if existing_value:
-                            repaired.append(
-                                {
-                                    "label": label,
-                                    "ok": True,
-                                    "value": existing_value,
-                                    "skipped": "already_selected",
-                                }
-                            )
-                            continue
-                        await input_locator.scroll_into_view_if_needed(timeout=1500)
-                        await input_locator.click(timeout=2500)
-                        await target_page.wait_for_timeout(300)
-                        picker = target_page.locator(".el-picker-panel:visible,.el-date-picker:visible").last
-                        if not await picker.count():
-                            repaired.append({"label": label, "ok": False, "reason": "date_picker_not_opened"})
-                            continue
-                        day_cells = picker.locator(
-                            "td.available:not(.disabled):not(.today) .cell, "
-                            "td.available:not(.disabled):not(.today)"
-                        )
-                        if not await day_cells.count():
-                            repaired.append({"label": label, "ok": False, "reason": "date_option_not_found"})
-                            continue
-                        day_cell = day_cells.first
-                        await day_cell.scroll_into_view_if_needed(timeout=1500)
-                        await day_cell.click(timeout=2500)
-                        await target_page.wait_for_timeout(300)
-                        with suppress(Exception):
-                            await input_locator.dispatch_event("change")
-                            await input_locator.dispatch_event("blur")
-                        selected_value = _text(await input_locator.input_value(timeout=800))
-                        repaired.append({"label": label, "ok": bool(selected_value), "value": selected_value or None})
-                    except Exception as exc:
-                        repaired.append(
-                            {"label": label, "ok": False, "reason": f"{type(exc).__name__}: {exc}"}
-                        )
-                return repaired
+                return await select_required_online_apply_dates(target_page)
 
             async def collect_validation_errors() -> list[str]:
                 errors = await target_page.evaluate(
@@ -1635,6 +1847,10 @@ async def _run_browser_use_target_handover(
                     "native_controls",
                     lambda: select_required_online_apply_dropdowns(target_page),
                 )
+                date_result = await run_prefill_phase(
+                    "native_date_controls",
+                    lambda: select_required_online_apply_dates(target_page),
+                )
                 with suppress(Exception):
                     await clear_blocking_overlays(target_page)
                 second_fill_result = await run_prefill_phase(
@@ -1647,6 +1863,7 @@ async def _run_browser_use_target_handover(
                         "phases": phases,
                         "prefill": first_fill_result,
                         "dropdowns": dropdown_result,
+                        "dates": date_result,
                         "expanded_prefill": second_fill_result,
                     },
                     ensure_ascii=False,
@@ -1837,18 +2054,86 @@ async def _run_browser_use_target_handover(
                     return bool(await locator.is_visible(timeout=800))
                 return False
 
+            dialog_select_trigger_selectors = [
+                "[role=combobox]",
+                "input[placeholder*='请选择']",
+                ".el-select .el-input__wrapper",
+                ".el-select__wrapper",
+                ".el-select__placeholder",
+                ".el-select__selected-item",
+                ".el-select",
+                "input[readonly]",
+                ".el-input__wrapper",
+                ".el-input",
+                "[class*='select']",
+            ]
+
+            async def dialog_trigger_container(trigger: Any) -> Any:
+                for class_name in ["el-select", "el-form-item", "el-input"]:
+                    container = trigger.locator(
+                        f"xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' {class_name} ')][1]"
+                    )
+                    if await container.count():
+                        return container
+                return trigger
+
+            async def click_dialog_select_trigger() -> bool:
+                for selector in dialog_select_trigger_selectors:
+                    triggers = dialog.locator(selector)
+                    trigger_count = await triggers.count()
+                    for index in range(trigger_count):
+                        trigger = triggers.nth(index)
+                        if not await is_visible(trigger):
+                            continue
+                        await trigger.scroll_into_view_if_needed(timeout=1500)
+                        await trigger.click(timeout=2500)
+                        return True
+                visible_placeholder_triggers = dialog.locator(
+                    "xpath=.//*[normalize-space(.)='请选择备案登记/监管单位'] | "
+                    ".//*[contains(normalize-space(.), '请选择备案登记/监管单位') "
+                    "and string-length(normalize-space(.)) <= 40]"
+                )
+                visible_placeholder_count = await visible_placeholder_triggers.count()
+                for index in range(visible_placeholder_count):
+                    trigger = visible_placeholder_triggers.nth(index)
+                    if not await is_visible(trigger):
+                        continue
+                    container = await dialog_trigger_container(trigger)
+                    await container.scroll_into_view_if_needed(timeout=1500)
+                    await container.click(timeout=2500)
+                    return True
+                return False
+
             async def collect_dialog_select_diagnostics() -> dict[str, Any]:
                 trigger_candidates: list[dict[str, Any]] = []
-                triggers = dialog.locator(
-                    "[role=combobox], input[placeholder*='请选择'], "
-                    ".el-select .el-input__wrapper, .el-select__wrapper, "
-                    ".el-select__placeholder, .el-select__selected-item, .el-select"
+                for selector in dialog_select_trigger_selectors:
+                    triggers = dialog.locator(selector)
+                    trigger_count = await triggers.count()
+                    for index in range(min(trigger_count, 4)):
+                        trigger = triggers.nth(index)
+                        trigger_candidates.append(
+                            {
+                                "selector": selector,
+                                "index": index,
+                                "text": (await visible_text(trigger))[:120],
+                                "visible": await is_visible(trigger),
+                            }
+                        )
+                        if len(trigger_candidates) >= 20:
+                            break
+                    if len(trigger_candidates) >= 20:
+                        break
+                visible_placeholder_triggers = dialog.locator(
+                    "xpath=.//*[normalize-space(.)='请选择备案登记/监管单位'] | "
+                    ".//*[contains(normalize-space(.), '请选择备案登记/监管单位') "
+                    "and string-length(normalize-space(.)) <= 40]"
                 )
-                trigger_count = await triggers.count()
-                for index in range(min(trigger_count, 20)):
-                    trigger = triggers.nth(index)
+                visible_placeholder_count = await visible_placeholder_triggers.count()
+                for index in range(min(visible_placeholder_count, 8)):
+                    trigger = visible_placeholder_triggers.nth(index)
                     trigger_candidates.append(
                         {
+                            "selector": "visible_placeholder_triggers",
                             "index": index,
                             "text": (await visible_text(trigger))[:120],
                             "visible": await is_visible(trigger),
@@ -1876,14 +2161,7 @@ async def _run_browser_use_target_handover(
                 }
 
             with suppress(Exception):
-                select_trigger = dialog.locator(
-                    "[role=combobox], input[placeholder*='请选择'], "
-                    ".el-select .el-input__wrapper, .el-select__wrapper, "
-                    ".el-select__placeholder, .el-select__selected-item, .el-select"
-                ).first
-                if await select_trigger.count():
-                    await select_trigger.scroll_into_view_if_needed(timeout=1500)
-                    await select_trigger.click(timeout=2500)
+                if await click_dialog_select_trigger():
                     await target_page.wait_for_timeout(350)
                     options = target_page.locator(
                         ".el-select-dropdown .el-select-dropdown__item:not(.is-disabled), "
@@ -2058,10 +2336,9 @@ async def _run_browser_use_target_handover(
             browser=browser,
             tools=tools,
             use_vision=True,
-            max_steps=BROWSER_USE_DETERMINISTIC_TOOL_FIRST_MAX_STEPS,
             max_actions_per_step=1,
         )
-        history = await agent.run()
+        history = await agent.run(max_steps=BROWSER_USE_DETERMINISTIC_TOOL_FIRST_MAX_STEPS)
         screenshots.append(
             await _capture_playwright_screenshot(
                 page,
@@ -2218,7 +2495,7 @@ def _browser_use_handover_task(
     repair_goal = (
         "如果提交后出现“育苗开始日期、验收监管单位、验收日期、验收文件”等红字必填错误，调用 "
         "script_repair_required_fields 修复一次，再调用 script_submit_form 重试一次；如果仍有红字必填错误，记录失败原因并结束本轮，"
-        "不要再自行编写 evaluate/JS 或 write_file 脚本，不要进入重复兜底循环。"
+        "如果验收监管单位仍未提交成功，立即结束并报告失败，不要再尝试 evaluate，不要再自行编写 evaluate/JS 或 write_file 脚本，不要进入重复兜底循环。"
         if can_submit
         else "如果表单出现红字必填错误，只调用 get_page_feedback 记录校验反馈并结束本轮；不要为了修复校验而提交或重试提交。"
     )
@@ -2235,8 +2512,8 @@ def _browser_use_handover_task(
 3. 找到“我要申请备案”“申请备案”或“新增”按钮并点击，进入申请表单。
 4. {execution_goal}
 5. 每个 script_* 工具最多调用一次，只有 script_repair_required_fields 后允许再调用一次 script_submit_form 作为修复重试。
-6. script_prefill_form 会预填文本字段、勾选协议，并用 Playwright 直接点击备案品种 plantId、备案类型 registerType、育苗目的、可见的育苗方式、验收监管单位和“育苗地点”三级 cascader；如果提交后仍提示下拉必填，再调用 script_select_required_dropdowns 重试。不要用 evaluate/JS 直接给下拉输入框赋值。
-7. 如果页面出现“育苗方式”下拉框，测试数据默认走低前置数据分支：不要选择“种子繁殖”，因为它会要求填写“种子采集许可证号”；优先选择“分蘗繁殖”“分蘖繁殖”“炼苗”或“其他”等不需要许可证的选项。遇到“育苗地点”这类城市/城区/社区三级控件时，不要手工逐项尝试，不要反复手工点击 cascader，直接依赖 script_prefill_form 内置的 Playwright cascader 选择。
+6. script_prefill_form 会预填文本字段、勾选协议，并用 Playwright 直接点击备案品种 plantId、备案类型 registerType、育苗目的、可见的育苗方式、验收监管单位和“育苗地点”多级 cascader（最多四级）；其中“验收监管单位”可能是 vue-treeselect 控件，必须依赖 script_prefill_form / script_select_required_dropdowns 内置的原生控件交互。如果提交后仍提示下拉必填，再调用 script_select_required_dropdowns 重试。不要用 evaluate/JS 直接给下拉输入框赋值。
+7. 如果页面出现“育苗方式”下拉框，测试数据默认走低前置数据分支：不要选择“种子繁殖”，因为它会要求填写“种子采集许可证号”；优先选择“分蘗繁殖”“分蘖繁殖”“炼苗”或“其他”等不需要许可证的选项。遇到“育苗地点”这类城市/城区/社区多级控件时，不要手工逐项尝试，不要反复手工点击 cascader，直接依赖 script_prefill_form 内置的 Playwright cascader 选择。
 8. 文件上传必须调用 script_upload_sample_files，它会按控件附近的标签完成 4 处上传，分别使用真实样本文件：人员信息表 xls、备案图片 jpg、附件 doc、验收文件 pdf。不要用 evaluate/JS 构造 File 对象，不要反复尝试手工文件上传；同一上传位已有文件时不要重复上传。
 9. 如果 script_submit_form 后弹出要求选择“备案登记/监管单位”并上传申请表的最终提交弹窗，必须调用 script_complete_final_record_dialog；不要点击弹窗里的“上传文件”按钮，不要打开原生文件选择窗口，不要用 evaluate/JS 构造 File 对象。
 10. {repair_goal}
