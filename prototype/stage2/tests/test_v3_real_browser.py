@@ -17,8 +17,11 @@ from prototype.stage2.app.v3_real_browser import (  # noqa: E402
     build_menu_discovery_artifacts,
     _ensure_online_apply_upload_samples,
     _browser_use_history_result,
+    _browser_use_history_is_success,
     _dedupe_page_exploration,
     _browser_use_handover_task,
+    _choose_final_dialog_unit,
+    _final_dialog_unit_options_from_visible_text,
     _infer_feature_type,
     _merge_browser_use_handover,
     _normalize_page_url,
@@ -29,6 +32,12 @@ from prototype.stage2.app.v3_real_browser import (  # noqa: E402
     _should_block_for_login_text,
     _snapshot_is_blank,
     _side_effect_execution_result,
+    _restore_target_page_start,
+    _target_page_restore_plan,
+    _return_to_start_url_after_menu_leaf,
+    _return_to_start_url_after_browser_use_handover,
+    _normalize_playwright_menu_shell,
+    _click_playwright_menu_candidate,
 )
 
 
@@ -637,6 +646,144 @@ def test_browser_use_handover_task_tells_agent_not_to_repeat_manual_cascader_cli
     assert "script_prefill_form" in task
 
 
+def test_target_page_restore_plan_prefers_matched_menu_route_hint() -> None:
+    config = V3RunConfig(start_url="https://www.zbsykj.com:19096/index")
+    plan = _target_page_restore_plan(
+        config,
+        [{"target": "线上备案申请", "matched_menu_entry_ids": ["menu_online_apply"]}],
+        {
+            "menu_entries": [
+                {
+                    "menu_id": "menu_online_apply",
+                    "text": "线上备案申请",
+                    "route_hint": "/record/online",
+                    "menu_path": ["业务办理", "线上备案申请"],
+                    "is_leaf": True,
+                }
+            ]
+        },
+        {"pages": []},
+    )
+
+    assert plan == {
+        "target": "线上备案申请",
+        "source": "menu_entry_route_hint",
+        "menu_id": "menu_online_apply",
+        "url": "https://www.zbsykj.com:19096/record/online",
+        "route_hint": "/record/online",
+        "menu_path": ["业务办理", "线上备案申请"],
+    }
+
+
+def test_restore_target_page_start_navigates_route_hint_before_browser_use() -> None:
+    class _Page:
+        def __init__(self) -> None:
+            self.url = "https://www.zbsykj.com:19096/index"
+            self.goto_calls: list[str] = []
+
+        async def goto(self, url: str, wait_until: str = "", timeout: int = 0) -> None:
+            self.goto_calls.append(url)
+            self.url = url
+
+        async def wait_for_load_state(self, state: str, timeout: int = 0) -> None:
+            return None
+
+        async def wait_for_timeout(self, timeout: int) -> None:
+            return None
+
+    page = _Page()
+    result = asyncio.run(
+        _restore_target_page_start(
+            page,
+            V3RunConfig(start_url="https://www.zbsykj.com:19096/index"),
+            [{"target": "线上备案申请", "matched_menu_entry_ids": ["menu_online_apply"]}],
+            {
+                "menu_entries": [
+                    {
+                        "menu_id": "menu_online_apply",
+                        "text": "线上备案申请",
+                        "route_hint": "/record/online",
+                        "is_leaf": True,
+                    }
+                ]
+            },
+            {"pages": []},
+        )
+    )
+
+    assert page.goto_calls == ["https://www.zbsykj.com:19096/record/online"]
+    assert result["ok"] is True
+    assert result["method"] == "goto"
+    assert result["plan"]["source"] == "menu_entry_route_hint"
+
+
+def test_menu_leaf_page_exploration_returns_to_home_after_each_page() -> None:
+    class _Page:
+        def __init__(self) -> None:
+            self.goto_calls: list[str] = []
+            self.wait_calls: list[str] = []
+
+        async def goto(self, url: str, wait_until: str = "", timeout: int = 0) -> None:
+            self.goto_calls.append(url)
+
+        async def wait_for_load_state(self, state: str, timeout: int = 0) -> None:
+            self.wait_calls.append(state)
+
+        async def wait_for_timeout(self, timeout: int) -> None:
+            return None
+
+    page = _Page()
+    result = asyncio.run(
+        _return_to_start_url_after_menu_leaf(
+            page,
+            V3RunConfig(start_url="https://www.zbsykj.com:19096/index"),
+            menu_id="menu_7",
+            page_id="menu_page_002",
+        )
+    )
+
+    assert result == {
+        "event": "return_to_home_after_menu_leaf",
+        "status": "completed",
+        "menu_id": "menu_7",
+        "page_entry_id": "menu_page_002",
+        "url": "https://www.zbsykj.com:19096/index",
+        "method": "goto_start_url",
+    }
+    assert page.goto_calls == ["https://www.zbsykj.com:19096/index"]
+    assert "domcontentloaded" in page.wait_calls
+
+
+def test_browser_use_handover_returns_to_home_after_target_flow() -> None:
+    class _Page:
+        def __init__(self) -> None:
+            self.goto_calls: list[str] = []
+
+        async def goto(self, url: str, wait_until: str = "", timeout: int = 0) -> None:
+            self.goto_calls.append(url)
+
+        async def wait_for_load_state(self, state: str, timeout: int = 0) -> None:
+            return None
+
+        async def wait_for_timeout(self, timeout: int) -> None:
+            return None
+
+    page = _Page()
+    result = asyncio.run(
+        _return_to_start_url_after_browser_use_handover(
+            page,
+            V3RunConfig(start_url="https://www.zbsykj.com:19096/index"),
+            targets=["线上备案申请"],
+        )
+    )
+
+    assert result["event"] == "return_to_home_after_browser_use_handover"
+    assert result["status"] == "completed"
+    assert result["targets"] == ["线上备案申请"]
+    assert result["url"] == "https://www.zbsykj.com:19096/index"
+    assert page.goto_calls == ["https://www.zbsykj.com:19096/index"]
+
+
 def test_browser_use_handover_caps_steps_and_limits_feedback_calls() -> None:
     source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
     agent_block = source[source.index("agent = Agent(") : source.index("screenshots.append(")]
@@ -665,6 +812,20 @@ def test_browser_use_tool_timing_preview_keeps_dropdown_diagnostics_visible() ->
     assert '"result_preview": _text(result)[:BROWSER_USE_TOOL_RESULT_PREVIEW_LIMIT]' in source
 
 
+def test_browser_use_handover_writes_standard_action_and_network_evidence() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    handover_block = source[
+        source.index("async def _run_browser_use_target_handover")
+        : source.index("def _browser_use_handover_failure")
+    ]
+
+    assert 'run_dir / "action_log.jsonl"' in handover_block
+    assert '"schema_version": "stage2_action_log.v1"' in handover_block
+    assert '"executor": "browser_use_playwright_tool"' in handover_block
+    assert 'run_dir / "network_events.json"' in handover_block
+    assert '"schema_version": "stage2_network_events.v1"' in handover_block
+
+
 def test_prefill_script_clears_element_plus_message_boxes_before_dropdown_clicks() -> None:
     source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
     prefill_block = source[source.index("async def script_prefill_form") : source.index("async def script_select_required_dropdowns")]
@@ -676,6 +837,7 @@ def test_prefill_script_clears_element_plus_message_boxes_before_dropdown_clicks
 def test_prefill_script_returns_phase_timings_without_breaking_legacy_keys() -> None:
     source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
     prefill_block = source[source.index("async def script_prefill_form") : source.index("async def script_select_required_dropdowns")]
+    dropdown_block = source[source.index("async def select_required_online_apply_dropdowns") : source.index("async def prefill_visible_online_apply_fields")]
 
     assert "run_prefill_phase" in prefill_block
     assert '"phases": phases' in prefill_block
@@ -686,6 +848,10 @@ def test_prefill_script_returns_phase_timings_without_breaking_legacy_keys() -> 
     assert '"prefill": first_fill_result' in prefill_block
     assert '"dropdowns": dropdown_result' in prefill_block
     assert '"expanded_prefill": second_fill_result' in prefill_block
+    assert "control_timings" in dropdown_block
+    assert "timed_control" in dropdown_block
+    assert '"control_id"' in dropdown_block
+    assert '"duration_ms"' in dropdown_block
 
 
 def test_prefill_dropdown_selection_prefers_active_form_and_enabled_widgets() -> None:
@@ -778,7 +944,9 @@ def test_online_apply_required_field_repair_targets_acceptance_unit_not_record_u
 
     assert "/备案监管单位/" not in repair_block
     assert "setItemInput([/验收监管单位/]" not in repair_block
-    assert '"acceptanceUnit": await choose_dropdown(' in source
+    assert 'acceptance_unit_result = await timed_control(' in source
+    assert '"acceptanceUnit"' in source
+    assert '"acceptanceUnit": acceptance_unit_result' in source
     assert 'label_texts=["验收监管单位"]' in source
     assert 'label_texts: list[str] | None = None' in source
 
@@ -1063,6 +1231,26 @@ def test_final_record_dialog_can_find_visible_placeholder_text_trigger() -> None
     assert ".el-input" in dialog_block
 
 
+def test_final_record_dialog_extracts_unit_options_from_visible_select_text() -> None:
+    text = """
+    请选择备案登记/监管单位
+    广西壮族自治区林业局
+    柳州市林业局
+    融水县林业局
+    钦州市林业局
+    """
+
+    options = _final_dialog_unit_options_from_visible_text(text)
+
+    assert options == [
+        "广西壮族自治区林业局",
+        "柳州市林业局",
+        "融水县林业局",
+        "钦州市林业局",
+    ]
+    assert _choose_final_dialog_unit(["柳州市林业局", "广西壮族自治区林业局"]) == "广西壮族自治区林业局"
+
+
 def test_browser_use_handover_mentions_four_upload_slots_with_matching_files() -> None:
     task = _browser_use_handover_task(
         V3RunConfig(
@@ -1112,6 +1300,53 @@ def test_final_record_dialog_skips_existing_application_upload_and_disabled_subm
     assert '"skipped": "already_uploaded"' in dialog_block
     assert "native_button_is_disabled(button)" in dialog_block
     assert '"reason": "submit_button_disabled"' in dialog_block
+
+
+def test_final_record_dialog_reselects_unit_when_submit_remains_disabled() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dialog_block = source[
+        source.index("async def complete_online_apply_final_record_dialog")
+        : source.index("@tools.action(description=\"[脚本内部工具] 上传线上备案申请 4 处所需样本文件")
+    ]
+
+    assert "current_dialog_unit_value" in dialog_block
+    assert "click_submit_button" in dialog_block
+    assert "wait_for_submit_enabled" in dialog_block
+    assert "submit_disabled_retry" in dialog_block
+    assert '"reselect_attempts"' in dialog_block
+    assert '"committed_value"' in dialog_block
+    assert '"submit_enabled_after_wait"' in dialog_block
+
+
+def test_final_record_dialog_clicks_real_option_and_requires_commit_confirmation() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dialog_block = source[
+        source.index("async def complete_online_apply_final_record_dialog")
+        : source.index("@tools.action(description=\"[脚本内部工具] 上传线上备案申请 4 处所需样本文件")
+    ]
+
+    assert "unit_option_selectors" in dialog_block
+    assert ".vue-treeselect__option" in dialog_block
+    assert ".vue-treeselect__label" in dialog_block
+    assert ".el-select-dropdown__item" in dialog_block
+    assert "click_visible_unit_option" in dialog_block
+    assert "unit_not_committed" in dialog_block
+    assert 'result["ok"] = bool(result.get("ok") and result.get("commit_confirmed"))' in dialog_block
+
+
+def test_final_record_dialog_avoids_treeselect_arrow_click_area() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dialog_block = source[
+        source.index("async def complete_online_apply_final_record_dialog")
+        : source.index("@tools.action(description=\"[脚本内部工具] 上传线上备案申请 4 处所需样本文件")
+    ]
+
+    assert "click_unit_option_safely" in dialog_block
+    assert ".vue-treeselect__label-container" in dialog_block
+    assert ".vue-treeselect__option-arrow-container" in dialog_block
+    assert "safe_x = min(max(48" in dialog_block
+    assert 'position={"x": safe_x, "y": safe_y}' in dialog_block
+    assert '"safe_offset_avoiding_arrow"' in dialog_block
 
 
 def test_online_apply_upload_mapping_prefers_pdf_for_acceptance_and_doc_for_attachment() -> None:
@@ -1261,6 +1496,45 @@ def test_browser_use_history_success_requires_positive_done_signal() -> None:
     assert result["manual_confirmation_required"] is False
 
 
+def test_browser_use_history_treats_later_confirmed_success_as_recovered_passed() -> None:
+    feedback = """
+    ActionResult(extracted_content='{"ok": false, "submit": {"ok": false, "reason": "submit_button_disabled"}}')
+    INFO Step 15: Eval: 最终提交弹窗显示“提交成功”，提示“提交完成，待备案登记/监管单位登记备案”。
+    Network evidence: POST /prod-api/zwsy/registration/apply/dept status=200
+    ActionResult(is_done=True, success=True, extracted_content='提交成功')
+    """
+
+    result = _browser_use_history_result(feedback)
+
+    assert result["status"] == "recovered_passed"
+    assert result["verdict"] == "passed"
+    assert result["failure_reason"] is None
+    assert result["manual_confirmation_required"] is False
+    assert result["recovered_from"] == "browser_use_intermediate_failure"
+
+
+def test_browser_use_history_recovered_passed_counts_as_handover_success() -> None:
+    result = {
+        "status": "recovered_passed",
+        "verdict": "passed",
+        "failure_reason": None,
+        "manual_confirmation_required": False,
+    }
+
+    assert _browser_use_history_is_success(result) is True
+
+
+def test_browser_use_history_failed_status_with_passed_verdict_is_not_success() -> None:
+    result = {
+        "status": "failed",
+        "verdict": "passed",
+        "failure_reason": "browser_use_handover_failed",
+        "manual_confirmation_required": True,
+    }
+
+    assert _browser_use_history_is_success(result) is False
+
+
 def test_login_residual_text_does_not_block_when_menu_evidence_exists() -> None:
     menu_bundle = {
         "menu_entries": [
@@ -1281,3 +1555,88 @@ def test_login_residual_text_does_not_block_when_menu_evidence_exists() -> None:
     }
 
     assert _should_block_for_login_text("登录 密码 大写锁定已打开", menu_bundle) is False
+
+
+def test_collapsed_business_menu_does_not_report_login_required() -> None:
+    menu_bundle = {
+        "menu_entries": [
+            {
+                "menu_id": "menu_1",
+                "text": "备案管理线上备案申请",
+                "is_leaf": False,
+                "expandable": True,
+                "status": "expansion_failed",
+                "failure_reason": "element is outside of the viewport",
+            },
+            {
+                "menu_id": "menu_2",
+                "text": "溯源管理",
+                "is_leaf": False,
+                "expandable": True,
+                "status": "expansion_failed",
+                "failure_reason": "element is outside of the viewport",
+            },
+        ]
+    }
+
+    assert _should_block_for_login_text("欢迎您 登录使用追本溯源管理平台 密码", menu_bundle) is False
+
+
+def test_normalize_menu_shell_expands_collapsed_sidebar_before_menu_scan() -> None:
+    class _Page:
+        def __init__(self) -> None:
+            self.evaluate_calls: list[str] = []
+
+        async def evaluate(self, script: str) -> dict[str, object]:
+            self.evaluate_calls.append(script)
+            return {
+                "attempted": True,
+                "expanded": True,
+                "reason": "clicked_sidebar_toggle",
+                "collapsedBefore": True,
+                "collapsedAfter": False,
+            }
+
+        async def wait_for_timeout(self, timeout: int) -> None:
+            return None
+
+    page = _Page()
+    result = asyncio.run(_normalize_playwright_menu_shell(page))
+
+    assert result["attempted"] is True
+    assert result["expanded"] is True
+    assert result["reason"] == "clicked_sidebar_toggle"
+    assert "el-menu--collapse" in page.evaluate_calls[0]
+
+
+def test_menu_candidate_click_falls_back_to_safe_dom_point_when_locator_is_offscreen() -> None:
+    class _Locator:
+        async def scroll_into_view_if_needed(self, timeout: int = 0) -> None:
+            return None
+
+        async def click(self, timeout: int = 0) -> None:
+            raise RuntimeError("element is outside of the viewport")
+
+    class _LocatorFactory:
+        @property
+        def first(self) -> _Locator:
+            return _Locator()
+
+    class _Page:
+        def __init__(self) -> None:
+            self.evaluate_args: list[object] = []
+
+        def locator(self, selector: str) -> _LocatorFactory:
+            assert selector == "[data-stage2-menu-id='menu_2']"
+            return _LocatorFactory()
+
+        async def evaluate(self, script: str, arg: object) -> dict[str, object]:
+            self.evaluate_args.append(arg)
+            return {"ok": True, "method": "dom_label_safe_point_click", "x": 48, "y": 24}
+
+    page = _Page()
+    result = asyncio.run(_click_playwright_menu_candidate(page, "menu_2"))
+
+    assert result["method"] == "dom_label_safe_point_click"
+    assert "outside of the viewport" in result["fallback_after"]
+    assert page.evaluate_args == ["menu_2"]

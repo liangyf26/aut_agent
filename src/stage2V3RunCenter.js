@@ -30,6 +30,8 @@ const ARTIFACTS = {
   menu_entries: 'menu_entries.json',
   menu_traversal_log: 'menu_traversal_log.jsonl',
   page_exploration_log: 'page_exploration_log.jsonl',
+  action_log: 'action_log.jsonl',
+  network_events: 'network_events.json',
   page_entries: 'page_entries.json',
   feature_points: 'feature_points.json',
   discovery_review: 'discovery_review.json',
@@ -972,6 +974,7 @@ async function loadRunArtifacts(runDir) {
     'human_tasks',
     'promotion_candidates',
     'model_comparison',
+    'network_events',
     'run_report_json'
   ];
   const entries = await Promise.all(keys.map(async (key) => [
@@ -982,6 +985,7 @@ async function loadRunArtifacts(runDir) {
     ...Object.fromEntries(entries),
     menu_traversal_log: await readTextIfExists(path.join(runDir, ARTIFACTS.menu_traversal_log)),
     page_exploration_log: await readTextIfExists(path.join(runDir, ARTIFACTS.page_exploration_log)),
+    action_log: await readTextIfExists(path.join(runDir, ARTIFACTS.action_log)),
     progress_events: await readProgressEventsIfExists(path.join(runDir, ARTIFACTS.progress_events))
   };
 }
@@ -1967,6 +1971,98 @@ function evidenceRefsForItem(item = {}) {
   ].filter(Boolean);
 }
 
+function controlSkillFromAction(action = {}) {
+  const name = normalizeText(action.action || action.type || action.name, '');
+  const field = normalizeText(action.field || action.target || action.label, '');
+  const haystack = `${name} ${field}`.toLowerCase();
+  if (/cascader|address|location|育苗地点|育苗地址|地址/.test(haystack)) {
+    return {
+      skill_key: 'cascader_select',
+      friendly_name: '四级地址选择',
+      plain_description: '系统已经能按层级依次选择省、市、区、社区这类多级地址控件。',
+      beginner_next_action: '可在同项目相似地址控件上直接复用；如果换系统，请先人工审核一次。'
+    };
+  }
+  if (/upload|file|上传|人员信息表|图片|附件|验收文件/.test(haystack)) {
+    return {
+      skill_key: 'file_upload',
+      friendly_name: '文件上传',
+      plain_description: '系统已经能按字段名称选择对应样本文件，并避免同一上传位重复上传。',
+      beginner_next_action: '检查样本文件是否适合当前页面，再保存为本项目上传控件经验。'
+    };
+  }
+  if (/date|picker|日期/.test(haystack)) {
+    return {
+      skill_key: 'date_picker',
+      friendly_name: '日期选择',
+      plain_description: '系统已经能优先使用日期控件自身面板选择日期，而不是直接硬填文本。',
+      beginner_next_action: '确认日期规则没有业务限制后，可复用到同项目其他日期字段。'
+    };
+  }
+  if (/dialog|final|提交备案|备案登记|最终弹窗/.test(haystack)) {
+    return {
+      skill_key: 'final_submit_dialog',
+      friendly_name: '最终确认弹窗',
+      plain_description: '系统已经能处理最终确认弹窗中的监管单位选择、申请表上传和提交按钮状态。',
+      beginner_next_action: '先人工确认这是测试环境，再决定是否允许最终提交。'
+    };
+  }
+  if (/select|dropdown|treeselect|combobox|下拉|监管单位|育苗方式|请选择/.test(haystack)) {
+    return {
+      skill_key: 'dropdown_select',
+      friendly_name: '下拉框选择',
+      plain_description: '系统已经能打开下拉框并从真实选项中选择值，减少 AI 临场猜测。',
+      beginner_next_action: '可保存为本项目控件技能；平台级复用前需要人工审核。'
+    };
+  }
+  return null;
+}
+
+function makeControlSkillCandidates(resultItems) {
+  const byKey = new Map();
+  for (const result of resultItems) {
+    if (!['passed', 'real_passed', 'side_effect_executed'].includes(result.status)) {
+      continue;
+    }
+    for (const action of Array.isArray(result.actions) ? result.actions : []) {
+      const skill = controlSkillFromAction(action);
+      if (!skill) {
+        continue;
+      }
+      const existing = byKey.get(skill.skill_key);
+      const evidence = [
+        'execution_results',
+        ...(Array.isArray(result.screenshot_refs) ? result.screenshot_refs : [])
+      ];
+      if (existing) {
+        existing.asset_value.success_count += 1;
+        existing.evidence_refs = [...new Set(existing.evidence_refs.concat(evidence))];
+        continue;
+      }
+      byKey.set(skill.skill_key, {
+        candidate_id: `project_control_skill_${skill.skill_key}`,
+        layer: 'project',
+        asset_type: 'control_skill',
+        title: `控件技能：${skill.friendly_name}`,
+        friendly_name: skill.friendly_name,
+        plain_description: skill.plain_description,
+        reuse_level_label: '本项目可直接复用',
+        beginner_next_action: skill.beginner_next_action,
+        asset_value: {
+          skill_key: skill.skill_key,
+          success_count: 1,
+          source_actions: [action.action || action.type || action.name || 'unknown']
+        },
+        evidence_refs: evidence,
+        confidence: 0.82,
+        requires_human_approval: false,
+        auto_apply: false
+      });
+    }
+  }
+  return Array.from(byKey.values());
+}
+
 function makePromotionCandidates({
   manifest = {},
   pageEntries = { items: [] },
@@ -1982,6 +2078,7 @@ function makePromotionCandidates({
   const passedResults = resultItems.filter((item) => ['passed', 'real_passed', 'side_effect_executed'].includes(item.status));
   const failedOrSkippedResults = resultItems.filter((item) => item.failure_reason || ['failed', 'real_failed', 'skipped', 'skipped_by_policy', 'blocked_by_policy', 'needs_review'].includes(item.status));
   const candidates = [];
+  candidates.push(...makeControlSkillCandidates(passedResults));
 
   for (const page of pageItems.slice(0, 8)) {
     candidates.push({
@@ -2961,6 +3058,7 @@ async function persistContractOnlyArtifacts(runDir, manifest, inputConfig, execu
 }
 
 async function persistRealBrowserFailure(runDir, manifest, inputConfig, processResult, roundId) {
+  const pyRunDir = await findPythonRunDir(processResult).catch(() => null);
   const priorDiscovery = await readPriorRealBrowserDiscovery(runDir, inputConfig, manifest);
   const preflightResult = {
     schema_version: 'stage2_preflight_result.v3',
@@ -3048,6 +3146,16 @@ async function persistRealBrowserFailure(runDir, manifest, inputConfig, processR
   await writeJson(path.join(runDir, ARTIFACTS.generated_test_cases), testCases);
   await writeJson(path.join(runDir, ARTIFACTS.execution_results), executionResults);
   await writeJson(path.join(runDir, ARTIFACTS.screenshots_index), screenshotsIndex);
+  if (pyRunDir) {
+    await copyTextFileIfExists(
+      path.join(pyRunDir, 'action_log.jsonl'),
+      path.join(runDir, ARTIFACTS.action_log)
+    );
+    await copyTextFileIfExists(
+      path.join(pyRunDir, 'network_events.json'),
+      path.join(runDir, ARTIFACTS.network_events)
+    );
+  }
   await persistAnalysisPack(runDir, analysisPack);
   return analysisPack;
 }
@@ -3149,6 +3257,14 @@ async function persistRealBrowserArtifacts(runDir, manifest, inputConfig, proces
   await copyTextFileIfExists(
     path.join(pyRunDir || '', 'page_exploration_log.jsonl'),
     path.join(runDir, ARTIFACTS.page_exploration_log)
+  );
+  await copyTextFileIfExists(
+    path.join(pyRunDir || '', 'action_log.jsonl'),
+    path.join(runDir, ARTIFACTS.action_log)
+  );
+  await copyTextFileIfExists(
+    path.join(pyRunDir || '', 'network_events.json'),
+    path.join(runDir, ARTIFACTS.network_events)
   );
   await writeJson(path.join(runDir, ARTIFACTS.page_entries), pageEntries);
   await writeJson(path.join(runDir, ARTIFACTS.feature_points), featurePoints);
@@ -3294,7 +3410,15 @@ async function persistAnalysisPack(runDir, analysisPack) {
   await writeJson(path.join(runDir, ARTIFACTS.next_round_plan), analysisPack.nextRoundPlan);
   await writeJson(path.join(runDir, ARTIFACTS.human_tasks), analysisPack.humanTasks);
   await writeJson(path.join(runDir, ARTIFACTS.failure_summary), makeFailureSummary(analysisPack.failureClusters));
-  await writeJson(path.join(runDir, ARTIFACTS.promotion_candidates), makePromotionCandidates());
+  const manifest = await readJsonIfExists(path.join(runDir, ARTIFACTS.run_manifest)) || {};
+  await writeJson(path.join(runDir, ARTIFACTS.promotion_candidates), makePromotionCandidates({
+    manifest,
+    pageEntries: await readJsonIfExists(path.join(runDir, ARTIFACTS.page_entries)) || { items: [] },
+    featurePoints: await readJsonIfExists(path.join(runDir, ARTIFACTS.feature_points)) || { items: [] },
+    testCases: await readJsonIfExists(path.join(runDir, ARTIFACTS.generated_test_cases)) || { items: [] },
+    executionResults: await readJsonIfExists(path.join(runDir, ARTIFACTS.execution_results)) || { items: [] },
+    roundAnalysis: analysisPack.analysis
+  }));
 }
 
 const AI_EVIDENCE_SAMPLE_LIMIT = 8;
@@ -4282,7 +4406,28 @@ function markdownValue(value) {
   return String(value);
 }
 
-function makeReport({ manifest, menuEntries, pageEntries, featurePoints, testCases, executionResults, roundAnalysis, nextRoundPlan, humanTasks, modelComparison, promotionCandidates }) {
+function countJsonlLines(text) {
+  return String(text || '').split(/\r?\n/).filter((line) => line.trim()).length;
+}
+
+function makeEvidenceIndex({ screenshotsIndex, actionLog, networkEvents }) {
+  const screenshotItems = artifactItems(screenshotsIndex, 'items', 'screenshots');
+  const networkItems = artifactItems(networkEvents, 'items', 'events');
+  const actionLogCount = countJsonlLines(actionLog);
+  return {
+    screenshot_count: screenshotItems.length,
+    action_log_count: actionLogCount,
+    network_event_count: networkItems.length,
+    artifacts: [
+      { key: 'screenshots_index', file: 'screenshots_index.json', count: screenshotItems.length },
+      { key: 'action_log', file: 'action_log.jsonl', count: actionLogCount },
+      { key: 'network_events', file: 'network_events.json', count: networkItems.length }
+    ],
+    summary: `截图 ${screenshotItems.length} 条，操作日志 ${actionLogCount} 条，网络证据 ${networkItems.length} 条。`
+  };
+}
+
+function makeReport({ manifest, menuEntries, pageEntries, featurePoints, testCases, executionResults, screenshotsIndex, actionLog, networkEvents, roundAnalysis, nextRoundPlan, humanTasks, modelComparison, promotionCandidates }) {
   const pageItems = artifactItems(pageEntries, 'page_entries');
   const featureItems = artifactItems(featurePoints, 'feature_points');
   const testCaseItems = artifactItems(testCases, 'test_cases');
@@ -4292,6 +4437,7 @@ function makeReport({ manifest, menuEntries, pageEntries, featurePoints, testCas
   const coverageByPage = buildCoverageByPage({ menuEntries, pageEntries, featurePoints, testCases, executionResults });
   const skippedAreas = buildSkippedAreas({ pageEntries, featurePoints, testCases, executionResults, humanTasks });
   const modelComparisonReport = buildModelComparisonCommentary(modelComparison);
+  const evidenceIndex = makeEvidenceIndex({ screenshotsIndex, actionLog, networkEvents });
   const reportJson = {
     schema_version: 'stage2_run_report.v3',
     run_id: manifest.run_id,
@@ -4310,6 +4456,7 @@ function makeReport({ manifest, menuEntries, pageEntries, featurePoints, testCas
     },
     coverage_by_page: coverageByPage,
     skipped_areas: skippedAreas,
+    evidence_index: evidenceIndex,
     model_comparison: modelComparisonReport,
     promotion_candidates: promotionCandidates,
     sections: [
@@ -4328,6 +4475,11 @@ function makeReport({ manifest, menuEntries, pageEntries, featurePoints, testCas
       { title: '功能点识别', items: featureItems },
       { title: '执行型测试用例', items: testCaseItems },
       { title: '自动执行结果', items: executionItems },
+      { title: '执行证据索引', facts: [
+        { label: 'screenshots_index.json', value: evidenceIndex.screenshot_count },
+        { label: 'action_log.jsonl', value: evidenceIndex.action_log_count },
+        { label: 'network_events.json', value: evidenceIndex.network_event_count }
+      ], items: evidenceIndex.artifacts },
       { title: '模型效果对比', items: modelComparisonReport.commentary || [] },
       { title: '项目级沉淀候选', items: artifactItems(promotionCandidates, 'promotion_candidates') },
       { title: 'AI 复盘与下一轮计划', facts: [{ label: 'decision', value: nextRoundPlan.decision }], items: roundAnalysis.improvement_candidates || [] },
@@ -4359,6 +4511,9 @@ function makeReport({ manifest, menuEntries, pageEntries, featurePoints, testCas
   const promotionLines = artifactItems(promotionCandidates, 'promotion_candidates').length
     ? artifactItems(promotionCandidates, 'promotion_candidates').map((item) => `- [${markdownValue(item.layer)} / ${markdownValue(item.asset_type)}] ${markdownValue(item.title)} · confidence ${markdownValue(item.confidence)} · auto_apply ${markdownValue(item.auto_apply)}`)
     : ['- 暂无沉淀候选。'];
+  const evidenceLines = evidenceIndex.artifacts.map((item) => (
+    `- ${markdownValue(item.file)}: ${markdownValue(item.count)} 条`
+  ));
 
   const md = [
     `# ${manifest.system_name} 第二阶段 v3 运行报告`,
@@ -4385,6 +4540,10 @@ function makeReport({ manifest, menuEntries, pageEntries, featurePoints, testCas
     '',
     ...skippedLines,
     '',
+    '## 执行证据索引',
+    '',
+    ...evidenceLines,
+    '',
     '## 模型效果对比',
     '',
     ...modelLines,
@@ -4408,6 +4567,9 @@ async function generateV3Report(runId, options = {}) {
   const featurePoints = await readJsonIfExists(path.join(runDir, ARTIFACTS.feature_points)) || { items: [] };
   const testCases = await readJsonIfExists(path.join(runDir, ARTIFACTS.generated_test_cases)) || { items: [] };
   const executionResults = await readJsonIfExists(path.join(runDir, ARTIFACTS.execution_results)) || { items: [] };
+  const screenshotsIndex = await readJsonIfExists(path.join(runDir, ARTIFACTS.screenshots_index)) || { items: [] };
+  const actionLog = await readTextIfExists(path.join(runDir, ARTIFACTS.action_log));
+  const networkEvents = await readJsonIfExists(path.join(runDir, ARTIFACTS.network_events)) || { items: [] };
   const roundAnalysis = await readJsonIfExists(path.join(runDir, ARTIFACTS.round_analysis)) || { improvement_candidates: [] };
   const nextRoundPlan = await readJsonIfExists(path.join(runDir, ARTIFACTS.next_round_plan)) || { decision: 'unknown' };
   const humanTasks = await readJsonIfExists(path.join(runDir, ARTIFACTS.human_tasks)) || { items: [] };
@@ -4427,6 +4589,9 @@ async function generateV3Report(runId, options = {}) {
     featurePoints,
     testCases,
     executionResults,
+    screenshotsIndex,
+    actionLog,
+    networkEvents,
     roundAnalysis,
     nextRoundPlan,
     humanTasks,

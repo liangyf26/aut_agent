@@ -2296,6 +2296,7 @@ function renderStage2V3AiTab() {
   const analysis = getRunRoundAnalysis(run);
   const nextPlan = getRunNextRoundPlan(run);
   const targetTracking = getRunTargetTracking(run);
+  const controlSkills = getRunPromotionCandidates(run).filter((item) => (item.asset_type || item.assetType) === 'control_skill');
   container.innerHTML = `
     <section class="stage2-ai-grid">
       <article class="stage2-work-card">
@@ -2325,10 +2326,42 @@ function renderStage2V3AiTab() {
         ${renderStage2TargetTrackingList(targetTracking.items)}
       </article>
       <article class="stage2-work-card stage2-work-card-wide">
+        <header><strong>控件技能库</strong><span class="tag">${escapeHtml(String(controlSkills.length))}</span></header>
+        ${renderStage2ControlSkillLibrary(controlSkills)}
+      </article>
+      <article class="stage2-work-card stage2-work-card-wide">
         <header><strong>改进与沉淀候选</strong><span class="tag">${escapeHtml(String((analysis.improvement_candidates || analysis.improvementCandidates || []).length || 0))}</span></header>
         ${renderStage2CompactList(analysis.improvement_candidates || analysis.improvementCandidates || [], '暂无改进候选。')}
       </article>
     </section>
+  `;
+}
+
+function getRunPromotionCandidates(run = {}) {
+  return toArrayItems(
+    run?.artifacts?.promotion_candidates?.items
+    || run?.artifacts?.promotionCandidates?.items
+    || run?.promotion_candidates?.items
+    || run?.promotionCandidates?.items
+    || []
+  );
+}
+
+function renderStage2ControlSkillLibrary(items) {
+  if (!items.length) {
+    return renderStage2Empty('控件技能库', '当前还没有可复用的控件操作经验。成功处理下拉框、日期、地址或上传控件后，会出现在这里。');
+  }
+  return `
+    <div class="stage2-compact-list">
+      ${items.slice(0, 8).map((item) => `
+        <div class="stage2-compact-item">
+          <strong>${escapeHtml(item.friendly_name || item.friendlyName || item.title || '控件技能')}</strong>
+          <span>${escapeHtml(item.plain_description || item.plainDescription || '系统已记录一条可复用控件操作。')}</span>
+          <small>可复用范围：${escapeHtml(item.reuse_level_label || item.reuseLevelLabel || (item.layer === 'platform' ? '平台候选，需审核' : '本项目可直接复用'))}</small>
+          <small>下一步：${escapeHtml(item.beginner_next_action || item.beginnerNextAction || '人工确认后保存为可复用经验。')}</small>
+        </div>
+      `).join('')}
+    </div>
   `;
 }
 
@@ -3267,11 +3300,11 @@ function renderStage2RunDetail() {
     </section>
 
     <section class="run-detail-section">
-      <h3>沉淀候选</h3>
+      <h3>技能晋升登记</h3>
       <div class="control-grid">
         <article class="control-block">
           <header>
-            <strong>候选摘要</strong>
+            <strong>可复用经验摘要</strong>
             <span class="tag">${escapeHtml(String(promotionReview.candidateCount || run.stats.promotionCandidates || 0))}</span>
           </header>
           <div class="control-fact-list">
@@ -3282,14 +3315,14 @@ function renderStage2RunDetail() {
 
         <article class="control-block control-block-wide">
           <header>
-            <strong>候选条目与审阅入口</strong>
+            <strong>待确认的可复用经验</strong>
             <div class="tag-row">
               ${promotionReview.readyCandidateCount ? `<span class="tag passed">${escapeHtml(String(promotionReview.readyCandidateCount))} 个可审阅</span>` : ''}
               ${promotionReview.manualReviewRequired ? `<span class="tag manual">需人工审阅</span>` : ''}
               ${(promotionReview.topCandidateTitles || []).slice(0, 3).map((title) => `<span class="tag">${escapeHtml(title)}</span>`).join('')}
             </div>
           </header>
-          ${promotionArtifacts.length ? renderInlineArtifactLinks(promotionArtifacts, '') : '<div class="empty-state">当前 run 还没有沉淀候选 artifacts。</div>'}
+          ${promotionArtifacts.length ? renderInlineArtifactLinks(promotionArtifacts, '') : '<div class="empty-state">当前还没有可登记的技能经验。</div>'}
         </article>
       </div>
     </section>

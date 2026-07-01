@@ -280,6 +280,12 @@ async function writeFakePythonV3Artifacts(artifactRoot, runId, overrides = {}) {
       execution_mode: 'real_browser'
     }]
   }, null, 2));
+  if (overrides.actionLogLines) {
+    await fs.writeFile(path.join(pythonRunDir, 'action_log.jsonl'), overrides.actionLogLines.join('\n'));
+  }
+  if (overrides.networkEvents) {
+    await fs.writeFile(path.join(pythonRunDir, 'network_events.json'), JSON.stringify(overrides.networkEvents, null, 2));
+  }
   await fs.writeFile(path.join(pythonRunDir, 'next_round_plan.json'), JSON.stringify({
     schema_version: 'stage2_next_round_plan.v3',
     current_round_id: 'round_001',
@@ -1171,6 +1177,46 @@ test('stage2 v3 run center starts real_browser mode through Python v3 bridge', a
     assert.match(executionResults.items[0].title, /feature_nav/);
     assert.match(executionResults.items[0].title, /首页可达基础验证/);
     assert.equal(preflight.checks.python_orchestrator.ok, true);
+  });
+});
+
+test('stage2 v3 run center imports action log and network evidence artifacts from Python bridge', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '证据样例系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+
+    const started = await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          actionLogLines: [
+            JSON.stringify({ action: 'script_restore_target_page', status: 'completed', duration_ms: 120 }),
+            JSON.stringify({ action: 'script_prefill_form', status: 'completed', duration_ms: 350 })
+          ],
+          networkEvents: {
+            schema_version: 'stage2_network_events.v1',
+            capture_status: 'enabled',
+            items: [{ url: 'https://example.com/api/submit', method: 'POST', status: 200 }]
+          }
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    assert.ok(started.run.artifacts.action_log.href.includes('/artifacts/action_log'));
+    assert.ok(started.run.artifacts.network_events.href.includes('/artifacts/network_events'));
+    const actionLogArtifact = await resolveV3RunArtifact(created.run.runId, 'action_log', { runsDir });
+    const networkArtifact = await resolveV3RunArtifact(created.run.runId, 'network_events', { runsDir });
+    assert.match(await fs.readFile(actionLogArtifact.path, 'utf8'), /script_prefill_form/);
+    const networkEvents = await readJson(networkArtifact.path);
+    assert.equal(networkEvents.items[0].status, 200);
   });
 });
 
@@ -2360,6 +2406,15 @@ test('stage2 v3 report organizes structured artifacts and skipped areas', async 
       pythonRunner: async ({ args, artifactRoot }) => {
         const runId = argValue(args, '--v3-run-id');
         const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          actionLogLines: [
+            JSON.stringify({ action: 'goto', status: 'completed', duration_ms: 120 }),
+            JSON.stringify({ action: 'submit', status: 'skipped_by_policy', duration_ms: 10 })
+          ],
+          networkEvents: {
+            schema_version: 'stage2_network_events.v1',
+            capture_status: 'enabled',
+            items: [{ url: 'https://example.com/api/query', method: 'GET', status: 200 }]
+          },
           executionItems: [{
             test_case_id: 'case_nav',
             feature_point_id: 'feature_nav',
@@ -2398,9 +2453,15 @@ test('stage2 v3 report organizes structured artifacts and skipped areas', async 
     assert.ok(reported.report.skipped_areas.some((item) => item.reason === 'policy_denied'));
     assert.ok(reported.report.sections.some((section) => section.title === '覆盖与结果矩阵'));
     assert.ok(reported.report.sections.some((section) => section.title === '未执行/阻断/需复核区域'));
+    assert.ok(reported.report.sections.some((section) => section.title === '执行证据索引'));
+    assert.equal(reported.report.evidence_index.action_log_count, 2);
+    assert.equal(reported.report.evidence_index.network_event_count, 1);
 
     const reportMd = await fs.readFile(path.join(runsDir, created.run.runId, 'reports', 'run_report.md'), 'utf8');
     assert.match(reportMd, /## 覆盖与结果矩阵/);
+    assert.match(reportMd, /## 执行证据索引/);
+    assert.match(reportMd, /action_log\.jsonl/);
+    assert.match(reportMd, /network_events\.json/);
     assert.match(reportMd, /policy_denied/);
     assert.ok(reportMd.includes('screenshots/home_entry.png'));
   });
@@ -2522,7 +2583,24 @@ test('stage2 v3 report writes project-level promotion candidates with human-gate
       runsDir,
       pythonRunner: async ({ args, artifactRoot }) => {
         const runId = argValue(args, '--v3-run-id');
-        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId);
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          executionItems: [{
+            test_case_id: 'case_controls',
+            feature_point_id: 'feature_nav',
+            status: 'passed',
+            verdict: 'passed',
+            execution_mode: 'real_browser',
+            actions: [
+              { action: 'select_required_dropdown', field: '验收监管单位', status: 'completed' },
+              { action: 'select_date', field: '验收日期', status: 'completed' },
+              { action: 'upload_file', field: '人员信息表', status: 'completed' }
+            ],
+            page_feedback: ['控件填写成功'],
+            screenshot_refs: [],
+            failure_reason: null,
+            manual_confirmation_required: false
+          }]
+        });
         return {
           stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
           stderr: ''
@@ -2535,6 +2613,12 @@ test('stage2 v3 report writes project-level promotion candidates with human-gate
     assert.ok(promotion.items.some((item) => item.layer === 'project'));
     assert.ok(promotion.items.some((item) => item.asset_type === 'stable_locator'));
     assert.ok(promotion.items.some((item) => item.asset_type === 'test_data_suggestion'));
+    const controlSkill = promotion.items.find((item) => item.asset_type === 'control_skill');
+    assert.ok(controlSkill);
+    assert.ok(['下拉框选择', '日期选择', '文件上传'].includes(controlSkill.friendly_name));
+    assert.ok(controlSkill.plain_description);
+    assert.equal(controlSkill.reuse_level_label, '本项目可直接复用');
+    assert.ok(controlSkill.beginner_next_action);
     assert.ok(promotion.items
       .filter((item) => item.layer === 'platform')
       .every((item) => item.requires_human_approval === true && item.auto_apply === false));

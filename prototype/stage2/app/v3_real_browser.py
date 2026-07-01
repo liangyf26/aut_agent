@@ -34,6 +34,33 @@ BROWSER_USE_DETERMINISTIC_TOOL_FIRST_MAX_STEPS = 30
 BROWSER_USE_TOOL_RESULT_PREVIEW_LIMIT = 4000
 
 
+def _final_dialog_unit_options_from_visible_text(text: str) -> list[str]:
+    options: list[str] = []
+    seen: set[str] = set()
+    for line in re.split(r"[\r\n]+", _text(text)):
+        candidate = _text(line)
+        if not candidate:
+            continue
+        if re.search(r"请选择|备案登记|监管单位|申请表|提交备案|上传|文件", candidate):
+            continue
+        if not re.search(r"林业局|监管", candidate):
+            continue
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        options.append(candidate)
+    return options
+
+
+def _choose_final_dialog_unit(candidates: list[str]) -> str:
+    clean = [_text(item) for item in candidates if _text(item) and not re.search(r"请选择|全部", _text(item))]
+    for pattern in [r"广西壮族自治区林业局", r"自治区林业局", r"林业局"]:
+        for candidate in clean:
+            if re.search(pattern, candidate):
+                return candidate
+    return clean[0] if clean else ""
+
+
 def _online_apply_repair_plan(validation_errors: list[str]) -> dict[str, Any]:
     text = "\n".join(_text(item) for item in validation_errors if _text(item))
     if not text:
@@ -485,6 +512,7 @@ async def _discover_menu_with_playwright(
     screenshots_dir: Path,
     config: V3RunConfig,
 ) -> dict[str, Any]:
+    normalization = await _normalize_playwright_menu_shell(page)
     screenshots: list[dict[str, Any]] = [
         await _capture_playwright_screenshot(
             page,
@@ -512,6 +540,15 @@ async def _discover_menu_with_playwright(
     expandable_queue = list(expandable_roots)
     expanded_ids: set[str] = set()
     max_expand_attempts = max(1, int(config.max_pages or 1)) * 4
+    if normalization.get("attempted"):
+        traversal_events.append(
+            {
+                "event": "normalize_menu_shell",
+                "status": "success" if normalization.get("expanded") else "skipped",
+                "reason": normalization.get("reason"),
+                "details": normalization,
+            }
+        )
     while expandable_queue and len(expanded_ids) < max_expand_attempts:
         candidate = expandable_queue.pop(0)
         menu_id = _text(candidate.get("discovery_id"))
@@ -529,11 +566,7 @@ async def _discover_menu_with_playwright(
             )
             continue
         try:
-            locator = page.locator(f"[data-stage2-menu-id='{menu_id}']").first
-            if callable(locator):
-                locator = locator()
-            await locator.scroll_into_view_if_needed(timeout=1000)
-            await locator.click(timeout=2500)
+            click_result = await _click_playwright_menu_candidate(page, menu_id)
             await page.wait_for_timeout(600)
             screenshot_id = f"{menu_id}_after_expand"
             screenshots.append(
@@ -580,6 +613,7 @@ async def _discover_menu_with_playwright(
                     "failure_reason": None if new_children else "no_child_menu_appeared",
                     "screenshot_ref": screenshot_id,
                     "new_child_count": len(new_children),
+                    "click_method": click_result.get("method"),
                 }
             )
         except Exception as exc:
@@ -597,6 +631,125 @@ async def _discover_menu_with_playwright(
         menu_candidates=candidates,
         traversal_events=traversal_events,
         screenshots=screenshots,
+    )
+
+
+async def _normalize_playwright_menu_shell(page: Any) -> dict[str, Any]:
+    """Open a collapsed app sidebar before scanning or clicking menu candidates."""
+
+    try:
+        result = await page.evaluate(_normalize_menu_shell_script())
+        if not isinstance(result, dict):
+            return {"attempted": False, "expanded": False, "reason": "unexpected_result"}
+        if result.get("attempted"):
+            with suppress(Exception):
+                await page.wait_for_timeout(350)
+        return result
+    except Exception as exc:
+        return {
+            "attempted": False,
+            "expanded": False,
+            "reason": "normalization_failed",
+            "failure_reason": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _normalize_menu_shell_script() -> str:
+    return """
+    () => {
+      const visible = (el) => {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+      };
+      const hasCollapsedMenu = () => Boolean(document.querySelector('.el-menu--collapse'));
+      const sidebar = document.querySelector('.sidebar-container, aside, nav, .el-menu');
+      const collapsedBefore = hasCollapsedMenu()
+        || (sidebar && sidebar.getBoundingClientRect().width > 0 && sidebar.getBoundingClientRect().width < 96);
+      if (!collapsedBefore) {
+        return {
+          attempted: false,
+          expanded: false,
+          reason: 'menu_shell_already_open',
+          collapsedBefore: false,
+          collapsedAfter: false,
+        };
+      }
+      const candidates = Array.from(document.querySelectorAll(
+        '.hamburger, #hamburger-container, .hamburger-container, .sidebar-toggle, [class*="hamburger"], [class*="collapse"], .navbar svg, .navbar button, button'
+      )).filter(visible);
+      const toggle = candidates.find((el) => {
+        const rect = el.getBoundingClientRect();
+        const text = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+        return rect.left <= 96 && rect.top <= 96 && !/退出|个人中心|通知|消息/.test(text);
+      }) || candidates[0];
+      if (!toggle) {
+        return {
+          attempted: true,
+          expanded: false,
+          reason: 'sidebar_toggle_not_found',
+          collapsedBefore,
+          collapsedAfter: hasCollapsedMenu(),
+        };
+      }
+      toggle.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+      return {
+        attempted: true,
+        expanded: !hasCollapsedMenu(),
+        reason: 'clicked_sidebar_toggle',
+        collapsedBefore,
+        collapsedAfter: hasCollapsedMenu(),
+      };
+    }
+    """
+
+
+async def _click_playwright_menu_candidate(page: Any, menu_id: str) -> dict[str, Any]:
+    locator = page.locator(f"[data-stage2-menu-id='{menu_id}']").first
+    if callable(locator):
+        locator = locator()
+    try:
+        await locator.scroll_into_view_if_needed(timeout=1000)
+        await locator.click(timeout=2500)
+        return {"method": "playwright_locator_click"}
+    except Exception as exc:
+        fallback_result = await _click_playwright_menu_candidate_by_label(page, menu_id)
+        if fallback_result.get("ok"):
+            return {
+                "method": fallback_result.get("method") or "dom_label_click_fallback",
+                "fallback_after": f"{type(exc).__name__}: {exc}",
+            }
+        raise exc
+
+
+async def _click_playwright_menu_candidate_by_label(page: Any, menu_id: str) -> dict[str, Any]:
+    return await page.evaluate(
+        """
+        (menuId) => {
+          const escapeAttr = (value) => String(value).replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'");
+          const el = document.querySelector(`[data-stage2-menu-id='${escapeAttr(menuId)}']`);
+          if (!el) return { ok: false, method: 'dom_label_click_fallback', reason: 'menu_not_found' };
+          const target = el.matches('.el-submenu__title, .el-menu-item')
+            ? el
+            : (el.querySelector('.el-submenu__title, .el-menu-item, [role="menuitem"]') || el);
+          const rect = target.getBoundingClientRect();
+          if (!rect.width || !rect.height) {
+            return { ok: false, method: 'dom_label_click_fallback', reason: 'empty_rect' };
+          }
+          if (rect.right < 0 || rect.left > window.innerWidth || rect.bottom < 0 || rect.top > window.innerHeight) {
+            return { ok: false, method: 'dom_label_click_fallback', reason: 'still_outside_viewport' };
+          }
+          const safeX = Math.min(Math.max(rect.left + 36, rect.left + rect.width * 0.35), rect.right - 8);
+          const safeY = rect.top + rect.height / 2;
+          const clickTarget = document.elementFromPoint(safeX, safeY) || target;
+          clickTarget.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window, clientX: safeX, clientY: safeY }));
+          clickTarget.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window, clientX: safeX, clientY: safeY }));
+          clickTarget.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window, clientX: safeX, clientY: safeY }));
+          return { ok: true, method: 'dom_label_safe_point_click', x: safeX, y: safeY };
+        }
+        """,
+        menu_id,
     )
 
 
@@ -741,6 +894,15 @@ async def _explore_menu_leaf_pages_with_playwright(
                     "failure_reason": f"{type(exc).__name__}: {exc}",
                 }
             )
+        finally:
+            logs.append(
+                await _return_to_start_url_after_menu_leaf(
+                    page,
+                    config,
+                    menu_id=menu_id,
+                    page_id=page_id,
+                )
+            )
     deduped_pages, deduped_features = _dedupe_page_exploration(pages, features)
     return {
         "pages": deduped_pages,
@@ -819,6 +981,190 @@ def _is_shallow_playwright_target_feature(feature: dict[str, Any]) -> bool:
         "view",
         "navigation",
     }
+
+
+def _target_page_restore_plan(
+    config: V3RunConfig,
+    handover_reasons: list[dict[str, Any]],
+    menu_bundle: dict[str, Any],
+    page_bundle: dict[str, Any],
+) -> dict[str, Any] | None:
+    menu_entries = menu_bundle.get("menu_entries") if isinstance(menu_bundle, dict) else []
+    if not isinstance(menu_entries, list):
+        menu_entries = []
+    pages = page_bundle.get("pages") if isinstance(page_bundle, dict) else []
+    if not isinstance(pages, list):
+        pages = []
+
+    for reason in handover_reasons:
+        target = _text(reason.get("target"))
+        matched_menu_ids = {
+            _text(item)
+            for item in reason.get("matched_menu_entry_ids", [])
+            if _text(item)
+        }
+        for entry in menu_entries:
+            if not isinstance(entry, dict):
+                continue
+            menu_id = _text(entry.get("menu_id") or entry.get("menu_entry_id"))
+            if matched_menu_ids and menu_id not in matched_menu_ids:
+                continue
+            if not matched_menu_ids and not (
+                _record_matches_target(entry, target, ("text", "name", "route_hint", "url"))
+                or _path_matches_target(entry.get("menu_path"), target)
+            ):
+                continue
+            route_hint = _text(entry.get("route_hint") or entry.get("href") or entry.get("url"))
+            if not route_hint:
+                continue
+            return {
+                "target": target,
+                "source": "menu_entry_route_hint",
+                "menu_id": menu_id,
+                "url": urljoin(config.start_url, route_hint),
+                "route_hint": route_hint,
+                "menu_path": entry.get("menu_path", []),
+            }
+
+        matched_page_ids = {
+            _text(item)
+            for item in reason.get("matched_page_ids", [])
+            if _text(item)
+        }
+        for page in pages:
+            if not isinstance(page, dict):
+                continue
+            page_id = _text(page.get("page_id") or page.get("page_entry_id"))
+            if matched_page_ids and page_id not in matched_page_ids:
+                continue
+            if not matched_page_ids and not (
+                _record_matches_target(page, target, ("name", "title", "url", "failure_reason"))
+                or _path_matches_target(page.get("menu_path"), target)
+            ):
+                continue
+            url = _text(page.get("url"))
+            if not url:
+                continue
+            return {
+                "target": target,
+                "source": "page_entry_url",
+                "page_id": page_id,
+                "url": urljoin(config.start_url, url),
+                "menu_path": page.get("menu_path", []),
+            }
+    return None
+
+
+async def _restore_target_page_start(
+    page: Any,
+    config: V3RunConfig,
+    handover_reasons: list[dict[str, Any]],
+    menu_bundle: dict[str, Any],
+    page_bundle: dict[str, Any],
+) -> dict[str, Any]:
+    plan = _target_page_restore_plan(config, handover_reasons, menu_bundle, page_bundle)
+    if not plan:
+        return {"ok": False, "reason": "no_restore_plan"}
+    url = _text(plan.get("url"))
+    if not url:
+        return {"ok": False, "reason": "restore_plan_missing_url", "plan": plan}
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=8000)
+        with suppress(Exception):
+            await page.wait_for_load_state("networkidle", timeout=2500)
+        with suppress(Exception):
+            await page.wait_for_timeout(300)
+        return {
+            "ok": True,
+            "method": "goto",
+            "url": url,
+            "plan": plan,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "reason": "target_page_restore_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+            "plan": plan,
+        }
+
+
+async def _return_to_start_url_after_menu_leaf(
+    page: Any,
+    config: V3RunConfig,
+    *,
+    menu_id: str,
+    page_id: str,
+) -> dict[str, Any]:
+    target_url = _text(config.start_url)
+    if not target_url:
+        return {
+            "event": "return_to_home_after_menu_leaf",
+            "status": "skipped",
+            "menu_id": menu_id,
+            "page_entry_id": page_id,
+            "failure_reason": "missing_start_url",
+        }
+    try:
+        await page.goto(target_url, wait_until="domcontentloaded", timeout=8000)
+        with suppress(Exception):
+            await page.wait_for_load_state("domcontentloaded", timeout=2500)
+        with suppress(Exception):
+            await page.wait_for_timeout(300)
+        return {
+            "event": "return_to_home_after_menu_leaf",
+            "status": "completed",
+            "menu_id": menu_id,
+            "page_entry_id": page_id,
+            "url": target_url,
+            "method": "goto_start_url",
+        }
+    except Exception as exc:
+        return {
+            "event": "return_to_home_after_menu_leaf",
+            "status": "failed",
+            "menu_id": menu_id,
+            "page_entry_id": page_id,
+            "url": target_url,
+            "failure_reason": f"{type(exc).__name__}: {exc}",
+        }
+
+
+async def _return_to_start_url_after_browser_use_handover(
+    page: Any,
+    config: V3RunConfig,
+    *,
+    targets: list[str],
+) -> dict[str, Any]:
+    target_url = _text(config.start_url)
+    if not target_url:
+        return {
+            "event": "return_to_home_after_browser_use_handover",
+            "status": "skipped",
+            "targets": targets,
+            "failure_reason": "missing_start_url",
+        }
+    try:
+        await page.goto(target_url, wait_until="domcontentloaded", timeout=8000)
+        with suppress(Exception):
+            await page.wait_for_load_state("domcontentloaded", timeout=2500)
+        with suppress(Exception):
+            await page.wait_for_timeout(300)
+        return {
+            "event": "return_to_home_after_browser_use_handover",
+            "status": "completed",
+            "targets": targets,
+            "url": target_url,
+            "method": "goto_start_url",
+        }
+    except Exception as exc:
+        return {
+            "event": "return_to_home_after_browser_use_handover",
+            "status": "failed",
+            "targets": targets,
+            "url": target_url,
+            "failure_reason": f"{type(exc).__name__}: {exc}",
+        }
 
 
 def _merge_browser_use_handover(
@@ -911,6 +1257,41 @@ async def _run_browser_use_target_handover(
         browser = Browser(cdp_url=config.cdp_url)
         tools = Tools()
         uploaded_kinds_in_session: set[str] = set()
+        network_events: list[dict[str, Any]] = []
+
+        def capture_response(response: Any) -> None:
+            if len(network_events) >= 100:
+                return
+            with suppress(Exception):
+                request = response.request
+                network_events.append(
+                    {
+                        "at": datetime.now().isoformat(timespec="seconds"),
+                        "url": _text(response.url),
+                        "method": _text(request.method),
+                        "status": response.status,
+                    }
+                )
+
+        def write_network_events(capture_status: str = "enabled") -> None:
+            with suppress(Exception):
+                (run_dir / "network_events.json").write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "stage2_network_events.v1",
+                            "capture_status": capture_status,
+                            "items": network_events,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+        with suppress(Exception):
+            page.on("response", capture_response)
+        write_network_events("enabled")
 
         def append_tool_timing(action: str, status: str, started: float, detail: dict[str, Any] | None = None) -> None:
             record = {
@@ -923,6 +1304,18 @@ async def _run_browser_use_target_handover(
             with suppress(Exception):
                 with (run_dir / "browser_use_tool_timings.jsonl").open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            action_record = {
+                "schema_version": "stage2_action_log.v1",
+                "at": record["at"],
+                "executor": "browser_use_playwright_tool",
+                "action": action,
+                "status": status,
+                "duration_ms": record["duration_ms"],
+                "detail": detail or {},
+            }
+            with suppress(Exception):
+                with (run_dir / "action_log.jsonl").open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(action_record, ensure_ascii=False) + "\n")
 
         async def timed_tool(action: str, factory: Any) -> Any:
             started = perf_counter()
@@ -943,6 +1336,17 @@ async def _run_browser_use_target_handover(
                     {"error": f"{type(exc).__name__}: {exc}"},
                 )
                 raise
+
+        restore_result = await timed_tool(
+            "script_restore_target_page",
+            lambda: _restore_target_page_start(
+                page,
+                config,
+                handover_reasons,
+                menu_bundle,
+                page_bundle,
+            ),
+        )
 
         async def current_browser_page() -> Any:
             with suppress(Exception):
@@ -1578,10 +1982,48 @@ async def _run_browser_use_target_handover(
                 await target_page.keyboard.press("Escape")
             with suppress(Exception):
                 await clear_blocking_overlays(target_page)
-            return {
-                "plantId": await choose_dropdown([re.compile(r"备案品种|品种|plantId", re.I)]),
-                "registerType": await choose_dropdown([re.compile(r"备案类型|类型|registerType", re.I)]),
-                "seedlingMethod": await choose_dropdown(
+            control_timings: list[dict[str, Any]] = []
+
+            async def timed_control(control_id: str, label: str, factory: Any) -> dict[str, Any]:
+                started = perf_counter()
+                try:
+                    result = await factory()
+                    control_timings.append(
+                        {
+                            "control_id": control_id,
+                            "label": label,
+                            "status": "completed" if result.get("ok") else "failed",
+                            "duration_ms": round((perf_counter() - started) * 1000),
+                            "reason": result.get("reason"),
+                        }
+                    )
+                    return result
+                except Exception as exc:
+                    control_timings.append(
+                        {
+                            "control_id": control_id,
+                            "label": label,
+                            "status": "failed",
+                            "duration_ms": round((perf_counter() - started) * 1000),
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+                    raise
+
+            plant_result = await timed_control(
+                "plantId",
+                "备案品种",
+                lambda: choose_dropdown([re.compile(r"备案品种|品种|plantId", re.I)]),
+            )
+            register_type_result = await timed_control(
+                "registerType",
+                "备案类型",
+                lambda: choose_dropdown([re.compile(r"备案类型|类型|registerType", re.I)]),
+            )
+            seedling_method_result = await timed_control(
+                "seedlingMethod",
+                "育苗方式",
+                lambda: choose_dropdown(
                     [re.compile(r"育苗方式|繁殖方式|seedling|breeding", re.I)],
                     label_texts=["育苗方式"],
                     preferred=[
@@ -1589,17 +2031,38 @@ async def _run_browser_use_target_handover(
                     ],
                     avoid=[re.compile(r"种子繁殖|种子", re.I)],
                 ),
-                "seedlingPurpose": await choose_dropdown([re.compile(r"育苗目的|目的|purpose", re.I)]),
-                "acceptanceUnit": await choose_dropdown(
+            )
+            seedling_purpose_result = await timed_control(
+                "seedlingPurpose",
+                "育苗目的",
+                lambda: choose_dropdown([re.compile(r"育苗目的|目的|purpose", re.I)]),
+            )
+            acceptance_unit_result = await timed_control(
+                "acceptanceUnit",
+                "验收监管单位",
+                lambda: choose_dropdown(
                     [],
                     label_texts=["验收监管单位"],
                     placeholder_texts=["请选择验收监管单位"],
                     preferred=[re.compile(r"广西壮族自治区林业局|林业局|监管", re.I)],
                 ),
-                "seedlingLocation": await choose_cascader(
+            )
+            seedling_location_result = await timed_control(
+                "seedlingLocation",
+                "育苗地址/育苗地点",
+                lambda: choose_cascader(
                     [],
                     label_texts=["育苗地址", "育苗地点"],
                 ),
+            )
+            return {
+                "plantId": plant_result,
+                "registerType": register_type_result,
+                "seedlingMethod": seedling_method_result,
+                "seedlingPurpose": seedling_purpose_result,
+                "acceptanceUnit": acceptance_unit_result,
+                "seedlingLocation": seedling_location_result,
+                "control_timings": control_timings,
             }
 
         async def select_required_online_apply_dates(target_page: Any) -> list[dict[str, Any]]:
@@ -2055,6 +2518,9 @@ async def _run_browser_use_target_handover(
                 return False
 
             dialog_select_trigger_selectors = [
+                ".vue-treeselect__control",
+                ".vue-treeselect__placeholder",
+                ".vue-treeselect",
                 "[role=combobox]",
                 "input[placeholder*='请选择']",
                 ".el-select .el-input__wrapper",
@@ -2067,9 +2533,17 @@ async def _run_browser_use_target_handover(
                 ".el-input",
                 "[class*='select']",
             ]
+            unit_option_selectors = [
+                ".vue-treeselect__menu .vue-treeselect__option",
+                ".vue-treeselect__menu .vue-treeselect__label",
+                ".vue-treeselect__option",
+                ".vue-treeselect__label",
+                ".el-select-dropdown .el-select-dropdown__item:not(.is-disabled)",
+                "[role=option]:not(.is-disabled)",
+            ]
 
             async def dialog_trigger_container(trigger: Any) -> Any:
-                for class_name in ["el-select", "el-form-item", "el-input"]:
+                for class_name in ["vue-treeselect", "el-select", "el-form-item", "el-input"]:
                     container = trigger.locator(
                         f"xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' {class_name} ')][1]"
                     )
@@ -2106,16 +2580,21 @@ async def _run_browser_use_target_handover(
 
             async def collect_dialog_select_diagnostics() -> dict[str, Any]:
                 trigger_candidates: list[dict[str, Any]] = []
+                visible_text_option_candidates = _final_dialog_unit_options_from_visible_text(text)
                 for selector in dialog_select_trigger_selectors:
                     triggers = dialog.locator(selector)
                     trigger_count = await triggers.count()
                     for index in range(min(trigger_count, 4)):
                         trigger = triggers.nth(index)
+                        trigger_text = await visible_text(trigger)
+                        visible_text_option_candidates.extend(
+                            _final_dialog_unit_options_from_visible_text(trigger_text)
+                        )
                         trigger_candidates.append(
                             {
                                 "selector": selector,
                                 "index": index,
-                                "text": (await visible_text(trigger))[:120],
+                                "text": trigger_text[:120],
                                 "visible": await is_visible(trigger),
                             }
                         )
@@ -2140,10 +2619,7 @@ async def _run_browser_use_target_handover(
                         }
                     )
                 option_candidates: list[dict[str, Any]] = []
-                options = target_page.locator(
-                    ".el-select-dropdown .el-select-dropdown__item:not(.is-disabled), "
-                    "[role=option]:not(.is-disabled)"
-                )
+                options = target_page.locator(", ".join(unit_option_selectors))
                 option_count = await options.count()
                 for index in range(min(option_count, 30)):
                     option = options.nth(index)
@@ -2158,37 +2634,210 @@ async def _run_browser_use_target_handover(
                     "dialog_text": text[:300],
                     "trigger_candidates": trigger_candidates,
                     "option_candidates": option_candidates,
+                    "visible_text_option_candidates": list(dict.fromkeys(visible_text_option_candidates)),
                 }
 
-            with suppress(Exception):
-                if await click_dialog_select_trigger():
-                    await target_page.wait_for_timeout(350)
-                    options = target_page.locator(
-                        ".el-select-dropdown .el-select-dropdown__item:not(.is-disabled), "
-                        "[role=option]:not(.is-disabled)"
-                    )
+            async def option_click_target(option: Any) -> Any:
+                container = option.locator(
+                    "xpath=ancestor-or-self::*[contains(concat(' ', normalize-space(@class), ' '), ' vue-treeselect__option ') "
+                    "or contains(concat(' ', normalize-space(@class), ' '), ' el-select-dropdown__item ') "
+                    "or @role='option'][1]"
+                )
+                if await container.count():
+                    return container.first
+                return option
+
+            async def click_unit_option_safely(option: Any) -> dict[str, Any]:
+                label_selectors = [
+                    ".vue-treeselect__label",
+                    ".vue-treeselect__label-container",
+                    "xpath=ancestor-or-self::*[contains(concat(' ', normalize-space(@class), ' '), ' vue-treeselect__label ')][1]",
+                    "xpath=ancestor-or-self::*[contains(concat(' ', normalize-space(@class), ' '), ' vue-treeselect__label-container ')][1]",
+                ]
+                for selector in label_selectors:
+                    labels = option.locator(selector)
+                    label_count = await labels.count()
+                    for index in range(min(label_count, 4)):
+                        label = labels.nth(index)
+                        if not await is_visible(label):
+                            continue
+                        label_text = await visible_text(label)
+                        if not label_text or re.search(r"请选择|全部", label_text):
+                            continue
+                        await label.scroll_into_view_if_needed(timeout=1500)
+                        await label.click(timeout=2500)
+                        return {
+                            "click_method": "label_center",
+                            "click_selector": selector,
+                            "clicked_text": label_text[:120],
+                        }
+
+                click_target = await option_click_target(option)
+                await click_target.scroll_into_view_if_needed(timeout=1500)
+                arrow_count = 0
+                with suppress(Exception):
+                    arrow_count = await click_target.locator(".vue-treeselect__option-arrow-container").count()
+                with suppress(Exception):
+                    box = await click_target.bounding_box(timeout=800)
+                    if box and box.get("width") and box.get("height"):
+                        safe_x = min(max(48, box["width"] * 0.35), max(1, box["width"] - 8))
+                        safe_y = min(max(4, box["height"] / 2), max(1, box["height"] - 4))
+                        await click_target.click(position={"x": safe_x, "y": safe_y}, timeout=2500)
+                        return {
+                            "click_method": "safe_offset_avoiding_arrow",
+                            "click_position": {"x": round(safe_x, 1), "y": round(safe_y, 1)},
+                            "arrow_container_count": arrow_count,
+                        }
+                await click_target.click(timeout=2500)
+                return {
+                    "click_method": "fallback_center",
+                    "arrow_container_count": arrow_count,
+                }
+
+            async def click_visible_unit_option() -> dict[str, Any]:
+                candidates = _final_dialog_unit_options_from_visible_text(await dialog_text())
+                option_records: list[dict[str, Any]] = []
+                for selector in unit_option_selectors:
+                    options = target_page.locator(selector)
                     option_count = await options.count()
-                    for index in range(option_count):
+                    for index in range(min(option_count, 40)):
                         option = options.nth(index)
-                        option_text = _text(await option.inner_text(timeout=800))
-                        if option_text and not re.search(r"请选择|全部", option_text):
-                            await option.scroll_into_view_if_needed(timeout=1500)
-                            await option.click(timeout=2500)
-                            unit_result = {"ok": True, "selected": option_text}
-                            await target_page.wait_for_timeout(300)
-                            break
-                    if not unit_result.get("ok"):
-                        unit_result = {
+                        if not await is_visible(option):
+                            continue
+                        option_text = await visible_text(option)
+                        if not option_text or re.search(r"请选择|全部", option_text):
+                            continue
+                        candidates.extend(_final_dialog_unit_options_from_visible_text(option_text))
+                        option_records.append(
+                            {
+                                "selector": selector,
+                                "index": index,
+                                "text": option_text,
+                                "locator": option,
+                            }
+                        )
+                selected = _choose_final_dialog_unit([item["text"] for item in option_records]) or _choose_final_dialog_unit(candidates)
+                if not selected:
+                    return {
+                        "ok": False,
+                        "reason": "visible_dropdown_option_not_found",
+                        "candidates": list(dict.fromkeys(candidates)),
+                    }
+                for record in option_records:
+                    option_text = _text(record.get("text"))
+                    if selected not in option_text and option_text not in selected:
+                        continue
+                    with suppress(Exception):
+                        click_info = await click_unit_option_safely(record["locator"])
+                        await target_page.wait_for_timeout(500)
+                        with suppress(Exception):
+                            await target_page.keyboard.press("Tab")
+                        return {
+                            "ok": True,
+                            "selected": selected,
+                            "method": "visible_dropdown_option",
+                            "selector": record["selector"],
+                            "candidate_index": record["index"],
+                            "candidates": list(dict.fromkeys(candidates)),
+                            "click": click_info,
+                        }
+                return {
+                    "ok": False,
+                    "reason": "visible_dropdown_option_click_failed",
+                    "selected": selected,
+                    "candidates": list(dict.fromkeys(candidates)),
+                }
+
+            async def current_dialog_unit_value() -> str:
+                value_selectors = [
+                    ".vue-treeselect__single-value",
+                    ".el-select__selected-item",
+                    ".el-select .el-input__inner",
+                    "input[placeholder*='备案登记']",
+                    "input[placeholder*='监管单位']",
+                    ".el-input__inner",
+                ]
+                for selector in value_selectors:
+                    locators = dialog.locator(selector)
+                    locator_count = await locators.count()
+                    for index in range(min(locator_count, 8)):
+                        locator = locators.nth(index)
+                        if not await is_visible(locator):
+                            continue
+                        value = await native_control_selected_value(locator)
+                        if not value:
+                            value = await visible_text(locator)
+                        value = _text(value)
+                        if value and not re.search(r"请选择|全部", value):
+                            return value
+                return ""
+
+            async def select_dialog_unit_once(reason: str) -> dict[str, Any]:
+                result: dict[str, Any]
+                try:
+                    if await click_dialog_select_trigger():
+                        await target_page.wait_for_timeout(350)
+                        options = target_page.locator(", ".join(unit_option_selectors))
+                        option_count = await options.count()
+                        option_candidates: list[tuple[int, str]] = []
+                        for index in range(option_count):
+                            option = options.nth(index)
+                            option_text = _text(await option.inner_text(timeout=800))
+                            if option_text and not re.search(r"请选择|全部", option_text):
+                                option_candidates.append((index, option_text))
+                        selected_option_text = _choose_final_dialog_unit([item[1] for item in option_candidates])
+                        result = {"ok": False, "reason": "unit_option_not_found"}
+                        if selected_option_text:
+                            for index, option_text in option_candidates:
+                                if option_text != selected_option_text:
+                                    continue
+                                option = options.nth(index)
+                                click_info = await click_unit_option_safely(option)
+                                result = {
+                                    "ok": True,
+                                    "selected": option_text,
+                                    "method": "standard_option",
+                                    "click": click_info,
+                                }
+                                await target_page.wait_for_timeout(500)
+                                with suppress(Exception):
+                                    await target_page.keyboard.press("Tab")
+                                break
+                        if not result.get("ok"):
+                            visible_unit_result = await click_visible_unit_option()
+                            result = visible_unit_result if visible_unit_result.get("ok") else {
+                                "ok": False,
+                                "reason": "unit_option_not_found",
+                                "visible_text_result": visible_unit_result,
+                                "diagnostics": await collect_dialog_select_diagnostics(),
+                            }
+                    else:
+                        result = {
                             "ok": False,
-                            "reason": "unit_option_not_found",
+                            "reason": "unit_field_not_found",
                             "diagnostics": await collect_dialog_select_diagnostics(),
                         }
-                else:
-                    unit_result = {
+                except Exception as exc:
+                    result = {
                         "ok": False,
-                        "reason": "unit_field_not_found",
-                        "diagnostics": await collect_dialog_select_diagnostics(),
+                        "reason": "unit_select_exception",
+                        "error": f"{type(exc).__name__}: {exc}",
                     }
+                committed_value = await current_dialog_unit_value()
+                if committed_value:
+                    result["committed_value"] = committed_value
+                selected_value = _text(result.get("selected"))
+                result["commit_confirmed"] = bool(
+                    committed_value and (not selected_value or selected_value in committed_value or committed_value in selected_value)
+                )
+                if result.get("ok") and not result.get("commit_confirmed"):
+                    result["pre_commit_reason"] = result.get("reason")
+                    result["reason"] = "unit_not_committed"
+                    result["ok"] = bool(result.get("ok") and result.get("commit_confirmed"))
+                result["attempt_reason"] = reason
+                return result
+
+            unit_result = await select_dialog_unit_once("initial")
 
             file_inputs = dialog.locator("input[type=file]")
             file_input_count = await file_inputs.count()
@@ -2211,30 +2860,75 @@ async def _run_browser_use_target_handover(
                         "file_name": samples["application"].name,
                         "input_count": file_input_count,
                     }
+                    await target_page.wait_for_timeout(800)
 
-            submit_skipped: list[dict[str, Any]] = []
-            submit_result: dict[str, Any] = {"ok": False, "reason": "submit_button_not_found"}
-            buttons = dialog.locator("button,[role=button],input[type=submit]")
-            button_count = await buttons.count()
-            for index in range(button_count):
-                button = buttons.nth(index)
-                button_text = _text(await button.inner_text(timeout=800))
-                if not (button_text and re.search(r"提交备案|提交|确定", button_text)):
-                    continue
-                if await native_button_is_disabled(button):
-                    submit_skipped.append({"index": index, "text": button_text, "skipped": "disabled"})
-                    continue
-                await button.scroll_into_view_if_needed(timeout=1500)
-                await button.click(timeout=2500)
-                submit_result = {"ok": True, "clicked": button_text}
-                await target_page.wait_for_timeout(500)
-                break
-            if not submit_result.get("ok") and submit_skipped:
+            async def submit_button_states() -> list[dict[str, Any]]:
+                states: list[dict[str, Any]] = []
+                buttons = dialog.locator("button,[role=button],input[type=submit]")
+                button_count = await buttons.count()
+                for index in range(button_count):
+                    button = buttons.nth(index)
+                    button_text = _text(await button.inner_text(timeout=800))
+                    if not (button_text and re.search(r"提交备案|提交|确定", button_text)):
+                        continue
+                    states.append(
+                        {
+                            "index": index,
+                            "text": button_text,
+                            "disabled": await native_button_is_disabled(button),
+                        }
+                    )
+                return states
+
+            async def wait_for_submit_enabled() -> dict[str, Any]:
+                checks: list[dict[str, Any]] = []
+                for delay_ms in [0, 300, 700, 1200]:
+                    if delay_ms:
+                        await target_page.wait_for_timeout(delay_ms)
+                    states = await submit_button_states()
+                    checks.append({"after_ms": delay_ms, "buttons": states})
+                    if any(not item.get("disabled") for item in states):
+                        return {"ok": True, "checks": checks}
+                return {"ok": False, "checks": checks}
+
+            async def click_submit_button() -> dict[str, Any]:
+                submit_skipped: list[dict[str, Any]] = []
+                buttons = dialog.locator("button,[role=button],input[type=submit]")
+                button_count = await buttons.count()
+                for index in range(button_count):
+                    button = buttons.nth(index)
+                    button_text = _text(await button.inner_text(timeout=800))
+                    if not (button_text and re.search(r"提交备案|提交|确定", button_text)):
+                        continue
+                    if await native_button_is_disabled(button):
+                        submit_skipped.append({"index": index, "text": button_text, "skipped": "disabled"})
+                        continue
+                    await button.scroll_into_view_if_needed(timeout=1500)
+                    await button.click(timeout=2500)
+                    await target_page.wait_for_timeout(500)
+                    return {"ok": True, "clicked": button_text}
+                if submit_skipped:
+                    return {"ok": False, "reason": "submit_button_disabled", "skipped": submit_skipped}
+                return {"ok": False, "reason": "submit_button_not_found"}
+
+            submit_enabled_after_wait = await wait_for_submit_enabled()
+            unit_result["submit_enabled_after_wait"] = submit_enabled_after_wait
+            submit_result = await click_submit_button()
+            if (
+                not submit_result.get("ok")
+                and submit_result.get("reason") == "submit_button_disabled"
+                and (unit_result.get("ok") or unit_result.get("reason") == "unit_not_committed")
+            ):
+                retry_result = await select_dialog_unit_once("submit_disabled_retry")
+                unit_result.setdefault("reselect_attempts", []).append(retry_result)
+                submit_enabled_after_retry = await wait_for_submit_enabled()
+                unit_result["submit_enabled_after_retry"] = submit_enabled_after_retry
+                submit_result = await click_submit_button()
+            if not submit_result.get("ok") and submit_result.get("reason") == "submit_button_disabled":
                 upload_result = {
                     **upload_result,
-                    "submit_button_blocked": submit_skipped,
+                    "submit_button_blocked": submit_result.get("skipped", []),
                 }
-                submit_result = {"ok": False, "reason": "submit_button_disabled", "skipped": submit_skipped}
 
             return {
                 "ok": bool(unit_result.get("ok") and upload_result.get("ok") and submit_result.get("ok")),
@@ -2347,13 +3041,20 @@ async def _run_browser_use_target_handover(
                 f"Browser Use 接管后状态：{'、'.join(targets)}",
             )
         )
+        write_network_events("enabled")
         feedback = _text(history)
         history_result = _browser_use_history_result(feedback)
         current_url = page.url or config.start_url
+        handover_return_home = await _return_to_start_url_after_browser_use_handover(
+            page,
+            config,
+            targets=targets,
+        )
         page_id = "browser_use_target_001"
         feature_id = "browser_use_target_001_flow"
         screenshot_refs = [item["screenshot_id"] for item in screenshots if item.get("screenshot_id")]
-        handover_status = "completed" if history_result["status"] == "passed" else "failed"
+        handover_succeeded = _browser_use_history_is_success(history_result)
+        handover_status = "completed" if handover_succeeded else "failed"
         return {
             "schema_version": V3_SCHEMA_VERSION,
             "status": handover_status,
@@ -2361,7 +3062,7 @@ async def _run_browser_use_target_handover(
             "handover_reasons": handover_reasons,
             "message": (
                 "Browser Use 已接管优先目标并返回执行历史。"
-                if history_result["status"] == "passed"
+                if handover_succeeded
                 else "Browser Use 接管已结束，但最终裁判为失败。"
             ),
             "failure_reason": history_result["failure_reason"],
@@ -2416,23 +3117,45 @@ async def _run_browser_use_target_handover(
                 "manual_confirmation_required": history_result["manual_confirmation_required"],
                 "message": (
                     "Browser Use 接管已完成，执行历史和截图已落盘。"
-                    if history_result["status"] == "passed"
+                    if handover_succeeded
                     else "Browser Use 接管失败，执行历史和截图已落盘。"
                 ),
             }],
             "page_exploration_log": [{
+                "event": "target_page_restore",
+                "status": "completed" if restore_result.get("ok") else "failed",
+                "targets": targets,
+                "url": restore_result.get("url"),
+                "method": restore_result.get("method"),
+                "detail": restore_result,
+            }, {
                 "event": "browser_use_handover",
                 "status": handover_status,
                 "targets": targets,
                 "reasons": handover_reasons,
                 "url": current_url,
                 "failure_reason": history_result["failure_reason"],
-            }],
+            }, handover_return_home],
             "screenshots_index": _menu_screenshots_index(
                 [{**item, "stage": "browser_use_handover", "source": "browser_use.semantic_recovery"} for item in screenshots]
             ),
         }
     except Exception as exc:
+        with suppress(Exception):
+            (run_dir / "network_events.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "stage2_network_events.v1",
+                        "capture_status": "failed",
+                        "items": [],
+                        "failure_reason": f"{type(exc).__name__}: {exc}",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
         return _browser_use_handover_failure(
             targets,
             handover_reasons,
@@ -2795,7 +3518,29 @@ def _should_block_for_login_text(text: str, menu_bundle: dict[str, Any]) -> bool
     menu_entries = menu_bundle.get("menu_entries") if isinstance(menu_bundle, dict) else []
     if not isinstance(menu_entries, list):
         return True
+    if _looks_like_logged_in_app_shell(text):
+        return False
+    if any(_is_business_menu_label_evidence(entry) for entry in menu_entries if isinstance(entry, dict)):
+        return False
     return not any(_is_business_menu_evidence(entry) for entry in menu_entries if isinstance(entry, dict))
+
+
+def _looks_like_logged_in_app_shell(text: str) -> bool:
+    value = _text(text)
+    return (
+        ("欢迎您" in value and "管理平台" in value)
+        or "当前品种" in value
+        or "通知公告" in value
+        or "录入提醒" in value
+    )
+
+
+def _is_business_menu_label_evidence(entry: dict[str, Any]) -> bool:
+    text = _text(entry.get("text"))
+    if not text or text == "首页" or _is_noise_menu_label(text) or _looks_like_login_text(text):
+        return False
+    business_words = ("管理", "备案", "申请", "溯源", "通知", "列表", "收购", "生产", "销售", "查询")
+    return any(word in text for word in business_words)
 
 
 def _is_business_menu_evidence(entry: dict[str, Any]) -> bool:
@@ -3720,6 +4465,9 @@ def _browser_use_history_result(feedback: str) -> dict[str, Any]:
     failure_patterns = [
         r"Judge Verdict:\s*(?:❌\s*)?FAIL",
         r"success\s*[:=]\s*False",
+        r'"ok"\s*:\s*false',
+        r"'ok'\s*:\s*False",
+        r"submit_button_disabled",
         r"测试未能成功提交",
         r"未能成功提交",
         r"仍为空",
@@ -3731,20 +4479,40 @@ def _browser_use_history_result(feedback: str) -> dict[str, Any]:
         r"required field",
         r"不能为空",
     ]
-    if any(re.search(pattern, text, re.I) for pattern in failure_patterns):
+    success_patterns = [
+        r"Judge Verdict:\s*(?:✅\s*)?PASS",
+        r"success\s*[:=]\s*True",
+        r"is_done\s*=\s*True[^)]*success\s*=\s*True",
+        r"成功提交",
+        r"提交成功",
+        r"提交完成",
+    ]
+    has_failure_signal = any(re.search(pattern, text, re.I) for pattern in failure_patterns)
+    has_success_signal = any(re.search(pattern, text, re.I) for pattern in success_patterns)
+    has_final_success_evidence = bool(
+        re.search(r"(提交成功|成功提交|提交完成)", text, re.I)
+        and (
+            re.search(r"(success\s*[:=]\s*True|is_done\s*=\s*True[^)]*success\s*=\s*True)", text, re.I)
+            or re.search(r"/registration/apply/dept[^\\n\\r]*(?:status\s*=?\s*200|POST)", text, re.I)
+            or re.search(r"待备案登记/监管单位登记备案", text, re.I)
+        )
+    )
+    if has_failure_signal and has_final_success_evidence:
+        return {
+            "status": "recovered_passed",
+            "verdict": "passed",
+            "failure_reason": None,
+            "manual_confirmation_required": False,
+            "recovered_from": "browser_use_intermediate_failure",
+        }
+    if has_failure_signal:
         return {
             "status": "failed",
             "verdict": "failed",
             "failure_reason": "browser_use_handover_failed",
             "manual_confirmation_required": True,
         }
-    success_patterns = [
-        r"Judge Verdict:\s*(?:✅\s*)?PASS",
-        r"success\s*[:=]\s*True",
-        r"成功提交",
-        r"提交成功",
-    ]
-    if any(re.search(pattern, text, re.I) for pattern in success_patterns):
+    if has_success_signal:
         return {
             "status": "passed",
             "verdict": "passed",
@@ -3757,6 +4525,10 @@ def _browser_use_history_result(feedback: str) -> dict[str, Any]:
         "failure_reason": "browser_use_handover_unverified",
         "manual_confirmation_required": True,
     }
+
+
+def _browser_use_history_is_success(history_result: dict[str, Any]) -> bool:
+    return _text(history_result.get("verdict")) == "passed" and not _text(history_result.get("failure_reason"))
 
 
 def _dedupe_menu_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
