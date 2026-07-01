@@ -197,7 +197,7 @@ npm run check
 - 已实现模板 bootstrap 入口：`--bootstrap-template`，可为新系统快速生成 `template.json`、`baseline.json`、`data_schema.json`、`locator_hints.json` 四件套的最小草稿，供第一轮 discovery / human recording 直接使用。
 - 已补 discovery 审核回填最小闭环：支持在已完成 discovery 上加载 `discovery_review_patch.json`，对页面入口和功能点执行忽略、重命名与字段修正，并让后续 discovery / verification 优先消费人工回填后的结果。
 - 已把 discovery 阶段显式化为策略决策：当前会在 `blocked`、`template_seed_only`、`live_enrich`、`skip_completed_discovery` 之间选择，并把决策纳入 run 产物与报告。
-- 已补真实浏览器 v3 菜单/页面探索护栏：菜单扫描会过滤顶部工具、字号选择、个人中心、退出登录等非业务 chrome；页面入口会按规范化 URL 去重，白屏或不可达入口会保留证据并标记为未覆盖。
+- 已补真实浏览器 v3 菜单/页面探索护栏：菜单扫描会过滤顶部工具、字号选择、个人中心、退出登录等非业务 chrome；开始菜单遍历前会尝试展开折叠菜单壳，菜单点击遇到视口外会优先走菜单标题/安全区域点击；页面入口会按规范化 URL 去重，白屏或不可达入口会保留证据并标记为未覆盖。
 - 已实现验证阶段统一执行器，可输出执行日志、关键截图、失败簇、重试计划、运行报告、平台日报和模型对比结果。
 - 已实现运行态进度视图产物：`progress_events.jsonl`、`current_status.json`、`phase_summary.json`。
 - 已把 Node.js 主平台首页调整为运行中心视图：当前可通过 `GET /api/stage2/overview` 聚合 stage2 run、验证矩阵、平台日报、模型对比、人工录制候选审阅摘要、基线冻结清单，以及 `artifacts/stage2/sessions/` 下的 orchestration session 摘要，并展示选中 run 的阶段时间线、判停说明、人工接管摘要、沉淀候选审阅摘要和关键 artifacts 动作区；页面空闲时默认每 15 秒刷新。
