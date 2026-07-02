@@ -405,20 +405,28 @@ class GoalLoopEngine:
         goal = self.goals[attempt.goal_id]
 
         # Only evidence bound to THIS attempt's chain may enter the audit trail.
+        # First validate existence, then validate ownership (Finding 1 from review).
         refs = list(evidence_refs or [])
-        valid_refs = [r for r in refs if self._attempt_of_evidence(r) == attempt_id]
-        invalid_refs = [r for r in refs if r not in set(valid_refs)]
+        missing_refs = [r for r in refs if r not in self.evidence]
 
         note: str | None = None
-        if invalid_refs:
-            # cross-goal / cross-attempt / fabricated refs are a chain break: do
-            # not accept them silently — surface as evidence_incomplete (§5.7).
+        if missing_refs:
+            # Non-existent evidence refs are a chain break: reject with EVIDENCE_INCOMPLETE
             failure_class, confidence = fc.EVIDENCE_INCOMPLETE, fc.CONFIDENCE_HIGH
-            note = f"dropped {len(invalid_refs)} evidence ref(s) not bound to this attempt: {invalid_refs}"
+            note = f"evidence refs do not exist: {missing_refs}"
+            valid_refs = []
         else:
-            failure_class, confidence = fc.classify_failure(
-                explicit_class=explicit_class, signals=signals
-            )
+            valid_refs = [r for r in refs if self._attempt_of_evidence(r) == attempt_id]
+            invalid_refs = [r for r in refs if r not in set(valid_refs)]
+
+            if invalid_refs:
+                # cross-goal / cross-attempt refs are a chain break: surface as evidence_incomplete (§5.7).
+                failure_class, confidence = fc.EVIDENCE_INCOMPLETE, fc.CONFIDENCE_HIGH
+                note = f"dropped {len(invalid_refs)} evidence ref(s) not bound to this attempt: {invalid_refs}"
+            else:
+                failure_class, confidence = fc.classify_failure(
+                    explicit_class=explicit_class, signals=signals
+                )
 
         return self._apply_failure(
             attempt,
@@ -473,6 +481,17 @@ class GoalLoopEngine:
         # and retry the SAME attempt, or record_failure(EVIDENCE_INCOMPLETE)
         # explicitly if the gap is genuine. A step-less attempt is tolerated (the
         # skeleton allows signal-only conclusions).
+
+        # First validate all step evidence exists (Finding 1 from review)
+        all_refs: set[str] = set()
+        for step in self.steps.values():
+            if step.attempt_id == attempt_id:
+                all_refs.update(step.evidence_ids)
+        missing_refs = [r for r in all_refs if r not in self.evidence]
+        if missing_refs:
+            raise ValueError(f"cannot record success: evidence refs do not exist: {missing_refs}")
+
+        # Then check for gaps (steps without evidence)
         evidence_gaps = [g for g in self.check_evidence_complete(attempt_id) if "has no evidence" in g]
         if evidence_gaps:
             raise ValueError(f"cannot record success: evidence incomplete: {evidence_gaps}")

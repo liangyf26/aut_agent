@@ -14,7 +14,26 @@ Exits are a closed set so failure handling is a finite state, not free play:
 - ``stop``     -> trigger a stop condition
 - ``degrade``  -> switch executor (e.g. semantic takeover unavailable)
 - ``escalate`` -> feed the systematic-defect escalation counter (§7.4)
-"""
+
+**Safety Framework (Finding 2 from adversarial review)**:
+
+The ``safety_constraints`` field is DECLARATIVE ONLY at the goal loop level.
+Stage A records high-risk flags (e.g., "no_real_submit_without_authorization")
+but does NOT enforce them. Enforcement is the responsibility of the execution
+layer (Stage D/E browser integration).
+
+The goal loop provides:
+- ``PlaybookAction.safety_constraints``: declared risk taxonomy
+- ``predicates.policy_blocked``: boolean flag to stop when policy gate fires
+- ``classification.BLOCKED_BY_SAFETY_POLICY``: failure class for gated actions
+
+Menu/page/feature goals should pre-screen for high-risk patterns (e.g., menu
+paths containing "删除/delete/批量/submit") and set
+``allow_human_intervention=True`` by default. However, the actual prevention
+of destructive actions (e.g., blocking form submission) must be implemented
+by the browser executor, not by the goal loop state machine.
+
+See 技术方案 §8.1 for safety policy architecture."""
 
 from __future__ import annotations
 
