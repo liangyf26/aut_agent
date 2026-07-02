@@ -118,7 +118,12 @@ class MenuGoalOrchestrator:
         total_goals = len(self.engine.goals)
         succeeded = sum(1 for g in self.engine.goals.values() if g.status == "succeeded")
         failed = sum(1 for g in self.engine.goals.values() if g.status == "failed")
-        pending = sum(1 for g in self.engine.goals.values() if g.status == "pending")
+        # pending includes both "pending" and "planned" states
+        pending = sum(
+            1
+            for g in self.engine.goals.values()
+            if g.status in ("pending", "planned", "running")
+        )
 
         # Get root goal stop_reason if available
         root_conclusion = None

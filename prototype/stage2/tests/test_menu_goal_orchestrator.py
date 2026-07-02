@@ -88,7 +88,7 @@ def test_orchestrator_get_summary():
         goal1.status = "succeeded"
         goal2.status = "failed"
 
-        # Add root note (goals don't have conclusion attribute)
+        # Root goal remains pending (planned status)
         root_goal = orch.engine.goals[root_id]
         root_goal.stop_reason = "2 menus discovered, 1 succeeded"
 
@@ -100,7 +100,8 @@ def test_orchestrator_get_summary():
         assert summary["total_goals"] == 3  # root + 2 menus
         assert summary["succeeded"] == 1
         assert summary["failed"] == 1
-        assert summary["pending"] == 1  # root goal
+        # Root goal is in planned state (counts as pending)
+        assert summary["pending"] == 1  # root goal (planned status)
         assert summary["root_goal_id"] == root_id
         assert summary["root_conclusion"] == "2 menus discovered, 1 succeeded"
 

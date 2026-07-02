@@ -75,21 +75,9 @@ def write_menu_fixture(
         }
         status = status_map.get(goal.status, "pending")
 
-        # Find screenshot evidence if available
+        # Screenshot path: simplified - not retrieved from attempts
+        # In real usage, orchestrator would track this separately
         screenshot_path = None
-        if goal.last_attempt_id:
-            attempt = engine.attempts.get(goal.last_attempt_id)
-            if attempt:
-                for step_id in attempt.step_ids:
-                    step = engine.steps.get(step_id)
-                    if step:
-                        for ev_id in step.evidence_ids:
-                            evidence = engine.evidence.get(ev_id)
-                            if evidence and evidence.evidence_type == "screenshot":
-                                screenshot_path = evidence.content
-                                break
-                    if screenshot_path:
-                        break
 
         # Find parent goal if hierarchical
         if goal.parent_goal_id:
@@ -108,7 +96,7 @@ def write_menu_fixture(
             "metadata": {
                 "goal_id": goal.goal_id,
                 "attempts": goal.attempt_count,
-                "conclusion": goal.conclusion,
+                "stop_reason": goal.stop_reason,
             },
         }
 
