@@ -178,16 +178,16 @@ def classify_from_page_state(
     is_blank = (
         visible_text_len < thresholds.min_visible_text_len
         or dom_nodes < thresholds.min_dom_nodes
-        or blank_ratio >= thresholds.blank_screenshot_threshold
+        or blank_ratio >= thresholds.blank_screenshot_ratio
     )
 
-    if http_ok and is_blank:
-        # HTTP 200 but page is blank
+    # Page is blank if content indicators show emptiness (regardless of http_ok)
+    if is_blank:
         # Confidence based on how many thresholds violated
         violations = sum([
             visible_text_len < thresholds.min_visible_text_len,
             dom_nodes < thresholds.min_dom_nodes,
-            blank_ratio >= thresholds.blank_screenshot_threshold,
+            blank_ratio >= thresholds.blank_screenshot_ratio,
         ])
         if violations >= 2:
             return ("page_blank", "high")

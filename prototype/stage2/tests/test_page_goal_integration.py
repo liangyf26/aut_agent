@@ -258,7 +258,7 @@ def test_page_discovery_with_blank_page():
 
         # Test low confidence blank (should retry)
         _, low_confidence = classify_page_discovery_failure(
-            page_signals={"visible_text_len": 15, "dom_nodes": 4}  # Only 2 violations
+            page_signals={"visible_text_len": 15, "dom_nodes": 6, "blank_screenshot_ratio": 0.5}  # Only 1 violation
         )
         assert low_confidence in ["medium", "low"]
         should_retry_low = should_retry_page_discovery("page_blank", 1, low_confidence)

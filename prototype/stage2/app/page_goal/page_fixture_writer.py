@@ -176,12 +176,30 @@ def write_page_fixture(adapter: "PageAdapter", output_path: str | Path) -> None:
         has_main_content = False
         is_blank = False
 
-        # Find last attempt signals
+        # Find last attempt with page_metadata evidence
         for attempt in reversed(adapter.engine.attempts):
-            if attempt.goal_id == goal_id and attempt.status == "succeeded":
-                # Try to extract signals from attempt steps/evidence
-                # For now, leave as defaults since Goal doesn't store signals
-                break
+            if attempt.goal_id == goal_id:
+                for step in attempt.steps:
+                    for evidence_id in step.evidence_ids:
+                        ev = adapter.engine.evidence.get(evidence_id)
+                        if ev and ev.kind == "page_metadata" and ev.note:
+                            # Parse JSON-encoded metadata
+                            try:
+                                metadata = json.loads(ev.note)
+                                http_status = metadata.get("http_status")
+                                has_main_content = metadata.get("has_main_content", False)
+                                visible_text_len = metadata.get("visible_text_len", 0)
+                                dom_nodes = metadata.get("dom_nodes", 0)
+                                # Compute is_blank from thresholds
+                                is_blank = visible_text_len < 20 or dom_nodes < 5
+                            except (json.JSONDecodeError, KeyError):
+                                pass
+                        if http_status is not None:
+                            break
+                    if http_status is not None:
+                        break
+                if http_status is not None:
+                    break
 
         # Find last failure_class from attempts
         last_failure_class = None
