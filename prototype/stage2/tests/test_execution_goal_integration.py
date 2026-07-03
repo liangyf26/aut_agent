@@ -14,6 +14,8 @@ import json
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from prototype.stage2.app.execution_goal import ExecutionGoalOrchestrator
 from prototype.stage2.app.goal_loop.models import PAUSED_STATUSES, TERMINAL_STATUSES
 
@@ -83,14 +85,26 @@ def test_execution_session_basic_all_pass():
         for goal_id in goal_ids:
             assert orch.engine.goals[goal_id].status == "succeeded"
 
+        # each outcome's goal_id must match the goal actually driven for it
+        # (execute_all processes goals in frontier/registration order, same
+        # order load_test_cases returned goal_ids in).
+        assert [outcome.goal_id for outcome in outcomes] == goal_ids
+
         results_path = orch.export_execution_results()
         results = json.loads(results_path.read_text(encoding="utf-8"))
         assert results["count"] == 3
+        assert results["results"] == results["items"]  # v3_orchestrator schema-compat alias
         assert {item["test_case_id"] for item in results["items"]} == {
             "tc_feat_001",
             "tc_feat_002",
             "tc_feat_003",
         }
+        # each item's goal_id must match the goal actually registered for
+        # its test_case_id — catches a goal_id/outcome mix-up bug that a
+        # mere set-of-test_case_ids comparison would miss.
+        by_test_case_id = {item["test_case_id"]: item for item in results["items"]}
+        for goal_id, test_case in zip(goal_ids, _sample_cases()):
+            assert by_test_case_id[test_case["test_case_id"]]["goal_id"] == goal_id
         # entry_confirmation never attempts the real high-risk action itself
         entry_item = next(item for item in results["items"] if item["test_case_id"] == "tc_feat_003")
         assert entry_item["requires_human_authorization"] is True
@@ -116,9 +130,19 @@ def test_execution_session_basic_all_pass():
 
         human_tasks_path = orch.export_human_tasks()
         human_tasks_payload = json.loads(human_tasks_path.read_text(encoding="utf-8"))
-        assert human_tasks_payload["open_task_count"] == 0
+        # tc_feat_003 (entry_confirmation) passed its basic path but still
+        # requires a SEPARATE human authorization before the real high-risk
+        # action can be attempted — requires_human_authorization=True must
+        # actually surface as an open task, not be inert metadata.
+        assert human_tasks_payload["open_task_count"] == 1
+        auth_task = human_tasks_payload["tasks"][0]
+        assert auth_task["type"] == "high_risk_action_authorization"
+        assert auth_task["test_case_id"] == "tc_feat_003"
 
-        assert orch.export_human_takeover() is None  # nothing paused -> no packet
+        takeover_path = orch.export_human_takeover()
+        assert takeover_path is not None  # a pending authorization is a real open item
+        takeover_payload = json.loads(takeover_path.read_text(encoding="utf-8"))
+        assert takeover_payload["pending_actions"][0]["action_kind"] == "authorize_high_risk_action"
 
         round_analysis_path = orch.export_round_analysis()
         round_analysis = json.loads(round_analysis_path.read_text(encoding="utf-8"))
@@ -169,6 +193,15 @@ def test_human_required_failure_pauses_batch_and_writes_takeover_packet():
         assert orch.halted_early is True
         assert len(orch.engine.frontier) == 2  # remaining two cases still queued, not dropped
 
+        # verify WHICH two cases remain (not just a count) — a loader bug
+        # that drops/duplicates a case would still leave len(frontier)==2.
+        remaining_test_case_ids = {
+            orch.adapter.get_execution_context(gid)["test_case_id"] for gid in orch.engine.frontier
+        }
+        assert remaining_test_case_ids == {"tc_feat_002", "tc_feat_003"}
+        # and neither remaining goal was touched by an attempt.
+        assert not any(a.goal_id in orch.engine.frontier for a in orch.engine.attempts)
+
         first_goal = orch.engine.goals[goal_ids[0]]
         assert first_goal.status in PAUSED_STATUSES  # paused, NOT a terminal failure
 
@@ -176,7 +209,10 @@ def test_human_required_failure_pauses_batch_and_writes_takeover_packet():
         human_tasks = json.loads(human_tasks_path.read_text(encoding="utf-8"))
         assert human_tasks["open_task_count"] == 1
         assert human_tasks["tasks"][0]["failure_class"] == "permission_blocked"
-        assert human_tasks["tasks"][0]["type"] == "high_risk_authorization"
+        # permission_blocked has its own task type, distinct from the
+        # generic label previously collapsed across all 5 human-required
+        # classes — see human_tasks_writer._TASK_TYPE_BY_FAILURE_CLASS.
+        assert human_tasks["tasks"][0]["type"] == "permission_grant"
 
         takeover_path = orch.export_human_takeover()
         assert takeover_path is not None
@@ -184,7 +220,16 @@ def test_human_required_failure_pauses_batch_and_writes_takeover_packet():
         assert takeover["status"] == "waiting_human"
         assert len(takeover["pending_actions"]) == 1
         assert takeover["pending_actions"][0]["test_case_id"] == "tc_feat_001"
-        assert "resume_command" in takeover and takeover["resume_command"]
+        # waiting_reason must carry the ACTUAL failure class (permission_blocked),
+        # not the generic stop-condition name "waiting_human" — a safety-policy
+        # block must be distinguishable from a routine login pause.
+        assert takeover["waiting_reason"] == "permission_blocked"
+        # resume_command must reference a command that actually exists in
+        # this codebase (prototype/stage2/main.py's --resume-human-takeover),
+        # not a module that was never created.
+        assert takeover["resume_command"] == (
+            f'python -m prototype.stage2.main --resume-human-takeover "{output_dir}"'
+        )
 
         next_round_path = orch.export_next_round_plan()
         next_round = json.loads(next_round_path.read_text(encoding="utf-8"))
@@ -278,6 +323,9 @@ def test_evidence_chain_traces_goal_to_evidence():
         assert len(attempts) == 1
         attempt = attempts[0]
         assert attempt.steps  # at least the action step + network_capture step
+        # the action step specifically must be present — the primary
+        # evidence of what was actually done, not just any step kind.
+        assert any(step.kind == "action" for step in attempt.steps)
         for step in attempt.steps:
             assert step.attempt_id == attempt.attempt_id
             for evidence_id in step.evidence_ids:
@@ -288,6 +336,168 @@ def test_evidence_chain_traces_goal_to_evidence():
         # this run carried evidence attached in the same call.
         gaps = orch.engine.check_evidence_complete(attempt.attempt_id)
         assert gaps == []
+
+
+def test_action_log_test_case_id_matches_execution_results():
+    """action_log.jsonl's test_case_id must be the REAL test_case_id, not the
+    feature_id — the two are different strings in a real Stage D run
+    (test_case_id = f'tc_{feature_id}'), so parsing it out of goal.origin
+    (which only ever encodes feature_id) silently breaks any join between
+    action_log.jsonl and execution_results.json."""
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_dir = Path(tmpdir) / "output"
+        output_dir.mkdir()
+        test_cases_path = output_dir / "generated_test_cases.json"
+        _write_test_cases(
+            test_cases_path,
+            [
+                {
+                    "test_case_id": "tc_page_001_feat_001",
+                    "feature_id": "page_001_feat_001",
+                    "page_id": "page_001",
+                    "type": "executable",
+                    "risk_level": "low",
+                    "confidence": "high",
+                    "steps": [{"step": 1, "action": "click"}],
+                }
+            ],
+        )
+
+        orch = ExecutionGoalOrchestrator(output_dir=str(output_dir), run_id="test_run_actionlog")
+        orch.create_root_goal()
+        orch.load_test_cases(test_cases_path)
+        orch.execute_all()
+
+        results = json.loads(orch.export_execution_results().read_text(encoding="utf-8"))
+        action_log_lines = orch.export_action_log().read_text(encoding="utf-8").strip().splitlines()
+
+        assert results["items"][0]["test_case_id"] == "tc_page_001_feat_001"
+        action_entry = json.loads(action_log_lines[0])
+        assert action_entry["test_case_id"] == "tc_page_001_feat_001"
+        # explicitly NOT the feature_id (the bug this test guards against)
+        assert action_entry["test_case_id"] != "page_001_feat_001"
+
+
+def test_executable_case_with_high_risk_level_is_refused_not_executed():
+    """Defense-in-depth: an 'executable' case that (via a stale fixture or a
+    future classifier bug) declares risk_level='high' must be refused, not
+    executed as if it were a genuine low-risk case — Stage E must not trust
+    generated_test_cases.json blindly for the type<->risk_level invariant
+    Stage D's classifier is supposed to enforce."""
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_dir = Path(tmpdir) / "output"
+        output_dir.mkdir()
+        test_cases_path = output_dir / "generated_test_cases.json"
+        _write_test_cases(
+            test_cases_path,
+            [
+                {
+                    "test_case_id": "tc_evil",
+                    "feature_id": "feat_evil",
+                    "page_id": "page_x",
+                    "type": "executable",
+                    "risk_level": "high",
+                    "confidence": "high",
+                    "steps": [{"step": 1, "action": "submit_delete_all"}],
+                }
+            ],
+        )
+
+        orch = ExecutionGoalOrchestrator(output_dir=str(output_dir), run_id="test_run_defense")
+        orch.create_root_goal()
+        orch.load_test_cases(test_cases_path)
+        outcomes = orch.execute_all()
+
+        assert len(outcomes) == 1
+        assert outcomes[0].status == "failed"
+        assert outcomes[0].failure_reason == "blocked_by_safety_policy"
+        # the dangerous action must never be reported as "completed"
+        assert not any(action.get("status") == "completed" for action in outcomes[0].actions)
+
+
+def test_escalation_counter_does_not_leak_across_goal_origins():
+    """round_analysis.json's escalations must be scoped to THIS run's
+    execution goals — failures recorded against a differently-originated
+    goal on a shared engine must not inflate Stage E's own escalation
+    counters."""
+
+    from prototype.stage2.app.goal_loop.state_machine import GoalLoopEngine
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_dir = Path(tmpdir) / "output"
+        output_dir.mkdir()
+
+        shared_engine = GoalLoopEngine(run_id="shared")
+        foreign_goal = shared_engine.register_goal(goal_type="menu", goal_name="unrelated menu goal")
+        shared_engine.activate_next()
+        for _ in range(3):
+            attempt = shared_engine.start_attempt(foreign_goal.goal_id)
+            shared_engine.record_failure(attempt.attempt_id, explicit_class="locator_unstable")
+        # resolve the foreign goal to a terminal status so it releases
+        # active_goal_id — otherwise activate_next() (used by Stage E below)
+        # would correctly refuse to advance past it, which is a different
+        # invariant than the one this test is about.
+        shared_engine.evaluate_stop(foreign_goal.goal_id)
+        assert foreign_goal.status in TERMINAL_STATUSES
+
+        test_cases_path = output_dir / "generated_test_cases.json"
+        _write_test_cases(
+            test_cases_path,
+            [_sample_cases()[0]],
+        )
+
+        orch = ExecutionGoalOrchestrator(engine=shared_engine, output_dir=str(output_dir), run_id="shared")
+        orch.create_root_goal()
+        orch.load_test_cases(test_cases_path)
+        orch.execute_all(injected_failures={"tc_feat_001": "locator_unstable"})
+
+        round_analysis = json.loads(orch.export_round_analysis().read_text(encoding="utf-8"))
+        assert round_analysis["coverage"]["failed"] == 1
+        # the escalation view must reflect only Stage E's 1 occurrence, not
+        # the foreign goal's 3 + Stage E's 1 = 4.
+        escalation = next(
+            (row for row in round_analysis["escalations"] if row["failure_class"] == "locator_unstable"),
+            None,
+        )
+        assert escalation is None or escalation["occurrences"] == 1
+
+
+def test_execute_all_raises_on_foreign_goal_and_preserves_prior_outcomes():
+    """If engine.frontier ever contains a goal this orchestrator did not
+    register (e.g. a shared engine with another goal producer), execute_all
+    must raise loudly rather than silently stranding the foreign goal at
+    STATUS_RUNNING — and outcomes already recorded earlier in the SAME call
+    must not be discarded when the error is raised."""
+
+    from prototype.stage2.app.goal_loop.state_machine import GoalLoopEngine
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_dir = Path(tmpdir) / "output"
+        output_dir.mkdir()
+
+        shared_engine = GoalLoopEngine(run_id="shared_foreign")
+        orch = ExecutionGoalOrchestrator(engine=shared_engine, output_dir=str(output_dir), run_id="shared_foreign")
+        root_id = orch.create_root_goal()
+
+        test_cases_path = output_dir / "generated_test_cases.json"
+        _write_test_cases(test_cases_path, [_sample_cases()[0]])
+        goal_ids = orch.load_test_cases(test_cases_path)
+
+        # insert a foreign goal into the frontier AFTER the one real execution goal
+        foreign_goal = shared_engine.register_goal(goal_type="menu", goal_name="foreign", parent_goal_id=root_id)
+        assert shared_engine.frontier == [goal_ids[0], foreign_goal.goal_id]
+
+        with pytest.raises(RuntimeError):
+            orch.execute_all()
+
+        # the real goal (executed before the foreign one was reached) must
+        # have its outcome preserved despite the later crash.
+        assert len(orch._outcomes) == 1
+        assert orch.engine.goals[goal_ids[0]].status == "succeeded"
+        results = json.loads(orch.export_execution_results().read_text(encoding="utf-8"))
+        assert results["count"] == 1
 
 
 def test_unrecognized_case_type_fails_with_evidence_incomplete():
@@ -329,6 +539,18 @@ if __name__ == "__main__":
 
     test_evidence_chain_traces_goal_to_evidence()
     print("[OK] test_evidence_chain_traces_goal_to_evidence")
+
+    test_action_log_test_case_id_matches_execution_results()
+    print("[OK] test_action_log_test_case_id_matches_execution_results")
+
+    test_executable_case_with_high_risk_level_is_refused_not_executed()
+    print("[OK] test_executable_case_with_high_risk_level_is_refused_not_executed")
+
+    test_escalation_counter_does_not_leak_across_goal_origins()
+    print("[OK] test_escalation_counter_does_not_leak_across_goal_origins")
+
+    test_execute_all_raises_on_foreign_goal_and_preserves_prior_outcomes()
+    print("[OK] test_execute_all_raises_on_foreign_goal_and_preserves_prior_outcomes")
 
     test_unrecognized_case_type_fails_with_evidence_incomplete()
     print("[OK] test_unrecognized_case_type_fails_with_evidence_incomplete")

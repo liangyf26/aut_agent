@@ -169,17 +169,26 @@ def write_run_report(
     run_id: str,
     output_dir: Path,
 ) -> tuple[Path, Path]:
+    """Write run_report.json/.md under output_dir/reports/, matching the
+    EXISTING convention (runtime.artifacts.RunPaths.reports_dir,
+    verification/run_sample.py) that orchestration.session_artifacts's
+    _load_run_session_record() already reads from
+    (``run_dir / "reports" / "run_report.json"``) — writing flat at the top
+    level would make a genuine Stage E run invisible to that reader.
+    """
+
     report = build_run_report(engine, outcomes, run_id, output_dir)
 
-    json_path = output_dir / "run_report.json"
-    json_path.parent.mkdir(parents=True, exist_ok=True)
+    reports_dir = output_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
     import json
 
+    json_path = reports_dir / "run_report.json"
     json_path.write_text(
         json.dumps(report.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    md_path = output_dir / "run_report.md"
+    md_path = reports_dir / "run_report.md"
     md_path.write_text(render_run_report_markdown(report), encoding="utf-8")
 
     return json_path, md_path

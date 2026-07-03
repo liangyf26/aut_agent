@@ -111,6 +111,20 @@ class ExecutionGoalOrchestrator:
             The list of :class:`ExecutionOutcome` produced this call, in
             execution order. ``self.halted_early`` is set if the batch
             stopped on a paused goal with cases still left in the frontier.
+
+        Raises:
+            RuntimeError: if ``activate_next()`` promotes a goal this
+                orchestrator did not register (no execution context) — this
+                can only happen if the ``engine`` passed to the constructor
+                is shared with another goal producer whose goals are mixed
+                into the same frontier. Such a goal is left permanently
+                STATUS_RUNNING (this orchestrator has no basic path to run
+                for it and no basis to resolve it), so every SUBSEQUENT call
+                to ``execute_all``/``activate_next`` on this engine will also
+                raise until the caller resolves it directly. Outcomes already
+                recorded before this point are NOT lost: each is appended to
+                ``self._outcomes`` immediately after ``_execute_one``
+                returns, not batched at the end of the loop.
         """
 
         injected_failures = injected_failures or {}
@@ -123,8 +137,16 @@ class ExecutionGoalOrchestrator:
 
             context = self.adapter.get_execution_context(goal.goal_id)
             if context is None:
-                # not an execution goal (e.g. the root); nothing to run.
-                continue
+                raise RuntimeError(
+                    f"activate_next() promoted goal {goal.goal_id!r}, which this "
+                    "ExecutionGoalOrchestrator did not register (no execution "
+                    "context). This goal is now stuck at STATUS_RUNNING — "
+                    "resolve it directly via engine.record_success()/"
+                    "record_failure()/supersede_active() before calling "
+                    "execute_all() again. This orchestrator's engine must not "
+                    "be shared with another goal producer unless their "
+                    "frontiers are kept disjoint."
+                )
 
             outcome = self._execute_one(
                 goal.goal_id,
@@ -132,13 +154,13 @@ class ExecutionGoalOrchestrator:
                 injected_failure=injected_failures.get(context["test_case_id"]),
             )
             outcomes.append(outcome)
+            self._outcomes.append(outcome)
 
             stop_eval = self.engine.evaluate_stop(goal.goal_id)
             if stop_eval.target_status in PAUSED_STATUSES:
                 self.halted_early = True
                 break
 
-        self._outcomes.extend(outcomes)
         return outcomes
 
     def _execute_one(self, goal_id: str, context: dict, *, injected_failure: str | None) -> ExecutionOutcome:
@@ -167,7 +189,7 @@ class ExecutionGoalOrchestrator:
         return write_execution_results(self._outcomes, self.output_dir / filename)
 
     def export_action_log(self, filename: str = "action_log.jsonl") -> Path:
-        return write_action_log(self.engine, self.output_dir / filename)
+        return write_action_log(self.engine, self.adapter, self.output_dir / filename)
 
     def export_network_events(self, filename: str = "network_events.json") -> Path:
         return write_network_events(self._outcomes, self.output_dir / filename)
@@ -176,18 +198,30 @@ class ExecutionGoalOrchestrator:
         return write_screenshots_index(self._outcomes, self.output_dir / filename)
 
     def export_human_tasks(self, filename: str = "human_tasks.json") -> Path:
-        return write_human_tasks(self.engine, self.adapter, self.run_id, self.output_dir / filename)
+        return write_human_tasks(
+            self.engine, self.adapter, self._outcomes, self.run_id, self.output_dir / filename
+        )
 
     def export_human_takeover(self, filename: str = "human_takeover.json") -> Path | None:
         return write_human_takeover(
-            self.engine, self.adapter, self.run_id, self.output_dir, self.output_dir / filename
+            self.engine,
+            self.adapter,
+            self._outcomes,
+            self.run_id,
+            self.output_dir,
+            self.output_dir / filename,
         )
 
     def export_round_analysis(self, filename: str = "round_analysis.json") -> Path:
         return write_round_analysis(self.engine, self.run_id, self.output_dir / filename)
 
     def export_next_round_plan(self, filename: str = "next_round_plan.json") -> Path:
-        return write_next_round_plan(self.engine, self.run_id, self.output_dir / filename)
+        return write_next_round_plan(
+            self.engine,
+            self.run_id,
+            self.output_dir / filename,
+            decision_alias_path=self.output_dir / "next_round_decision.json",
+        )
 
     def export_run_report(self) -> tuple[Path, Path]:
         return write_run_report(self.engine, self._outcomes, self.run_id, self.output_dir)

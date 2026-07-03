@@ -118,6 +118,34 @@ def simulate_test_case_execution(
     feature_id = test_case.get("feature_id")
     page_id = test_case.get("page_id")
     case_type = test_case.get("type")
+    risk_level = test_case.get("risk_level")
+
+    # Defense-in-depth (技术方案 §2.4/§4.7): Stage D's classifier is supposed to
+    # route every risk_level=="high" feature to an entry_confirmation case, but
+    # Stage E must not TRUST that blindly — generated_test_cases.json can be
+    # stale, hand-edited, or produced by a future classifier bug. An
+    # "executable" case claiming risk_level=="high" is refused here rather
+    # than executed, so a mislabeled high-risk case can never slip through as
+    # a real basic-path execution (fixture-simulated today; a real_browser
+    # runner substituted later inherits this same refusal since it is not
+    # case-type-dispatch-specific).
+    if case_type == "executable" and risk_level == "high":
+        return ExecutionOutcome(
+            test_case_id=test_case_id,
+            feature_id=feature_id,
+            page_id=page_id,
+            goal_id=goal_id,
+            status=STATUS_FAILED,
+            case_kind=case_type,
+            failure_reason="blocked_by_safety_policy",
+            requires_human_authorization=True,
+            notes=[
+                "refused: an 'executable' case declared risk_level='high'; "
+                "high-risk actions must be generated as 'entry_confirmation', "
+                "not executed automatically — this is a defense-in-depth check "
+                "independent of Stage D's own classification",
+            ],
+        )
 
     if case_type == "view_only":
         if injected_failure:

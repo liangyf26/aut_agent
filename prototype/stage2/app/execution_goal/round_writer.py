@@ -62,6 +62,64 @@ def _evidence_quality(engine: "GoalLoopEngine", goals: list) -> dict[str, Any]:
     }
 
 
+def _scoped_escalations(
+    engine: "GoalLoopEngine", execution_goal_ids: set[str], thresholds
+) -> list[dict[str, Any]]:
+    """Recompute escalation counters restricted to THIS run's execution
+    goals only.
+
+    ``engine.evaluate_escalations()`` reads ``engine._defect_counter``, which
+    is a single run-wide dict keyed only by ``failure_class`` with no
+    goal-origin scoping (adversarial review finding: on a shared engine,
+    another stage's failures of the same class silently inflate Stage E's
+    occurrence/streak counts). Recomputing from ``engine.classifications``
+    filtered to ``execution_goal_ids`` — the same filter already applied to
+    ``failure_clusters`` in this module — keeps the escalation view honestly
+    scoped to what Stage E itself actually observed.
+    """
+
+    occurrences: dict[str, int] = {}
+    resolved: dict[str, int] = {}
+    for record in engine.classifications:
+        if record.goal_id not in execution_goal_ids:
+            continue
+        occurrences[record.failure_reason] = occurrences.get(record.failure_reason, 0) + 1
+
+    for goal_id in execution_goal_ids:
+        goal = engine.goals.get(goal_id)
+        if goal is None or goal.status != STATUS_SUCCEEDED:
+            continue
+        for attempt in reversed(engine.attempts):
+            if attempt.goal_id == goal_id and attempt.failure_class:
+                resolved[attempt.failure_class] = resolved.get(attempt.failure_class, 0) + 1
+                break
+
+    rows: list[dict[str, Any]] = []
+    for failure_class, count in sorted(occurrences.items()):
+        resolved_count = resolved.get(failure_class, 0)
+        success_rate = (resolved_count / count) if count else 0.0
+        triggered = (
+            count >= thresholds.escalation_occurrence_threshold
+            and success_rate <= thresholds.escalation_success_floor
+        )
+        rows.append(
+            {
+                "failure_class": failure_class,
+                "scope": "execution_goal",
+                "occurrences": count,
+                "playbook_success_rate": round(success_rate, 4),
+                "triggered": triggered,
+                "recommendation": (
+                    f"escalate {failure_class} to programming model: "
+                    f"{count} occurrences with success_rate {success_rate:.2f}"
+                    if triggered
+                    else None
+                ),
+            }
+        )
+    return [row for row in rows if row["triggered"]]
+
+
 def write_round_analysis(
     engine: "GoalLoopEngine",
     run_id: str,
@@ -87,7 +145,7 @@ def write_round_analysis(
         for record in engine.classifications
         if record.goal_id in execution_goal_ids
     ]
-    escalations = [row.to_dict() for row in engine.evaluate_escalations(scope="run") if row.triggered]
+    escalations = _scoped_escalations(engine, execution_goal_ids, engine.thresholds)
 
     if any(g.status in PAUSED_STATUSES for g in goals):
         suggestion = "存在暂停中的执行目标，需人工处理后才能继续下一轮。"
@@ -112,7 +170,20 @@ def write_next_round_plan(
     engine: "GoalLoopEngine",
     run_id: str,
     output_path: str | Path,
+    *,
+    decision_alias_path: str | Path | None = None,
 ) -> Path:
+    """Write next_round_plan.json (方案 §2.6's mandated artifact name).
+
+    Also writes an identical copy to ``decision_alias_path`` when given, so
+    the EXISTING run-center reader (orchestration.session_artifacts, which
+    reads ``run_dir / "next_round_decision.json"`` — a different filename
+    that predates this module) sees the same decision without requiring a
+    second, divergent schema. This is a filename alias, not a new source of
+    truth: both paths get byte-identical content from the same
+    NextRoundDecisionRecord.
+    """
+
     goals = _execution_goals(engine)
     paused_goals = [g for g in goals if g.status in PAUSED_STATUSES]
     failed_goals = [g for g in goals if g.status in TERMINAL_STATUSES and g.status != STATUS_SUCCEEDED]
@@ -168,7 +239,10 @@ def write_next_round_plan(
     payload = record.to_dict()
     payload["next_goal"] = target_ids[0] if target_ids else None
     payload["target_ids"] = target_ids
-    return _safe_json_write(output_path, payload)
+    written_path = _safe_json_write(output_path, payload)
+    if decision_alias_path is not None:
+        _safe_json_write(decision_alias_path, payload)
+    return written_path
 
 
 __all__ = ["write_round_analysis", "write_next_round_plan"]
