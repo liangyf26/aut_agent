@@ -1,0 +1,221 @@
+"""
+Execution goal orchestrator for Stage E.
+
+Drives the goal loop over every test case Stage D generated: activates one
+execution goal at a time (enforcing the engine's single-active-goal
+invariant, 技术方案 §4.3), simulates its basic path, records step-level
+evidence, and concludes success/failure via ``ExecutionAdapter``.
+
+IMPORTANT — batch halts on a paused goal, by design: ``assertion_failed``,
+``permission_blocked``, ``login_required``, ``missing_prerequisite_data``
+and ``blocked_by_safety_policy`` are all in the fixed playbook's
+``HUMAN_REQUIRED_CLASSES`` (Stage A, ``goal_loop/playbook.py``) — a case
+that fails with one of these classes pauses its goal as
+``waiting_human``/``blocked_by_*`` (a PAUSED, non-terminal status). The
+engine refuses to advance the frontier past an unresolved paused goal
+(``activate_next`` raises), so ``execute_all`` stops the batch right there
+rather than silently skipping ahead. This matches 技术方案 §4.11: "当系统被
+安全策略、权限、前置数据或执行器问题阻断时，应输出结构化接管包... 再继续下一轮" —
+remaining cases stay queued in ``engine.frontier`` for the next round, not
+silently dropped or force-run out of order.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..goal_loop.state_machine import GoalLoopEngine
+
+from ..goal_loop.models import PAUSED_STATUSES
+from .execution_adapter import ExecutionAdapter
+from .execution_fixture_writer import (
+    write_action_log,
+    write_execution_results,
+    write_network_events,
+    write_screenshots_index,
+)
+from .execution_runner import ExecutionOutcome, simulate_test_case_execution
+from .human_tasks_writer import write_human_takeover, write_human_tasks
+from .loader import load_execution_goals_from_test_cases
+from .round_writer import write_next_round_plan, write_round_analysis
+from .run_report_writer import write_run_report
+
+
+class ExecutionGoalOrchestrator:
+    """Orchestrator for Stage E's execution / evidence / retrospective session."""
+
+    def __init__(
+        self,
+        engine: "GoalLoopEngine | None" = None,
+        *,
+        output_dir: str | Path = "output",
+        run_id: str = "execution_run_001",
+    ):
+        from ..goal_loop.state_machine import GoalLoopEngine
+
+        self.engine = engine or GoalLoopEngine(run_id=run_id)
+        self.adapter = ExecutionAdapter(self.engine)
+        self.output_dir = Path(output_dir)
+        self.run_id = run_id
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        self._outcomes: list[ExecutionOutcome] = []
+        self.halted_early = False
+
+    def create_root_goal(self, description: str = "Execute discovered feature test cases") -> str:
+        """Register a bookkeeping root goal for lineage only.
+
+        Unlike a real execution goal, the root has no test case and no
+        satisfiable success predicate (feature success requires
+        basic_path_executed/has_feedback, which do not apply to an empty
+        container). It is removed from ``engine.frontier`` immediately so
+        ``activate_next()`` — which this orchestrator uses for real,
+        single-active-goal semantics (see module docstring) — never picks it
+        up and stalls waiting for it to be resolved. It stays in
+        ``engine.goals`` so child goals still carry a valid
+        ``parent_goal_id`` lineage.
+        """
+
+        goal = self.engine.register_goal(
+            goal_type="feature",
+            goal_name=description,
+            parent_goal_id=None,
+            origin="root::execution",
+        )
+        if goal.goal_id in self.engine.frontier:
+            self.engine.frontier.remove(goal.goal_id)
+        return goal.goal_id
+
+    def load_test_cases(self, test_cases_path: str | Path) -> list[str]:
+        root_goals = [g for g in self.engine.goals.values() if g.origin == "root::execution"]
+        if not root_goals:
+            raise RuntimeError("No root goal found. Call create_root_goal() first.")
+        return load_execution_goals_from_test_cases(
+            self.engine,
+            self.adapter,
+            test_cases_path,
+            parent_goal_id=root_goals[0].goal_id,
+        )
+
+    def execute_all(self, *, injected_failures: dict[str, str] | None = None) -> list[ExecutionOutcome]:
+        """Run every queued execution goal's basic path until the frontier is
+        exhausted or a goal pauses for human resolution.
+
+        Args:
+            injected_failures: optional ``test_case_id -> fixed_failure_class``
+                overrides, for tests / future real-runner integration.
+
+        Returns:
+            The list of :class:`ExecutionOutcome` produced this call, in
+            execution order. ``self.halted_early`` is set if the batch
+            stopped on a paused goal with cases still left in the frontier.
+        """
+
+        injected_failures = injected_failures or {}
+        outcomes: list[ExecutionOutcome] = []
+
+        while True:
+            goal = self.engine.activate_next()
+            if goal is None:
+                break
+
+            context = self.adapter.get_execution_context(goal.goal_id)
+            if context is None:
+                # not an execution goal (e.g. the root); nothing to run.
+                continue
+
+            outcome = self._execute_one(
+                goal.goal_id,
+                context,
+                injected_failure=injected_failures.get(context["test_case_id"]),
+            )
+            outcomes.append(outcome)
+
+            stop_eval = self.engine.evaluate_stop(goal.goal_id)
+            if stop_eval.target_status in PAUSED_STATUSES:
+                self.halted_early = True
+                break
+
+        self._outcomes.extend(outcomes)
+        return outcomes
+
+    def _execute_one(self, goal_id: str, context: dict, *, injected_failure: str | None) -> ExecutionOutcome:
+        test_case = context["test_case"]
+        outcome = simulate_test_case_execution(test_case, goal_id=goal_id, injected_failure=injected_failure)
+
+        attempt_id = self.adapter.record_execution_attempt(goal_id=goal_id)
+        for action_record in outcome.actions:
+            self.adapter.record_action(attempt_id=attempt_id, action_record=action_record)
+        if outcome.page_feedback:
+            self.adapter.record_feedback(attempt_id=attempt_id, feedback=outcome.page_feedback)
+        self.adapter.record_network_capture(
+            attempt_id=attempt_id,
+            network_events=outcome.network_events,
+            capture_status="not_applicable_fixture_mode" if outcome.execution_mode == "fixture_simulated" else "captured",
+        )
+        for screenshot_ref in outcome.screenshot_refs:
+            self.adapter.record_screenshot(attempt_id=attempt_id, screenshot_ref=screenshot_ref)
+
+        self.adapter.conclude_execution(attempt_id=attempt_id, outcome=outcome)
+        return outcome
+
+    # --- exports -------------------------------------------------------
+
+    def export_execution_results(self, filename: str = "execution_results.json") -> Path:
+        return write_execution_results(self._outcomes, self.output_dir / filename)
+
+    def export_action_log(self, filename: str = "action_log.jsonl") -> Path:
+        return write_action_log(self.engine, self.output_dir / filename)
+
+    def export_network_events(self, filename: str = "network_events.json") -> Path:
+        return write_network_events(self._outcomes, self.output_dir / filename)
+
+    def export_screenshots_index(self, filename: str = "screenshots_index.json") -> Path:
+        return write_screenshots_index(self._outcomes, self.output_dir / filename)
+
+    def export_human_tasks(self, filename: str = "human_tasks.json") -> Path:
+        return write_human_tasks(self.engine, self.adapter, self.run_id, self.output_dir / filename)
+
+    def export_human_takeover(self, filename: str = "human_takeover.json") -> Path | None:
+        return write_human_takeover(
+            self.engine, self.adapter, self.run_id, self.output_dir, self.output_dir / filename
+        )
+
+    def export_round_analysis(self, filename: str = "round_analysis.json") -> Path:
+        return write_round_analysis(self.engine, self.run_id, self.output_dir / filename)
+
+    def export_next_round_plan(self, filename: str = "next_round_plan.json") -> Path:
+        return write_next_round_plan(self.engine, self.run_id, self.output_dir / filename)
+
+    def export_run_report(self) -> tuple[Path, Path]:
+        return write_run_report(self.engine, self._outcomes, self.run_id, self.output_dir)
+
+    def get_summary(self) -> dict:
+        from collections import Counter
+
+        status_counts = Counter()
+        for goal in self.engine.goals.values():
+            if not goal.origin or not goal.origin.startswith("feature_execution::"):
+                continue
+            status_counts[goal.status] += 1
+
+        case_kind_counts = Counter(outcome.case_kind for outcome in self._outcomes)
+        outcome_status_counts = Counter(outcome.status for outcome in self._outcomes)
+        pending_authorization = sum(1 for outcome in self._outcomes if outcome.requires_human_authorization)
+
+        return {
+            "run_id": self.run_id,
+            "total_execution_goals": sum(status_counts.values()),
+            "goal_status_breakdown": dict(status_counts),
+            "executed_case_count": len(self._outcomes),
+            "case_kind_breakdown": dict(case_kind_counts),
+            "outcome_status_breakdown": dict(outcome_status_counts),
+            "pending_human_authorization_count": pending_authorization,
+            "halted_early": self.halted_early,
+            "remaining_in_frontier": len(self.engine.frontier),
+        }
+
+
+__all__ = ["ExecutionGoalOrchestrator"]
