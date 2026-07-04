@@ -19,8 +19,9 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ..goal_loop.state_machine import GoalLoopEngine
+    from .execution_adapter import ExecutionAdapter
 
-from ..goal_loop import compat
+from ..goal_loop import compat, playbook as pb
 from ..goal_loop.models import PAUSED_STATUSES, STATUS_SUCCEEDED, TERMINAL_STATUSES
 from prototype.stage2.app.iteration.models import NextRoundDecisionRecord
 
@@ -118,6 +119,83 @@ def _scoped_escalations(
             }
         )
     return [row for row in rows if row["triggered"]]
+
+
+def resolve_retryable_test_cases(
+    engine: "GoalLoopEngine",
+    adapter: "ExecutionAdapter",
+    *,
+    goal_ids: "set[str] | None" = None,
+) -> dict[str, Any]:
+    """Decide which failed execution goals are safe to auto-retry next round.
+
+    Only goals whose last attempt's failure_class maps to a playbook with
+    ``exit == EXIT_RETRY`` are retryable (方案 §13: exit=retry means the goal
+    loop itself schedules a fresh attempt, distinct from exit=human/stop/
+    escalate/degrade, which must NOT be silently retried without a human
+    clearing the blocker first). Paused goals (``PAUSED_STATUSES``) are never
+    included here for the same reason, even though some paused stop_reasons
+    look superficially similar to a retryable failure_class.
+
+    Args:
+        goal_ids: restrict the scan to THESE execution goals only (typically
+            "the goals registered in the round that just ran"). Without
+            this, a multi-round caller re-scanning the whole engine would
+            keep re-surfacing round 1's already-superseded failed goal
+            alongside round 2's fresh outcome for the SAME test_case — the
+            engine never deletes/supersedes a prior round's terminal goal,
+            it just accumulates a new one alongside it (round_index-suffixed
+            origin, see ``execution_adapter.register_execution_goal``).
+            Pass ``None`` only for a single-round/whole-engine snapshot use
+            (e.g. ad-hoc inspection), never from a multi-round loop.
+
+    Returns:
+        ``{"retryable": [{"test_case": ..., "failure_class": ..., "playbook_id": ...,
+        "source_goal_id": ...}, ...], "blocked_reasons": [str, ...]}`` — the
+        retryable list feeds directly into the next round's
+        ``load_test_cases_from_list``, no goal_id/cluster_id indirection.
+    """
+
+    goals = _execution_goals(engine)
+    if goal_ids is not None:
+        goals = [g for g in goals if g.goal_id in goal_ids]
+    failed_goals = [g for g in goals if g.status in TERMINAL_STATUSES and g.status != STATUS_SUCCEEDED]
+    paused_goals = [g for g in goals if g.status in PAUSED_STATUSES]
+
+    retryable: list[dict[str, Any]] = []
+    blocked_reasons: list[str] = []
+
+    for goal in failed_goals:
+        last_attempt = engine.last_attempt_for(goal.goal_id)
+        failure_class = last_attempt.failure_class if last_attempt else None
+        context = adapter.get_execution_context(goal.goal_id)
+        if context is None:
+            continue
+        spec = pb.select_playbook(failure_class or "")
+        if spec.exit == pb.EXIT_RETRY:
+            retryable.append(
+                {
+                    "test_case": context["test_case"],
+                    "failure_class": failure_class,
+                    "playbook_id": spec.playbook_id,
+                    "source_goal_id": goal.goal_id,
+                }
+            )
+        else:
+            blocked_reasons.append(
+                f"goal {goal.goal_id} (test_case={context.get('test_case_id')}) failure_class="
+                f"{failure_class!r} has playbook exit={spec.exit!r}, not auto-retryable."
+            )
+
+    for goal in paused_goals:
+        context = adapter.get_execution_context(goal.goal_id)
+        test_case_id = context.get("test_case_id") if context else None
+        blocked_reasons.append(
+            f"goal {goal.goal_id} (test_case={test_case_id}) is paused (status={goal.status!r}); "
+            "requires human takeover resolution before any retry."
+        )
+
+    return {"retryable": retryable, "blocked_reasons": blocked_reasons}
 
 
 def write_round_analysis(
@@ -245,4 +323,4 @@ def write_next_round_plan(
     return written_path
 
 
-__all__ = ["write_round_analysis", "write_next_round_plan"]
+__all__ = ["resolve_retryable_test_cases", "write_round_analysis", "write_next_round_plan"]

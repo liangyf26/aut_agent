@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 RealBrowserRunner = Callable[..., Awaitable["ExecutionOutcome"]]
 
 from ..goal_loop.models import PAUSED_STATUSES
+from ..goal_loop.resolution_writer import write_human_takeover_resolution
 from .execution_adapter import ExecutionAdapter
 from .execution_fixture_writer import (
     write_action_log,
@@ -41,7 +42,7 @@ from .execution_fixture_writer import (
 from .execution_runner import ExecutionOutcome, simulate_test_case_execution
 from .human_tasks_writer import write_human_takeover, write_human_tasks
 from .loader import load_execution_goals_from_test_case_list, load_execution_goals_from_test_cases
-from .round_writer import write_next_round_plan, write_round_analysis
+from .round_writer import resolve_retryable_test_cases, write_next_round_plan, write_round_analysis
 from .run_report_writer import write_run_report
 
 
@@ -101,11 +102,12 @@ class ExecutionGoalOrchestrator:
             parent_goal_id=root_goals[0].goal_id,
         )
 
-    def load_test_cases_from_list(self, test_cases: list[dict]) -> list[str]:
+    def load_test_cases_from_list(self, test_cases: list[dict], *, round_index: int = 1) -> list[str]:
         """Same registration as :meth:`load_test_cases`, from an in-memory list.
 
-        For callers (e.g. a real-browser verification driver) that build
-        test cases directly in Python rather than reading Stage D's
+        For callers (e.g. a real-browser verification driver, or
+        :meth:`run_until_stable` re-registering a retried test_case) that
+        build cases directly in Python rather than reading Stage D's
         ``generated_test_cases.json`` off disk.
         """
 
@@ -117,6 +119,7 @@ class ExecutionGoalOrchestrator:
             self.adapter,
             test_cases,
             parent_goal_id=root_goals[0].goal_id,
+            round_index=round_index,
         )
 
     def execute_all(self, *, injected_failures: dict[str, str] | None = None) -> list[ExecutionOutcome]:
@@ -336,6 +339,133 @@ class ExecutionGoalOrchestrator:
 
         raise ValueError(f"unrecognized execution mode: {mode!r}; expected 'fixture_simulated' or 'real_browser'")
 
+    async def run_until_stable(
+        self,
+        initial_test_cases: list[dict],
+        *,
+        mode: str = "fixture_simulated",
+        max_rounds: int = 1,
+        page: Any = None,
+        screenshots_dir: Path | None = None,
+        injected_failures: dict[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Run round 1, then keep auto-advancing through retryable failures
+        (方案 §13 exit=retry) within THIS process, up to ``max_rounds``.
+
+        This is the round-to-round closing of the loop that
+        ``round_analysis.json``/``next_round_plan.json`` alone never
+        provided (those files were write-only — nothing consumed them to
+        actually start a next round). It works by calling :meth:`run` /
+        :meth:`load_test_cases_from_list` repeatedly on the SAME in-memory
+        ``GoalLoopEngine`` instance within this one call, never by
+        serializing/reconstructing engine state across process boundaries
+        (``GoalLoopEngine`` has no such serialization — see
+        ``goal_loop/resolution_writer.py``'s docstring for the related
+        human-takeover-resolve design).
+
+        Auto-advance stops (before starting a NEW round) as soon as any of:
+          - a goal paused (``self.halted_early``): the engine's active goal
+            is now stuck non-terminal, and ``activate_next()`` would raise
+            on any further call — this is a hard stop, not a choice. A human
+            must resolve the takeover first (see
+            ``main.resolve_goal_loop_takeover_entrypoint``) and then re-invoke
+            this command fresh.
+          - ``mode == "real_browser"``: real-browser rounds ALWAYS stop after
+            round 1 regardless of ``max_rounds`` or retryable failures — this
+            is a deliberate safety boundary (a retryable failure_class like
+            LOCATOR_UNSTABLE means "try a different locator against the real
+            production system", which must not happen unattended).
+          - no retryable failures remain (converged).
+          - ``round_index >= max_rounds`` (budget exhausted).
+
+        Args:
+            initial_test_cases: round 1's test cases (same shape as
+                ``generated_test_cases.json``).
+            mode: forwarded to :meth:`run` each round.
+            max_rounds: upper bound on rounds attempted (default 1 — no
+                auto-advance, matching the pre-existing single-round
+                behavior exactly).
+            page, screenshots_dir: forwarded to :meth:`run` when
+                ``mode == "real_browser"``.
+
+        Returns:
+            One summary dict per round actually run: ``{"round_index":,
+            "outcome_count":, "retryable_count":, "blocked_reasons":,
+            "stopped_reason": <set only on the LAST round's entry>}``.
+        """
+
+        rounds: list[dict[str, Any]] = []
+        round_index = 1
+        round_goal_ids = set(self.load_test_cases_from_list(initial_test_cases, round_index=round_index))
+
+        while True:
+            round_injected_failures = injected_failures if round_index == 1 else None
+            outcomes = await self.run(
+                mode=mode,
+                page=page,
+                screenshots_dir=screenshots_dir,
+                injected_failures=round_injected_failures,
+            )
+            # Scoped to THIS round's goal_ids only: the engine never deletes
+            # a prior round's terminal goal, it accumulates a new one
+            # alongside it — an unscoped scan would keep re-surfacing round
+            # 1's already-superseded failure after round 2 already passed
+            # the same test_case.
+            decision = resolve_retryable_test_cases(self.engine, self.adapter, goal_ids=round_goal_ids)
+            retryable = decision["retryable"]
+            blocked_reasons = decision["blocked_reasons"]
+
+            round_summary: dict[str, Any] = {
+                "round_index": round_index,
+                "outcome_count": len(outcomes),
+                "retryable_count": len(retryable),
+                "blocked_reasons": blocked_reasons,
+            }
+
+            if self.halted_early:
+                round_summary["stopped_reason"] = (
+                    "paused_on_human_takeover: a goal is waiting_human/blocked_* — "
+                    "resolve it (--resolve-goal-loop-takeover) before re-invoking "
+                    "this command; auto-advance cannot continue past an unresolved "
+                    "active goal."
+                )
+                rounds.append(round_summary)
+                break
+
+            if mode == "real_browser":
+                round_summary["stopped_reason"] = (
+                    "real_browser_round_limit: real-browser rounds always stop after "
+                    "one round regardless of max_rounds; resolve/verify manually, then "
+                    "re-invoke with the retryable test_case(s) if you want to retry."
+                    if retryable
+                    else "converged: no retryable failures after round 1."
+                )
+                rounds.append(round_summary)
+                break
+
+            if not retryable:
+                round_summary["stopped_reason"] = "converged: no retryable failures remain."
+                rounds.append(round_summary)
+                break
+
+            if round_index >= max_rounds:
+                round_summary["stopped_reason"] = (
+                    f"max_rounds_reached: {len(retryable)} retryable failure(s) remain "
+                    f"but max_rounds={max_rounds} was hit."
+                )
+                rounds.append(round_summary)
+                break
+
+            rounds.append(round_summary)
+            round_index += 1
+            round_goal_ids = set(
+                self.load_test_cases_from_list(
+                    [item["test_case"] for item in retryable], round_index=round_index
+                )
+            )
+
+        return rounds
+
     def _execute_one(self, goal_id: str, context: dict, *, injected_failure: str | None) -> ExecutionOutcome:
         test_case = context["test_case"]
         outcome = simulate_test_case_execution(test_case, goal_id=goal_id, injected_failure=injected_failure)
@@ -383,6 +513,26 @@ class ExecutionGoalOrchestrator:
             self.run_id,
             self.output_dir,
             self.output_dir / filename,
+        )
+
+    def export_human_takeover_resolution(
+        self,
+        *,
+        status: str,
+        operator_id: str | None = None,
+        note: str | None = None,
+        ready_to_resume: bool = False,
+        resolved_at: str,
+        filename: str = "human_takeover_resolution.json",
+    ) -> Path:
+        return write_human_takeover_resolution(
+            self.output_dir,
+            status=status,
+            operator_id=operator_id,
+            note=note,
+            ready_to_resume=ready_to_resume,
+            resolved_at=resolved_at,
+            filename=filename,
         )
 
     def export_round_analysis(self, filename: str = "round_analysis.json") -> Path:

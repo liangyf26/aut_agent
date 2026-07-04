@@ -39,6 +39,7 @@ class ExecutionAdapter:
         page_id: str | None,
         test_case: dict[str, Any],
         parent_goal_id: str,
+        round_index: int = 1,
     ) -> str:
         test_case_id = test_case.get("test_case_id") or f"exec_{feature_id}"
         # max_rounds=1: Stage E executes a case's basic path exactly once per
@@ -47,11 +48,21 @@ class ExecutionAdapter:
         # next_round_plan to schedule a retry in a LATER round, same as any
         # other goal-loop failure (§13 exit=retry means "goal loop retries",
         # not "retry inside one execution pass").
+        #
+        # round_index>1 marks a fresh goal re-registered for the SAME
+        # test_case in an auto-advanced round (round_writer.resolve_retryable_
+        # test_cases + orchestrator.run_until_stable) — the "#round{N}" origin
+        # suffix keeps it origin-distinguishable from round 1's goal for the
+        # same feature_id, while _execution_goals' "feature_execution::"
+        # prefix filter (round_writer.py) still matches it unchanged.
+        origin = f"feature_execution::{feature_id}"
+        if round_index > 1:
+            origin += f"#round{round_index}"
         goal = self.engine.register_goal(
             goal_type="feature",
             goal_name=f"Execute {test_case.get('type', 'unknown')} case for {feature_id}",
             parent_goal_id=parent_goal_id,
-            origin=f"feature_execution::{feature_id}",
+            origin=origin,
             max_rounds=1,
         )
         self._execution_context[goal.goal_id] = {

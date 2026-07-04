@@ -23,6 +23,7 @@ def load_execution_goals_from_test_case_list(
     test_cases: list[dict],
     *,
     parent_goal_id: str,
+    round_index: int = 1,
 ) -> list[str]:
     """Register one execution goal per already-in-memory test case dict.
 
@@ -37,6 +38,9 @@ def load_execution_goals_from_test_case_list(
         test_cases: list of test case dicts, same shape as
             ``generated_test_cases.json`` entries.
         parent_goal_id: parent goal (typically the Stage E root goal).
+        round_index: forwarded to :meth:`ExecutionAdapter.register_execution_goal`
+            — 1 for the first pass, >1 when re-registering a retried
+            test_case in an auto-advanced round.
 
     Returns:
         List of created execution goal IDs, in list order.
@@ -60,6 +64,7 @@ def load_execution_goals_from_test_case_list(
             page_id=test_case.get("page_id"),
             test_case=test_case,
             parent_goal_id=parent_goal_id,
+            round_index=round_index,
         )
         goal_ids.append(goal_id)
 
@@ -72,6 +77,7 @@ def load_execution_goals_from_test_cases(
     test_cases_path: str | Path,
     *,
     parent_goal_id: str,
+    round_index: int = 1,
 ) -> list[str]:
     """Register one execution goal per entry in generated_test_cases.json.
 
@@ -80,6 +86,7 @@ def load_execution_goals_from_test_cases(
         adapter: ExecutionAdapter instance.
         test_cases_path: path to Stage D's ``generated_test_cases.json``.
         parent_goal_id: parent goal (typically the Stage E root goal).
+        round_index: forwarded to :func:`load_execution_goals_from_test_case_list`.
 
     Returns:
         List of created execution goal IDs, in file order.
@@ -100,7 +107,7 @@ def load_execution_goals_from_test_cases(
         raise ValueError(f"Expected list in generated_test_cases.json, got {type(test_cases)}")
 
     return load_execution_goals_from_test_case_list(
-        engine, adapter, test_cases, parent_goal_id=parent_goal_id
+        engine, adapter, test_cases, parent_goal_id=parent_goal_id, round_index=round_index
     )
 
 

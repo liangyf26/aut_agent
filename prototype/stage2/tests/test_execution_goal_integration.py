@@ -226,10 +226,16 @@ def test_human_required_failure_pauses_batch_and_writes_takeover_packet():
         # block must be distinguishable from a routine login pause.
         assert takeover["waiting_reason"] == "permission_blocked"
         # resume_command must reference a command that actually exists in
-        # this codebase (prototype/stage2/main.py's --resume-human-takeover),
-        # not a module that was never created.
+        # this codebase and actually works against a goal_loop run_dir.
+        # --resume-human-takeover looks like the obvious choice but is a
+        # trap: it unconditionally dispatches to
+        # tools/suyuan_submit_loop.py's resume_profile_from_human_takeover,
+        # which requires a round_input.json (with model_name) that goal_loop
+        # runs never write — it would raise immediately. Only
+        # --resolve-goal-loop-takeover actually understands this run_dir's
+        # human_takeover.json shape (found + fixed 2026-07-04).
         assert takeover["resume_command"] == (
-            f'python -m prototype.stage2.main --resume-human-takeover "{output_dir}"'
+            f'python -m prototype.stage2.main --resolve-goal-loop-takeover "{output_dir}"'
         )
 
         next_round_path = orch.export_next_round_plan()
@@ -577,6 +583,207 @@ def test_run_rejects_unrecognized_mode():
 
         with pytest.raises(ValueError, match="unrecognized execution mode"):
             asyncio.run(orch.run(mode="not_a_real_mode"))
+
+
+def test_run_until_stable_auto_retries_locator_unstable_and_converges():
+    """A LOCATOR_UNSTABLE (playbook exit=retry) failure on round 1 must be
+    auto-retried in round 2 within the SAME process/engine, and — since
+    injected_failures only applies to round 1 — round 2 must pass, causing
+    the loop to converge and stop (not burn through max_rounds)."""
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_dir = Path(tmpdir) / "output"
+        output_dir.mkdir()
+
+        orch = ExecutionGoalOrchestrator(output_dir=str(output_dir), run_id="test_run_until_stable_retry")
+        orch.create_root_goal()
+
+        test_cases = [
+            {
+                "test_case_id": "tc_unstable",
+                "feature_id": "feat_unstable",
+                "page_id": "page_unstable",
+                "type": "view_only",
+                "risk_level": "none",
+            }
+        ]
+
+        rounds = asyncio.run(
+            orch.run_until_stable(
+                test_cases,
+                max_rounds=3,
+                injected_failures={"tc_unstable": "locator_unstable"},
+            )
+        )
+
+        # converged at round 2, never reached round 3
+        assert [r["round_index"] for r in rounds] == [1, 2]
+        assert rounds[0]["retryable_count"] == 1
+        assert rounds[1]["retryable_count"] == 0
+        assert rounds[1]["stopped_reason"] == "converged: no retryable failures remain."
+        assert "stopped_reason" not in rounds[0]
+
+        assert len(orch._outcomes) == 2
+        assert orch._outcomes[0].status == "failed"
+        assert orch._outcomes[1].status == "passed"
+
+        origins = sorted(
+            g.origin for g in orch.engine.goals.values() if g.origin.startswith("feature_execution::")
+        )
+        assert origins == ["feature_execution::feat_unstable", "feature_execution::feat_unstable#round2"]
+
+
+def test_run_until_stable_does_not_auto_retry_human_required_failure():
+    """A permission_blocked (playbook exit=human) failure must NEVER be
+    auto-retried, even with max_rounds>1 — it pauses the goal instead, and
+    run_until_stable must hard-stop there (an unresolved active goal makes
+    any further activate_next() raise), surfacing the block via
+    blocked_reasons/stopped_reason rather than silently looping."""
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_dir = Path(tmpdir) / "output"
+        output_dir.mkdir()
+
+        orch = ExecutionGoalOrchestrator(output_dir=str(output_dir), run_id="test_run_until_stable_human")
+        orch.create_root_goal()
+
+        test_cases = [
+            {
+                "test_case_id": "tc_blocked",
+                "feature_id": "feat_blocked",
+                "page_id": "page_blocked",
+                "type": "view_only",
+                "risk_level": "none",
+            }
+        ]
+
+        rounds = asyncio.run(
+            orch.run_until_stable(
+                test_cases,
+                max_rounds=3,
+                injected_failures={"tc_blocked": "permission_blocked"},
+            )
+        )
+
+        assert [r["round_index"] for r in rounds] == [1]
+        assert rounds[0]["retryable_count"] == 0
+        assert len(rounds[0]["blocked_reasons"]) == 1
+        assert "paused" in rounds[0]["blocked_reasons"][0]
+        assert "paused_on_human_takeover" in rounds[0]["stopped_reason"]
+        assert orch.halted_early is True
+
+        # only round 1's goal was ever registered — no #round2 retry attempt
+        origins = [g.origin for g in orch.engine.goals.values() if g.origin.startswith("feature_execution::")]
+        assert origins == ["feature_execution::feat_blocked"]
+
+
+def test_run_until_stable_real_browser_mode_always_stops_after_one_round():
+    """Even with max_rounds>1 and a retryable failure present, real_browser
+    mode must stop after exactly one round — auto-retrying a live production
+    action unattended is the explicit safety boundary this feature must not
+    cross (confirmed with the user before implementation)."""
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_dir = Path(tmpdir) / "output"
+        output_dir.mkdir()
+
+        orch = ExecutionGoalOrchestrator(output_dir=str(output_dir), run_id="test_run_until_stable_real_browser")
+        orch.create_root_goal()
+
+        test_cases = [
+            {
+                "test_case_id": "tc_real",
+                "feature_id": "feat_real",
+                "page_id": "page_real",
+                "type": "view_only",
+                "risk_level": "none",
+            }
+        ]
+
+        class _FakePage:
+            pass
+
+        async def _fake_runner(test_case, *, goal_id, injected_failure, **_kwargs):
+            from prototype.stage2.app.execution_goal.execution_runner import simulate_test_case_execution
+
+            return simulate_test_case_execution(test_case, goal_id=goal_id, injected_failure=injected_failure)
+
+        import prototype.stage2.app.execution_goal.orchestrator as orchestrator_module
+
+        original_run = orchestrator_module.ExecutionGoalOrchestrator.run
+
+        async def _patched_run(self, *, mode, page=None, screenshots_dir=None, injected_failures=None):
+            if mode != "real_browser":
+                return await original_run(
+                    self, mode=mode, page=page, screenshots_dir=screenshots_dir, injected_failures=injected_failures
+                )
+            return await self.execute_all_async(runner=_fake_runner, injected_failures=injected_failures)
+
+        orchestrator_module.ExecutionGoalOrchestrator.run = _patched_run
+        try:
+            rounds = asyncio.run(
+                orch.run_until_stable(
+                    test_cases,
+                    mode="real_browser",
+                    max_rounds=5,
+                    page=_FakePage(),
+                    screenshots_dir=output_dir / "screenshots",
+                    injected_failures={"tc_real": "locator_unstable"},
+                )
+            )
+        finally:
+            orchestrator_module.ExecutionGoalOrchestrator.run = original_run
+
+        assert [r["round_index"] for r in rounds] == [1]
+        assert rounds[0]["retryable_count"] == 1
+        assert "real_browser_round_limit" in rounds[0]["stopped_reason"]
+
+
+def test_resolve_retryable_test_cases_only_returns_retry_exit_goals():
+    """Direct unit test of round_writer.resolve_retryable_test_cases: given
+    goals with different failure classes, only the one whose playbook exit
+    is 'retry' (locator_unstable) should come back retryable; the
+    exit='human' one (permission_blocked) must land in blocked_reasons
+    instead, with its original test_case content untouched."""
+
+    from prototype.stage2.app.execution_goal.round_writer import resolve_retryable_test_cases
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_dir = Path(tmpdir) / "output"
+        output_dir.mkdir()
+
+        orch = ExecutionGoalOrchestrator(output_dir=str(output_dir), run_id="test_resolve_retryable")
+        orch.create_root_goal()
+
+        test_cases = [
+            {
+                "test_case_id": "tc_retry_me",
+                "feature_id": "feat_retry_me",
+                "page_id": "page_x",
+                "type": "view_only",
+                "risk_level": "none",
+            },
+            {
+                "test_case_id": "tc_human_me",
+                "feature_id": "feat_human_me",
+                "page_id": "page_x",
+                "type": "view_only",
+                "risk_level": "none",
+            },
+        ]
+        orch.load_test_cases_from_list(test_cases)
+        orch.execute_all(
+            injected_failures={"tc_retry_me": "locator_unstable", "tc_human_me": "permission_blocked"}
+        )
+
+        decision = resolve_retryable_test_cases(orch.engine, orch.adapter)
+
+        assert len(decision["retryable"]) == 1
+        assert decision["retryable"][0]["test_case"]["test_case_id"] == "tc_retry_me"
+        assert decision["retryable"][0]["failure_class"] == "locator_unstable"
+
+        assert len(decision["blocked_reasons"]) == 1
+        assert "tc_human_me" in decision["blocked_reasons"][0]
 
 
 if __name__ == "__main__":

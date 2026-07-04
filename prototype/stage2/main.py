@@ -697,6 +697,7 @@ async def run_execution_goal_entrypoint(
     mode: str = "fixture_simulated",
     cdp_url: str = DEFAULT_CDP_URL,
     run_id: str | None = None,
+    max_rounds: int = 1,
 ) -> dict[str, Any]:
     """Run Stage E's execution_goal orchestrator over a generated_test_cases.json fixture.
 
@@ -710,6 +711,13 @@ async def run_execution_goal_entrypoint(
     target page before invoking this in real_browser mode — execution_goal's
     test cases span whatever page(s) they were generated for, so there is no
     single template page_entry URL to auto-navigate to here.
+
+    max_rounds: forwarded to ``ExecutionGoalOrchestrator.run_until_stable`` —
+    auto-advances through retryable failures (方案 §13 exit=retry) within
+    this one process/call, up to ``max_rounds`` rounds. Default 1 preserves
+    the exact previous single-round behavior. Only takes effect for
+    mode="fixture_simulated"; mode="real_browser" always stops after round 1
+    regardless of this value (see ``run_until_stable``'s docstring).
     """
 
     from prototype.stage2.app.execution_goal import ExecutionGoalOrchestrator
@@ -717,12 +725,17 @@ async def run_execution_goal_entrypoint(
     run_id = run_id or f"execution_goal_{mode}_run"
     output_dir = ROOT_DIR / "artifacts" / "stage2" / "execution_goal_runs" / run_id
 
+    test_cases = json.loads(Path(test_cases_path).read_text(encoding="utf-8"))
+    if not isinstance(test_cases, list):
+        raise ValueError(f"Expected list in {test_cases_path}, got {type(test_cases)}")
+
     orchestrator = ExecutionGoalOrchestrator(output_dir=output_dir, run_id=run_id)
     orchestrator.create_root_goal()
-    orchestrator.load_test_cases(test_cases_path)
 
-    async def _run_and_export(**run_kwargs: Any) -> None:
-        await orchestrator.run(mode=mode, **run_kwargs)
+    async def _run_and_export(**run_kwargs: Any) -> list[dict[str, Any]]:
+        rounds = await orchestrator.run_until_stable(
+            test_cases, mode=mode, max_rounds=max_rounds, **run_kwargs
+        )
 
         orchestrator.export_execution_results()
         orchestrator.export_action_log()
@@ -733,9 +746,10 @@ async def run_execution_goal_entrypoint(
         orchestrator.export_round_analysis()
         orchestrator.export_next_round_plan()
         orchestrator.export_run_report()
+        return rounds
 
     if mode == "fixture_simulated":
-        await _run_and_export()
+        rounds = await _run_and_export()
     else:
         from playwright.async_api import async_playwright
 
@@ -749,12 +763,15 @@ async def run_execution_goal_entrypoint(
                     raise RuntimeError("未发现可用页面，无法执行 execution_goal real_browser 模式")
                 page = pages[0]
                 screenshots_dir = output_dir / "screenshots"
-                await _run_and_export(page=page, screenshots_dir=screenshots_dir)
+                rounds = await _run_and_export(page=page, screenshots_dir=screenshots_dir)
             finally:
                 await browser.close()
 
     summary = orchestrator.get_summary()
     summary["output_dir"] = str(output_dir)
+    summary["rounds_run"] = len(rounds)
+    summary["round_history"] = rounds
+    summary["stopped_reason"] = rounds[-1]["stopped_reason"] if rounds else None
     return summary
 
 
@@ -1527,6 +1544,78 @@ async def resume_human_takeover_entrypoint(
     )
 
 
+def resolve_goal_loop_takeover_entrypoint(
+    run_dir: str,
+    *,
+    operator_id: str | None = None,
+    note: str | None = None,
+    ready_to_resume: bool = False,
+) -> dict[str, Any]:
+    """Record that a human reviewed a goal_loop-family run's pending takeover.
+
+    This is NOT --resume-human-takeover's counterpart in the sense of
+    reconstructing and continuing a paused run — ``GoalLoopEngine`` has no
+    serialization, so the in-memory engine that paused is gone the moment
+    its CLI process exited. This only writes ``human_takeover_resolution.json``
+    (via ``goal_loop.resolution_writer.write_human_takeover_resolution``, the
+    same schema ``cross_system_goal`` already produces) confirming a human
+    looked at ``human_takeover.json`` and what they decided.
+
+    Requires ``run_dir/human_takeover.json`` to actually exist with
+    ``status == "waiting_human"`` — refuses to fabricate a resolution record
+    against a run_dir that never raised a real takeover request.
+
+    To actually continue the work after this, re-invoke the relevant
+    ``--run-execution-goal``/``--run-menu-goal``/``--run-page-goal``/
+    ``--run-feature-goal`` command with fresh inputs; ``ready_to_resume`` is
+    a recorded signal for a human reader, not a trigger.
+    """
+
+    from datetime import datetime, timezone
+
+    from prototype.stage2.app.goal_loop.resolution_writer import write_human_takeover_resolution
+
+    run_dir_path = Path(run_dir)
+    takeover_path = run_dir_path / "human_takeover.json"
+    if not takeover_path.exists():
+        raise RuntimeError(
+            f"{takeover_path} 不存在，无法确认这是一个真实的目标循环人工接管请求；"
+            "请确认 run_dir 是否正确，或该次运行是否真的触发了人工接管。"
+        )
+    takeover = json.loads(takeover_path.read_text(encoding="utf-8"))
+    if takeover.get("status") != "waiting_human":
+        raise RuntimeError(
+            f"{takeover_path} 的 status 是 {takeover.get('status')!r}，不是 'waiting_human'；"
+            "该接管请求可能已经被处理过，或这份文件不是目标循环家族写出的格式。"
+        )
+
+    resolved_at = datetime.now(timezone.utc).isoformat()
+    resolution_path = write_human_takeover_resolution(
+        run_dir_path,
+        status="resolved",
+        operator_id=operator_id,
+        note=note,
+        ready_to_resume=ready_to_resume,
+        resolved_at=resolved_at,
+    )
+
+    next_step = (
+        "人工接管已记录为可继续；请重新执行对应的 --run-execution-goal / --run-menu-goal / "
+        "--run-page-goal / --run-feature-goal 命令，用新的输入开始下一轮。"
+        if ready_to_resume
+        else "人工接管已记录，但尚未标记为可继续（未传 --resolve-ready-to-resume）。"
+    )
+
+    return {
+        "run_dir": str(run_dir_path),
+        "human_takeover_resolution_path": str(resolution_path),
+        "waiting_reason": takeover.get("waiting_reason"),
+        "pending_action_count": len(takeover.get("pending_actions") or []),
+        "ready_to_resume": ready_to_resume,
+        "next_step": next_step,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Stage 2 prototype entrypoint.")
     parser.add_argument(
@@ -1795,6 +1884,20 @@ def main() -> None:
         help="Optional note recorded when resuming a human takeover.",
     )
     parser.add_argument(
+        "--resolve-goal-loop-takeover",
+        default="",
+        help="Record that a human reviewed a goal_loop-family run's human_takeover.json "
+        "(writes human_takeover_resolution.json). Does NOT reconstruct or continue the "
+        "paused run — re-invoke the relevant --run-*-goal command afterward. Use this, "
+        "NOT --resume-human-takeover, for menu/page/feature/execution_goal run directories.",
+    )
+    parser.add_argument(
+        "--resolve-ready-to-resume",
+        action="store_true",
+        help="For --resolve-goal-loop-takeover, mark the takeover as ready for a follow-up "
+        "round (recorded only — does not itself start one).",
+    )
+    parser.add_argument(
         "--validate-template",
         default="",
         help="Run a local generic-template validation for the given template name.",
@@ -1830,6 +1933,15 @@ def main() -> None:
         "--execution-goal-run-id",
         default="",
         help="Optional explicit run id for --run-execution-goal.",
+    )
+    parser.add_argument(
+        "--execution-goal-max-rounds",
+        type=int,
+        default=1,
+        help="For --run-execution-goal, how many rounds to auto-advance through retryable "
+        "failures within this single process (default 1 = no auto-advance, current behavior). "
+        "Only applies to mode=fixture_simulated; mode=real_browser always stops after round 1 "
+        "regardless of this value, since retrying a live production action unattended is not safe.",
     )
     parser.add_argument(
         "--run-menu-goal",
@@ -2098,6 +2210,21 @@ def main() -> None:
         )
         return
 
+    if args.resolve_goal_loop_takeover:
+        print(
+            json.dumps(
+                resolve_goal_loop_takeover_entrypoint(
+                    args.resolve_goal_loop_takeover,
+                    operator_id=args.resume_operator or None,
+                    note=args.resume_note or None,
+                    ready_to_resume=args.resolve_ready_to_resume,
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+
     if args.validate_template:
         print(
             json.dumps(
@@ -2148,6 +2275,7 @@ def main() -> None:
                         mode=args.execution_goal_mode,
                         cdp_url=args.cdp_url,
                         run_id=args.execution_goal_run_id or None,
+                        max_rounds=args.execution_goal_max_rounds,
                     )
                 ),
                 ensure_ascii=False,

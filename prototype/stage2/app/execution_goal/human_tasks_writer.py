@@ -59,13 +59,17 @@ _TASK_TYPE_BY_FAILURE_CLASS: dict[str, str] = {
 }
 _DEFAULT_TASK_TYPE = "manual_review"
 
-# The one real resume path that exists and is wired up (prototype/stage2/main.py
-# --resume-human-takeover, dispatching to resume_human_takeover_entrypoint).
-# The goal-loop side has no CLI wrapper of its own yet, so this packet points
-# at the SAME command the existing iteration-pipeline packets already use
-# (tools/suyuan_submit_loop.py's build_human_takeover_packet) rather than a
-# module that was never created.
-_RESUME_COMMAND_TEMPLATE = 'python -m prototype.stage2.main --resume-human-takeover "{run_dir}"'
+# NOT --resume-human-takeover: that entrypoint unconditionally dispatches to
+# tools/suyuan_submit_loop.py's resume_profile_from_human_takeover, which
+# requires a round_input.json (with a model_name key) that goal_loop runs
+# never write — invoking it against a goal_loop run_dir raises immediately.
+# --resolve-goal-loop-takeover is goal_loop's own resume-adjacent entrypoint:
+# it does NOT reconstruct the paused GoalLoopEngine (it has no serialization)
+# or auto-continue the batch — it only records that a human reviewed the
+# takeover request (writes human_takeover_resolution.json). Actually
+# continuing means re-invoking the relevant --run-*-goal command with fresh
+# inputs; see main.resolve_goal_loop_takeover_entrypoint's docstring.
+_RESUME_COMMAND_TEMPLATE = 'python -m prototype.stage2.main --resolve-goal-loop-takeover "{run_dir}"'
 
 
 def _safe_json_write(path: str | Path, data: Any) -> Path:
@@ -234,7 +238,11 @@ def write_human_takeover(
         "resume_command": _RESUME_COMMAND_TEMPLATE.format(run_dir=run_dir),
         "notes": [
             "Complete the required human review or authorization for each pending action.",
-            "Then resume the run to continue the goal loop from where it paused.",
+            "resume_command only RECORDS that a human reviewed this takeover "
+            "(writes human_takeover_resolution.json) — it does not automatically "
+            "continue the batch. To actually proceed, re-invoke the relevant "
+            "--run-execution-goal (or upstream --run-menu-goal/--run-page-goal/"
+            "--run-feature-goal) command with fresh inputs.",
         ],
     }
     return _safe_json_write(output_path, payload)

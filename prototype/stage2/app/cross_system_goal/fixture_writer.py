@@ -39,6 +39,7 @@ from prototype.stage2.app.iteration.writer import _build_promotion_candidate_sum
 
 from ..goal_loop import compat
 from ..goal_loop.models import PROMOTION_PLATFORM, PROMOTION_PROJECT
+from ..goal_loop.resolution_writer import write_human_takeover_resolution
 from .promotion_reviewer import PromotionReview
 from .run_record import CrossSystemRunRecord
 
@@ -193,35 +194,10 @@ def _demote_unvetted_platform_claim(update_row: dict[str, Any]) -> dict[str, Any
     return demoted
 
 
-def write_human_takeover_resolution(
-    output_dir: str | Path,
-    *,
-    status: str,
-    operator_id: str | None,
-    note: str | None,
-    ready_to_resume: bool,
-    resolved_at: str,
-    filename: str = "human_takeover_resolution.json",
-) -> Path:
-    """Write ``human_takeover_resolution.json`` if a human takeover was
-    actually resolved during Stage F (实施计划 §8.3: "如阶段内发生人工恢复").
-
-    This schema already has a READER
-    (``orchestration.session_artifacts._load_run_session_record``,
-    confirmed by investigation to have no producer before Stage F) — this
-    function reuses that exact field set rather than inventing a new one, so
-    Stage F is the first real producer for an existing consumer, not a
-    parallel schema.
-    """
-
-    payload = {
-        "status": status,
-        "operator_id": operator_id,
-        "note": note,
-        "ready_to_resume": ready_to_resume,
-        "resolved_at": resolved_at,
-    }
-    return _safe_json_write(Path(output_dir) / filename, payload)
+# write_human_takeover_resolution is imported (not redefined) above from
+# goal_loop.resolution_writer — this module's __all__ re-exports it so
+# existing `from cross_system_goal.fixture_writer import
+# write_human_takeover_resolution` call sites keep working.
 
 
 __all__ = [
