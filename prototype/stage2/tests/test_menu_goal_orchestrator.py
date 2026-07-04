@@ -117,3 +117,24 @@ def test_orchestrator_custom_run_id():
 
         assert orch.run_id == custom_id
         assert orch.engine.run_id == custom_id
+
+
+def test_orchestrator_export_goal_summary():
+    """Test orchestrator writes run_summary.json matching get_summary()."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        orch = MenuGoalOrchestrator(output_dir=tmpdir)
+        orch.create_root_goal()
+
+        summary_path = orch.export_goal_summary()
+
+        assert summary_path.exists()
+        assert summary_path == orch.output_dir / "run_summary.json"
+
+        with summary_path.open(encoding="utf-8") as f:
+            persisted = json.load(f)
+
+        live_summary = orch.get_summary()
+        for key, value in live_summary.items():
+            assert persisted[key] == value
+        assert "generated_at" in persisted
+

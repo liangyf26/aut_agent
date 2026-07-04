@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "node src/server.js",
     "start": "node src/server.js",
-    "check": "node --check src/server.js && node --check src/stage2OperationCenter.js && node --check src/stage2Dashboard.js && node --check src/stage2V3RunCenter.js && node --check public/app.js && node --check src/storage.js && node --check src/domain/agents.js && node --check src/domain/assessment.js && node --check src/domain/executors.js && node --check src/domain/llmProviders.js && node --test src/stage2OperationCenter.test.js && node --test src/stage2V3RunCenter.test.js"
+    "check": "node --check src/server.js && node --check src/stage2OperationCenter.js && node --check src/stage2Dashboard.js && node --check src/stage2V3RunCenter.js && node --check src/stage2GoalLoopRunCenter.js && node --check public/app.js && node --check src/storage.js && node --check src/domain/agents.js && node --check src/domain/assessment.js && node --check src/domain/executors.js && node --check src/domain/llmProviders.js && node --test src/stage2OperationCenter.test.js && node --test src/stage2V3RunCenter.test.js && node --test src/stage2Dashboard.test.js && node --test src/stage2GoalLoopRunCenter.test.js"
   },
   "engines": {
     "node": ">=20"

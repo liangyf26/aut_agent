@@ -1800,6 +1800,7 @@ function renderStage2Overview() {
   renderStage2V3HumanTab();
   renderStage2V3ReportTab();
   renderStage2V3ArtifactsTab();
+  renderStage2GoalLoopTab();
   renderStage2ActionFeedback();
   renderStage2BrowserPreflight();
   renderStage2ModelPreflight();
@@ -2465,6 +2466,64 @@ function renderStage2V3ArtifactsTab() {
       ${renderStage2ArtifactLinks(artifacts, '暂无 artifact 链接。后端应按白名单 key 暴露 run_manifest、page_entries、feature_points、execution_results、round_analysis、next_round_plan 和 report。')}
     </section>
   `;
+}
+
+function renderStage2GoalLoopRunCard(run) {
+  const summary = run.summary || {};
+  const hasHumanTakeover = run.artifacts.some((artifact) => artifact.key === 'human_takeover');
+  const statusTag = run.summaryMissing
+    ? '<span class="tag warning">产物不全</span>'
+    : `<span class="tag">已发现 ${escapeHtml(String(summary.total_goals ?? summary.total_execution_goals ?? '-'))}</span>`;
+  return `
+    <article class="stage2-work-card">
+      <header>
+        <strong>${escapeHtml(run.runId)}</strong>
+        ${statusTag}
+        ${hasHumanTakeover ? `<span class="tag ${verdictClass('waiting_human')}">${escapeHtml(statusLabel('waiting_human'))}</span>` : ''}
+      </header>
+      <div class="tag-row">
+        <span class="tag">成功 ${escapeHtml(String(summary.succeeded ?? '-'))}</span>
+        <span class="tag">失败 ${escapeHtml(String(summary.failed ?? '-'))}</span>
+        <span class="tag">待处理 ${escapeHtml(String(summary.pending ?? '-'))}</span>
+        <span class="tag">更新于 ${escapeHtml(formatDate(run.updatedAt))}</span>
+      </div>
+      ${renderStage2ArtifactLinks(run.artifacts, '暂无产物文件。')}
+    </article>
+  `;
+}
+
+function renderStage2GoalLoopTab() {
+  const container = document.querySelector('#stage2GoalloopTab');
+  if (!container) {
+    return;
+  }
+  const goalLoopRuns = state.stage2Overview?.goalLoopRuns;
+  if (!goalLoopRuns) {
+    container.innerHTML = renderStage2Empty('Goal Loop 运行', '尚未读取到 menu/page/feature/execution_goal 的运行产物。');
+    return;
+  }
+
+  const kindOrder = [
+    ['menu', '菜单发现'],
+    ['page', '页面发现'],
+    ['feature', '功能点发现'],
+    ['execution', '执行']
+  ];
+
+  container.innerHTML = kindOrder.map(([kind, label]) => {
+    const runs = goalLoopRuns[kind] || [];
+    return `
+      <section class="stage2-table-card">
+        <div class="stage2-section-head">
+          <h3>${escapeHtml(label)}</h3>
+          <span class="tag">${escapeHtml(String(runs.length))}</span>
+        </div>
+        ${runs.length
+          ? runs.map((run) => renderStage2GoalLoopRunCard(run)).join('')
+          : renderStage2Empty(label, `暂无 ${escapeHtml(label)} 的运行记录。`)}
+      </section>
+    `;
+  }).join('');
 }
 
 function renderStage2Table(title, rows, columns, emptyText) {

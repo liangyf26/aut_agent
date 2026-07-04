@@ -574,5 +574,37 @@ class ExecutionGoalOrchestrator:
             "remaining_in_frontier": len(self.engine.frontier),
         }
 
+    def export_run_summary(self, filename: str = "run_summary.json", *, extra: dict | None = None) -> Path:
+        """Export run_summary.json with execution session statistics.
+
+        Sibling to menu_goal/page_goal/feature_goal's own
+        ``export_goal_summary`` — all four goal packages write the SAME
+        filename so the dashboard's goal-loop run scanner doesn't need
+        per-package special-casing (方案: 运行中心可见性).
+
+        ``extra`` merges caller-known fields ``get_summary()`` itself
+        cannot see — e.g. ``rounds_run``/``round_history``/``stopped_reason``,
+        which only exist in ``main.py``'s ``run_until_stable`` call site,
+        not on the orchestrator/engine (a single orchestrator instance is
+        reused across all rounds within one run, so it has no notion of
+        "which round produced which outcome").
+
+        Returns:
+            Path to exported file
+        """
+        import json
+        from datetime import datetime, timezone
+
+        summary = self.get_summary()
+        if extra:
+            summary.update(extra)
+        summary["generated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        output_path = self.output_dir / filename
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+
+        return output_path
+
 
 __all__ = ["ExecutionGoalOrchestrator"]

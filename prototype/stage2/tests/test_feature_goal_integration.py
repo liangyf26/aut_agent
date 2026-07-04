@@ -66,6 +66,7 @@ def test_feature_discovery_session_basic():
         feature_fixture = orch.export_fixture()
         test_cases_fixture = orch.export_test_cases()
         review_fixture = orch.export_discovery_review()
+        run_summary_path = orch.export_goal_summary()
 
         # Verify feature_points.json
         assert feature_fixture.exists()
@@ -73,6 +74,16 @@ def test_feature_discovery_session_basic():
             features = json.load(f)
         assert isinstance(features, list)
         assert len(features) > 0
+
+        # Verify run_summary.json matches get_summary()
+        assert run_summary_path.exists()
+        assert run_summary_path == output_dir / "run_summary.json"
+        with open(run_summary_path, "r", encoding="utf-8") as f:
+            persisted_summary = json.load(f)
+        live_summary = orch.get_summary()
+        for key, value in live_summary.items():
+            assert persisted_summary[key] == value
+        assert "generated_at" in persisted_summary
 
         # Check feature structure — every entry has the expected shape
         for feature in features:

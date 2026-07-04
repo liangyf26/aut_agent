@@ -7,6 +7,7 @@ and page_entries.json export with run-level aggregation.
 
 import json
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -230,7 +231,7 @@ class PageGoalOrchestrator:
 
     def export_goal_summary(self, summary_path: str | Path | None = None) -> Path:
         """
-        Export goal_summary.json with page goal aggregation.
+        Export run_summary.json with page goal aggregation.
 
         Schema:
         {
@@ -247,19 +248,26 @@ class PageGoalOrchestrator:
             blank_count: int,
             timeout_count: int,
             root_goal_id: str,
-            root_conclusion: str | null
+            root_conclusion: str | null,
+            generated_at: str (ISO 8601 UTC)
         }
 
+        Renamed from goal_summary.json to run_summary.json (仪表盘可见性 gap
+        fix) so the dashboard's goal-loop run scanner can read the same
+        filename across all four goal-loop packages (menu/page/feature/
+        execution) without per-package special-casing.
+
         Args:
-            summary_path: Optional output path (default: output_dir/goal_summary.json)
+            summary_path: Optional output path (default: output_dir/run_summary.json)
 
         Returns:
             Path to exported summary
         """
         if summary_path is None:
-            summary_path = self.output_dir / "goal_summary.json"
+            summary_path = self.output_dir / "run_summary.json"
 
         summary = self.get_summary()
+        summary["generated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
         # Mitigation for Finding #7: use safe_json_write
         safe_json_write(summary_path, summary)

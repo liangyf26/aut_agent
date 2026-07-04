@@ -12,6 +12,7 @@ const {
   markHumanTakeoverResolved,
   resumeHumanTakeover
 } = require('./stage2Actions');
+const { resolveGoalLoopRunArtifact } = require('./stage2GoalLoopRunCenter');
 const {
   checkOperationEnvironment,
   loadOperationCenter,
@@ -391,6 +392,32 @@ async function handleApi(req, res, pathname) {
       res.end(content);
     } catch {
       sendError(res, 404, 'Stage-2 artifact file is unavailable.');
+    }
+    return true;
+  }
+
+  const goalLoopArtifactParams = routeMatch(pathname, '/api/stage2/goal-loop/:kind/:runId/artifacts/:artifactKey');
+  if (goalLoopArtifactParams && req.method === 'GET') {
+    const artifact = await resolveGoalLoopRunArtifact(
+      goalLoopArtifactParams.kind,
+      goalLoopArtifactParams.runId,
+      goalLoopArtifactParams.artifactKey
+    );
+    if (!artifact) {
+      sendError(res, 404, 'Goal-loop artifact not found.');
+      return true;
+    }
+
+    try {
+      const content = await fs.readFile(artifact.path);
+      res.writeHead(200, {
+        'Content-Type': mimeTypes[path.extname(artifact.path).toLowerCase()] || 'application/octet-stream',
+        'Cache-Control': 'no-store',
+        'Content-Disposition': `inline; filename="${encodeURIComponent(artifact.fileName)}"`
+      });
+      res.end(content);
+    } catch {
+      sendError(res, 404, 'Goal-loop artifact file is unavailable.');
     }
     return true;
   }

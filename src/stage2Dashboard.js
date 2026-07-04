@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const fs = require('fs/promises');
 const path = require('path');
 const { listV3Runs } = require('./stage2V3RunCenter');
+const { listGoalLoopRuns } = require('./stage2GoalLoopRunCenter');
 
 const STAGE2_DIR = path.join(__dirname, '..', 'artifacts', 'stage2');
 const SESSIONS_DIR = path.join(STAGE2_DIR, 'sessions');
@@ -1852,7 +1853,8 @@ async function loadStage2Overview() {
     humanLoopSummary,
     operationCenter,
     v3RunCenter,
-    runDirectories
+    runDirectories,
+    goalLoopRuns
   ] = await Promise.all([
     readJsonIfExists(path.join(STAGE2_DIR, 'latest_platform_daily_report.json')),
     readJsonIfExists(path.join(STAGE2_DIR, 'latest_baseline_freeze_manifest.json')),
@@ -1861,7 +1863,8 @@ async function loadStage2Overview() {
     readLatestHumanLoopSummary(),
     readOperationCenterOverview(),
     listV3Runs(),
-    listRunDirectories()
+    listRunDirectories(),
+    listGoalLoopRuns()
   ]);
 
   const runSummaries = (await Promise.all(runDirectories.map((entry) => readRunDirectory(entry.name))))
@@ -1880,7 +1883,8 @@ async function loadStage2Overview() {
       failedCount: runSummaries.filter((item) => item.overallStatus === 'failed').length,
       scheduledNextRoundCount: runSummaries.filter((item) => item.nextRound.shouldStart).length,
       v3RunCount: v3RunCenter.runs.length,
-      v3WaitingHumanCount: v3RunCenter.runs.filter((item) => item.status === 'waiting_human').length
+      v3WaitingHumanCount: v3RunCenter.runs.filter((item) => item.status === 'waiting_human').length,
+      goalLoopRunCount: Object.values(goalLoopRuns).reduce((total, items) => total + items.length, 0)
     },
     latestValidationMatrix: latestValidationMatrix ? {
       status: latestValidationMatrix.summary?.status || 'unknown',
@@ -1906,6 +1910,7 @@ async function loadStage2Overview() {
     } : null,
     latestBaselineFreezeManifest: await summarizeBaselineFreezeManifest(latestBaselineFreezeManifest),
     v3RunCenter,
+    goalLoopRuns,
     humanLoopSummary,
     operationCenter,
     sessionSummaries,

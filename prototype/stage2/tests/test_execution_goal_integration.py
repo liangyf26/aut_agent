@@ -171,6 +171,15 @@ def test_execution_session_basic_all_pass():
         assert summary["pending_human_authorization_count"] == 1
         assert summary["halted_early"] is False
 
+        run_summary_path = orch.export_run_summary(extra={"rounds_run": 1})
+        assert run_summary_path.exists()
+        assert run_summary_path == orch.output_dir / "run_summary.json"
+        persisted_summary = json.loads(run_summary_path.read_text(encoding="utf-8"))
+        for key, value in summary.items():
+            assert persisted_summary[key] == value
+        assert persisted_summary["rounds_run"] == 1
+        assert "generated_at" in persisted_summary
+
 
 def test_human_required_failure_pauses_batch_and_writes_takeover_packet():
     """A permission_blocked failure must pause its goal (not fail it outright)

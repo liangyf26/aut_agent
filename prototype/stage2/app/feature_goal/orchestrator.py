@@ -277,16 +277,23 @@ class FeatureGoalOrchestrator:
         write_discovery_review(self.adapter, output_path)
         return output_path
 
-    def export_goal_summary(self, filename: str = "goal_summary.json") -> Path:
+    def export_goal_summary(self, filename: str = "run_summary.json") -> Path:
         """
-        Export goal_summary.json with goal-level statistics.
+        Export run_summary.json with goal-level statistics.
+
+        Renamed from goal_summary.json to run_summary.json (仪表盘可见性 gap
+        fix) so the dashboard's goal-loop run scanner can read the same
+        filename across all four goal-loop packages (menu/page/feature/
+        execution) without per-package special-casing.
 
         Returns:
             Path to exported file
         """
         import json
+        from datetime import datetime, timezone
 
         summary = self.get_summary()
+        summary["generated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         output_path = self.output_dir / filename
 
         with open(output_path, "w", encoding="utf-8") as f:

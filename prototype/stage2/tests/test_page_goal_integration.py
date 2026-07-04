@@ -161,8 +161,17 @@ def test_page_discovery_session_basic():
         screenshots_index_path = orch.export_screenshots_index()
         assert screenshots_index_path.exists()
 
-        goal_summary_path = orch.export_goal_summary()
-        assert goal_summary_path.exists()
+        run_summary_path = orch.export_goal_summary()
+        assert run_summary_path.exists()
+        assert run_summary_path == orch.output_dir / "run_summary.json"
+
+        with open(run_summary_path, "r", encoding="utf-8") as f:
+            persisted_summary = json.load(f)
+
+        live_summary = orch.get_summary()
+        for key, value in live_summary.items():
+            assert persisted_summary[key] == value
+        assert "generated_at" in persisted_summary
 
         # Verify page_entries.json content
         with open(fixture_path, "r", encoding="utf-8") as f:

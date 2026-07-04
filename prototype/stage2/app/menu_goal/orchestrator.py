@@ -142,3 +142,26 @@ class MenuGoalOrchestrator:
             "root_goal_id": self._root_goal_id,
             "root_conclusion": root_conclusion,
         }
+
+    def export_goal_summary(self, filename: str = "run_summary.json") -> Path:
+        """Export run_summary.json with menu discovery session statistics.
+
+        Sibling to page_goal/feature_goal's own ``export_goal_summary`` and
+        execution_goal's ``export_run_summary`` — all four goal packages
+        write the SAME filename so the dashboard's read side doesn't need
+        per-package special-casing (方案: 运行中心可见性).
+
+        Returns:
+            Path to exported file
+        """
+        import json
+        from datetime import datetime, timezone
+
+        summary = self.get_summary()
+        summary["generated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        output_path = self.output_dir / filename
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+
+        return output_path

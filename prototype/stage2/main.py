@@ -772,6 +772,14 @@ async def run_execution_goal_entrypoint(
     summary["rounds_run"] = len(rounds)
     summary["round_history"] = rounds
     summary["stopped_reason"] = rounds[-1]["stopped_reason"] if rounds else None
+    run_summary_path = orchestrator.export_run_summary(
+        extra={
+            "rounds_run": summary["rounds_run"],
+            "round_history": summary["round_history"],
+            "stopped_reason": summary["stopped_reason"],
+        }
+    )
+    summary["run_summary_path"] = str(run_summary_path)
     return summary
 
 
@@ -845,6 +853,8 @@ async def run_menu_goal_entrypoint(
     summary["output_dir"] = str(output_dir)
     summary["menu_entries_path"] = str(fixture_path)
     summary["menu_entries_raw_path"] = str(raw_entries_path)
+    run_summary_path = orchestrator.export_goal_summary()
+    summary["run_summary_path"] = str(run_summary_path)
     return summary
 
 
@@ -902,6 +912,8 @@ async def run_page_goal_entrypoint(
     summary = orchestrator.get_summary()
     summary["output_dir"] = str(output_dir)
     summary["page_entries_path"] = str(fixture_path)
+    run_summary_path = orchestrator.export_goal_summary()
+    summary["run_summary_path"] = str(run_summary_path)
     return summary
 
 
@@ -928,14 +940,13 @@ async def run_feature_goal_entrypoint(
 
     from playwright.async_api import async_playwright
 
-    from prototype.stage2.app.feature_goal.feature_adapter import FeatureAdapter
+    from prototype.stage2.app.feature_goal import FeatureGoalOrchestrator
     from prototype.stage2.app.feature_goal.feature_fixture_writer import (
         write_discovery_review,
         write_feature_fixture,
         write_test_cases_fixture,
     )
     from prototype.stage2.app.feature_goal.real_browser_classifier import classify_features_with_playwright
-    from prototype.stage2.app.goal_loop.state_machine import GoalLoopEngine
 
     page_entries = json.loads(Path(page_entries_path).read_text(encoding="utf-8"))
     if not isinstance(page_entries, list):
@@ -950,9 +961,13 @@ async def run_feature_goal_entrypoint(
     # requirement (see feature_goal/orchestrator.py's module docstring and
     # real_browser_classifier.py's — this stage's goal.status="running"
     # convention is incompatible with a shared, activate_next()-driven engine).
-    engine = GoalLoopEngine(run_id=run_id)
-    adapter = FeatureAdapter(engine)
-    root_goal = engine.register_goal(goal_type="feature", goal_name="Discover all features", origin="root::feature_discovery")
+    # Using the orchestrator itself (rather than hand-rolling engine/adapter)
+    # so export_goal_summary()/get_summary() see the same goal tree the
+    # dashboard's run_summary.json read side expects.
+    orchestrator = FeatureGoalOrchestrator(output_dir=output_dir, run_id=run_id)
+    adapter = orchestrator.adapter
+    engine = orchestrator.engine
+    root_goal_id = orchestrator.create_root_goal()
 
     all_test_cases: list[dict[str, Any]] = []
 
@@ -966,7 +981,7 @@ async def run_feature_goal_entrypoint(
                 page_goal = engine.register_goal(
                     goal_type="feature",
                     goal_name=f"Discover features on {entry.get('page_title') or page_id}",
-                    parent_goal_id=root_goal.goal_id,
+                    parent_goal_id=root_goal_id,
                     origin=f"page_features::{page_id}",
                 )
                 if page_url:
@@ -997,6 +1012,13 @@ async def run_feature_goal_entrypoint(
     write_test_cases_fixture(all_test_cases, test_cases_path)
     write_discovery_review(adapter, discovery_review_path)
 
+    # get_summary()'s test_case_types breakdown reads orchestrator._test_cases
+    # — classify_features_with_playwright returns cases directly rather than
+    # appending to it (that append only happens in the fixture-driven
+    # scan_page_features path), so backfill it here before summarizing.
+    orchestrator._test_cases = all_test_cases
+    run_summary_path = orchestrator.export_goal_summary()
+
     return {
         "run_id": run_id,
         "output_dir": str(output_dir),
@@ -1008,6 +1030,7 @@ async def run_feature_goal_entrypoint(
         "feature_points_path": str(feature_points_path),
         "generated_test_cases_path": str(test_cases_path),
         "discovery_review_path": str(discovery_review_path),
+        "run_summary_path": str(run_summary_path),
     }
 
 
