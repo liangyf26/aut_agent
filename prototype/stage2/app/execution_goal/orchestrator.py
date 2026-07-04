@@ -23,10 +23,12 @@ silently dropped or force-run out of order.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 if TYPE_CHECKING:
     from ..goal_loop.state_machine import GoalLoopEngine
+
+RealBrowserRunner = Callable[..., Awaitable["ExecutionOutcome"]]
 
 from ..goal_loop.models import PAUSED_STATUSES
 from .execution_adapter import ExecutionAdapter
@@ -38,7 +40,7 @@ from .execution_fixture_writer import (
 )
 from .execution_runner import ExecutionOutcome, simulate_test_case_execution
 from .human_tasks_writer import write_human_takeover, write_human_tasks
-from .loader import load_execution_goals_from_test_cases
+from .loader import load_execution_goals_from_test_case_list, load_execution_goals_from_test_cases
 from .round_writer import write_next_round_plan, write_round_analysis
 from .run_report_writer import write_run_report
 
@@ -96,6 +98,24 @@ class ExecutionGoalOrchestrator:
             self.engine,
             self.adapter,
             test_cases_path,
+            parent_goal_id=root_goals[0].goal_id,
+        )
+
+    def load_test_cases_from_list(self, test_cases: list[dict]) -> list[str]:
+        """Same registration as :meth:`load_test_cases`, from an in-memory list.
+
+        For callers (e.g. a real-browser verification driver) that build
+        test cases directly in Python rather than reading Stage D's
+        ``generated_test_cases.json`` off disk.
+        """
+
+        root_goals = [g for g in self.engine.goals.values() if g.origin == "root::execution"]
+        if not root_goals:
+            raise RuntimeError("No root goal found. Call create_root_goal() first.")
+        return load_execution_goals_from_test_case_list(
+            self.engine,
+            self.adapter,
+            test_cases,
             parent_goal_id=root_goals[0].goal_id,
         )
 
@@ -162,6 +182,159 @@ class ExecutionGoalOrchestrator:
                 break
 
         return outcomes
+
+    async def execute_all_async(
+        self,
+        *,
+        runner: RealBrowserRunner,
+        runner_kwargs: dict[str, Any] | None = None,
+        injected_failures: dict[str, str] | None = None,
+    ) -> list[ExecutionOutcome]:
+        """Real-browser counterpart to :meth:`execute_all`.
+
+        Mirrors the SAME frontier-advancement / single-active-goal / pause-halts-
+        the-batch semantics as :meth:`execute_all` (see that method's and this
+        class's docstrings) — the only difference is that each case's basic path
+        is driven by an awaited ``runner`` (e.g.
+        ``real_browser_runner.execute_test_case_with_playwright``) instead of
+        the fixture-simulated ``simulate_test_case_execution``. The synchronous
+        ``execute_all``/`_execute_one`` path is untouched by this method.
+
+        Args:
+            runner: an async callable with the same contract as
+                ``execute_test_case_with_playwright`` — called as
+                ``runner(test_case, goal_id=..., injected_failure=..., **runner_kwargs)``
+                and returning an :class:`ExecutionOutcome`.
+            runner_kwargs: extra keyword arguments forwarded to every call
+                (e.g. ``page``, ``screenshots_dir``).
+            injected_failures: optional ``test_case_id -> fixed_failure_class``
+                overrides, same contract as :meth:`execute_all`.
+        """
+
+        runner_kwargs = runner_kwargs or {}
+        injected_failures = injected_failures or {}
+        outcomes: list[ExecutionOutcome] = []
+
+        while True:
+            goal = self.engine.activate_next()
+            if goal is None:
+                break
+
+            context = self.adapter.get_execution_context(goal.goal_id)
+            if context is None:
+                raise RuntimeError(
+                    f"activate_next() promoted goal {goal.goal_id!r}, which this "
+                    "ExecutionGoalOrchestrator did not register (no execution "
+                    "context). This goal is now stuck at STATUS_RUNNING — "
+                    "resolve it directly via engine.record_success()/"
+                    "record_failure()/supersede_active() before calling "
+                    "execute_all_async() again. This orchestrator's engine must not "
+                    "be shared with another goal producer unless their "
+                    "frontiers are kept disjoint."
+                )
+
+            outcome = await self._execute_one_async(
+                goal.goal_id,
+                context,
+                runner=runner,
+                runner_kwargs=runner_kwargs,
+                injected_failure=injected_failures.get(context["test_case_id"]),
+            )
+            outcomes.append(outcome)
+            self._outcomes.append(outcome)
+
+            stop_eval = self.engine.evaluate_stop(goal.goal_id)
+            if stop_eval.target_status in PAUSED_STATUSES:
+                self.halted_early = True
+                break
+
+        return outcomes
+
+    async def _execute_one_async(
+        self,
+        goal_id: str,
+        context: dict,
+        *,
+        runner: RealBrowserRunner,
+        runner_kwargs: dict[str, Any],
+        injected_failure: str | None,
+    ) -> ExecutionOutcome:
+        test_case = context["test_case"]
+        outcome = await runner(
+            test_case,
+            goal_id=goal_id,
+            injected_failure=injected_failure,
+            **runner_kwargs,
+        )
+
+        attempt_id = self.adapter.record_execution_attempt(goal_id=goal_id)
+        for action_record in outcome.actions:
+            self.adapter.record_action(attempt_id=attempt_id, action_record=action_record)
+        if outcome.page_feedback:
+            self.adapter.record_feedback(attempt_id=attempt_id, feedback=outcome.page_feedback)
+        self.adapter.record_network_capture(
+            attempt_id=attempt_id,
+            network_events=outcome.network_events,
+            capture_status="not_applicable_fixture_mode" if outcome.execution_mode == "fixture_simulated" else "captured",
+        )
+        for screenshot_ref in outcome.screenshot_refs:
+            self.adapter.record_screenshot(attempt_id=attempt_id, screenshot_ref=screenshot_ref)
+
+        self.adapter.conclude_execution(attempt_id=attempt_id, outcome=outcome)
+        return outcome
+
+    async def run(
+        self,
+        *,
+        mode: str = "fixture_simulated",
+        page: Any = None,
+        screenshots_dir: Path | None = None,
+        injected_failures: dict[str, str] | None = None,
+    ) -> list[ExecutionOutcome]:
+        """Run every queued execution goal via either execution mode.
+
+        This is a convenience dispatcher over :meth:`execute_all` (default,
+        fixture-simulated, unchanged) and :meth:`execute_all_async` (real
+        browser) so a caller (CLI entrypoint, verification script) can pick
+        the mode via one string argument instead of knowing which of the two
+        underlying methods to call and how to build the runner closure
+        itself. Neither underlying method is modified by this wrapper.
+
+        Args:
+            mode: ``"fixture_simulated"`` (default) or ``"real_browser"``.
+            page: a live Playwright ``Page``, required when
+                ``mode == "real_browser"``.
+            screenshots_dir: directory real screenshots are written under,
+                required when ``mode == "real_browser"``.
+            injected_failures: forwarded to whichever underlying method runs.
+
+        Raises:
+            ValueError: for an unrecognized ``mode``, or a missing
+                ``page``/``screenshots_dir`` when ``mode == "real_browser"``.
+        """
+
+        if mode == "fixture_simulated":
+            return self.execute_all(injected_failures=injected_failures)
+
+        if mode == "real_browser":
+            if page is None or screenshots_dir is None:
+                raise ValueError(
+                    "mode='real_browser' requires both page and screenshots_dir"
+                )
+            from .real_browser_runner import execute_test_case_with_playwright
+
+            async def runner(test_case: dict, *, goal_id: str | None, injected_failure: str | None):
+                return await execute_test_case_with_playwright(
+                    page,
+                    test_case,
+                    goal_id=goal_id,
+                    screenshots_dir=screenshots_dir,
+                    injected_failure=injected_failure,
+                )
+
+            return await self.execute_all_async(runner=runner, injected_failures=injected_failures)
+
+        raise ValueError(f"unrecognized execution mode: {mode!r}; expected 'fixture_simulated' or 'real_browser'")
 
     def _execute_one(self, goal_id: str, context: dict, *, injected_failure: str | None) -> ExecutionOutcome:
         test_case = context["test_case"]

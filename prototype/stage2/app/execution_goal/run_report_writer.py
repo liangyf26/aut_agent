@@ -150,16 +150,28 @@ def build_run_report(
         ],
     )
 
+    any_real_browser = any(o.execution_mode != "fixture_simulated" for o in outcomes)
+    notes = (
+        [
+            "This run executed at least one case via a real-browser runner "
+            "(execution_mode on the corresponding outcome is not "
+            "'fixture_simulated'); see each success/failure item's "
+            "execution_mode for which cases were real vs. simulated.",
+        ]
+        if any_real_browser
+        else [
+            "Stage E executes each case's basic path via a fixture-simulated runner "
+            "(no live browser); execution_mode on every outcome makes this explicit.",
+        ]
+    )
+
     return RunReport(
         summary=summary,
         success_items=_build_success_items(outcomes),
         failure_items=_build_failure_items(outcomes),
         failure_clusters=_build_failure_clusters(engine),
         key_artifacts=_build_key_artifacts(output_dir),
-        notes=[
-            "Stage E executes each case's basic path via a fixture-simulated runner "
-            "(no live browser); execution_mode on every outcome makes this explicit.",
-        ],
+        notes=notes,
     )
 
 

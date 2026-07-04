@@ -30,11 +30,14 @@
 ## 关键目录
 
 - `prototype/stage2/app/`: 第二阶段平台原型模块
+- `prototype/stage2/app/goal_loop/`: 目标循环内核（第二阶段 v4，见 `docs/技术方案第二阶段v4.md`/`docs/第二阶段实施计划v4.md`）——`menu_goal`/`page_goal`/`feature_goal`/`execution_goal`/`cross_system_goal` 各自对应阶段A-F 的菜单/页面/功能点/执行/跨系统闭环，均通过 pytest 或 `goal_loop/demo.py` 运行，**尚未接入 `main.py` 任何 CLI 入口**，与下面的 v3 真实浏览器管线是两条独立代码路径
+- `prototype/stage2/app/execution_goal/execution_runner.py` vs `real_browser_runner.py`: 阶段E 执行分两种模式——`execution_runner.py` 是默认的 fixture 模拟执行（`execution_mode="fixture_simulated"`，不驱动浏览器）；`real_browser_runner.py` 是 2026-07-04 验证过的真实 Playwright 执行分支（`execution_mode="real_browser"`），已针对真实苏源系统跑通，但还只是可选模块，未合并为默认路径
 - `prototype/stage2/templates/`: 项目级执行模板、基线、schema、locator hints
 - `prototype/stage2/app/verification/suyuan_shared_actions.py`: 溯源样本的 wizard / drawer 共享动作族
 - `prototype/stage2/app/verification/suyuan_submit_dialog_actions.py`: 溯源样本的 upload / submit dialog 共享动作族
 - `src/stage2Dashboard.js`: Node.js 运行中心对 `artifacts/stage2/` 的聚合入口
 - `tools/suyuan_submit_loop.py`: 溯源系统样本闭环与迭代编排脚本
+- `prototype/stage2/tools/verify_execution_goal_real_browser.py`: 阶段E 真实浏览器一次性验证驱动脚本，需先手动起 `--remote-debugging-port` 的 Chrome 并登录目标系统
 - `prototype/stage2/tests/`: 第二阶段 smoke / regression 测试
 - `artifacts/stage2/`: 第二阶段运行产物，属于证据层，不是源码层
 
@@ -80,6 +83,7 @@ python -m prototype.stage2.main --validation-matrix --cdp-url http://localhost:9
 - 运行中心新系统接入卡片会把 `system key/template` 输入归一化为 `<base>_system_map`，并优先暴露系统地图 / discovery 核心 artifact 直链；“步骤结果”链接主要用于排错命令返回
 - 项目级沉淀可以自动落盘；平台级基线沉淀必须人工审核后晋升
 - 生成的 `artifacts/`、日报、报告是证据，不是设计真相；设计真相以 `docs/` 和 `CONTEXT.md` 为准
+- 真实浏览器判断表格行内按钮可见性时必须查全部匹配元素（不能只查 `.first`/默认匹配）：固定列表格（如 Element Plus fixed-right column）会把同一按钮渲染两份，可滚动主体里那份 `visibility: hidden`，只查第一个匹配会误判为不可见（见 CONTEXT.md「表格固定列重复渲染」）
 
 ## /neat 维护规则
 

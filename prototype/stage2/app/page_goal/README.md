@@ -285,7 +285,7 @@ orch.export_goal_summary("goal_summary.json")
     "menu_text": "系统管理",
     "route_hint": "/system",
     "status": "discovered",
-    "parent_id": null
+    "parent_menu_id": null
   }
 ]
 ```

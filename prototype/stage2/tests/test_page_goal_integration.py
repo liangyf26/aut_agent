@@ -39,7 +39,7 @@ def test_page_discovery_session_basic():
                 "menu_text": "System Management",
                 "route_hint": "/system",
                 "status": "discovered",
-                "parent_id": None,
+                "parent_menu_id": None,
             },
             {
                 "menu_id": "menu_002",
@@ -47,7 +47,7 @@ def test_page_discovery_session_basic():
                 "menu_text": "User Management",
                 "route_hint": "/system/users",
                 "status": "discovered",
-                "parent_id": "menu_001",
+                "parent_menu_id": "menu_001",
             },
             {
                 "menu_id": "menu_003",
@@ -55,7 +55,7 @@ def test_page_discovery_session_basic():
                 "menu_text": "Reports",
                 "route_hint": None,
                 "status": "failed",  # Should be skipped
-                "parent_id": None,
+                "parent_menu_id": None,
             },
         ]
 

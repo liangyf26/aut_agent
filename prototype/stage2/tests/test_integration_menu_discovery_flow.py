@@ -1,5 +1,6 @@
 """Stage B集成测试：完整菜单发现流程演示"""
 
+import json
 import tempfile
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from prototype.stage2.app.menu_goal import (
     classify_menu_discovery_failure,
     write_menu_fixture,
 )
+from prototype.stage2.app.page_goal import PageAdapter
 
 
 def test_complete_menu_discovery_flow():
@@ -112,6 +114,61 @@ def test_complete_menu_discovery_flow():
         assert fixture_path.exists()
 
         print("\n[SUCCESS] Complete flow test passed!")
+
+
+def test_menu_fixture_output_feeds_page_goal_loader_with_parent_lineage_intact():
+    """Cross-package regression: menu_goal's REAL write_menu_fixture() output,
+    fed directly into page_goal's REAL load_page_goals_from_menu_fixture(),
+    must preserve parent lineage end to end.
+
+    This guards against a real bug found in 2026-07 real-browser
+    verification: menu_goal.fixture_writer wrote "parent_menu_id" while
+    page_goal.loader read "parent_id" — two different field names for the
+    same concept, so parent lineage silently came back None for every child
+    menu even in the pure-fixture chain. Earlier tests only exercised each
+    side in isolation with hand-written fixtures that happened to match
+    whichever field name each side expected, so the mismatch never surfaced.
+    """
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        menu_orch = MenuGoalOrchestrator(output_dir=tmpdir, run_id="parent_lineage_run")
+        adapter = menu_orch.adapter
+
+        root_id = menu_orch.create_root_goal(description="Discover L1 menus")
+        parent_menu_id = adapter.register_menu_goal(
+            menu_id="menu_sys", menu_path=["系统管理"], parent_goal_id=root_id
+        )
+        child_menu_id = adapter.register_menu_goal(
+            menu_id="menu_user",
+            menu_path=["系统管理", "用户管理"],
+            parent_goal_id=parent_menu_id,
+        )
+
+        for menu_id in (parent_menu_id, child_menu_id):
+            attempt = adapter.record_discovery_attempt(goal_id=menu_id)
+            step = adapter.record_navigation_step(attempt_id=attempt, action="click_menu")
+            screenshot = adapter.attach_screenshot_evidence(step_id=step, screenshot_path="/tmp/menu.png")
+            metadata = adapter.attach_menu_metadata_evidence(step_id=step, menu_text="菜单")
+            adapter.record_discovery_success(attempt_id=attempt, evidence_refs=[screenshot, metadata])
+
+        menu_entries_path = menu_orch.export_fixture()
+        exported = json.loads(menu_entries_path.read_text(encoding="utf-8"))
+        by_menu_id = {entry["menu_id"]: entry for entry in exported}
+        # confirm the real writer's actual field name before trusting the loader read it
+        assert "parent_menu_id" in by_menu_id["menu_user"]
+        assert by_menu_id["menu_user"]["parent_menu_id"] == "menu_sys"
+
+        page_engine = GoalLoopEngine(run_id="page_run")
+        page_adapter = PageAdapter(page_engine)
+
+        from prototype.stage2.app.page_goal import load_page_goals_from_menu_fixture
+
+        goal_ids = load_page_goals_from_menu_fixture(page_engine, page_adapter, menu_entries_path)
+        assert len(goal_ids) == 2
+
+        contexts = {page_adapter.get_page_context(gid)["page_id"]: page_adapter.get_page_context(gid) for gid in goal_ids}
+        assert contexts["menu_sys"]["parent_menu_id"] is None
+        assert contexts["menu_user"]["parent_menu_id"] == "menu_sys"
 
 
 if __name__ == "__main__":

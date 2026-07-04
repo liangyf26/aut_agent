@@ -73,7 +73,10 @@ def load_page_goals_from_menu_fixture(
         # Extract menu context
         menu_path = entry.get("menu_path", [])
         route_hint = entry.get("route_hint")
-        parent_menu_id = entry.get("parent_id")  # From menu hierarchy
+        parent_menu_id = entry.get("parent_menu_id")  # From menu hierarchy (matches
+        # menu_goal.fixture_writer.write_menu_fixture's actual output field name;
+        # NOT "parent_id" — that key never appears in a real menu_entries.json
+        # produced by menu_goal, so reading it here always silently returned None.
 
         # Register page goal via adapter
         goal_id = adapter.register_page_goal(

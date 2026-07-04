@@ -10,6 +10,7 @@ Tests independently, no browser — the execution runner is fixture-simulated
 (实施计划 §2.6: 每个阶段边界都产出一份冻结的 golden / fixture 产物).
 """
 
+import asyncio
 import json
 import tempfile
 from pathlib import Path
@@ -522,6 +523,60 @@ def test_unrecognized_case_type_fails_with_evidence_incomplete():
         assert len(outcomes) == 1
         assert outcomes[0].status == "failed"
         assert outcomes[0].failure_reason == "evidence_incomplete"
+
+
+def test_run_dispatches_fixture_mode_by_default():
+    """run() with the default mode delegates to execute_all() unchanged —
+    same outcomes, same artifacts, no real_browser_runner import triggered."""
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_dir = Path(tmpdir) / "output"
+        output_dir.mkdir()
+        test_cases_path = output_dir / "generated_test_cases.json"
+        _write_test_cases(test_cases_path, _sample_cases())
+
+        orch = ExecutionGoalOrchestrator(output_dir=str(output_dir), run_id="test_run_dispatch")
+        orch.create_root_goal()
+        orch.load_test_cases(test_cases_path)
+
+        outcomes = asyncio.run(orch.run(mode="fixture_simulated"))
+
+        assert len(outcomes) == 3
+        assert all(outcome.status == "passed" for outcome in outcomes)
+        assert all(outcome.execution_mode == "fixture_simulated" for outcome in outcomes)
+
+
+def test_run_real_browser_mode_requires_page_and_screenshots_dir():
+    """run(mode='real_browser') must refuse to proceed without a page/dir
+    rather than crash deep inside the runner closure with a confusing error."""
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_dir = Path(tmpdir) / "output"
+        output_dir.mkdir()
+        test_cases_path = output_dir / "generated_test_cases.json"
+        _write_test_cases(test_cases_path, _sample_cases())
+
+        orch = ExecutionGoalOrchestrator(output_dir=str(output_dir), run_id="test_run_missing_page")
+        orch.create_root_goal()
+        orch.load_test_cases(test_cases_path)
+
+        with pytest.raises(ValueError, match="requires both page and screenshots_dir"):
+            asyncio.run(orch.run(mode="real_browser"))
+
+
+def test_run_rejects_unrecognized_mode():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_dir = Path(tmpdir) / "output"
+        output_dir.mkdir()
+        test_cases_path = output_dir / "generated_test_cases.json"
+        _write_test_cases(test_cases_path, _sample_cases())
+
+        orch = ExecutionGoalOrchestrator(output_dir=str(output_dir), run_id="test_run_bad_mode")
+        orch.create_root_goal()
+        orch.load_test_cases(test_cases_path)
+
+        with pytest.raises(ValueError, match="unrecognized execution mode"):
+            asyncio.run(orch.run(mode="not_a_real_mode"))
 
 
 if __name__ == "__main__":

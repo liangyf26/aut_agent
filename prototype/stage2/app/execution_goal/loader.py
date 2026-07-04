@@ -17,6 +17,55 @@ if TYPE_CHECKING:
     from .execution_adapter import ExecutionAdapter
 
 
+def load_execution_goals_from_test_case_list(
+    engine: "GoalLoopEngine",
+    adapter: "ExecutionAdapter",
+    test_cases: list[dict],
+    *,
+    parent_goal_id: str,
+) -> list[str]:
+    """Register one execution goal per already-in-memory test case dict.
+
+    Same registration logic as :func:`load_execution_goals_from_test_cases`,
+    factored out so callers that build cases directly in Python (e.g. a
+    one-off real-browser verification driver) don't need to round-trip
+    through a JSON file on disk.
+
+    Args:
+        engine: GoalLoopEngine instance.
+        adapter: ExecutionAdapter instance.
+        test_cases: list of test case dicts, same shape as
+            ``generated_test_cases.json`` entries.
+        parent_goal_id: parent goal (typically the Stage E root goal).
+
+    Returns:
+        List of created execution goal IDs, in list order.
+
+    Raises:
+        ValueError: if ``test_cases`` is not a list.
+    """
+
+    if not isinstance(test_cases, list):
+        raise ValueError(f"Expected a list of test cases, got {type(test_cases)}")
+
+    goal_ids: list[str] = []
+    for test_case in test_cases:
+        if not isinstance(test_case, dict):
+            continue
+        feature_id = test_case.get("feature_id")
+        if not feature_id:
+            continue
+        goal_id = adapter.register_execution_goal(
+            feature_id=feature_id,
+            page_id=test_case.get("page_id"),
+            test_case=test_case,
+            parent_goal_id=parent_goal_id,
+        )
+        goal_ids.append(goal_id)
+
+    return goal_ids
+
+
 def load_execution_goals_from_test_cases(
     engine: "GoalLoopEngine",
     adapter: "ExecutionAdapter",
@@ -50,22 +99,12 @@ def load_execution_goals_from_test_cases(
     if not isinstance(test_cases, list):
         raise ValueError(f"Expected list in generated_test_cases.json, got {type(test_cases)}")
 
-    goal_ids: list[str] = []
-    for test_case in test_cases:
-        if not isinstance(test_case, dict):
-            continue
-        feature_id = test_case.get("feature_id")
-        if not feature_id:
-            continue
-        goal_id = adapter.register_execution_goal(
-            feature_id=feature_id,
-            page_id=test_case.get("page_id"),
-            test_case=test_case,
-            parent_goal_id=parent_goal_id,
-        )
-        goal_ids.append(goal_id)
-
-    return goal_ids
+    return load_execution_goals_from_test_case_list(
+        engine, adapter, test_cases, parent_goal_id=parent_goal_id
+    )
 
 
-__all__ = ["load_execution_goals_from_test_cases"]
+__all__ = [
+    "load_execution_goals_from_test_cases",
+    "load_execution_goals_from_test_case_list",
+]

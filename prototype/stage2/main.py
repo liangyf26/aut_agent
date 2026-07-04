@@ -691,6 +691,309 @@ async def run_connected_template_validation(
             await browser.close()
 
 
+async def run_execution_goal_entrypoint(
+    test_cases_path: str,
+    *,
+    mode: str = "fixture_simulated",
+    cdp_url: str = DEFAULT_CDP_URL,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Run Stage E's execution_goal orchestrator over a generated_test_cases.json fixture.
+
+    mode="fixture_simulated" (default) never touches a browser — same as
+    calling ``ExecutionGoalOrchestrator.execute_all()`` directly.
+    mode="real_browser" connects to an already-logged-in Chrome session via
+    ``cdp_url`` (same connect/resolve-page pattern as
+    ``run_connected_template_validation``) and drives every case for real via
+    ``real_browser_runner.execute_test_case_with_playwright``. The caller is
+    responsible for having already navigated that Chrome session to the
+    target page before invoking this in real_browser mode — execution_goal's
+    test cases span whatever page(s) they were generated for, so there is no
+    single template page_entry URL to auto-navigate to here.
+    """
+
+    from prototype.stage2.app.execution_goal import ExecutionGoalOrchestrator
+
+    run_id = run_id or f"execution_goal_{mode}_run"
+    output_dir = ROOT_DIR / "artifacts" / "stage2" / "execution_goal_runs" / run_id
+
+    orchestrator = ExecutionGoalOrchestrator(output_dir=output_dir, run_id=run_id)
+    orchestrator.create_root_goal()
+    orchestrator.load_test_cases(test_cases_path)
+
+    async def _run_and_export(**run_kwargs: Any) -> None:
+        await orchestrator.run(mode=mode, **run_kwargs)
+
+        orchestrator.export_execution_results()
+        orchestrator.export_action_log()
+        orchestrator.export_network_events()
+        orchestrator.export_screenshots_index()
+        orchestrator.export_human_tasks()
+        orchestrator.export_human_takeover()
+        orchestrator.export_round_analysis()
+        orchestrator.export_next_round_plan()
+        orchestrator.export_run_report()
+
+    if mode == "fixture_simulated":
+        await _run_and_export()
+    else:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.connect_over_cdp(cdp_url)
+            try:
+                pages = []
+                for context in browser.contexts:
+                    pages.extend(context.pages)
+                if not pages:
+                    raise RuntimeError("未发现可用页面，无法执行 execution_goal real_browser 模式")
+                page = pages[0]
+                screenshots_dir = output_dir / "screenshots"
+                await _run_and_export(page=page, screenshots_dir=screenshots_dir)
+            finally:
+                await browser.close()
+
+    summary = orchestrator.get_summary()
+    summary["output_dir"] = str(output_dir)
+    return summary
+
+
+async def _resolve_connected_page(cdp_url: str, browser: Any) -> Any:
+    pages = []
+    for context in browser.contexts:
+        pages.extend(context.pages)
+    if not pages:
+        raise RuntimeError("未发现可用页面，无法执行 real_browser goal-loop 发现")
+    page = pages[0]
+    await page.bring_to_front()
+    await page.wait_for_load_state("domcontentloaded")
+    return page
+
+
+async def run_menu_goal_entrypoint(
+    *,
+    cdp_url: str = DEFAULT_CDP_URL,
+    run_id: str | None = None,
+    max_pages: int = 5,
+) -> dict[str, Any]:
+    """Run Stage B's menu_goal real-browser discovery and write menu_entries.json.
+
+    Connects to an already-logged-in Chrome session via ``cdp_url`` (same
+    connect/resolve-page pattern as ``run_connected_template_validation``),
+    scans real menus via ``menu_goal.real_browser_discovery``, and writes
+    TWO artifacts:
+
+    - ``menu_entries.json``: the SAME reduced schema the fixture path
+      (``MenuGoalOrchestrator.export_fixture``) already produces, for
+      consumers of that established shape.
+    - ``menu_entries_raw.json``: the underlying scanner's full entry list
+      (``is_leaf``/``expandable``/``locator_candidates`` included) —
+      ``run_page_goal_entrypoint`` chains off THIS file, not the reduced one,
+      because ``page_goal.real_browser_discovery`` needs ``is_leaf`` to know
+      which entries are navigable pages.
+    """
+
+    import json as _json
+
+    from playwright.async_api import async_playwright
+
+    from prototype.stage2.app.menu_goal import MenuGoalOrchestrator
+    from prototype.stage2.app.menu_goal.real_browser_discovery import discover_menus_with_playwright
+
+    run_id = run_id or "menu_goal_real_browser_run"
+    output_dir = ROOT_DIR / "artifacts" / "stage2" / "menu_goal_runs" / run_id
+
+    orchestrator = MenuGoalOrchestrator(output_dir=output_dir, run_id=run_id)
+    root_id = orchestrator.create_root_goal()
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.connect_over_cdp(cdp_url)
+        try:
+            page = await _resolve_connected_page(cdp_url, browser)
+            _goal_ids, raw_entries = await discover_menus_with_playwright(
+                page,
+                orchestrator.adapter,
+                screenshots_dir=output_dir / "screenshots",
+                parent_goal_id=root_id,
+                max_pages=max_pages,
+            )
+        finally:
+            await browser.close()
+
+    fixture_path = orchestrator.export_fixture()
+    raw_entries_path = output_dir / "menu_entries_raw.json"
+    raw_entries_path.write_text(_json.dumps(raw_entries, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    summary = orchestrator.get_summary()
+    summary["output_dir"] = str(output_dir)
+    summary["menu_entries_path"] = str(fixture_path)
+    summary["menu_entries_raw_path"] = str(raw_entries_path)
+    return summary
+
+
+async def run_page_goal_entrypoint(
+    menu_entries_path: str,
+    *,
+    cdp_url: str = DEFAULT_CDP_URL,
+    run_id: str | None = None,
+    max_pages: int = 5,
+    max_features_per_page: int = 6,
+) -> dict[str, Any]:
+    """Run Stage C's page_goal real-browser discovery and write page_entries.json.
+
+    ``menu_entries_path`` must be the ``menu_entries_raw.json`` written by
+    ``run_menu_goal_entrypoint`` (NOT its ``menu_entries.json``) — this
+    driver's underlying ``page_goal.real_browser_discovery`` filters on
+    ``is_leaf``, which only the raw scanner output carries; the reduced
+    fixture schema drops it (实施计划 §2.6 stage boundary).
+    """
+
+    import json
+
+    from playwright.async_api import async_playwright
+
+    from prototype.stage2.app.page_goal import PageGoalOrchestrator
+    from prototype.stage2.app.page_goal.real_browser_discovery import discover_pages_with_playwright
+
+    menu_entries = json.loads(Path(menu_entries_path).read_text(encoding="utf-8"))
+    if not isinstance(menu_entries, list):
+        raise ValueError(f"Expected a list in {menu_entries_path}, got {type(menu_entries)}")
+
+    run_id = run_id or "page_goal_real_browser_run"
+    output_dir = ROOT_DIR / "artifacts" / "stage2" / "page_goal_runs" / run_id
+
+    orchestrator = PageGoalOrchestrator(output_dir=output_dir, run_id=run_id)
+    root_id = orchestrator.create_root_goal()
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.connect_over_cdp(cdp_url)
+        try:
+            page = await _resolve_connected_page(cdp_url, browser)
+            await discover_pages_with_playwright(
+                page,
+                orchestrator.adapter,
+                menu_entries,
+                screenshots_dir=output_dir / "screenshots",
+                parent_goal_id=root_id,
+                max_pages=max_pages,
+                max_features_per_page=max_features_per_page,
+            )
+        finally:
+            await browser.close()
+
+    fixture_path = orchestrator.export_fixture()
+    summary = orchestrator.get_summary()
+    summary["output_dir"] = str(output_dir)
+    summary["page_entries_path"] = str(fixture_path)
+    return summary
+
+
+async def run_feature_goal_entrypoint(
+    page_entries_path: str,
+    *,
+    cdp_url: str = DEFAULT_CDP_URL,
+    run_id: str | None = None,
+    max_features_per_page: int = 6,
+) -> dict[str, Any]:
+    """Run Stage D's feature_goal real-browser classification and write
+    feature_points.json / generated_test_cases.json.
+
+    ``page_entries_path`` is typically the ``page_entries.json`` just written
+    by ``run_page_goal_entrypoint``, filtered to ``status == "reachable"``
+    (same filter ``feature_goal.loader.load_feature_goals_from_page_fixture``
+    applies). For each reachable page this navigates the connected Chrome
+    session to that page's real URL before classifying its real DOM — unlike
+    the fixture path, which never re-navigates because it only has the page's
+    recorded title/URL, not a live page to visit.
+    """
+
+    import json
+
+    from playwright.async_api import async_playwright
+
+    from prototype.stage2.app.feature_goal.feature_adapter import FeatureAdapter
+    from prototype.stage2.app.feature_goal.feature_fixture_writer import (
+        write_discovery_review,
+        write_feature_fixture,
+        write_test_cases_fixture,
+    )
+    from prototype.stage2.app.feature_goal.real_browser_classifier import classify_features_with_playwright
+    from prototype.stage2.app.goal_loop.state_machine import GoalLoopEngine
+
+    page_entries = json.loads(Path(page_entries_path).read_text(encoding="utf-8"))
+    if not isinstance(page_entries, list):
+        raise ValueError(f"Expected a list in {page_entries_path}, got {type(page_entries)}")
+    reachable_entries = [entry for entry in page_entries if entry.get("status") == "reachable"]
+
+    run_id = run_id or "feature_goal_real_browser_run"
+    output_dir = ROOT_DIR / "artifacts" / "stage2" / "feature_goal_runs" / run_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Independent engine per FeatureGoalOrchestrator's own documented
+    # requirement (see feature_goal/orchestrator.py's module docstring and
+    # real_browser_classifier.py's — this stage's goal.status="running"
+    # convention is incompatible with a shared, activate_next()-driven engine).
+    engine = GoalLoopEngine(run_id=run_id)
+    adapter = FeatureAdapter(engine)
+    root_goal = engine.register_goal(goal_type="feature", goal_name="Discover all features", origin="root::feature_discovery")
+
+    all_test_cases: list[dict[str, Any]] = []
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.connect_over_cdp(cdp_url)
+        try:
+            page = await _resolve_connected_page(cdp_url, browser)
+            for entry in reachable_entries:
+                page_id = entry["page_id"]
+                page_url = entry.get("page_url")
+                page_goal = engine.register_goal(
+                    goal_type="feature",
+                    goal_name=f"Discover features on {entry.get('page_title') or page_id}",
+                    parent_goal_id=root_goal.goal_id,
+                    origin=f"page_features::{page_id}",
+                )
+                if page_url:
+                    await page.goto(page_url, wait_until="domcontentloaded", timeout=8000)
+                    # 1500ms, matching run_connected_template_validation's own
+                    # post-navigation wait (main.py above) — 300ms was too
+                    # short to observe this codebase's real target systems'
+                    # Vue/Element-UI controls render after navigation (found
+                    # during 2026-07-04 real suyuan-system verification: a
+                    # 300ms wait produced 0 controls, 1500ms produced 6).
+                    await page.wait_for_timeout(1500)
+                _feature_goal_ids, test_cases = await classify_features_with_playwright(
+                    page,
+                    adapter,
+                    page_goal.goal_id,
+                    page_id=page_id,
+                    screenshots_dir=output_dir / "screenshots",
+                    max_features_per_page=max_features_per_page,
+                )
+                all_test_cases.extend(test_cases)
+        finally:
+            await browser.close()
+
+    feature_points_path = output_dir / "feature_points.json"
+    test_cases_path = output_dir / "generated_test_cases.json"
+    discovery_review_path = output_dir / "discovery_review.json"
+    write_feature_fixture(adapter, feature_points_path)
+    write_test_cases_fixture(all_test_cases, test_cases_path)
+    write_discovery_review(adapter, discovery_review_path)
+
+    return {
+        "run_id": run_id,
+        "output_dir": str(output_dir),
+        "pages_scanned": len(reachable_entries),
+        "feature_count": sum(
+            1 for gid, goal in engine.goals.items() if goal.origin and goal.origin.startswith("feature_entry::")
+        ),
+        "test_cases_generated": len(all_test_cases),
+        "feature_points_path": str(feature_points_path),
+        "generated_test_cases_path": str(test_cases_path),
+        "discovery_review_path": str(discovery_review_path),
+    }
+
+
 def _coerce_validation_matrix_result(
     target: ValidationMatrixTarget,
     payload: dict[str, Any],
@@ -1507,6 +1810,77 @@ def main() -> None:
         help="Run the G4 cross-system validation matrix and write aggregated json/markdown artifacts.",
     )
     parser.add_argument(
+        "--run-execution-goal",
+        action="store_true",
+        help="Run Stage E's execution_goal orchestrator over a generated_test_cases.json fixture.",
+    )
+    parser.add_argument(
+        "--execution-goal-test-cases",
+        default="",
+        help="Path to generated_test_cases.json for --run-execution-goal (required).",
+    )
+    parser.add_argument(
+        "--execution-goal-mode",
+        choices=("fixture_simulated", "real_browser"),
+        default="fixture_simulated",
+        help="For --run-execution-goal, choose fixture_simulated (default, no browser) or real_browser "
+        "(connects via --cdp-url to an already-logged-in Chrome session).",
+    )
+    parser.add_argument(
+        "--execution-goal-run-id",
+        default="",
+        help="Optional explicit run id for --run-execution-goal.",
+    )
+    parser.add_argument(
+        "--run-menu-goal",
+        action="store_true",
+        help="Run Stage B's menu_goal real-browser discovery against the currently connected "
+        "Chrome CDP session and write menu_entries.json.",
+    )
+    parser.add_argument(
+        "--run-page-goal",
+        action="store_true",
+        help="Run Stage C's page_goal real-browser discovery over the menu entries just "
+        "discovered by --run-menu-goal (or --goal-chain-menu-entries) and write page_entries.json.",
+    )
+    parser.add_argument(
+        "--run-feature-goal",
+        action="store_true",
+        help="Run Stage D's feature_goal real-browser classification over the reachable pages "
+        "just discovered by --run-page-goal (or --goal-chain-page-entries) and write "
+        "feature_points.json / generated_test_cases.json.",
+    )
+    parser.add_argument(
+        "--goal-chain-menu-entries",
+        default="",
+        help="Path to the menu_entries_raw.json written by --run-menu-goal (NOT its "
+        "menu_entries.json — the raw file carries is_leaf, which --run-page-goal requires). "
+        "Required for --run-page-goal since each CLI invocation is a separate process.",
+    )
+    parser.add_argument(
+        "--goal-chain-page-entries",
+        default="",
+        help="Optional explicit page_entries.json path for --run-feature-goal, when not chaining "
+        "directly after --run-page-goal in the same invocation.",
+    )
+    parser.add_argument(
+        "--goal-chain-run-id",
+        default="",
+        help="Optional explicit run id shared by --run-menu-goal/--run-page-goal/--run-feature-goal.",
+    )
+    parser.add_argument(
+        "--goal-chain-max-pages",
+        type=int,
+        default=5,
+        help="Maximum pages/menu-expansion budget for the real-browser menu/page goal drivers.",
+    )
+    parser.add_argument(
+        "--goal-chain-max-features-per-page",
+        type=int,
+        default=6,
+        help="Maximum features-per-page budget for the real-browser page/feature goal drivers.",
+    )
+    parser.add_argument(
         "--report-date",
         default="",
         help="Optional explicit date string for the generated platform daily report.",
@@ -1755,6 +2129,80 @@ def main() -> None:
                 asyncio.run(
                     run_g4_validation_matrix(
                         cdp_url=args.cdp_url,
+                    )
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+
+    if args.run_execution_goal:
+        if not args.execution_goal_test_cases:
+            raise SystemExit("--run-execution-goal requires --execution-goal-test-cases <path>")
+        print(
+            json.dumps(
+                asyncio.run(
+                    run_execution_goal_entrypoint(
+                        args.execution_goal_test_cases,
+                        mode=args.execution_goal_mode,
+                        cdp_url=args.cdp_url,
+                        run_id=args.execution_goal_run_id or None,
+                    )
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+
+    if args.run_menu_goal:
+        print(
+            json.dumps(
+                asyncio.run(
+                    run_menu_goal_entrypoint(
+                        cdp_url=args.cdp_url,
+                        run_id=args.goal_chain_run_id or None,
+                        max_pages=args.goal_chain_max_pages,
+                    )
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+
+    if args.run_page_goal:
+        if not args.goal_chain_menu_entries:
+            raise SystemExit("--run-page-goal requires --goal-chain-menu-entries <path>")
+        print(
+            json.dumps(
+                asyncio.run(
+                    run_page_goal_entrypoint(
+                        args.goal_chain_menu_entries,
+                        cdp_url=args.cdp_url,
+                        run_id=args.goal_chain_run_id or None,
+                        max_pages=args.goal_chain_max_pages,
+                        max_features_per_page=args.goal_chain_max_features_per_page,
+                    )
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+
+    if args.run_feature_goal:
+        if not args.goal_chain_page_entries:
+            raise SystemExit("--run-feature-goal requires --goal-chain-page-entries <path>")
+        print(
+            json.dumps(
+                asyncio.run(
+                    run_feature_goal_entrypoint(
+                        args.goal_chain_page_entries,
+                        cdp_url=args.cdp_url,
+                        run_id=args.goal_chain_run_id or None,
+                        max_features_per_page=args.goal_chain_max_features_per_page,
                     )
                 ),
                 ensure_ascii=False,
