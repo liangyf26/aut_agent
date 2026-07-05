@@ -30,7 +30,7 @@
 ## 关键目录
 
 - `prototype/stage2/app/`: 第二阶段平台原型模块
-- `prototype/stage2/app/goal_loop/`: 目标循环内核（第二阶段 v4，见 `docs/技术方案第二阶段v4.md`/`docs/第二阶段实施计划v4.md`）——`menu_goal`/`page_goal`/`feature_goal`/`execution_goal`/`cross_system_goal` 各自对应阶段A-F 的菜单/页面/功能点/执行/跨系统闭环，均通过 pytest 或 `goal_loop/demo.py` 运行，**尚未接入 `main.py` 任何 CLI 入口**，与下面的 v3 真实浏览器管线是两条独立代码路径
+- `prototype/stage2/app/goal_loop/`: 目标循环内核（第二阶段 v4，见 `docs/技术方案第二阶段v4.md`/`docs/第二阶段实施计划v4.md`）——`menu_goal`/`page_goal`/`feature_goal`/`execution_goal`/`cross_system_goal` 各自对应阶段A-F 的菜单/页面/功能点/执行/跨系统闭环，与下面的 v3 真实浏览器管线是两条独立代码路径。四阶段（B/C/D/E）均已接入 `main.py` 的 `--run-menu-goal`/`--run-page-goal`/`--run-feature-goal`/`--run-execution-goal`；阶段F（`cross_system_goal`）2026-07-05 接入 `--run-cross-system-goal`，已用两个真实系统（追本溯源 + 订场系统）跑通端到端验证，见「第二阶段入口」的命令示例
 - `prototype/stage2/app/execution_goal/execution_runner.py` vs `real_browser_runner.py`: 阶段E 执行分两种模式——`execution_runner.py` 是默认的 fixture 模拟执行（`execution_mode="fixture_simulated"`，不驱动浏览器）；`real_browser_runner.py` 是 2026-07-04 验证过的真实 Playwright 执行分支（`execution_mode="real_browser"`），已针对真实苏源系统跑通，但还只是可选模块，未合并为默认路径
 - `prototype/stage2/templates/`: 项目级执行模板、基线、schema、locator hints
 - `prototype/stage2/app/verification/suyuan_shared_actions.py`: 溯源样本的 wizard / drawer 共享动作族
@@ -65,6 +65,19 @@ python -m prototype.stage2.main --resume-human-takeover <run_dir> --cdp-url http
 python -m prototype.stage2.main --validation-matrix --cdp-url http://localhost:9222
 ```
 
+goal_loop 家族（阶段A-F）命令：
+
+```powershell
+python -m prototype.stage2.main --run-menu-goal --cdp-url http://localhost:9222
+python -m prototype.stage2.main --run-page-goal --goal-chain-menu-entries <menu_entries_raw.json> --cdp-url http://localhost:9222
+python -m prototype.stage2.main --run-feature-goal --goal-chain-page-entries <page_entries.json> --cdp-url http://localhost:9222
+python -m prototype.stage2.main --run-execution-goal --execution-goal-test-cases <generated_test_cases.json> --execution-goal-mode real_browser --cdp-url http://localhost:9222
+python -m prototype.stage2.main --run-cross-system-goal --cross-system-systems <systems.json>
+python -m prototype.stage2.main --resolve-goal-loop-takeover <run_dir>
+```
+
+`--cross-system-systems` 指向一个系统列表 JSON，每项含 `system_id`/`system_name`/`cdp_url`/`target_url?`/`max_pages?`；顺序连接各系统 CDP，跑只读菜单发现验证，产物落在 `artifacts/stage2/cross_system_goal_runs/<run_id>/`。
+
 ## 事实约束
 
 - 发现阶段允许受控 Browser Use / 页面理解；验证阶段默认由 Playwright 确定性执行
@@ -82,6 +95,7 @@ python -m prototype.stage2.main --validation-matrix --cdp-url http://localhost:9
 - Node.js 第二阶段 v3 运行中心入口是 `http://localhost:4173/stage2`；涉及平台 UI 时，应从 `public/index.html`、`public/app.js`、`src/stage2Dashboard.js`、`src/stage2V3RunCenter.js` 理解当前外壳，而不是假设仍是表单优先首页。当前 overview 还会聚合 `latest_baseline_freeze_manifest.json` 与 run 级 `promotion_candidate_summary`
 - 运行中心新系统接入卡片会把 `system key/template` 输入归一化为 `<base>_system_map`，并优先暴露系统地图 / discovery 核心 artifact 直链；“步骤结果”链接主要用于排错命令返回
 - 项目级沉淀可以自动落盘；平台级基线沉淀必须人工审核后晋升
+- `cross_system_goal`（阶段F）的真实浏览器验证目标目前仅覆盖菜单发现（纯只读 + Stage B 已证明安全的受限展开点击），未经专门模板证明特定 locator 安全前，不要扩展成对未探索系统（如订场系统）做 feature 级点击/填表/提交
 - 生成的 `artifacts/`、日报、报告是证据，不是设计真相；设计真相以 `docs/` 和 `CONTEXT.md` 为准
 - 真实浏览器判断表格行内按钮可见性时必须查全部匹配元素（不能只查 `.first`/默认匹配）：固定列表格（如 Element Plus fixed-right column）会把同一按钮渲染两份，可滚动主体里那份 `visibility: hidden`，只查第一个匹配会误判为不可见（见 CONTEXT.md「表格固定列重复渲染」）
 

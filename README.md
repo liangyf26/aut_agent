@@ -100,6 +100,10 @@ artifacts/           运行产物、报告、截图和阶段性证据
 
 如果通过运行中心首页的新系统接入卡片操作，`system key/template` 建议只填基础 key，例如 `bus` 或 `suyuan`；前端会自动归一化为 `<system_key>_system_map`。完成“先探索系统地图”后，卡片会直接暴露 `navigation_tree.json`、`page_semantic_summary.json`、`page_entries.json` 三个核心 artifact 链接；“步骤结果”链接主要用于查看该步命令返回 JSON 以便排错。
 
+### 第二阶段 v4：目标循环家族（goal_loop）
+
+与上面的 v3 真实浏览器管线并行的另一条代码路径，位于 `prototype/stage2/app/goal_loop/`，围绕“尝试 -> 失败分类 -> 套路动作 -> 经验沉淀 -> 再尝试”循环，实现阶段A-F：菜单目标（B）、页面目标（C）、功能点目标（D）、执行与复盘（E）、跨系统验证（F），阶段A为共享内核。四阶段均已接入 `python -m prototype.stage2.main` 的 `--run-menu-goal`/`--run-page-goal`/`--run-feature-goal`/`--run-execution-goal`/`--run-cross-system-goal` 入口，命令示例见 `AGENTS.md`「第二阶段入口」。设计细节见 [第二阶段技术方案v4](docs/技术方案第二阶段v4.md)、[第二阶段实施计划v4](docs/第二阶段实施计划v4.md)。
+
 ## 技术路线
 
 第一阶段遵循现有 ADR：
@@ -205,6 +209,7 @@ npm run check
 - 已实现人工接管恢复续跑入口：`--resume-human-takeover`，并在需要人工审核/接管时输出 `human_takeover.json`。
 - 已补人工处理记录产物：运行中心或人工流程记录“已处理 / 可继续”时，会额外落盘 `human_takeover_resolution.json`；它只表示人工处理状态，不等价于自动判定问题已解决。
 - 已实现 G4 骨架入口：`--validation-matrix`，可将 `lab_*` 本地模板族与 `suyuan_*` 样本放进同一套验证矩阵并输出 json / markdown 聚合结果；默认目标已包含 `suyuan_online_query_reset` 与 `suyuan_online_detail_view` 两个 connected 样本。
+- 已完成第二阶段 v4 目标循环家族阶段A-F（`goal_loop`/`menu_goal`/`page_goal`/`feature_goal`/`execution_goal`/`cross_system_goal`），四阶段均已接入 `main.py` CLI；2026-07-05 阶段F 补齐真实浏览器菜单发现验证与 `--run-cross-system-goal` 入口，已用两个真实业务系统（追本溯源、订场系统）跑通跨系统失败对比与平台晋升判定端到端验证，见「第二阶段 v4：目标循环家族」。
 - 已完成多组对照验证：
   - 2026-06-16 的探针结果显示：`demo/.env` 指向的本地 `AI-tester` 对 `/chat/completions` 连通性不稳定，基础 chat、`json_object`、`json_schema`、tool calling 全部超时。
   - 2026-06-16 的探针结果显示：`demo/local_qwen.env` 指向的本地 `Qwen3.6-35B-A3B-UD-Q5_K_M-MTP` 对 `/chat/completions` 连通性不稳定，基础 chat、`json_object`、`json_schema`、forced tool calling、auto tool calling、Browser Use 封装路径全部超时或连接失败。
