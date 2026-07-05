@@ -20,6 +20,17 @@ const {
   runOperationStep
 } = require('./stage2OperationCenter');
 const {
+  TestCenterInputError,
+  UNIT_TEST_SUITES,
+  GOAL_CHAIN_STAGES,
+  listTestCenterRuns,
+  persistTestCenterRun,
+  resolveTestCenterArtifact,
+  runGoalChainEndToEnd,
+  runGoalChainStage,
+  runUnitTestSuite
+} = require('./stage2TestCenter');
+const {
   analyzeV3Run,
   checkBrowserPreflight,
   checkStage2ModelProfiles,
@@ -83,6 +94,10 @@ function sendOperationError(res, error) {
 
 function sendStage2V3Error(res, error) {
   sendError(res, error.statusCode || 500, error.message || 'Stage-2 v3 run operation failed.');
+}
+
+function sendTestCenterError(res, error) {
+  sendError(res, error.statusCode || 500, error.message || 'Stage-2 test center operation failed.');
 }
 
 async function readJson(req) {
@@ -418,6 +433,86 @@ async function handleApi(req, res, pathname) {
       res.end(content);
     } catch {
       sendError(res, 404, 'Goal-loop artifact file is unavailable.');
+    }
+    return true;
+  }
+
+  if (req.method === 'GET' && pathname === '/api/stage2/test-center/state') {
+    try {
+      const runs = await listTestCenterRuns();
+      sendJson(res, 200, {
+        runs,
+        unitTestSuites: Object.entries(UNIT_TEST_SUITES).map(([kind, suite]) => ({ kind, label: suite.label, files: suite.files })),
+        goalChainStages: Object.entries(GOAL_CHAIN_STAGES).map(([id, stage]) => ({ id, label: stage.label, fields: stage.fields }))
+      });
+    } catch (error) {
+      sendTestCenterError(res, error);
+    }
+    return true;
+  }
+
+  if (req.method === 'POST' && pathname === '/api/stage2/test-center/run-unit-tests') {
+    try {
+      const body = await readJson(req);
+      const kind = String(body.kind || '');
+      if (!UNIT_TEST_SUITES[kind]) {
+        throw new TestCenterInputError(`不支持的单元测试分组：${kind}`);
+      }
+      const result = await runUnitTestSuite(kind);
+      const persisted = await persistTestCenterRun(`单元测试：${UNIT_TEST_SUITES[kind].label}`, result);
+      sendJson(res, 200, { result, runId: persisted.runId });
+    } catch (error) {
+      sendTestCenterError(res, error);
+    }
+    return true;
+  }
+
+  if (req.method === 'POST' && pathname === '/api/stage2/test-center/run-goal-chain-stage') {
+    try {
+      const body = await readJson(req);
+      const stageId = String(body.stageId || '');
+      if (!GOAL_CHAIN_STAGES[stageId]) {
+        throw new TestCenterInputError(`不支持的 goal-chain 阶段：${stageId}`);
+      }
+      const result = await runGoalChainStage(stageId, body.params || {});
+      const persisted = await persistTestCenterRun(`单阶段：${GOAL_CHAIN_STAGES[stageId].label}`, result);
+      sendJson(res, 200, { result, runId: persisted.runId });
+    } catch (error) {
+      sendTestCenterError(res, error);
+    }
+    return true;
+  }
+
+  if (req.method === 'POST' && pathname === '/api/stage2/test-center/run-goal-chain-e2e') {
+    try {
+      const body = await readJson(req);
+      const result = await runGoalChainEndToEnd(body.params || {});
+      const persisted = await persistTestCenterRun('端到端全流程测试', result);
+      sendJson(res, 200, { result, runId: persisted.runId });
+    } catch (error) {
+      sendTestCenterError(res, error);
+    }
+    return true;
+  }
+
+  const testCenterArtifactParams = routeMatch(pathname, '/api/stage2/test-center/artifacts/:runId');
+  if (testCenterArtifactParams && req.method === 'GET') {
+    const artifact = await resolveTestCenterArtifact(testCenterArtifactParams.runId);
+    if (!artifact) {
+      sendError(res, 404, 'Test center run artifact not found.');
+      return true;
+    }
+
+    try {
+      const content = await fs.readFile(artifact.path);
+      res.writeHead(200, {
+        'Content-Type': mimeTypes[path.extname(artifact.path).toLowerCase()] || 'application/octet-stream',
+        'Cache-Control': 'no-store',
+        'Content-Disposition': `inline; filename="${encodeURIComponent(artifact.fileName)}"`
+      });
+      res.end(content);
+    } catch {
+      sendError(res, 404, 'Test center run artifact file is unavailable.');
     }
     return true;
   }

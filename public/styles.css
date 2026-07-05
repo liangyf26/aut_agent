@@ -830,6 +830,39 @@ textarea:focus {
   gap: 10px;
 }
 
+.stage2-field-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.stage2-field {
+  display: grid;
+  gap: 6px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.stage2-field input,
+.stage2-field select {
+  width: 100%;
+  min-width: 0;
+  font-weight: 400;
+}
+
+.stage2-field small {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.stage2-help-text {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 0;
+}
+
 .stage2-run-list {
   display: grid;
   gap: 10px;
@@ -1316,14 +1349,16 @@ textarea:focus {
 .stage2-overview-grid,
 .stage2-ai-grid,
 .stage2-report-layout,
-.stage2-human-grid {
+.stage2-human-grid,
+.stage2-work-grid {
   display: grid;
   gap: 12px;
 }
 
 .stage2-overview-grid,
 .stage2-ai-grid,
-.stage2-report-layout {
+.stage2-report-layout,
+.stage2-work-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 

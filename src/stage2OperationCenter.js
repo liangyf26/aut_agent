@@ -881,9 +881,11 @@ module.exports = {
   buildStepArtifactRefs,
   checkEnvironment,
   checkOperationEnvironment: checkEnvironment,
+  execFileWithCapture,
   getOperationState,
   loadOperationCenter,
   listOperationSessions,
   resolveOperationArtifact,
+  resolvePythonCommand,
   runOperationStep
 };

@@ -36,6 +36,7 @@
 - `prototype/stage2/app/verification/suyuan_shared_actions.py`: 溯源样本的 wizard / drawer 共享动作族
 - `prototype/stage2/app/verification/suyuan_submit_dialog_actions.py`: 溯源样本的 upload / submit dialog 共享动作族
 - `src/stage2Dashboard.js`: Node.js 运行中心对 `artifacts/stage2/` 的聚合入口
+- `src/stage2TestCenter.js`: Node.js 运行中心「测试中心」tab 的后端模块——纯 UI 封装，不改变 `goal_loop` 家族任何行为，只是把阶段A-E的 pytest 单元测试（内置 `pytest --junit-xml` 解析，无新增依赖）和 `--run-menu-goal`/`--run-page-goal`/`--run-feature-goal`/`--run-execution-goal` 的单阶段/端到端链式调用封装成表单+按钮，供新测试人员使用；结果评价规则（通过/失败/需人工介入/未知）统一在 `evaluateGoalLoopStepResult` 里定义，单元测试和端到端测试共用
 - `tools/suyuan_submit_loop.py`: 溯源系统样本闭环与迭代编排脚本
 - `prototype/stage2/tools/verify_execution_goal_real_browser.py`: 阶段E 真实浏览器一次性验证驱动脚本，需先手动起 `--remote-debugging-port` 的 Chrome 并登录目标系统
 - `prototype/stage2/tests/`: 第二阶段 smoke / regression 测试
@@ -98,6 +99,7 @@ python -m prototype.stage2.main --resolve-goal-loop-takeover <run_dir>
 - `cross_system_goal`（阶段F）的真实浏览器验证目标目前仅覆盖菜单发现（纯只读 + Stage B 已证明安全的受限展开点击），未经专门模板证明特定 locator 安全前，不要扩展成对未探索系统（如订场系统）做 feature 级点击/填表/提交
 - 生成的 `artifacts/`、日报、报告是证据，不是设计真相；设计真相以 `docs/` 和 `CONTEXT.md` 为准
 - 真实浏览器判断表格行内按钮可见性时必须查全部匹配元素（不能只查 `.first`/默认匹配）：固定列表格（如 Element Plus fixed-right column）会把同一按钮渲染两份，可滚动主体里那份 `visibility: hidden`，只查第一个匹配会误判为不可见（见 CONTEXT.md「表格固定列重复渲染」）
+- 运行中心「测试中心」tab（`src/stage2TestCenter.js` + `public/app.js` 的 `renderStage2TestCenterTab`）是阶段A-E的测试外壳，本身不驱动/改变 `goal_loop` 家族逻辑；`--run-menu-goal`/`--run-page-goal`/`--run-feature-goal` 三个发现阶段在 CLI 层没有 fixture 模式，恒定驱动真实浏览器（需 CDP 连接），表单不出现模式选择器；只有 `--run-execution-goal` 才有 `fixture_simulated`/`real_browser` 可选
 
 ## /neat 维护规则
 
