@@ -38,6 +38,7 @@ class SystemProfile:
     template_name: str | None = None
     project_name: str | None = None
     notes: list[str] = field(default_factory=list)
+    run_mode: str = "unspecified"  # unspecified | real_browser | replayed_fixture
 
     def to_dict(self) -> dict[str, Any]:
         return _compact_dict(
@@ -47,6 +48,7 @@ class SystemProfile:
                 "template_name": self.template_name,
                 "project_name": self.project_name,
                 "notes": self.notes,
+                "run_mode": self.run_mode,
             }
         )
 

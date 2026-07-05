@@ -783,6 +783,81 @@ async def run_execution_goal_entrypoint(
     return summary
 
 
+async def run_cross_system_goal_entrypoint(
+    systems_config_path: str,
+    *,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Run Stage F's real-browser cross-system validation over N systems.
+
+    systems_config_path: JSON file, a list of objects:
+        {"system_id": str, "system_name": str, "cdp_url": str,
+         "target_url": str (optional), "max_pages": int (optional, default 5)}
+
+    Connects to each system's CDP endpoint SEQUENTIALLY (one Playwright
+    browser connection at a time) — capture_system_record only snapshots
+    already-recorded shared-engine state, so no two connections need to be
+    live simultaneously. Each system's validation goal(s) are driven by the
+    real, read-only menu-discovery scan
+    (cross_system_goal.real_browser_validation.run_menu_validation_goal).
+    """
+
+    from prototype.stage2.app.cross_system_goal import CrossSystemGoalOrchestrator, SystemProfile
+
+    systems_config = json.loads(Path(systems_config_path).read_text(encoding="utf-8"))
+    if not isinstance(systems_config, list) or not systems_config:
+        raise ValueError(f"Expected a non-empty list in {systems_config_path}")
+
+    run_id = run_id or "cross_system_goal_real_browser_run"
+    output_dir = ROOT_DIR / "artifacts" / "stage2" / "cross_system_goal_runs" / run_id
+
+    orchestrator = CrossSystemGoalOrchestrator(output_dir=output_dir, run_id=run_id)
+
+    from playwright.async_api import async_playwright
+
+    per_system_results: list[dict[str, Any]] = []
+    for entry in systems_config:
+        system = SystemProfile(
+            system_id=entry["system_id"],
+            system_name=entry.get("system_name", entry["system_id"]),
+            run_mode="real_browser",
+        )
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.connect_over_cdp(entry["cdp_url"])
+            try:
+                page = await _resolve_connected_page(entry["cdp_url"], browser)
+                target_url = entry.get("target_url")
+                if target_url and target_url not in page.url:
+                    await page.goto(target_url, wait_until="domcontentloaded")
+                    await page.wait_for_timeout(1500)
+
+                screenshots_dir = output_dir / system.system_id / "screenshots"
+                record = await orchestrator.run_real_browser_validation(
+                    system,
+                    page,
+                    screenshots_dir=screenshots_dir,
+                    max_pages=int(entry.get("max_pages", 5)),
+                )
+            finally:
+                await browser.close()
+
+        per_system_results.append(
+            {"system_id": system.system_id, "goal_count": len(record.goals)}
+        )
+
+    def _stringify_paths(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: _stringify_paths(item) for key, item in value.items()}
+        return str(value)
+
+    exported = orchestrator.export_all()
+    summary = orchestrator.get_summary()
+    summary["output_dir"] = str(output_dir)
+    summary["per_system_results"] = per_system_results
+    summary["exported_paths"] = _stringify_paths(exported)
+    return summary
+
+
 async def _resolve_connected_page(cdp_url: str, browser: Any) -> Any:
     pages = []
     for context in browser.contexts:
@@ -2016,6 +2091,24 @@ def main() -> None:
         help="Maximum features-per-page budget for the real-browser page/feature goal drivers.",
     )
     parser.add_argument(
+        "--run-cross-system-goal",
+        action="store_true",
+        help="Run Stage F's real-browser cross-system validation over N systems "
+        "listed in --cross-system-systems, comparing failures and reviewing "
+        "platform-promotion eligibility across them.",
+    )
+    parser.add_argument(
+        "--cross-system-systems",
+        default="",
+        help="Path to a JSON list of systems for --run-cross-system-goal, each "
+        "{system_id, system_name, cdp_url, target_url?, max_pages?} (required).",
+    )
+    parser.add_argument(
+        "--cross-system-run-id",
+        default="",
+        help="Optional explicit run id for --run-cross-system-goal.",
+    )
+    parser.add_argument(
         "--report-date",
         default="",
         help="Optional explicit date string for the generated platform daily report.",
@@ -2354,6 +2447,23 @@ def main() -> None:
                         cdp_url=args.cdp_url,
                         run_id=args.goal_chain_run_id or None,
                         max_features_per_page=args.goal_chain_max_features_per_page,
+                    )
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+
+    if args.run_cross_system_goal:
+        if not args.cross_system_systems:
+            raise SystemExit("--run-cross-system-goal requires --cross-system-systems <path>")
+        print(
+            json.dumps(
+                asyncio.run(
+                    run_cross_system_goal_entrypoint(
+                        args.cross_system_systems,
+                        run_id=args.cross_system_run_id or None,
                     )
                 ),
                 ensure_ascii=False,

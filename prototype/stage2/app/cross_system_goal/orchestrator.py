@@ -34,6 +34,7 @@ producer unless their frontiers are kept disjoint" precedent.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ..goal_loop.state_machine import GoalLoopEngine
 from .comparison import CrossSystemFailureComparison, compare_failure_classifications
@@ -47,6 +48,9 @@ from .fixture_writer import (
 from .promotion_reviewer import PromotionReview, review_experience_updates
 from .run_record import CrossSystemRunRecord
 from .system_registry import SystemProfile
+
+if TYPE_CHECKING:
+    from playwright.async_api import Page
 
 
 class CrossSystemGoalOrchestrator:
@@ -113,6 +117,39 @@ class CrossSystemGoalOrchestrator:
         self._records.append(record)
         self._captured_system_ids.add(system.system_id)
         return record
+
+    async def run_real_browser_validation(
+        self,
+        system: SystemProfile,
+        page: "Page",
+        *,
+        screenshots_dir: Path,
+        max_pages: int = 5,
+    ) -> CrossSystemRunRecord:
+        """Register ``system``, run the real menu-discovery validation goal
+        against it via ``page``, then capture and return its
+        :class:`CrossSystemRunRecord`.
+
+        Combines :meth:`register_system` + ``real_browser_validation.
+        run_menu_validation_goal`` + :meth:`capture_system_record` into one
+        call. This is the ONLY real-browser capability this orchestrator
+        gets — no sync counterpart is added, since Stage F never had a
+        "simulate a real check" fixture runner to preserve backward-compat
+        with (its only pre-existing paths are "drive the engine directly"
+        and "replay a frozen file", both untouched by this method).
+        """
+
+        from .real_browser_validation import run_menu_validation_goal
+
+        adapter = self.register_system(system)
+        await run_menu_validation_goal(
+            page,
+            adapter,
+            self.engine,
+            screenshots_dir=screenshots_dir,
+            max_pages=max_pages,
+        )
+        return self.capture_system_record(system.system_id)
 
     def _reject_duplicate_capture(self, system_id: str) -> None:
         if system_id in self._captured_system_ids:
