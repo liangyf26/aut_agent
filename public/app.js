@@ -2,7 +2,16 @@ const STAGE2_ONBOARDING_FORM_KEY = 'stage2_new_system_onboarding_form';
 const STAGE2_ONBOARDING_RESULTS_KEY = 'stage2_new_system_onboarding_results';
 const STAGE2_LOCAL_RUNS_KEY = 'stage2_v3_local_runs';
 const STAGE2_ACTION_LOG_LIMIT = 200;
-const WORKSPACE_VIEW = window.location.pathname.replace(/\/+$/, '') === '/stage2' ? 'stage2' : 'stage1';
+const WORKSPACE_VIEW = (() => {
+  const normalizedPath = window.location.pathname.replace(/\/+$/, '');
+  if (normalizedPath === '/stage2') {
+    return 'stage2';
+  }
+  if (normalizedPath === '/testcenter') {
+    return 'testcenter';
+  }
+  return 'stage1';
+})();
 
 const stage2OnboardingDefaults = {
   systemName: '',
@@ -1386,6 +1395,19 @@ function renderProjectHeader() {
   const project = state.currentProject;
   const runCenter = getProjectRunCenter(project);
   const eyebrow = document.querySelector('.eyebrow');
+
+  if (WORKSPACE_VIEW === 'testcenter') {
+    if (eyebrow) {
+      eyebrow.textContent = '第二阶段 goal_loop 测试工具';
+    }
+    pageTitle.textContent = '第二阶段测试中心';
+    pageSubtitle.textContent = '阶段A-E的单元测试和端到端全流程测试在这里独立操作，与第二阶段运行中心的 v3 run 无关。';
+    projectStatus.textContent = '就绪';
+    projectStatus.className = 'status-pill success';
+    document.title = '第二阶段测试中心 - aut_agent';
+    return;
+  }
+
   if (WORKSPACE_VIEW === 'stage2') {
     if (eyebrow) {
       eyebrow.textContent = '第二阶段 Python 执行子系统';
@@ -1394,17 +1416,7 @@ function renderProjectHeader() {
     pageSubtitle.textContent = '新系统接入、验证矩阵、人工接管和运行产物在这里独立操作。';
     projectStatus.textContent = state.stage2Overview ? '已接入' : '待读取';
     projectStatus.className = `status-pill ${state.stage2Overview ? 'success' : 'warning'}`;
-  } else if (eyebrow) {
-    eyebrow.textContent = '第一阶段需求驱动评测';
-  }
-
-  if (WORKSPACE_VIEW === 'stage2') {
     document.title = '第二阶段运行中心 - aut_agent';
-  } else {
-    document.title = 'aut_agent 软件自动化评测平台';
-  }
-
-  if (WORKSPACE_VIEW === 'stage2') {
     document.querySelector('#currentPhaseLabel').textContent = runCenter.currentPhaseLabel;
     document.querySelector('#currentStepLabel').textContent = runCenter.currentStepLabel;
     document.querySelector('#currentObjectLabel').textContent = runCenter.currentObjectLabel || '未选择项目';
@@ -1413,6 +1425,11 @@ function renderProjectHeader() {
     document.querySelector('#lastUpdatedLabel').textContent = formatDate(project?.updatedAt || runCenter.latestEventAt, true);
     return;
   }
+
+  if (eyebrow) {
+    eyebrow.textContent = '第一阶段需求驱动评测';
+  }
+  document.title = 'aut_agent 软件自动化评测平台';
 
   pageTitle.textContent = project ? project.name : '自动化测试运行中心';
   pageSubtitle.textContent = project
@@ -2807,7 +2824,7 @@ function renderTestCenterE2eSection() {
 }
 
 function renderStage2TestCenterTab() {
-  const container = document.querySelector('#stage2TestcenterTab');
+  const container = document.querySelector('#stage2TestcenterPanel');
   if (!container) {
     return;
   }
@@ -4451,7 +4468,7 @@ document.querySelector('#stage2Cockpit')?.addEventListener('click', (event) => {
   }
 });
 
-document.querySelector('#stage2TestcenterTab')?.addEventListener('click', (event) => {
+document.querySelector('#stage2TestcenterPanel')?.addEventListener('click', (event) => {
   const unitButton = event.target.closest('[data-test-center-run-unit]');
   if (unitButton) {
     runTestCenterUnitSuite(unitButton.dataset.testCenterRunUnit);
@@ -4470,7 +4487,7 @@ document.querySelector('#stage2TestcenterTab')?.addEventListener('click', (event
   }
 });
 
-document.querySelector('#stage2TestcenterTab')?.addEventListener('input', (event) => {
+document.querySelector('#stage2TestcenterPanel')?.addEventListener('input', (event) => {
   const stageField = event.target.closest('[data-test-center-stage-field]');
   if (stageField) {
     const card = stageField.closest('[data-test-center-stage-card]');

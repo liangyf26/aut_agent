@@ -242,28 +242,41 @@ dd {
 }
 
 body[data-workspace="stage1"] .stage2-panel,
+body[data-workspace="stage1"] .testcenter-panel,
 body[data-workspace="stage1"] .stage1-entry-link,
 body[data-workspace="stage2"] .stage1-sidebar-only,
 body[data-workspace="stage2"] .stage2-entry-link,
+body[data-workspace="stage2"] .testcenter-panel,
 body[data-workspace="stage2"] #toggleProjectFormButton,
 body[data-workspace="stage2"] .hero-grid,
 body[data-workspace="stage2"] .metric-strip,
 body[data-workspace="stage2"] .project-form-shell,
 body[data-workspace="stage2"] .event-panel,
-body[data-workspace="stage2"] .detail-grid {
+body[data-workspace="stage2"] .detail-grid,
+body[data-workspace="testcenter"] .stage1-sidebar-only,
+body[data-workspace="testcenter"] #toggleProjectFormButton,
+body[data-workspace="testcenter"] .hero-grid,
+body[data-workspace="testcenter"] .metric-strip,
+body[data-workspace="testcenter"] .project-form-shell,
+body[data-workspace="testcenter"] .event-panel,
+body[data-workspace="testcenter"] .detail-grid,
+body[data-workspace="testcenter"] .stage2-panel {
   display: none;
 }
 
 body[data-workspace="stage1"] .operator-grid,
-body[data-workspace="stage2"] .operator-grid {
+body[data-workspace="stage2"] .operator-grid,
+body[data-workspace="testcenter"] .operator-grid {
   grid-template-columns: minmax(0, 1fr);
 }
 
-body[data-workspace="stage2"] .operator-grid {
+body[data-workspace="stage2"] .operator-grid,
+body[data-workspace="testcenter"] .operator-grid {
   margin-bottom: 0;
 }
 
-body[data-workspace="stage2"] .stage2-panel {
+body[data-workspace="stage2"] .stage2-panel,
+body[data-workspace="testcenter"] .testcenter-panel {
   min-height: calc(100vh - 116px);
 }
 
@@ -1248,6 +1261,12 @@ textarea:focus {
 }
 
 .stage2-control-deck {
+  padding: 18px;
+}
+
+.testcenter-panel {
+  display: grid;
+  gap: 12px;
   padding: 18px;
 }
 

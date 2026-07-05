@@ -20,6 +20,7 @@
         <nav class="workspace-nav" aria-label="工作台导航">
           <a href="/" data-workspace-link="stage1">第一阶段评测</a>
           <a href="/stage2" data-workspace-link="stage2">第二阶段运行中心</a>
+          <a href="/testcenter" data-workspace-link="testcenter">第二阶段测试中心</a>
         </nav>
 
         <button class="primary-action stage1-sidebar-only" id="newProjectButton" type="button">新建评测项目</button>
@@ -341,7 +342,6 @@
                   <button data-stage2-tab="report" type="button">报告</button>
                   <button data-stage2-tab="artifacts" type="button">Artifacts</button>
                   <button data-stage2-tab="goalloop" type="button">Goal Loop</button>
-                  <button data-stage2-tab="testcenter" type="button">测试中心</button>
                 </div>
 
                 <div class="stage2-tab-body" id="stage2OverviewTab"></div>
@@ -354,10 +354,11 @@
                 <div class="stage2-tab-body" id="stage2ReportTab"></div>
                 <div class="stage2-tab-body" id="stage2ArtifactsTab"></div>
                 <div class="stage2-tab-body" id="stage2GoalloopTab"></div>
-                <div class="stage2-tab-body" id="stage2TestcenterTab"></div>
               </section>
             </div>
           </article>
+
+          <article class="panel testcenter-panel" id="stage2TestcenterPanel"></article>
         </section>
 
         <section class="detail-grid">
