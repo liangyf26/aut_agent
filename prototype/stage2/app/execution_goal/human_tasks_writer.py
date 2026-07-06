@@ -174,17 +174,28 @@ def write_human_takeover(
     run_dir: str | Path,
     output_path: str | Path,
 ) -> Path | None:
-    """Write human_takeover.json, or return None if nothing is open.
+    """Write human_takeover.json, or a cleared marker if nothing is open.
 
-    Mirrors the packet shape ``session_artifacts._load_run_session_record``
-    already reads: ``status``, ``target_stage``, ``waiting_reason``,
-    ``pending_actions``, ``resume_command``, ``notes``.
+    ALWAYS writes a file so that stale takeover packets from prior runs are
+    overwritten — a ``None`` return left the old file in place, which made the
+    test center (and any downstream reader) believe a prior run's paused goal
+    was still unresolved.
     """
 
     paused_goals = _paused_execution_goals(engine)
     pending_authorizations = [outcome for outcome in outcomes if outcome.requires_human_authorization]
     if not paused_goals and not pending_authorizations:
-        return None
+        _safe_json_write(output_path, {
+            "schema_version": "stage2_execution_human_takeover.v1",
+            "status": "resolved",
+            "run_id": run_id,
+            "target_stage": "execution",
+            "waiting_reason": None,
+            "pending_actions": [],
+            "resume_command": None,
+            "notes": ["No paused goals or pending authorizations — this file overwrites any stale takeover packet from a prior run."],
+        })
+        return Path(output_path)
 
     pending_actions: list[dict[str, Any]] = []
     for goal in paused_goals:
