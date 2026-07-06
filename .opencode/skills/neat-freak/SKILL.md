@@ -138,6 +138,22 @@ description: >
 
 在所有文件修改完之后（不是之前），给用户简洁摘要。
 
+### 第七步：Git 同步（强制）
+
+**所有修改完成后，必须执行 git sync，确保文档与代码的最新状态同步到远端仓库。** 这一步不是可选项——文档审查的价值依赖于"文档能被其他人看到"，而远端仓库是唯一可信的共享副本。
+
+执行顺序：
+1. `git status --short` — 确认所有变更已被纳入
+2. `git add -A` — 暂存全部变更（文档修改、新增文件、删除废弃文件）
+3. `git commit -m "neat: <简要描述本次同步做了什么>"` — 提交
+4. `git push` — 推送到远端
+
+commit message 约定：以 `neat:` 为前缀，简述本次同步的主要内容。例如：
+- `neat: 更新 AGENTS.md 环境变量表，同步 docs/architecture.md Data Model`
+- `neat: 毕业 3 条记忆进 docs/，删除 2 条过期临时待办，补 .gitignore 红线`
+
+如果工作区干净（`git status --short` 无输出），跳过此步并在摘要中注明「工作区无变更，跳过 git 同步」。
+
 ## 参考资料
 
 - **[references/sync-matrix.md](references/sync-matrix.md)** — 完整的"变更类型 → 要改哪些文件"映射表
