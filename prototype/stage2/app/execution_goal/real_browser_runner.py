@@ -406,23 +406,27 @@ async def execute_test_case_with_playwright(
     # BEFORE any Playwright call — a mislabeled high-risk case must be
     # refused here exactly as it is in the fixture path.
     if case_type == "executable" and risk_level == "high":
-        return ExecutionOutcome(
-            test_case_id=test_case_id,
-            feature_id=feature_id,
-            page_id=page_id,
-            goal_id=goal_id,
-            status=STATUS_FAILED,
-            case_kind=case_type,
-            execution_mode=EXECUTION_MODE_REAL_BROWSER,
-            failure_reason="blocked_by_safety_policy",
-            requires_human_authorization=True,
-            notes=[
-                "refused: an 'executable' case declared risk_level='high'; "
-                "high-risk actions must be generated as 'entry_confirmation', "
-                "not executed automatically — same defense-in-depth check as "
-                "the fixture-simulated runner, enforced before touching the browser",
-            ],
-        )
+        safety_policy = (cascade_context or {}).get("safety_policy") or "low_risk_only"
+        if safety_policy == "test_env_full_access":
+            pass  # allowed — proceed to execution
+        else:
+            return ExecutionOutcome(
+                test_case_id=test_case_id,
+                feature_id=feature_id,
+                page_id=page_id,
+                goal_id=goal_id,
+                status=STATUS_FAILED,
+                case_kind=case_type,
+                execution_mode=EXECUTION_MODE_REAL_BROWSER,
+                failure_reason="blocked_by_safety_policy",
+                requires_human_authorization=True,
+                notes=[
+                    "refused: an 'executable' case declared risk_level='high'; "
+                    "high-risk actions must be generated as 'entry_confirmation', "
+                    "not executed automatically — same defense-in-depth check as "
+                    "the fixture-simulated runner, enforced before touching the browser",
+                ],
+            )
 
     if case_type == "view_only":
         metadata = test_case.get("metadata") or {}

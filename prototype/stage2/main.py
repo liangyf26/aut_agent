@@ -699,6 +699,8 @@ async def run_execution_goal_entrypoint(
     run_id: str | None = None,
     max_rounds: int = 1,
     model_name: str | None = None,
+    allow_real_browser_retry: bool = False,
+    safety_policy: str = "low_risk_only",
 ) -> dict[str, Any]:
     """Run Stage E's execution_goal orchestrator over a generated_test_cases.json fixture.
 
@@ -756,7 +758,9 @@ async def run_execution_goal_entrypoint(
 
     async def _run_and_export(**run_kwargs: Any) -> list[dict[str, Any]]:
         rounds = await orchestrator.run_until_stable(
-            test_cases, mode=mode, max_rounds=max_rounds, **run_kwargs
+            test_cases, mode=mode, max_rounds=max_rounds,
+            allow_real_browser_retry=allow_real_browser_retry,
+            **run_kwargs
         )
 
         orchestrator.export_execution_results()
@@ -1023,6 +1027,8 @@ async def run_feature_goal_entrypoint(
     cdp_url: str = DEFAULT_CDP_URL,
     run_id: str | None = None,
     max_features_per_page: int = 6,
+    safety_policy: str = "low_risk_only",
+    model_name: str | None = None,
 ) -> dict[str, Any]:
     """Run Stage D's feature_goal real-browser classification and write
     feature_points.json / generated_test_cases.json.
@@ -1070,38 +1076,99 @@ async def run_feature_goal_entrypoint(
     root_goal_id = orchestrator.create_root_goal()
 
     all_test_cases: list[dict[str, Any]] = []
+    pages_to_rescan: list[dict] = list(reachable_entries)
+    auto_round = 0
+    MAX_AUTO_ROUNDS = 2
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.connect_over_cdp(cdp_url)
         try:
             page = await _resolve_connected_page(cdp_url, browser)
-            for entry in reachable_entries:
-                page_id = entry["page_id"]
-                page_url = entry.get("page_url")
-                page_goal = engine.register_goal(
-                    goal_type="feature",
-                    goal_name=f"Discover features on {entry.get('page_title') or page_id}",
-                    parent_goal_id=root_goal_id,
-                    origin=f"page_features::{page_id}",
-                )
-                if page_url:
-                    await page.goto(page_url, wait_until="domcontentloaded", timeout=8000)
-                    # 1500ms, matching run_connected_template_validation's own
-                    # post-navigation wait (main.py above) — 300ms was too
-                    # short to observe this codebase's real target systems'
-                    # Vue/Element-UI controls render after navigation (found
-                    # during 2026-07-04 real suyuan-system verification: a
-                    # 300ms wait produced 0 controls, 1500ms produced 6).
-                    await page.wait_for_timeout(1500)
-                _feature_goal_ids, test_cases = await classify_features_with_playwright(
-                    page,
-                    adapter,
-                    page_goal.goal_id,
-                    page_id=page_id,
-                    screenshots_dir=output_dir / "screenshots",
-                    max_features_per_page=max_features_per_page,
-                )
-                all_test_cases.extend(test_cases)
+
+            while auto_round <= MAX_AUTO_ROUNDS and pages_to_rescan:
+                round_test_cases: list[dict[str, Any]] = []
+                next_pages: list[dict] = []
+
+                for entry in pages_to_rescan:
+                    page_id = entry["page_id"]
+                    page_url = entry.get("page_url")
+                    if page_url:
+                        await page.goto(page_url, wait_until="domcontentloaded", timeout=8000)
+                        await page.wait_for_timeout(1500)
+
+                    if auto_round > 0 and model_name:
+                        # Browser Use re-classification for unrecognized controls
+                        from prototype.stage2.app.execution_goal.browser_use_executor import (
+                            BrowserUseSafety, execute_with_browser_use,
+                        )
+                        page_title = await page.title()
+                        page_text = (await page.inner_text("body"))[:500] if False else ""
+                        instruction = (
+                            f"当前页面标题：{page_title}。\n"
+                            "请浏览页面上所有可见的输入控件（input、select、textarea），"
+                            "对每个控件判断其功能类型：file_upload(文件上传)、date_picker(日期选择)、"
+                            "text_input(文本输入)、cascader(级联选择下拉)、dropdown(普通下拉)、"
+                            "submit(提交按钮)、number_input(数字输入)。\n"
+                            "返回 JSON: {\"controls\": [{\"tag\": \"...\", \"type\": \"...\", "
+                            "\"text\": \"...\", \"feature_type\": \"...\", \"risk_level\": \"low|high\"}]}"
+                        )
+                        try:
+                            result = await execute_with_browser_use(
+                                page, instruction,
+                                context={"stage": "feature_discovery", "cdp_url": cdp_url},
+                                safety=BrowserUseSafety(write_allowed=False, max_steps=5),
+                                model_name=model_name,
+                            )
+                            if result.ok:
+                                import json as _json
+                                actions_text = str(result.actions)
+                                m = __import__("re").search(r'\{[^{}]*"controls"\s*:\s*\[[^\]]*\][^{}]*\}', actions_text)
+                                if m:
+                                    data = _json.loads(m.group(0))
+                                    for ctrl in data.get("controls", []):
+                                        ft = ctrl.get("feature_type")
+                                        if ft and ft != "other":
+                                            from prototype.stage2.app.v3_real_browser import register_feature_type
+                                            keywords = [ctrl.get("text", ""), ctrl.get("tag", ""), ctrl.get("type", "")]
+                                            register_feature_type(ft, [k for k in keywords if k])
+                        except Exception:
+                            pass
+                        await page.wait_for_timeout(500)
+
+                    page_goal = engine.register_goal(
+                        goal_type="feature",
+                        goal_name=f"Discover features on {entry.get('page_title') or page_id}",
+                        parent_goal_id=root_goal_id,
+                        origin=f"page_features::{page_id}",
+                    )
+                    _feature_goal_ids, test_cases = await classify_features_with_playwright(
+                        page,
+                        adapter,
+                        page_goal.goal_id,
+                        page_id=page_id,
+                        screenshots_dir=output_dir / "screenshots",
+                        max_features_per_page=max_features_per_page,
+                        safety_policy=safety_policy,
+                        cdp_url=cdp_url,
+                        model_name=model_name,
+                    )
+                    round_test_cases.extend(test_cases)
+
+                    # Check if this page still has unrecognized controls
+                    from prototype.stage2.app.v3_real_browser import (
+                        get_unrecognized_controls, clear_unrecognized_controls,
+                    )
+                    remaining = [c for c in get_unrecognized_controls() if c.get("page_id") == page_id]
+                    if remaining:
+                        next_pages.append(entry)
+                    clear_unrecognized_controls()
+
+                all_test_cases = round_test_cases  # last round wins (has most complete classification)
+                if not next_pages:
+                    break
+                pages_to_rescan = next_pages
+                auto_round += 1
+
         finally:
             await browser.close()
 
@@ -1119,6 +1186,15 @@ async def run_feature_goal_entrypoint(
     orchestrator._test_cases = all_test_cases
     run_summary_path = orchestrator.export_goal_summary()
 
+    from prototype.stage2.app.v3_real_browser import get_unrecognized_controls, clear_unrecognized_controls
+
+    unrecognized = get_unrecognized_controls()
+    if unrecognized:
+        unrecognized_path = output_dir / "unrecognized_controls.json"
+        import json as _json
+        unrecognized_path.write_text(_json.dumps(unrecognized, ensure_ascii=False, indent=2), encoding="utf-8")
+    clear_unrecognized_controls()
+
     return {
         "run_id": run_id,
         "output_dir": str(output_dir),
@@ -1131,6 +1207,9 @@ async def run_feature_goal_entrypoint(
         "generated_test_cases_path": str(test_cases_path),
         "discovery_review_path": str(discovery_review_path),
         "run_summary_path": str(run_summary_path),
+        "unrecognized_controls": len(unrecognized),
+        "unrecognized_controls_path": str(unrecognized_path) if unrecognized else None,
+        "auto_rounds": auto_round,
     }
 
 
@@ -2067,6 +2146,14 @@ def main() -> None:
         "regardless of this value, since retrying a live production action unattended is not safe.",
     )
     parser.add_argument(
+        "--execution-goal-allow-real-browser-retry",
+        action="store_true",
+        default=False,
+        help="FOR TEST ENVIRONMENTS ONLY. Allows real_browser mode to auto-retry across "
+        "multiple rounds (like fixture_simulated). Retrying live production actions unattended "
+        "is unsafe — only use this against isolated test environments.",
+    )
+    parser.add_argument(
         "--run-menu-goal",
         action="store_true",
         help="Run Stage B's menu_goal real-browser discovery against the currently connected "
@@ -2114,6 +2201,12 @@ def main() -> None:
         type=int,
         default=6,
         help="Maximum features-per-page budget for the real-browser page/feature goal drivers.",
+    )
+    parser.add_argument(
+        "--goal-chain-safety-policy",
+        default="low_risk_only",
+        choices=("low_risk_only", "test_env_full_access"),
+        help="Safety policy for the goal-chain pipeline (feature + execution stages).",
     )
     parser.add_argument(
         "--run-cross-system-goal",
@@ -2417,6 +2510,8 @@ def main() -> None:
                         cdp_url=args.cdp_url,
                         run_id=args.execution_goal_run_id or None,
                         max_rounds=args.execution_goal_max_rounds,
+                        allow_real_browser_retry=args.execution_goal_allow_real_browser_retry,
+                        safety_policy=args.goal_chain_safety_policy,
                     )
                 ),
                 ensure_ascii=False,
@@ -2472,6 +2567,8 @@ def main() -> None:
                         cdp_url=args.cdp_url,
                         run_id=args.goal_chain_run_id or None,
                         max_features_per_page=args.goal_chain_max_features_per_page,
+                        safety_policy=args.goal_chain_safety_policy,
+                        model_name=args.model or None,
                     )
                 ),
                 ensure_ascii=False,

@@ -30,6 +30,7 @@ def generate_test_case(
     element_locator: str | None = None,
     locator_candidates: list[dict] | None = None,
     page_url: str | None = None,
+    safety_policy: str = "low_risk_only",
 ) -> dict:
     """
     Generate a test case for a feature point.
@@ -81,7 +82,8 @@ def generate_test_case(
     # export job), unlike a read-only query/reset/detail/tab action.
     needs_confirmation = (
         not should_generate_executable_test(risk_level, confidence)
-        or feature_type in _SIDE_EFFECTING_FEATURE_TYPES
+        and safety_policy != "test_env_full_access"
+        or (feature_type in _SIDE_EFFECTING_FEATURE_TYPES and safety_policy != "test_env_full_access")
     )
 
     if needs_confirmation:

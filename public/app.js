@@ -186,7 +186,7 @@ const state = {
     unitTestResults: {},
     goalChainStageResults: {},
     goalChainStageForms: {},
-    e2eForm: { cdpUrl: 'http://localhost:9222', executionMode: 'fixture_simulated' },
+    e2eForm: { cdpUrl: 'http://localhost:9222', executionMode: 'fixture_simulated', systemName: '', maxPages: '5', maxFeaturesPerPage: '12', safetyPolicy: 'low_risk_only', modelName: '' },
     e2eResult: null,
     e2eProgress: null,
     e2ePollTimer: null,
@@ -2616,12 +2616,14 @@ function testCenterVerdictTag(verdict, reason) {
     passed: '通过',
     failed: '失败',
     needs_human: '需人工介入',
+    warning: '注意',
     unknown: '未知'
   };
   const classByVerdict = {
     passed: 'passed',
     failed: 'failed',
     needs_human: 'manual',
+    warning: 'warning',
     unknown: 'warning'
   };
   const label = labelByVerdict[verdict] || verdict || '未知';
@@ -2938,6 +2940,11 @@ function renderTestCenterE2eSection() {
           <small>已登录目标系统的 Chrome 远程调试地址，四个阶段共用同一个连接。</small>
         </label>
         <label class="stage2-field">
+          <span>Browser Use 模型</span>
+          <input type="text" data-test-center-e2e-field="modelName" value="${escapeHtml(form.modelName || '')}" placeholder="local_ai" />
+          <small>功能发现阶段 Browser Use 复分类用的模型 profile 名（如 local_ai、local_qwen）。留空则跳过 Browser Use 复分类。</small>
+        </label>
+        <label class="stage2-field">
           <span>执行阶段模式</span>
           <select data-test-center-e2e-field="executionMode">
             <option value="fixture_simulated" ${form.executionMode === 'fixture_simulated' ? 'selected' : ''}>fixture_simulated（安全，纯模拟）</option>
@@ -2946,9 +2953,45 @@ function renderTestCenterE2eSection() {
           <small>只影响最后的执行阶段；菜单/页面/功能点发现三个阶段恒定驱动真实浏览器。</small>
         </label>
         <label class="stage2-field">
+          <span>安全策略</span>
+          <select data-test-center-e2e-field="safetyPolicy">
+            <option value="low_risk_only" ${form.safetyPolicy !== 'test_env_full_access' ? 'selected' : ''}>low_risk_only（仅低风险，提交/删除需人工确认）</option>
+            <option value="test_env_full_access" ${form.safetyPolicy === 'test_env_full_access' ? 'selected' : ''}>test_env_full_access（全功能，允许提交/保存/上传，仅测试环境）</option>
+          </select>
+          <small>影响执行阶段的风险控制。选 test_env_full_access 后提交、保存等高危操作将自动执行（需确认在测试环境）。</small>
+        </label>
+        <label class="stage2-field">
           <span>执行最大轮数</span>
           <input type="number" data-test-center-e2e-field="maxExecutionRounds" value="${escapeHtml(form.maxExecutionRounds || '1')}" min="1" max="20" />
           <small>real_browser 模式始终只执行一轮；fixture_simulated 可按此上限自动重试可重试的失败用例。</small>
+        </label>
+        <label class="stage2-field">
+          <span>real_browser 多轮重试</span>
+          <select data-test-center-e2e-field="allowRealBrowserRetry">
+            <option value="" ${!form.allowRealBrowserRetry ? 'selected' : ''}>不允许（默认，单轮后停止）</option>
+            <option value="true" ${form.allowRealBrowserRetry === 'true' ? 'selected' : ''}>允许（测试环境可用，多轮自动重试）</option>
+          </select>
+          <small>仅测试环境可用。默认禁止 real_browser 多轮重试（避免无人看守时对生产系统重复操作）。勾选后才放开 maxRounds 对 real_browser 的限制。</small>
+        </label>
+        <label class="stage2-field">
+          <span>目标系统名称</span>
+          <input type="text" data-test-center-e2e-field="systemName" value="${escapeHtml(form.systemName || '')}" placeholder="如：线上备案申请、用户管理" />
+          <small>可选，仅用于运行记录标记。</small>
+        </label>
+        <label class="stage2-field">
+          <span>目标页面 URL</span>
+          <input type="text" data-test-center-e2e-field="targetUrl" value="${escapeHtml(form.targetUrl || '')}" placeholder="https://example.com/page" />
+          <small>可选。设置后在启动前导航 Chrome 到此页面；留空则从 Chrome 当前页面开始发现。</small>
+        </label>
+        <label class="stage2-field">
+          <span>最大发现页面数</span>
+          <input type="number" data-test-center-e2e-field="maxPages" value="${escapeHtml(form.maxPages || '5')}" min="1" max="100" />
+          <small>菜单发现阶段扫描的菜单/页面数量上限，越大覆盖越全但耗时越长。</small>
+        </label>
+        <label class="stage2-field">
+          <span>每页最大功能点数</span>
+          <input type="number" data-test-center-e2e-field="maxFeaturesPerPage" value="${escapeHtml(form.maxFeaturesPerPage || '12')}" min="1" max="200" />
+          <small>功能点发现阶段每页识别的控件数量，调大可以捕获更多交互控件（上传、级联、日期选择等）。默认 12。</small>
         </label>
       </div>
       <div class="inline-actions">

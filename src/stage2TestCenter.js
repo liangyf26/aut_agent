@@ -1,4 +1,5 @@
 const fs = require('fs/promises');
+const http = require('http');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
@@ -141,6 +142,15 @@ function requireSafeId(value, fieldName) {
   const text = String(value || '').trim();
   if (!SAFE_ID_PATTERN.test(text)) {
     throw new TestCenterInputError(`${fieldName} 只能包含字母、数字、下划线或连字符，并且必须以字母或数字开头。`);
+  }
+  return text;
+}
+
+function requireSafeModelName(value, fieldName) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$/.test(text)) {
+    throw new TestCenterInputError(`${fieldName} 只能包含字母、数字、下划线或连字符。`);
   }
   return text;
 }
@@ -375,6 +385,12 @@ const GOAL_CHAIN_STAGES = {
         args.push('--goal-chain-run-id', requireSafeId(params.runId, 'runId'));
       }
       args.push('--goal-chain-max-features-per-page', String(requireInt(params.maxFeaturesPerPage, 'maxFeaturesPerPage', 1, 100, 6)));
+      if (params.safetyPolicy === 'test_env_full_access') {
+        args.push('--goal-chain-safety-policy', 'test_env_full_access');
+      }
+      if (params.modelName) {
+        args.push('--model', requireSafeModelName(params.modelName, 'modelName'));
+      }
       return args;
     },
     outputDir: (runId, stage2Dir) => path.join(stage2Dir, 'feature_goal_runs', runId),
@@ -389,7 +405,9 @@ const GOAL_CHAIN_STAGES = {
       { name: 'cdpUrl', label: 'CDP URL', help: '仅 mode=real_browser 时需要。' },
       { name: 'testCasesPath', label: 'generated_test_cases.json 路径', help: '上一步功能点发现写出的产物（端到端模式下自动填充）。' },
       { name: 'mode', label: '执行模式', help: 'fixture_simulated（默认，纯模拟，不碰真实系统，安全）或 real_browser（真实点击/填表/提交生产系统，需谨慎）。' },
-      { name: 'maxRounds', label: '自动重试轮次', help: '仅 fixture_simulated 生效：允许自动重试可重试失败（如 LOCATOR_UNSTABLE）的轮次数，默认 1；real_browser 恒定跑 1 轮，不受此参数影响。' }
+      { name: 'maxRounds', label: '自动重试轮次', help: '允许自动重试可重试失败（如 LOCATOR_UNSTABLE）的轮次数，默认 1。real_browser 模式下需同时勾选「允许 real_browser 多轮重试」。' },
+      { name: 'allowRealBrowserRetry', label: '允许 real_browser 多轮重试', help: '仅测试环境可用。real_browser 模式默认恒定只跑 1 轮（避免无人看守时重试生产环境）。勾选后可使用 maxRounds 控制 real_browser 的自动重试轮次。' },
+      { name: 'safetyPolicy', label: '安全策略', help: 'low_risk_only（默认，高风险操作需人工确认）或 test_env_full_access（测试环境全功能，允许提交/保存/上传）。' }
     ],
     buildArgs: (params, context) => {
       const args = stage2BaseArgs('--run-execution-goal');
@@ -402,6 +420,12 @@ const GOAL_CHAIN_STAGES = {
       const executionRunId = params.runId || `execution_goal_${mode}_run`;
       args.push('--execution-goal-run-id', requireSafeId(executionRunId, 'runId'));
       args.push('--execution-goal-max-rounds', String(requireInt(params.maxRounds, 'maxRounds', 1, 20, 1)));
+      if (params.allowRealBrowserRetry === true || params.allowRealBrowserRetry === 'true') {
+        args.push('--execution-goal-allow-real-browser-retry');
+      }
+      if (params.safetyPolicy === 'test_env_full_access') {
+        args.push('--goal-chain-safety-policy', 'test_env_full_access');
+      }
       return args;
     },
     outputDir: (runId, stage2Dir) => path.join(stage2Dir, 'execution_goal_runs', runId),
@@ -467,6 +491,9 @@ async function runGoalChainStage(stageId, params = {}, dependencies = {}) {
 
   // Read discovery names from artifact files for the UI detail view
   let discoveredNames = null;
+  let decisionChain = [];
+  let unrecognizedControls = 0;
+
   if (stageId === 'menu') {
     const entries = await readJsonIfExists(path.join(outputDir, 'menu_entries.json')) || [];
     discoveredNames = { kind: 'menu', names: (entries || []).slice(0, 20).map((e) => e.menu_text || e.title || e.name || null).filter(Boolean) };
@@ -479,6 +506,8 @@ async function runGoalChainStage(stageId, params = {}, dependencies = {}) {
       kind: 'feature',
       items: (features || []).slice(0, 20).map((f) => ({ name: f.name || f.feature_point_id || null, type: f.feature_type, risk: f.risk_level }))
     };
+    const unrec = await readJsonIfExists(path.join(outputDir, 'unrecognized_controls.json')) || [];
+    unrecognizedControls = unrec.length;
   } else if (stageId === 'execution') {
     const execResults = await readJsonIfExists(path.join(outputDir, 'execution_results.json'));
     if (execResults) {
@@ -488,6 +517,33 @@ async function runGoalChainStage(stageId, params = {}, dependencies = {}) {
       for (const item of items) {
         if (item.status === 'passed') passed++;
         else { failed++; reasons[item.failure_reason] = (reasons[item.failure_reason] || 0) + 1; }
+
+        const actions = item.actions || [];
+        const cascadeActions = actions.filter((a) => {
+          const r = a.result || {};
+          return r.layer || r.cascade_notes || r.tried_candidates;
+        });
+        if (cascadeActions.length) {
+          const features = [];
+          for (const act of cascadeActions) {
+            const r = act.result || {};
+            const layer = r.layer || (r.tried_candidates ? 'l2' : 'unknown');
+            const failedAttempts = (r.attempts || []).concat(r.l2_attempts || []).concat(r.l3_attempts || []);
+            features.push({
+              action: act.action || 'unknown',
+              status: act.status || 'unknown',
+              layer,
+              winning_strategy: r.winning_strategy || null,
+              cascade_notes: r.cascade_notes || [],
+              failed_count: failedAttempts.length
+            });
+          }
+          decisionChain.push({
+            test_case_id: item.test_case_id,
+            failure_reason: item.failure_reason || null,
+            features
+          });
+        }
       }
       discoveredNames = { kind: 'execution', passed, failed, reasons };
     }
@@ -499,7 +555,8 @@ async function runGoalChainStage(stageId, params = {}, dependencies = {}) {
     runSummary,
     humanTakeover,
     humanTakeoverResolution,
-    runReport
+    runReport,
+    unrecognizedControls,
   });
 
   return {
@@ -520,11 +577,48 @@ async function runGoalChainStage(stageId, params = {}, dependencies = {}) {
     humanTakeoverResolution,
     runReport,
     discoveredNames,
+    decisionChain,
+    unrecognizedControls,
     evaluation,
     chainOutputPath: stage.chainOutputKey && parsedStdout
       ? parsedStdout[stage.chainOutputKey] || null
       : null
   };
+}
+
+// ---------------------------------------------------------------------------
+// CDP 页面导航
+// ---------------------------------------------------------------------------
+
+function navigateCdpToUrl(cdpUrl, targetUrl) {
+  const base = cdpUrl.replace(/\/+$/, '');
+  return new Promise((resolve, reject) => {
+    const req = http.get(`${base}/json`, (res) => {
+      let body = '';
+      res.on('data', (chunk) => { body += chunk; });
+      res.on('end', async () => {
+        try {
+          const pages = JSON.parse(body);
+          const page = pages.find(p => p.type === 'page') || pages[0];
+          if (!page || !page.id) {
+            return reject(new Error('No open page found in CDP'));
+          }
+          await new Promise((res2, rej2) => {
+            http.get(`${base}/json/new?${encodeURIComponent(targetUrl)}`, (r) => {
+              r.resume();
+              r.on('end', res2);
+              r.on('error', rej2);
+            }).on('error', rej2);
+          });
+          resolve();
+        } catch (e) {
+          reject(e instanceof Error ? e : new Error(String(e)));
+        }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(5000, () => { req.destroy(); reject(new Error('CDP timeout')); });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -534,11 +628,18 @@ async function runGoalChainStage(stageId, params = {}, dependencies = {}) {
 const HUMAN_REQUIRED_GOAL_STATUSES = new Set(['waiting_human', 'blocked_by_policy', 'blocked_by_executor']);
 const FAILED_GOAL_STATUSES = new Set(['failed_max_rounds', 'stopped_no_progress']);
 
-function evaluateGoalLoopStepResult({ stageId, exitCode, runSummary, humanTakeover, humanTakeoverResolution, runReport }) {
+function evaluateGoalLoopStepResult({ stageId, exitCode, runSummary, humanTakeover, humanTakeoverResolution, runReport, unrecognizedControls }) {
   if (exitCode) {
     return {
       verdict: 'failed',
       reason: `命令以非零退出码 ${exitCode} 结束，视为该步骤失败。`
+    };
+  }
+
+  if (stageId === 'feature' && unrecognizedControls > 0) {
+    return {
+      verdict: 'warning',
+      reason: `功能发现完成，但有 ${unrecognizedControls} 个控件无法识别。建议启用 Browser Use 模型进行复分类，或检查页面控件类型是否在支持列表中。`
     };
   }
 
@@ -608,12 +709,23 @@ async function _runGoalChainEndToEndInternal(params = {}, dependencies = {}, onP
   const steps = [];
   let previousChainOutputPath = null;
 
+  // Navigate Chrome to target URL before starting discovery
+  if (params.targetUrl && params.cdpUrl) {
+    try {
+      await navigateCdpToUrl(params.cdpUrl, params.targetUrl);
+    } catch (_) {
+      // navigation failure is non-fatal — discovery starts from current page
+    }
+  }
+
   for (const stageId of GOAL_CHAIN_ORDER) {
     const stage = GOAL_CHAIN_STAGES[stageId];
     const stageParams = {
       ...(params.stageParams?.[stageId] || {}),
       cdpUrl: params.cdpUrl,
-      runId: sharedRunId
+      runId: sharedRunId,
+      maxPages: params.maxPages,
+      maxFeaturesPerPage: params.maxFeaturesPerPage,
     };
 
     if (onProgress) {
@@ -624,10 +736,14 @@ async function _runGoalChainEndToEndInternal(params = {}, dependencies = {}, onP
       stageParams.menuEntriesPath = previousChainOutputPath;
     } else if (stageId === 'feature') {
       stageParams.pageEntriesPath = previousChainOutputPath;
+      stageParams.safetyPolicy = params.safetyPolicy || 'low_risk_only';
+      stageParams.modelName = params.modelName || '';
     } else if (stageId === 'execution') {
       stageParams.testCasesPath = previousChainOutputPath;
       stageParams.mode = params.executionMode || 'fixture_simulated';
       stageParams.maxRounds = parseInt(params.maxExecutionRounds || '1', 10) || 1;
+      stageParams.allowRealBrowserRetry = params.allowRealBrowserRetry === true || params.allowRealBrowserRetry === 'true';
+      stageParams.safetyPolicy = params.safetyPolicy || 'low_risk_only';
     }
 
     let stepResult;

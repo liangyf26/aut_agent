@@ -348,6 +348,7 @@ class ExecutionGoalOrchestrator:
         page: Any = None,
         screenshots_dir: Path | None = None,
         injected_failures: dict[str, str] | None = None,
+        allow_real_browser_retry: bool = False,
     ) -> list[dict[str, Any]]:
         """Run round 1, then keep auto-advancing through retryable failures
         (方案 §13 exit=retry) within THIS process, up to ``max_rounds``.
@@ -432,7 +433,7 @@ class ExecutionGoalOrchestrator:
                 rounds.append(round_summary)
                 break
 
-            if mode == "real_browser":
+            if mode == "real_browser" and not allow_real_browser_retry:
                 round_summary["stopped_reason"] = (
                     "real_browser_round_limit: real-browser rounds always stop after "
                     "one round regardless of max_rounds; resolve/verify manually, then "

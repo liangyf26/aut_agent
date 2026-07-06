@@ -36,6 +36,7 @@
 - `prototype/stage2/app/execution_goal/preflight.py`: P0-3 Stage E 前置检查，启动时运行 capability routing 决定 L1-L4 各层可用性，写入 `routing_summary.json`
 - `prototype/stage2/app/execution_goal/browser_use_executor.py`: P0-4 Browser Use 统一执行器，提供 `execute_with_browser_use()` 入口和 `BrowserUseSafety` 安全约束层，供阶段 B/C/D/E 适配调用
 - `prototype/stage2/app/execution_goal/failure_adviser.py`: P1-1 LLM 归因顾问，提供 `analyze_failure()` 选择题型 prompt 和规则回退，结果写入 `round_analysis.json` 的 `llm_advice` 字段
+- `--goal-chain-safety-policy`: E2E 管线的安全策略开关（`low_risk_only` / `test_env_full_access`），接通 feature + execution 阶段，控制是否允许自动执行提交/上传等高危操作；同时 Stage D 对 `input[type=file]`/`date` 等原生类型做自动识别，并支持 Browser Use 对未知控件做语义复分类 + 动态词汇表注册 + 最多 2 轮自动循环
 - `prototype/stage2/templates/`: 项目级执行模板、基线、schema、locator hints
 - `prototype/stage2/app/verification/suyuan_shared_actions.py`: 溯源样本的 wizard / drawer 共享动作族
 - `prototype/stage2/app/verification/suyuan_submit_dialog_actions.py`: 溯源样本的 upload / submit dialog 共享动作族

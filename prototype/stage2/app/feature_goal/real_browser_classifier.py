@@ -232,6 +232,9 @@ async def classify_features_with_playwright(
     page_id: str,
     screenshots_dir: Path,
     max_features_per_page: int = 6,
+    safety_policy: str = "low_risk_only",
+    cdp_url: str = "",
+    model_name: str | None = None,
 ) -> tuple[list[str], list[dict[str, Any]]]:
     """Scan the CURRENT real page's DOM and register one feature goal per
     detected control.
@@ -302,16 +305,63 @@ async def classify_features_with_playwright(
 
     feature_goal_ids: list[str] = []
     test_cases: list[dict[str, Any]] = []
+    _browser_use_used = False
     for feature in real_features:
         feature_type = feature.get("feature_type", "view")
         risk_level = feature.get("risk_level", "low")
         element_text = feature.get("name")
         evidence = feature.get("evidence", {})
-        # Use the raw DOM text for locator construction (may be empty for
-        # icon-only elements); the display name (feature["name"]) can be a
-        # Python-generated fallback like "可见控件 1" that no DOM element
-        # actually contains.
         raw_text = str(evidence.get("raw_text") or "")
+        tag = evidence.get("tag") or ""
+        input_type = evidence.get("type") or ""
+
+        # Browser Use reclassification for unrecognized input/select controls
+        if feature_type == "view" and cdp_url and model_name and tag in {"input", "select", "textarea"}:
+            try:
+                from ..execution_goal.browser_use_executor import (
+                    BrowserUseSafety,
+                    execute_with_browser_use,
+                )
+                instruction = (
+                    f"页面上有一个 <{tag}> 控件" +
+                    (f"，type={input_type}" if input_type else "") +
+                    (f"，标签文字是 \"{element_text}\"" if element_text else "") +
+                    "。请判断这个控件的功能类型，从以下选项中选择："
+                    "file_upload(文件上传)、date_picker(日期选择)、text_input(文本输入)、"
+                    "cascader(级联选择下拉)、dropdown(普通下拉)、submit(提交按钮)、other(其他)。"
+                    "只返回 JSON: {\"feature_type\": \"...\", \"risk_level\": \"low|high\"}"
+                )
+                result = await execute_with_browser_use(
+                    page, instruction,
+                    context={"stage": "feature_discovery", "cdp_url": cdp_url},
+                    safety=BrowserUseSafety(write_allowed=False, max_steps=3),
+                    model_name=model_name,
+                )
+                if result.ok:
+                    import json as _json
+                    try:
+                        content = str(result.actions[0].get("content", "")) if result.actions else ""
+                        m = __import__("re").search(r'\{[^{}]*"feature_type"[^{}]*\}', content or str(result.actions))
+                        if m:
+                            data = _json.loads(m.group(0))
+                            new_type = data.get("feature_type")
+                        else:
+                            new_type = None
+                    except Exception:
+                        new_type = None
+                    if new_type and new_type != "other":
+                        feature_type = new_type
+                        risk_level = data.get("risk_level", "high") if new_type in {"file_upload", "submit"} else "low"
+                        _browser_use_used = True
+                        # Register new keywords so future rounds can classify this type directly
+                        from ..v3_real_browser import register_feature_type
+                        register_feature_type(new_type, [raw_text, element_text or "", tag, input_type])
+            except Exception:
+                pass
+            finally:
+                if feature_type == "view":
+                    continue  # still unrecognized — skip this control
+
         element_locator = _build_stable_locator(
             tag=evidence.get("tag") or "",
             text=raw_text,
@@ -374,6 +424,7 @@ async def classify_features_with_playwright(
                 element_locator=element_locator,
                 locator_candidates=locator_candidates,
                 page_url=page.url,
+                safety_policy=safety_policy,
             )
         )
 
