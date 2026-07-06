@@ -86,6 +86,13 @@ def _build_stable_locator(
         else:
             escaped = _escape_playwright_text(text)
             if escaped and len(escaped) < 60:
+                # Form elements (<input>, <textarea>, <select>) have no text
+                # content — their label() text comes from placeholder/value
+                # attributes.  ``:has-text`` only matches textContent, so it
+                # would never fire on these elements.  Use attribute selectors
+                # instead.
+                if tag in {"input", "textarea", "select"}:
+                    return f'{tag}[placeholder*="{escaped}"], {tag}[aria-label*="{escaped}"]'
                 return f'{tag}:has-text("{escaped}")'
 
     # 3. Tag + role attribute — stable across DOM re-renders, but ambiguous with multiple same-tag elements
