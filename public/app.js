@@ -1365,6 +1365,8 @@ function render() {
   renderStage2Overview();
   renderStage2RunDetail();
   renderTabs();
+  // 测试中心面板需要实时刷新（E2E 轮询驱动）
+  renderStage2TestCenterTab();
 }
 
 function renderWorkspaceChrome() {
