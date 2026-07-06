@@ -2777,7 +2777,7 @@ function _extractE2eDiscoveryDetail(result) {
       if (labels.length) parts.push(`（${labels.join('，')}）`);
     }
     if (parsed.total_execution_goals != null) parts.push(`共 ${parsed.total_execution_goals} 条用例`);
-    if (parsed.stopped_reason) parts.push(`\n停止原因: ${parsed.stopped_reason}`);
+    if (parsed.stopped_reason) parts.push(`\n停止原因: ${_translateStoppedReason(parsed.stopped_reason)}`);
     return parts.join(' ');
   }
   return null;
@@ -2884,7 +2884,7 @@ function renderTestCenterE2eSection() {
           `;
         }).join('')}
       </div>
-      <p class="stage2-help-text" data-e2e-stop-reason>${result?.stoppedReason ? `停止原因：${escapeHtml(result.stoppedReason)}` : ''}</p>
+      <p class="stage2-help-text" data-e2e-stop-reason>${result?.stoppedReason ? `停止原因：${escapeHtml(_translateStoppedReason(result.stoppedReason))}` : ''}</p>
       <div data-e2e-details>
         ${(steps || []).map((step) => `
           <details class="stage2-work-card" data-e2e-stage-id="${escapeHtml(step.stageId)}">
@@ -3001,6 +3001,21 @@ async function runTestCenterE2e() {
   }
 }
 
+function _translateStoppedReason(reason) {
+  if (!reason) return reason;
+  const m = {
+    'real_browser_round_limit': '真实浏览器执行限制：已执行一轮后自动停止，请人工核实后重新调用以重试可重试的用例',
+    'converged: no retryable failures remain.': '执行收敛：无可重试的失败用例',
+    'converged: no retryable failures after round 1.': '执行收敛：第一轮后无可重试的失败用例',
+    'paused_on_human_takeover': '存在待人工处理的暂停目标，请先执行 --resolve-goal-loop-takeover 再重新调用',
+    'max_rounds_reached': '已达最大轮数限制',
+  };
+  for (const [key, val] of Object.entries(m)) {
+    if (reason.includes(key)) return val;
+  }
+  return reason;
+}
+
 function refreshE2eProgress() {
   const panel = document.querySelector('#stage2TestcenterPanel');
   if (!panel) return;
@@ -3068,7 +3083,7 @@ function refreshE2eProgress() {
   // Update stop reason
   const stopReasonEl = e2eSection.querySelector('[data-e2e-stop-reason]');
   if (stopReasonEl) {
-    stopReasonEl.textContent = result?.stoppedReason ? `停止原因：${result.stoppedReason}` : '';
+    stopReasonEl.textContent = result?.stoppedReason ? `停止原因：${_translateStoppedReason(result.stoppedReason)}` : '';
   }
 }
 
