@@ -536,7 +536,7 @@ class ExecutionGoalOrchestrator:
         )
 
     def export_round_analysis(self, filename: str = "round_analysis.json") -> Path:
-        return write_round_analysis(self.engine, self.run_id, self.output_dir / filename)
+        return write_round_analysis(self.engine, self.adapter, self.run_id, self.output_dir / filename)
 
     def export_next_round_plan(self, filename: str = "next_round_plan.json") -> Path:
         return write_next_round_plan(

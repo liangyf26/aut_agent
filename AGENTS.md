@@ -35,6 +35,7 @@
 - `prototype/stage2/app/execution_goal/locator_trier.py`: P0-2 L2 定位器尝试引擎，按置信度降序遍历 Stage D 产出的 `locator_candidates`，首个命中的候选执行点击/填写动作，全部失败时抛出 `AllCandidatesFailed`
 - `prototype/stage2/app/execution_goal/preflight.py`: P0-3 Stage E 前置检查，启动时运行 capability routing 决定 L1-L4 各层可用性，写入 `routing_summary.json`
 - `prototype/stage2/app/execution_goal/browser_use_executor.py`: P0-4 Browser Use 统一执行器，提供 `execute_with_browser_use()` 入口和 `BrowserUseSafety` 安全约束层，供阶段 B/C/D/E 适配调用
+- `prototype/stage2/app/execution_goal/failure_adviser.py`: P1-1 LLM 归因顾问，提供 `analyze_failure()` 选择题型 prompt 和规则回退，结果写入 `round_analysis.json` 的 `llm_advice` 字段
 - `prototype/stage2/templates/`: 项目级执行模板、基线、schema、locator hints
 - `prototype/stage2/app/verification/suyuan_shared_actions.py`: 溯源样本的 wizard / drawer 共享动作族
 - `prototype/stage2/app/verification/suyuan_submit_dialog_actions.py`: 溯源样本的 upload / submit dialog 共享动作族

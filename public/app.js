@@ -2362,6 +2362,7 @@ function renderStage2V3AiTab() {
         <header><strong>改进与沉淀候选</strong><span class="tag">${escapeHtml(String((analysis.improvement_candidates || analysis.improvementCandidates || []).length || 0))}</span></header>
         ${renderStage2CompactList(analysis.improvement_candidates || analysis.improvementCandidates || [], '暂无改进候选。')}
       </article>
+      ${renderDecisionChain({decisionChain: run.decisionChain || run.summary?.decisionChain || []})}
     </section>
   `;
 }
@@ -2746,8 +2747,44 @@ function renderTestCenterStageResult(result) {
         </div>
       ` : ''}
     ` : ''}
+    ${renderDecisionChain(result)}
     ${result.stderrPreview ? `<details><summary>stderr</summary><pre>${escapeHtml(result.stderrPreview)}</pre></details>` : ''}
   `;
+}
+
+function renderDecisionChain(result) {
+  if (!result || !result.decisionChain || !result.decisionChain.length) {
+    return '';
+  }
+  const layerLabel = (l) => ({l2:'L2 候选池',l3:'L3 ARIA',l4:'L4 Browser Use',l1:'L1 静态'})[l] || l;
+  const statusIcons = {completed:'&#x2713;',failed:'&#x2717;',skipped:'&#x2014;'};
+  const statusClass = (s) => s === 'completed' ? 'passed' : 'failed';
+
+  let html = '<details class="stage2-work-card decision-chain"><summary>AI 决策链 <span class="tag muted">' + result.decisionChain.length + ' 个目标</span></summary>';
+  for (const chain of result.decisionChain) {
+    html += '<div class="chain-group">';
+    html += '<header><strong>' + escapeHtml(chain.test_case_id) + '</strong>';
+    if (chain.failure_reason) html += ' <span class="tag failed">' + escapeHtml(chain.failure_reason) + '</span>';
+    html += '</header>';
+    for (const feat of chain.features) {
+      const acts = feat.failed_attempts || [];
+      html += '<div class="chain-feature">';
+      html += '<span class="tag ' + statusClass(feat.status) + '">' + statusIcons[feat.status] + ' ' + layerLabel(feat.layer) + '</span>';
+      html += '<span class="chain-strategy">' + escapeHtml(feat.winning_strategy || feat.action) + '</span>';
+      if (feat.cascade_notes.length) {
+        html += '<ul class="chain-notes">' + feat.cascade_notes.map((n) => '<li>' + escapeHtml(n) + '</li>').join('') + '</ul>';
+      }
+      if (acts.length) {
+        html += '<details class="chain-attempts"><summary>' + acts.length + ' 次失败尝试</summary>';
+        html += '<ul class="chain-attempt-list">' + acts.map((a) => '<li><span class="tag muted">' + escapeHtml(a.strategy) + '</span> <code>' + escapeHtml(a.selector) + '</code></li>').join('') + '</ul>';
+        html += '</details>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  html += '</details>';
+  return html;
 }
 
 function _extractE2eDiscoveryDetail(result) {

@@ -198,8 +198,48 @@ def resolve_retryable_test_cases(
     return {"retryable": retryable, "blocked_reasons": blocked_reasons}
 
 
+def _load_llm_advice(engine: "GoalLoopEngine", adapter: "ExecutionAdapter") -> list[dict[str, Any]]:
+    """Generate rule-based failure advice for all failed goals in this round.
+
+    Produces structured ``FailureAdvice`` entries for ``round_analysis.json``'s
+    ``llm_advice`` field.  Uses only rule-based classification (no async LLM
+    call — the async ``analyze_round_failures()`` is for callers that can
+    await and have a model profile).
+    """
+    from ..goal_loop.models import STATUS_SUCCEEDED, TERMINAL_STATUSES, PAUSED_STATUSES
+    from .failure_adviser import _rule_based_advice
+
+    goals = _execution_goals(engine)
+    failed = [g for g in goals if g.status in TERMINAL_STATUSES and g.status != STATUS_SUCCEEDED]
+    paused = [g for g in goals if g.status in PAUSED_STATUSES]
+    advice_list: list[dict[str, Any]] = []
+
+    for goal in failed + paused:
+        last_attempt = engine.last_attempt_for(goal.goal_id)
+        failure_class = last_attempt.failure_class if last_attempt else None
+        context = adapter.get_execution_context(goal.goal_id)
+        test_case = context.get("test_case", {}) if context else {}
+        element_text = None
+        if isinstance(test_case, dict):
+            meta = test_case.get("metadata", {}) or {}
+            element_text = meta.get("element_text") or test_case.get("description")
+
+        advice = _rule_based_advice(failure_class)
+        if element_text:
+            advice.notes.append(f"element_text: {str(element_text)[:80]}")
+
+        advice_list.append({
+            "goal_id": goal.goal_id,
+            "failure_class": failure_class,
+            "advice": advice.to_dict(),
+        })
+
+    return advice_list
+
+
 def write_round_analysis(
     engine: "GoalLoopEngine",
+    adapter: "ExecutionAdapter",
     run_id: str,
     output_path: str | Path,
 ) -> Path:
@@ -240,6 +280,7 @@ def write_round_analysis(
         "failure_clusters": failure_clusters,
         "escalations": escalations,
         "next_round_suggestion": suggestion,
+        "llm_advice": _load_llm_advice(engine, adapter),
     }
     return _safe_json_write(output_path, payload)
 

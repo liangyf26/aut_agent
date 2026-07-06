@@ -126,6 +126,10 @@ _Avoid_: 候选失败直接报错、跳过 ARIA 直接调 LLM
 L4 语义接管层的统一入口 `execute_with_browser_use()`，接受 instruction、`BrowserUseSafety` 约束和 `context`（阶段/目标/已尝试策略），返回 `BrowserUseResult`。`write_allowed=False` 时仅允许导航和观察，禁用点击/填写/提交（P0-4）。
 _Avoid_: 各阶段各自造 Browser Use 封装、无统一安全层、高风险操作绕过门禁
 
+**LLM 归因顾问 (LLM Failure Adviser)**:
+Stage E 执行失败后，通过 `analyze_failure()` 生成选择题型 root cause 分析（`primary_cause`/`confidence`/`suggested_action`），LLM 调用 3s 超时后降级为规则回退。结果写入 `round_analysis.json` 的 `llm_advice` 字段（P1-1）。
+_Avoid_: 开放式长文本总结、不超时的 LLM 调用、无规则回退
+
 **泛化回归测试护栏 (Generalization Regression Guardrail)**:
 在继续抽象模板、动作族或接入新系统前，用于锁定模板动作名、registry contract、共享动作 handler 输入输出、policy bridge 等关键行为的一组回归测试。
 _Avoid_: 先拆再说、无护栏泛化
