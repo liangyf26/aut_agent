@@ -2797,9 +2797,35 @@ function _extractE2eDiscoveryDetail(result) {
     }
     if (parsed && parsed.total_execution_goals != null) parts.push(`共 ${parsed.total_execution_goals} 条用例`);
     if (parsed && parsed.stopped_reason) parts.push(`\n停止原因: ${_translateStoppedReason(parsed.stopped_reason)}`);
+    // Add actionable guidance for common failures
+    const guidance = _buildFailureGuidance(discovered);
+    if (guidance) parts.push(guidance);
     return parts.join(' ');
   }
   return null;
+}
+
+function _buildFailureGuidance(discovered) {
+  if (!discovered || !discovered.reasons || !discovered.failed) return null;
+  const parts = ['\n\n--- 操作指导 ---'];
+  if (discovered.reasons.locator_unstable) {
+    parts.push(`\n定位器不稳定（${discovered.reasons.locator_unstable} 例）：测试用例生成的 CSS 选择器/文本选择器在该页面上无法匹配到元素。`);
+    parts.push('建议：检查生成用例中 click/fill 步骤的 target 字段是否与页面实际 DOM 结构一致。');
+    parts.push('可在浏览器开发者工具中手动验证选择器，匹配后更新 locate_or_hints.json。');
+  }
+  if (discovered.reasons.page_load_timeout) {
+    parts.push(`\n页面加载超时（${discovered.reasons.page_load_timeout} 例）：导航步骤的目标 URL 无法在 5 秒内加载完成。`);
+    parts.push('建议：检查目标 URL 是否可访问、CDP Chrome 是否仍在运行且已登录。');
+  }
+  if (discovered.reasons.assertion_failed) {
+    parts.push(`\n断言失败（${discovered.reasons.assertion_failed} 例）：页面操作完成但验证步骤未通过。`);
+    parts.push('建议：检查测试用例的 verify 步骤目标是否对应真实 DOM 元素。');
+  }
+  if (discovered.reasons.evidence_incomplete) {
+    parts.push(`\n证据不完整（${discovered.reasons.evidence_incomplete} 例）：无法识别测试用例类型，无法执行。`);
+    parts.push('建议：检查 generated_test_cases.json 中用例的 type 字段是否正确。');
+  }
+  return parts.join('\n');
 }
 
 function formatTestCenterDuration(ms) {
@@ -2882,6 +2908,11 @@ function renderTestCenterE2eSection() {
           </select>
           <small>只影响最后的执行阶段；菜单/页面/功能点发现三个阶段恒定驱动真实浏览器。</small>
         </label>
+        <label class="stage2-field">
+          <span>执行最大轮数</span>
+          <input type="number" data-test-center-e2e-field="maxExecutionRounds" value="${escapeHtml(form.maxExecutionRounds || '1')}" min="1" max="20" />
+          <small>real_browser 模式始终只执行一轮；fixture_simulated 可按此上限自动重试可重试的失败用例。</small>
+        </label>
       </div>
       <div class="inline-actions">
         <button class="primary-action compact-action" data-test-center-run-e2e type="button" ${running ? 'disabled' : ''}>${running ? '运行中...' : '开始端到端测试'}</button>
@@ -2921,11 +2952,25 @@ function renderStage2TestCenterTab() {
   if (!container) {
     return;
   }
+
+  // Preserve <details> open state across re-renders
+  const openStates = {};
+  container.querySelectorAll('details').forEach((el) => {
+    const id = el.getAttribute('data-e2e-stage-id') || el.getAttribute('data-test-center-stage');
+    if (id) openStates[id] = el.open;
+  });
+
   container.innerHTML = `
     ${renderTestCenterUnitSection()}
     ${renderTestCenterStageSection()}
     ${renderTestCenterE2eSection()}
   `;
+
+  // Restore open state
+  container.querySelectorAll('details').forEach((el) => {
+    const id = el.getAttribute('data-e2e-stage-id') || el.getAttribute('data-test-center-stage');
+    if (id && openStates[id]) el.open = true;
+  });
 }
 
 async function runTestCenterUnitSuite(kind) {

@@ -469,15 +469,15 @@ async function runGoalChainStage(stageId, params = {}, dependencies = {}) {
   let discoveredNames = null;
   if (stageId === 'menu') {
     const entries = await readJsonIfExists(path.join(outputDir, 'menu_entries.json')) || [];
-    discoveredNames = { kind: 'menu', names: (entries || []).slice(0, 20).map((e) => e.name || e.title || null).filter(Boolean) };
+    discoveredNames = { kind: 'menu', names: (entries || []).slice(0, 20).map((e) => e.menu_text || e.title || e.name || null).filter(Boolean) };
   } else if (stageId === 'page') {
     const entries = await readJsonIfExists(path.join(outputDir, 'page_entries.json')) || [];
-    discoveredNames = { kind: 'page', names: (entries || []).slice(0, 20).map((e) => e.name || null).filter(Boolean) };
+    discoveredNames = { kind: 'page', names: (entries || []).slice(0, 20).map((e) => e.page_title || e.name || null).filter(Boolean) };
   } else if (stageId === 'feature') {
     const features = await readJsonIfExists(path.join(outputDir, 'feature_points.json')) || [];
     discoveredNames = {
       kind: 'feature',
-      items: (features || []).slice(0, 20).map((f) => ({ name: f.name, type: f.feature_type, risk: f.risk_level }))
+      items: (features || []).slice(0, 20).map((f) => ({ name: f.name || f.feature_point_id || null, type: f.feature_type, risk: f.risk_level }))
     };
   } else if (stageId === 'execution') {
     const execResults = await readJsonIfExists(path.join(outputDir, 'execution_results.json'));
@@ -627,6 +627,7 @@ async function _runGoalChainEndToEndInternal(params = {}, dependencies = {}, onP
     } else if (stageId === 'execution') {
       stageParams.testCasesPath = previousChainOutputPath;
       stageParams.mode = params.executionMode || 'fixture_simulated';
+      stageParams.maxRounds = parseInt(params.maxExecutionRounds || '1', 10) || 1;
     }
 
     let stepResult;
