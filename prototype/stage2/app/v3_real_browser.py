@@ -4227,7 +4227,7 @@ def _dom_collection_expression() -> str:
       };
       const label = (el) => (
         el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') ||
-        el.getAttribute('placeholder') || el.value || el.name || el.id || el.tagName
+        el.getAttribute('placeholder') || el.value || el.name || el.id || ''
       ).trim().replace(/\\s+/g, ' ').slice(0, 80);
       const cssPath = (el) => {
         if (!el || !el.tagName) return '';
@@ -4293,7 +4293,7 @@ def _side_effect_click_expression() -> str:
       };
       const label = (el) => (
         el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') ||
-        el.getAttribute('placeholder') || el.value || el.name || el.id || el.tagName
+        el.getAttribute('placeholder') || el.value || el.name || el.id || ''
       ).trim().replace(/\\s+/g, ' ').slice(0, 80);
       window.__stage2DialogLog = Array.isArray(window.__stage2DialogLog) ? window.__stage2DialogLog : [];
       if (!window.__stage2DialogPatched) {

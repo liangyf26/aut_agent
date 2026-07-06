@@ -75,9 +75,18 @@ def _build_stable_locator(
 
     # 2. Text-based Playwright selector — survives page reload; more specific than role
     if text and tag:
-        escaped = _escape_playwright_text(text)
-        if escaped and len(escaped) < 60:
-            return f'{tag}:has-text("{escaped}")'
+        # Skip when text is just a fallback to the tag name — "A" / "DIV" / "BUTTON"
+        # are never meaningful element text (``label()`` may fall back to
+        # ``el.name`` or ``el.id``, but an ``id``-derived text would have hit
+        # the ID selector above; a ``name``-derived text is usually synthetic).
+        if text.upper() == tag.upper() or text.strip().upper() in {"A", "BUTTON", "DIV", "INPUT", "SELECT", "SPAN",
+                                                                   "LI", "UL", "TD", "TR", "FORM", "LABEL", "NAV",
+                                                                   "HEADER", "FOOTER", "MAIN", "SECTION", "ARTICLE"}:
+            pass  # fall through to role / CSS path
+        else:
+            escaped = _escape_playwright_text(text)
+            if escaped and len(escaped) < 60:
+                return f'{tag}:has-text("{escaped}")'
 
     # 3. Tag + role attribute — stable across DOM re-renders, but ambiguous with multiple same-tag elements
     if role and tag:
