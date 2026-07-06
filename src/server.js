@@ -558,6 +558,27 @@ async function handleApi(req, res, pathname) {
     return true;
   }
 
+  if (req.method === 'POST' && pathname === '/api/stage2/test-center/mark-takeover-resolved') {
+    try {
+      const body = await readJson(req);
+      const outputDir = path.resolve(path.join(__dirname, '..'), String(body.outputDir || ''));
+      const note = String(body.note || '已在测试中心标记为已处理');
+      const resolutionPath = path.join(outputDir, 'human_takeover_resolution.json');
+      await writeJson(resolutionPath, {
+        schema_version: 'stage2_execution_human_takeover_resolution.v1',
+        status: 'resolved',
+        operator: 'test-center',
+        note,
+        ready_to_resume: true,
+        resolved_at: nowIso()
+      });
+      sendJson(res, 200, { ok: true, path: resolutionPath });
+    } catch (error) {
+      sendError(res, 500, `标记接管失败: ${error.message}`);
+    }
+    return true;
+  }
+
   const testCenterArtifactParams = routeMatch(pathname, '/api/stage2/test-center/artifacts/:runId');
   if (testCenterArtifactParams && req.method === 'GET') {
     const artifact = await resolveTestCenterArtifact(testCenterArtifactParams.runId);

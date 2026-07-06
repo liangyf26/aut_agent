@@ -2714,6 +2714,9 @@ function renderTestCenterStageResult(result) {
     return '';
   }
   const discovery = _extractE2eDiscoveryDetail(result);
+  const takeover = result.humanTakeover;
+  const resolved = result.humanTakeoverResolution?.ready_to_resume;
+  const canResolve = takeover && takeover.status === 'waiting_human' && !resolved;
   return `
     <div class="tag-row">
       ${testCenterVerdictTag(result.evaluation?.verdict, result.evaluation?.reason)}
@@ -2729,55 +2732,71 @@ function renderTestCenterStageResult(result) {
       ['root_conclusion', result.runSummary.root_conclusion || result.runSummary.stop_reason || '-']
     ]) : ''}
     ${discovery ? `<div class="stage2-help-text" style="white-space:pre-wrap;font-family:monospace;font-size:0.85em">${discovery}</div>` : ''}
-    ${result.humanTakeover ? `<p class="stage2-help-text">人工接管：${escapeHtml(result.humanTakeover.waiting_reason || result.humanTakeover.status || '-')}</p>` : ''}
+    ${takeover ? `
+      <p class="stage2-help-text">
+        人工接管：${escapeHtml(takeover.waiting_reason || takeover.status || '-')}
+        ${resolved ? ' <span class="tag pass">已处理</span>' : ''}
+      </p>
+      ${canResolve ? `
+        <div class="inline-actions" style="margin-top:0.5rem">
+          <button class="ghost-action compact-action" data-test-center-resolve-takeover
+            data-runid="${escapeHtml(result.runId)}"
+            data-outputdir="${escapeHtml(result.outputDir)}"
+            type="button">标记已处理</button>
+        </div>
+      ` : ''}
+    ` : ''}
     ${result.stderrPreview ? `<details><summary>stderr</summary><pre>${escapeHtml(result.stderrPreview)}</pre></details>` : ''}
   `;
 }
 
 function _extractE2eDiscoveryDetail(result) {
   const parsed = result.parsedStdout;
-  if (!parsed) return null;
+  const discovered = result.discoveredNames;
   const stageId = result.stageId;
   if (stageId === 'menu') {
     const parts = [];
-    if (parsed.total_goals != null) parts.push(`发现 ${parsed.succeeded ?? parsed.total_goals} 个菜单入口`);
-    if (parsed.pending != null && parsed.pending > 0) parts.push(`（${parsed.pending} 个待继续）`);
+    if (parsed && parsed.total_goals != null) parts.push(`发现 ${parsed.succeeded ?? parsed.total_goals} 个菜单入口`);
+    if (parsed && parsed.pending != null && parsed.pending > 0) parts.push(`（${parsed.pending} 个待继续）`);
+    if (discovered && discovered.names && discovered.names.length) {
+      parts.push('\n' + discovered.names.map((n, i) => `${i + 1}. ${n}`).join('\n'));
+    }
     return parts.join(' ');
   }
   if (stageId === 'page') {
     const parts = [];
-    if (parsed.reachable_count != null) parts.push(`可达页面 ${parsed.reachable_count} 个`);
-    if (parsed.blocked_count != null && parsed.blocked_count > 0) parts.push(`，${parsed.blocked_count} 个受限`);
-    if (parsed.blank_count != null && parsed.blank_count > 0) parts.push(`，${parsed.blank_count} 个白屏`);
-    if (parsed.timeout_count != null && parsed.timeout_count > 0) parts.push(`，${parsed.timeout_count} 个超时`);
-    if (parsed.deduplicated != null && parsed.deduplicated > 0) parts.push(`（${parsed.deduplicated} 条去重）`);
+    if (parsed && parsed.reachable_count != null) parts.push(`可达页面 ${parsed.reachable_count} 个`);
+    if (parsed && parsed.blocked_count) parts.push(`，${parsed.blocked_count} 个受限`);
+    if (parsed && parsed.blank_count) parts.push(`，${parsed.blank_count} 个白屏`);
+    if (discovered && discovered.names && discovered.names.length) {
+      parts.push('\n' + discovered.names.map((n, i) => `${i + 1}. ${n}`).join('\n'));
+    }
     return parts.join('');
   }
   if (stageId === 'feature') {
     const parts = [];
-    if (parsed.feature_count != null) parts.push(`功能点 ${parsed.feature_count} 个`);
-    if (parsed.test_cases_generated != null) parts.push(`，生成 ${parsed.test_cases_generated} 条用例`);
-    if (parsed.pages_scanned != null) parts.push(`（${parsed.pages_scanned} 个页面）`);
-    if (parsed.feature_types) {
-      const types = Object.entries(parsed.feature_types)
-        .map(([k, v]) => `${k}×${v}`).join(' ');
+    if (parsed && parsed.feature_count != null) parts.push(`功能点 ${parsed.feature_count} 个`);
+    if (parsed && parsed.test_cases_generated != null) parts.push(`，生成 ${parsed.test_cases_generated} 条用例`);
+    if (parsed && parsed.feature_types) {
+      const types = Object.entries(parsed.feature_types).map(([k, v]) => `${k}×${v}`).join(' ');
       if (types) parts.push(`\n类型分布: ${types}`);
     }
-    return parts.join('');
+    if (discovered && discovered.items && discovered.items.length) {
+      parts.push('\n' + discovered.items.map((f, i) => `${i + 1}. ${f.name} [${f.type}] ${f.risk === 'high' ? '⚠高风险' : ''}`).join('\n'));
+    }
+    return parts.join(' ');
   }
   if (stageId === 'execution') {
     const parts = [];
-    if (parsed.executed_case_count != null) parts.push(`已执行 ${parsed.executed_case_count} 条用例`);
-    if (parsed.outcome_status_breakdown) {
-      const b = parsed.outcome_status_breakdown;
-      const labels = [];
-      if (b.passed != null) labels.push(`通过 ${b.passed}`);
-      if (b.failed != null) labels.push(`失败 ${b.failed}`);
-      if (b.skipped != null) labels.push(`跳过 ${b.skipped}`);
-      if (labels.length) parts.push(`（${labels.join('，')}）`);
+    if (parsed && parsed.executed_case_count != null) parts.push(`已执行 ${parsed.executed_case_count} 条用例`);
+    if (discovered) {
+      parts.push(`（通过 ${discovered.passed}，失败 ${discovered.failed}）`);
+      if (discovered.reasons && Object.keys(discovered.reasons).length) {
+        parts.push(`\n失败原因: ${Object.entries(discovered.reasons).map(([k, v]) => `${k}×${v}`).join('  ')}`);
+      }
     }
-    if (parsed.total_execution_goals != null) parts.push(`共 ${parsed.total_execution_goals} 条用例`);
-    if (parsed.stopped_reason) parts.push(`\n停止原因: ${_translateStoppedReason(parsed.stopped_reason)}`);
+    if (parsed && parsed.total_execution_goals != null) parts.push(`共 ${parsed.total_execution_goals} 条用例`);
+    if (parsed && parsed.stopped_reason) parts.push(`\n停止原因: ${_translateStoppedReason(parsed.stopped_reason)}`);
     return parts.join(' ');
   }
   return null;
@@ -2943,6 +2962,30 @@ async function runTestCenterStage(stageId) {
   } catch (error) {
     state.testCenter.goalChainStageResults[stageId] = { evaluation: { verdict: 'failed', reason: error.message } };
     saveState.textContent = error.message;
+  } finally {
+    state.pendingAction = null;
+    render();
+  }
+}
+
+async function resolveHumanTakeover(runId, outputDir) {
+  state.pendingAction = 'resolve-takeover';
+  render();
+  try {
+    await api('/api/stage2/test-center/mark-takeover-resolved', {
+      method: 'POST',
+      body: JSON.stringify({ runId, outputDir })
+    });
+    saveState.textContent = '人工接管已标记为已处理';
+    // Reload the test center state to get updated takeover resolution
+    const state = await api('/api/stage2/test-center/state');
+    if (state) {
+      for (const [key, val] of Object.entries(state)) {
+        if (val != null) state.testCenter[key] = val;
+      }
+    }
+  } catch (error) {
+    saveState.textContent = '标记失败: ' + error.message;
   } finally {
     state.pendingAction = null;
     render();
@@ -4678,6 +4721,16 @@ document.querySelector('#stage2TestcenterPanel')?.addEventListener('click', (eve
   const e2eButton = event.target.closest('[data-test-center-run-e2e]');
   if (e2eButton) {
     runTestCenterE2e();
+    return;
+  }
+
+  const resolveTakeoverButton = event.target.closest('[data-test-center-resolve-takeover]');
+  if (resolveTakeoverButton) {
+    resolveHumanTakeover(
+      resolveTakeoverButton.dataset.runid,
+      resolveTakeoverButton.dataset.outputdir
+    );
+    return;
   }
 });
 

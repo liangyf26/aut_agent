@@ -465,6 +465,34 @@ async function runGoalChainStage(stageId, params = {}, dependencies = {}) {
   const humanTakeoverResolution = await readJsonIfExists(path.join(outputDir, 'human_takeover_resolution.json'));
   const runReport = await readJsonIfExists(path.join(outputDir, 'reports', 'run_report.json'));
 
+  // Read discovery names from artifact files for the UI detail view
+  let discoveredNames = null;
+  if (stageId === 'menu') {
+    const entries = await readJsonIfExists(path.join(outputDir, 'menu_entries.json')) || [];
+    discoveredNames = { kind: 'menu', names: (entries || []).slice(0, 20).map((e) => e.name || e.title || null).filter(Boolean) };
+  } else if (stageId === 'page') {
+    const entries = await readJsonIfExists(path.join(outputDir, 'page_entries.json')) || [];
+    discoveredNames = { kind: 'page', names: (entries || []).slice(0, 20).map((e) => e.name || null).filter(Boolean) };
+  } else if (stageId === 'feature') {
+    const features = await readJsonIfExists(path.join(outputDir, 'feature_points.json')) || [];
+    discoveredNames = {
+      kind: 'feature',
+      items: (features || []).slice(0, 20).map((f) => ({ name: f.name, type: f.feature_type, risk: f.risk_level }))
+    };
+  } else if (stageId === 'execution') {
+    const execResults = await readJsonIfExists(path.join(outputDir, 'execution_results.json'));
+    if (execResults) {
+      const items = execResults.items || execResults.results || [];
+      const reasons = {};
+      let passed = 0; let failed = 0;
+      for (const item of items) {
+        if (item.status === 'passed') passed++;
+        else { failed++; reasons[item.failure_reason] = (reasons[item.failure_reason] || 0) + 1; }
+      }
+      discoveredNames = { kind: 'execution', passed, failed, reasons };
+    }
+  }
+
   const evaluation = evaluateGoalLoopStepResult({
     stageId,
     exitCode: commandRun.error?.code ?? 0,
@@ -491,6 +519,7 @@ async function runGoalChainStage(stageId, params = {}, dependencies = {}) {
     humanTakeover,
     humanTakeoverResolution,
     runReport,
+    discoveredNames,
     evaluation,
     chainOutputPath: stage.chainOutputKey && parsedStdout
       ? parsedStdout[stage.chainOutputKey] || null
