@@ -3404,6 +3404,10 @@ def _build_page_features_from_snapshot(
                     "tag": control.get("tag"),
                     "type": control.get("type"),
                     "candidate_index": control.get("candidate_index"),
+                    "css_path": control.get("css_path") or "",
+                    "classes": control.get("classes") or [],
+                    "id": control.get("id") or "",
+                    "role": control.get("role") or "",
                 },
             }
         )
@@ -4225,6 +4229,27 @@ def _dom_collection_expression() -> str:
         el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') ||
         el.getAttribute('placeholder') || el.value || el.name || el.id || el.tagName
       ).trim().replace(/\\s+/g, ' ').slice(0, 80);
+      const cssPath = (el) => {
+        if (!el || !el.tagName) return '';
+        if (el.id) return '#' + CSS.escape(el.id);
+        const parts = [];
+        let current = el;
+        while (current && current.nodeType === 1 && parts.length < 5) {
+          let selector = current.tagName.toLowerCase();
+          const classes = Array.from(current.classList || [])
+            .filter(function (name) { return name && name.length < 40 && name.indexOf('is-') !== 0; })
+            .slice(0, 2);
+          if (classes.length) selector += '.' + classes.map(function (name) { return CSS.escape(name); }).join('.');
+          const parent = current.parentElement;
+          if (parent) {
+            const siblings = Array.from(parent.children).filter(function (node) { return node.tagName === current.tagName; });
+            if (siblings.length > 1) selector += ':nth-of-type(' + (siblings.indexOf(current) + 1) + ')';
+          }
+          parts.unshift(selector);
+          current = parent;
+        }
+        return parts.join(' > ');
+      };
       const bodyText = document.body ? document.body.innerText.toLowerCase() : '';
       const loginWords = ['login', 'sign in', '登录', '登陆', '验证码'];
       const links = Array.from(document.querySelectorAll('a[href]'))
@@ -4243,7 +4268,9 @@ def _dom_collection_expression() -> str:
           type: el.getAttribute('type') || '',
           href: el.href || '',
           name: el.name || '',
-          id: el.id || ''
+          id: el.id || '',
+          classes: Array.from(el.classList).filter(function (c) { return c && c.length < 40; }).slice(0, 4),
+          css_path: cssPath(el)
         }));
       return {
         links,
@@ -4401,6 +4428,10 @@ def _build_features(
                     "tag": control.get("tag"),
                     "type": control.get("type"),
                     "candidate_index": control.get("candidate_index"),
+                    "css_path": control.get("css_path") or "",
+                    "classes": control.get("classes") or [],
+                    "id": control.get("id") or "",
+                    "role": control.get("role") or "",
                 },
             }
         )

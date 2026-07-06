@@ -38,6 +38,7 @@ parallel entrypoint.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -47,6 +48,100 @@ if TYPE_CHECKING:
     from .feature_adapter import FeatureAdapter
 
 EXECUTION_MODE_REAL_BROWSER = "real_browser"
+
+
+def _build_stable_locator(
+    *,
+    tag: str = "",
+    text: str = "",
+    el_id: str = "",
+    role: str = "",
+    css_path: str = "",
+    classes: list[str] | None = None,
+) -> str:
+    """Build a stable Playwright locator for a DOM element from its collected properties.
+
+    Priority (descending):
+    1. ``#<id>`` — permanently stable, survives any page mutation
+    2. ``<tag>:has-text("<escaped text>")`` — text-based, survives re-render
+    3. ``<tag>[role="<role>"]`` — attribute-based, but ambiguous with multiple buttons
+    4. CSS path — structural, least stable but always available as fallback
+    """
+    classes = classes or []
+
+    # 1. ID selector — gold standard, never degrades
+    if el_id and _is_sane_css_id(el_id):
+        return f"#{el_id}"
+
+    # 2. Text-based Playwright selector — survives page reload; more specific than role
+    if text and tag:
+        escaped = _escape_playwright_text(text)
+        if escaped and len(escaped) < 60:
+            return f'{tag}:has-text("{escaped}")'
+
+    # 3. Tag + role attribute — stable across DOM re-renders, but ambiguous with multiple same-tag elements
+    if role and tag:
+        return f'{tag}[role="{role}"]'
+
+    # 4. CSS path — available for every element, but fragile against DOM restructuring
+    if css_path:
+        return css_path
+
+    # Last resort: class-based
+    if classes and tag:
+        safe_classes = [c for c in classes if _is_sane_css_class(c)]
+        if safe_classes:
+            return f"{tag}.{'.'.join(safe_classes)}"
+
+    return f'{tag}:has-text("未知控件")'
+
+
+def _escape_playwright_text(raw: str) -> str:
+    """Escape text for a Playwright text selector (``has-text`` / ``text=``).
+
+    Playwright treats single quotes, double quotes, and backslashes as
+    special inside a ``has-text`` argument.  We strip newlines (body text
+    often contains them) and backslash-escape the dangerous characters.
+    """
+    compacted = re.sub(r"\s+", " ", str(raw or "")).strip()[:80]
+    escaped = compacted.replace("\\", "\\\\").replace('"', '\\"').replace("'", "\\'")
+    return escaped
+
+
+def _is_sane_css_id(value: str) -> bool:
+    """True when *value* is safe to use as a bare CSS ``#`` selector.
+
+    Auto-generated ids (``:r1:``, random hex strings, very-long strings)
+    can change across page loads, making them no more stable than a CSS path,
+    so we skip them.
+    """
+    v = str(value).strip()
+    if not v or len(v) < 2 or len(v) > 48:
+        return False
+    # React-style auto-ids start with colon or digit
+    if re.match(r"^[:\d]", v):
+        return False
+    # Pure hex strings (8+ chars) are likely random
+    if re.fullmatch(r"[0-9a-fA-F]{8,}", v):
+        return False
+    # Space, slash, backslash are never safe in bare CSS #id
+    if "/" in v or "\\" in v or " " in v:
+        return False
+    # Otherwise: if it contains only alphanumeric, hyphens, underscores,
+    # and colons (for legacy frameworks), it's safe
+    if re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_:.\-]*", v):
+        return True
+    return False
+
+
+def _is_sane_css_class(value: str) -> bool:
+    """True when *value* is safe to use as a bare CSS ``.class`` selector."""
+    v = str(value).strip()
+    if not v or len(v) > 80:
+        return False
+    if re.search(r"[^a-zA-Z0-9_-]", v):
+        return False
+    return True
 
 
 async def classify_features_with_playwright(
@@ -131,7 +226,15 @@ async def classify_features_with_playwright(
         feature_type = feature.get("feature_type", "view")
         risk_level = feature.get("risk_level", "low")
         element_text = feature.get("name")
-        element_locator = f"[data-real-feature-index='{feature.get('evidence', {}).get('candidate_index')}']"
+        evidence = feature.get("evidence", {})
+        element_locator = _build_stable_locator(
+            tag=evidence.get("tag") or "",
+            text=element_text or "",
+            el_id=evidence.get("id") or "",
+            role=evidence.get("role") or "",
+            css_path=evidence.get("css_path") or "",
+            classes=evidence.get("classes") or [],
+        )
 
         feature_goal_id = adapter.register_feature_goal(
             feature_id=feature["feature_id"],
@@ -189,4 +292,8 @@ async def classify_features_with_playwright(
     return feature_goal_ids, test_cases
 
 
-__all__ = ["EXECUTION_MODE_REAL_BROWSER", "classify_features_with_playwright"]
+__all__ = [
+    "EXECUTION_MODE_REAL_BROWSER",
+    "_build_stable_locator",
+    "classify_features_with_playwright",
+]
