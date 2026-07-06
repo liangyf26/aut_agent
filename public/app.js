@@ -2711,11 +2711,12 @@ function renderTestCenterStageResult(result) {
   if (!result) {
     return '';
   }
+  const discovery = _extractE2eDiscoveryDetail(result);
   return `
     <div class="tag-row">
       ${testCenterVerdictTag(result.evaluation?.verdict, result.evaluation?.reason)}
       <span class="tag">退出码 ${escapeHtml(String(result.exitCode ?? '-'))}</span>
-      <span class="tag">耗时 ${escapeHtml(String(result.durationMs ?? '-'))}ms</span>
+      <span class="tag">耗时 ${formatTestCenterDuration(result.durationMs)}</span>
     </div>
     <p class="stage2-help-text">${escapeHtml(result.evaluation?.reason || '')}</p>
     ${result.runSummary ? renderStage2KeyValueList([
@@ -2725,9 +2726,69 @@ function renderTestCenterStageResult(result) {
       ['pending', result.runSummary.pending ?? '-'],
       ['root_conclusion', result.runSummary.root_conclusion || result.runSummary.stop_reason || '-']
     ]) : ''}
+    ${discovery ? `<div class="stage2-help-text" style="white-space:pre-wrap;font-family:monospace;font-size:0.85em">${discovery}</div>` : ''}
     ${result.humanTakeover ? `<p class="stage2-help-text">人工接管：${escapeHtml(result.humanTakeover.waiting_reason || result.humanTakeover.status || '-')}</p>` : ''}
     ${result.stderrPreview ? `<details><summary>stderr</summary><pre>${escapeHtml(result.stderrPreview)}</pre></details>` : ''}
   `;
+}
+
+function _extractE2eDiscoveryDetail(result) {
+  const parsed = result.parsedStdout;
+  if (!parsed) return null;
+  const stageId = result.stageId;
+  if (stageId === 'menu') {
+    const parts = [];
+    if (parsed.total_goals != null) parts.push(`发现 ${parsed.succeeded ?? parsed.total_goals} 个菜单入口`);
+    if (parsed.pending != null && parsed.pending > 0) parts.push(`（${parsed.pending} 个待继续）`);
+    return parts.join(' ');
+  }
+  if (stageId === 'page') {
+    const parts = [];
+    if (parsed.reachable_count != null) parts.push(`可达页面 ${parsed.reachable_count} 个`);
+    if (parsed.blocked_count != null && parsed.blocked_count > 0) parts.push(`，${parsed.blocked_count} 个受限`);
+    if (parsed.blank_count != null && parsed.blank_count > 0) parts.push(`，${parsed.blank_count} 个白屏`);
+    if (parsed.timeout_count != null && parsed.timeout_count > 0) parts.push(`，${parsed.timeout_count} 个超时`);
+    if (parsed.deduplicated != null && parsed.deduplicated > 0) parts.push(`（${parsed.deduplicated} 条去重）`);
+    return parts.join('');
+  }
+  if (stageId === 'feature') {
+    const parts = [];
+    if (parsed.feature_count != null) parts.push(`功能点 ${parsed.feature_count} 个`);
+    if (parsed.test_cases_generated != null) parts.push(`，生成 ${parsed.test_cases_generated} 条用例`);
+    if (parsed.pages_scanned != null) parts.push(`（${parsed.pages_scanned} 个页面）`);
+    if (parsed.feature_types) {
+      const types = Object.entries(parsed.feature_types)
+        .map(([k, v]) => `${k}×${v}`).join(' ');
+      if (types) parts.push(`\n类型分布: ${types}`);
+    }
+    return parts.join('');
+  }
+  if (stageId === 'execution') {
+    const parts = [];
+    if (parsed.executed_case_count != null) parts.push(`已执行 ${parsed.executed_case_count} 条用例`);
+    if (parsed.outcome_status_breakdown) {
+      const b = parsed.outcome_status_breakdown;
+      const labels = [];
+      if (b.passed != null) labels.push(`通过 ${b.passed}`);
+      if (b.failed != null) labels.push(`失败 ${b.failed}`);
+      if (b.skipped != null) labels.push(`跳过 ${b.skipped}`);
+      if (labels.length) parts.push(`（${labels.join('，')}）`);
+    }
+    if (parsed.total_execution_goals != null) parts.push(`共 ${parsed.total_execution_goals} 条用例`);
+    if (parsed.stopped_reason) parts.push(`\n停止原因: ${parsed.stopped_reason}`);
+    return parts.join(' ');
+  }
+  return null;
+}
+
+function formatTestCenterDuration(ms) {
+  if (ms == null) return '-';
+  if (ms < 1000) return `${ms}ms`;
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(1)}s`;
+  const m = Math.floor(s / 60);
+  const ss = (s % 60).toFixed(0);
+  return `${m}m${ss}s`;
 }
 
 function renderTestCenterStageSection() {
@@ -2803,11 +2864,13 @@ function renderTestCenterE2eSection() {
           const step = stepById[stageId];
           const stageLabel = TEST_CENTER_STAGE_ORDER.find((item) => item.id === stageId)?.label || stageId;
           const notRun = !step;
+          const dur = notRun ? '' : ` · ${formatTestCenterDuration(step.durationMs)}`;
+          const verdict = notRun ? '' : testCenterVerdictTag(step.evaluation?.verdict, step.evaluation?.reason);
           return `
             <article class="stage2-timeline-step ${notRun ? '' : 'current'}">
               <span>步骤 ${index + 1}</span>
-              <strong>${escapeHtml(stageLabel)}</strong>
-              ${notRun ? '<small>未运行</small>' : `<small>${testCenterVerdictTag(step.evaluation?.verdict, step.evaluation?.reason)}</small>`}
+              <strong>${escapeHtml(stageLabel)}${dur}</strong>
+              ${notRun ? '<small>未运行</small>' : `<small>${verdict}</small>`}
             </article>
           `;
         }).join('')}
