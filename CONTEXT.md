@@ -106,6 +106,18 @@ _Avoid_: 默认视觉执行、随意接管、无审核兜底
 第二阶段在验证层中，从复杂真实流程里抽出的可重复注册、可重复组合的一组共享动作实现。复用动作族通过 `TemplateActionRegistry` 组装，位于通用模板动作与项目级胶水之间，用于降低“项目专用大脚本”比例。
 _Avoid_: 项目专用大脚本、整流硬编码
 
+**L2 定位器候选池 (L2 Locator Candidate Pool)**:
+Stage D 不再只产出单一 `element_locator` 字符串，而是产出置信度排序的多策略定位器候选数组（`locator_candidates`），每个候选包含 `selector`、`confidence` 和 `strategy`。Stage E 按置信度降序尝试，首个命中即停（P0-1 + P0-2）。
+_Avoid_: 单一定位器、失败后直接报错、无候选回退
+
+**L2 尝试引擎 (L2 Locator Trier Engine)**:
+Stage E 在执行阶段消费 P0-1 产出的 `locator_candidates`，按置信度降序遍历并调用 `wait_for` 验证元素是否存在于 DOM。首个命中的候选直接用于执行动作（click/fill），全部失败时抛出 `AllCandidatesFailed`（P0-2）。
+_Avoid_: 直接使用单个 target、失败后不做候选回退
+
+**阶段E前置检查 (Stage E Preflight / Capability Preflight Gate)**:
+Stage E 启动时运行的 capability routing 检查，决定 L1（静态快照）、L2（候选池）、L3（ARIA）和 L4（Browser Use）各层在本次执行中是否可用。检查结果写入 `routing_summary.json`（P0-3）。
+_Avoid_: 不做检查直接执行、跳过 L4 能力门禁、无 routing_summary 落盘
+
 **泛化回归测试护栏 (Generalization Regression Guardrail)**:
 在继续抽象模板、动作族或接入新系统前，用于锁定模板动作名、registry contract、共享动作 handler 输入输出、policy bridge 等关键行为的一组回归测试。
 _Avoid_: 先拆再说、无护栏泛化

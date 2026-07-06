@@ -50,6 +50,15 @@ if TYPE_CHECKING:
 EXECUTION_MODE_REAL_BROWSER = "real_browser"
 
 
+_STRUCTURAL_TAG_NAMES = frozenset({
+    "A", "BUTTON", "DIV", "INPUT", "SELECT", "SPAN",
+    "LI", "UL", "TD", "TR", "FORM", "LABEL", "NAV",
+    "HEADER", "FOOTER", "MAIN", "SECTION", "ARTICLE",
+})
+
+_TAGS_WITHOUT_TEXT_CONTENT = frozenset({"input", "textarea", "select"})
+
+
 def _build_stable_locator(
     *,
     tag: str = "",
@@ -75,23 +84,12 @@ def _build_stable_locator(
 
     # 2. Text-based Playwright selector — survives page reload; more specific than role
     if text and tag:
-        # Skip when text is just a fallback to the tag name — "A" / "DIV" / "BUTTON"
-        # are never meaningful element text (``label()`` may fall back to
-        # ``el.name`` or ``el.id``, but an ``id``-derived text would have hit
-        # the ID selector above; a ``name``-derived text is usually synthetic).
-        if text.upper() == tag.upper() or text.strip().upper() in {"A", "BUTTON", "DIV", "INPUT", "SELECT", "SPAN",
-                                                                   "LI", "UL", "TD", "TR", "FORM", "LABEL", "NAV",
-                                                                   "HEADER", "FOOTER", "MAIN", "SECTION", "ARTICLE"}:
+        if text.upper() == tag.upper() or text.strip().upper() in _STRUCTURAL_TAG_NAMES:
             pass  # fall through to role / CSS path
         else:
             escaped = _escape_playwright_text(text)
             if escaped and len(escaped) < 60:
-                # Form elements (<input>, <textarea>, <select>) have no text
-                # content — their label() text comes from placeholder/value
-                # attributes.  ``:has-text`` only matches textContent, so it
-                # would never fire on these elements.  Use attribute selectors
-                # instead.
-                if tag in {"input", "textarea", "select"}:
+                if tag in _TAGS_WITHOUT_TEXT_CONTENT:
                     return f'{tag}[placeholder*="{escaped}"], {tag}[aria-label*="{escaped}"]'
                 return f'{tag}:has-text("{escaped}")'
 
@@ -110,6 +108,72 @@ def _build_stable_locator(
             return f"{tag}.{'.'.join(safe_classes)}"
 
     return f'{tag}:has-text("未知控件")'
+
+
+def _build_locator_candidates(
+    *,
+    tag: str = "",
+    text: str = "",
+    el_id: str = "",
+    role: str = "",
+    css_path: str = "",
+    classes: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Build a ranked list of locator candidates for a DOM element.
+
+    Each candidate::
+
+        {"selector": "<playwright locator>", "confidence": float, "strategy": "<id|text|role|css_path|class|fallback>"}
+
+    Candidates are ordered by descending confidence. The confidence values
+    follow the same priority hierarchy as ``_build_stable_locator()``:
+    #id (0.95) > :has-text (0.85) > [role] (0.60) > CSS path (0.40) >
+    class-based (0.30) > fallback (0.10).
+
+    P0-2's locator_trier iterates these candidates and picks the first one
+    that matches the live page at execution time.
+    """
+    classes = list(classes or [])
+    candidates: list[dict[str, Any]] = []
+
+    # 1. ID-based (0.95)
+    if el_id and _is_sane_css_id(el_id):
+        candidates.append({"selector": f"#{el_id}", "confidence": 0.95, "strategy": "id"})
+
+    # 2. Text-based (0.85) — when text is meaningful and distinct from the tag name
+    _text_is_meaningful = bool(
+        text
+        and tag
+        and text.upper() != tag.upper()
+        and text.strip().upper() not in _STRUCTURAL_TAG_NAMES
+    )
+    if _text_is_meaningful:
+        escaped = _escape_playwright_text(text)
+        if escaped and len(escaped) < 60:
+            if tag in _TAGS_WITHOUT_TEXT_CONTENT:
+                selector = f'{tag}[placeholder*="{escaped}"], {tag}[aria-label*="{escaped}"]'
+            else:
+                selector = f'{tag}:has-text("{escaped}")'
+            candidates.append({"selector": selector, "confidence": 0.85, "strategy": "text"})
+
+    # 3. Role-based (0.60)
+    if role and tag:
+        candidates.append({"selector": f'{tag}[role="{role}"]', "confidence": 0.60, "strategy": "role"})
+
+    # 4. CSS path (0.40)
+    if css_path:
+        candidates.append({"selector": css_path, "confidence": 0.40, "strategy": "css_path"})
+
+    # 5. Class-based (0.30)
+    if classes and tag:
+        safe_classes = [c for c in classes if _is_sane_css_class(c)]
+        if safe_classes:
+            candidates.append({"selector": f"{tag}.{'.'.join(safe_classes)}", "confidence": 0.30, "strategy": "class"})
+
+    # 6. Fallback (0.10) — always included as last resort
+    candidates.append({"selector": f'{tag}:has-text("未知控件")', "confidence": 0.10, "strategy": "fallback"})
+
+    return candidates
 
 
 def _escape_playwright_text(raw: str) -> str:
@@ -256,6 +320,14 @@ async def classify_features_with_playwright(
             css_path=evidence.get("css_path") or "",
             classes=evidence.get("classes") or [],
         )
+        locator_candidates = _build_locator_candidates(
+            tag=evidence.get("tag") or "",
+            text=raw_text,
+            el_id=evidence.get("id") or "",
+            role=evidence.get("role") or "",
+            css_path=evidence.get("css_path") or "",
+            classes=evidence.get("classes") or [],
+        )
 
         feature_goal_id = adapter.register_feature_goal(
             feature_id=feature["feature_id"],
@@ -265,6 +337,7 @@ async def classify_features_with_playwright(
             parent_goal_id=page_goal_id,
             element_text=element_text,
             element_locator=element_locator,
+            locator_candidates=locator_candidates,
         )
         adapter.engine.goals[feature_goal_id].status = "running"
 
@@ -279,6 +352,7 @@ async def classify_features_with_playwright(
             confidence=confidence,
             element_text=element_text,
             element_locator=element_locator,
+            locator_candidates=locator_candidates,
         )
         adapter.record_feature_identified(
             attempt_id=feature_attempt_id,
@@ -298,6 +372,7 @@ async def classify_features_with_playwright(
                 confidence=confidence,
                 element_text=element_text,
                 element_locator=element_locator,
+                locator_candidates=locator_candidates,
                 page_url=page.url,
             )
         )
@@ -315,6 +390,7 @@ async def classify_features_with_playwright(
 
 __all__ = [
     "EXECUTION_MODE_REAL_BROWSER",
+    "_build_locator_candidates",
     "_build_stable_locator",
     "classify_features_with_playwright",
 ]

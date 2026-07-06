@@ -14,11 +14,14 @@ from .execution_adapter import ExecutionAdapter
 from .execution_runner import simulate_test_case_execution, ExecutionOutcome
 from .loader import load_execution_goals_from_test_cases
 from .orchestrator import ExecutionGoalOrchestrator
+from .preflight import ExecutionLayerAvailability, run_execution_preflight
 
 __all__ = [
     "ExecutionAdapter",
     "ExecutionGoalOrchestrator",
+    "ExecutionLayerAvailability",
     "ExecutionOutcome",
     "load_execution_goals_from_test_cases",
+    "run_execution_preflight",
     "simulate_test_case_execution",
 ]

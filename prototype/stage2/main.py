@@ -698,6 +698,7 @@ async def run_execution_goal_entrypoint(
     cdp_url: str = DEFAULT_CDP_URL,
     run_id: str | None = None,
     max_rounds: int = 1,
+    model_name: str | None = None,
 ) -> dict[str, Any]:
     """Run Stage E's execution_goal orchestrator over a generated_test_cases.json fixture.
 
@@ -718,9 +719,15 @@ async def run_execution_goal_entrypoint(
     the exact previous single-round behavior. Only takes effect for
     mode="fixture_simulated"; mode="real_browser" always stops after round 1
     regardless of this value (see ``run_until_stable``'s docstring).
+
+    model_name: if set AND mode="real_browser", runs a capability preflight
+    (P0-3) to determine which L1-L4 detection layers are available and writes
+    ``routing_summary.json`` to the run output directory. Ignored for
+    fixture_simulated mode.
     """
 
     from prototype.stage2.app.execution_goal import ExecutionGoalOrchestrator
+    from prototype.stage2.app.execution_goal.preflight import run_execution_preflight
 
     run_id = run_id or f"execution_goal_{mode}_run"
     output_dir = ROOT_DIR / "artifacts" / "stage2" / "execution_goal_runs" / run_id
@@ -728,6 +735,21 @@ async def run_execution_goal_entrypoint(
     test_cases = json.loads(Path(test_cases_path).read_text(encoding="utf-8"))
     if not isinstance(test_cases, list):
         raise ValueError(f"Expected list in {test_cases_path}, got {type(test_cases)}")
+
+    try:
+        layers, routing_summary_path = run_execution_preflight(
+            output_dir,
+            model_name=model_name,
+            mode=mode,
+        )
+    except Exception:
+        from prototype.stage2.app.execution_goal.preflight import ExecutionLayerAvailability
+
+        layers = ExecutionLayerAvailability(
+            l4_blocked_reason="preflight_exception: capability check failed, run proceeds without preflight data",
+            notes=["Preflight raised an exception; degraded to default (all layers default, L4 unavailable)."],
+        )
+        routing_summary_path = None
 
     orchestrator = ExecutionGoalOrchestrator(output_dir=output_dir, run_id=run_id)
     orchestrator.create_root_goal()
@@ -772,6 +794,9 @@ async def run_execution_goal_entrypoint(
     summary["rounds_run"] = len(rounds)
     summary["round_history"] = rounds
     summary["stopped_reason"] = rounds[-1]["stopped_reason"] if rounds else None
+    summary["execution_layers"] = layers.to_dict()
+    if routing_summary_path:
+        summary["routing_summary_path"] = str(routing_summary_path)
     run_summary_path = orchestrator.export_run_summary(
         extra={
             "rounds_run": summary["rounds_run"],

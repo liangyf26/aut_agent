@@ -39,6 +39,10 @@ from .execution_runner import (
     STATUS_PASSED,
     ExecutionOutcome,
 )
+from .locator_trier import (
+    AllCandidatesFailed,
+    _try_locator_candidates,
+)
 
 EXECUTION_MODE_REAL_BROWSER = "real_browser"
 
@@ -80,6 +84,39 @@ async def _capture_screenshot(page: "Page", screenshots_dir: Path, name: str) ->
     return {"path": str(path), "kind": "screenshot"}
 
 
+async def _resolve_visibility_from_candidates(
+    page: "Page", candidates: list[dict[str, Any]]
+) -> tuple[bool, list[dict[str, Any]]]:
+    """Iterate locator candidates and check visibility via ``_any_visible``.
+
+    Returns ``(found_visible, attempts)``. Each attempt records the
+    strategy, confidence, selector, and whether it was visible.
+
+    Unlike ``_try_locator_candidates`` (which uses ``wait_for`` and is
+    for click/fill actions), this only checks visibility — safe for
+    ``view_only`` and ``entry_confirmation`` checks.
+    """
+    attempts: list[dict[str, Any]] = []
+    for cand in candidates:
+        selector = str(cand["selector"])
+        strategy = str(cand.get("strategy", "unknown"))
+        try:
+            visible = await _any_visible(page, selector)
+        except Exception:
+            visible = False
+        attempts.append(
+            {
+                "strategy": strategy,
+                "confidence": cand.get("confidence"),
+                "selector": selector,
+                "visible": visible,
+            }
+        )
+        if visible:
+            return True, attempts
+    return False, attempts
+
+
 async def _run_executable_steps(
     page: "Page", steps: list[dict[str, Any]]
 ) -> tuple[list[dict[str, Any]], str | None]:
@@ -99,11 +136,53 @@ async def _run_executable_steps(
                     await page.goto(str(target), wait_until="domcontentloaded", timeout=_DEFAULT_STEP_TIMEOUT_MS)
                 result = {"ok": True, "url": page.url}
             elif action_name == "fill":
-                await page.fill(str(target), str(item.get("value") or ""), timeout=_DEFAULT_STEP_TIMEOUT_MS)
-                result = {"ok": True}
+                _candidates = item.get("locator_candidates")
+                if _candidates:
+                    try:
+                        loc, selector, meta = await _try_locator_candidates(
+                            page, _candidates, timeout_ms=_DEFAULT_STEP_TIMEOUT_MS
+                        )
+                        await loc.fill(str(item.get("value") or ""), timeout=_DEFAULT_STEP_TIMEOUT_MS)
+                        result = {
+                            "ok": True,
+                            "tried_candidates": True,
+                            "winning_strategy": meta["strategy"],
+                            "winning_selector": selector,
+                            "attempts": meta["attempts"],
+                        }
+                    except AllCandidatesFailed:
+                        duration_ms = int((time.perf_counter() - started) * 1000)
+                        actions.append(
+                            _action(idx, action_name, "failed", duration_ms=duration_ms, result={"ok": False, "reason": "all_locator_candidates_failed"})
+                        )
+                        return actions, "locator_unstable"
+                else:
+                    await page.fill(str(target), str(item.get("value") or ""), timeout=_DEFAULT_STEP_TIMEOUT_MS)
+                    result = {"ok": True}
             elif action_name == "click":
-                await page.click(str(target), timeout=_DEFAULT_STEP_TIMEOUT_MS)
-                result = {"ok": True}
+                _candidates = item.get("locator_candidates")
+                if _candidates:
+                    try:
+                        loc, selector, meta = await _try_locator_candidates(
+                            page, _candidates, timeout_ms=_DEFAULT_STEP_TIMEOUT_MS
+                        )
+                        await loc.click(timeout=_DEFAULT_STEP_TIMEOUT_MS)
+                        result = {
+                            "ok": True,
+                            "tried_candidates": True,
+                            "winning_strategy": meta["strategy"],
+                            "winning_selector": selector,
+                            "attempts": meta["attempts"],
+                        }
+                    except AllCandidatesFailed:
+                        duration_ms = int((time.perf_counter() - started) * 1000)
+                        actions.append(
+                            _action(idx, action_name, "failed", duration_ms=duration_ms, result={"ok": False, "reason": "all_locator_candidates_failed"})
+                        )
+                        return actions, "locator_unstable"
+                else:
+                    await page.click(str(target), timeout=_DEFAULT_STEP_TIMEOUT_MS)
+                    result = {"ok": True}
             elif action_name == "wait_for":
                 await page.wait_for_selector(str(target), timeout=_DEFAULT_STEP_TIMEOUT_MS)
                 result = {"ok": True}
@@ -211,8 +290,17 @@ async def execute_test_case_with_playwright(
         )
 
     if case_type == "view_only":
-        locator = test_case.get("metadata", {}).get("element_locator") or "body"
-        visible = await _any_visible(page, str(locator)) if locator else True
+        metadata = test_case.get("metadata") or {}
+        locator = metadata.get("element_locator")
+        locator_candidates = metadata.get("locator_candidates")
+        visible = False
+        attempts: list[dict[str, Any]] = []
+        if locator:
+            visible = await _any_visible(page, str(locator))
+        elif locator_candidates:
+            visible, attempts = await _resolve_visibility_from_candidates(page, locator_candidates)
+        else:
+            visible = True
         if injected_failure or not visible:
             reason = injected_failure or "assertion_failed"
             return ExecutionOutcome(
@@ -224,7 +312,7 @@ async def execute_test_case_with_playwright(
                 case_kind=case_type,
                 execution_mode=EXECUTION_MODE_REAL_BROWSER,
                 failure_reason=reason,
-                actions=[_action(1, "confirm_visibility", "failed", result={"visible": visible, "reason": reason})],
+                actions=[_action(1, "confirm_visibility", "failed", result={"visible": visible, "reason": reason, "attempts": attempts})],
                 page_feedback={"observed": True, "summary": f"页面可见性验证失败：{reason}", "source": EXECUTION_MODE_REAL_BROWSER},
                 notes=[f"real browser visibility check failed: {reason}"],
             )
@@ -236,14 +324,21 @@ async def execute_test_case_with_playwright(
             status=STATUS_PASSED,
             case_kind=case_type,
             execution_mode=EXECUTION_MODE_REAL_BROWSER,
-            actions=[_action(1, "confirm_visibility", "completed", result={"visible": True})],
+            actions=[_action(1, "confirm_visibility", "completed", result={"visible": True, "attempts": attempts})],
             page_feedback={"observed": True, "summary": "视图可见性已确认（真实浏览器）", "source": EXECUTION_MODE_REAL_BROWSER},
             notes=["view-only feature confirmed via real Playwright page.is_visible"],
         )
 
     if case_type == "entry_confirmation":
-        locator = test_case.get("metadata", {}).get("element_locator")
-        entry_visible = await _any_visible(page, str(locator)) if locator else False
+        metadata = test_case.get("metadata") or {}
+        locator = metadata.get("element_locator")
+        locator_candidates = metadata.get("locator_candidates")
+        entry_visible = False
+        attempts: list[dict[str, Any]] = []
+        if locator:
+            entry_visible = await _any_visible(page, str(locator))
+        elif locator_candidates:
+            entry_visible, attempts = await _resolve_visibility_from_candidates(page, locator_candidates)
         if injected_failure or not entry_visible:
             reason = injected_failure or "assertion_failed"
             return ExecutionOutcome(
@@ -255,7 +350,7 @@ async def execute_test_case_with_playwright(
                 case_kind=case_type,
                 execution_mode=EXECUTION_MODE_REAL_BROWSER,
                 failure_reason=reason,
-                actions=[_action(1, "confirm_entry_visible", "failed", result={"entry_visible": entry_visible, "reason": reason})],
+                actions=[_action(1, "confirm_entry_visible", "failed", result={"entry_visible": entry_visible, "reason": reason, "attempts": attempts})],
                 page_feedback={"observed": True, "summary": f"高风险入口确认失败：{reason}", "source": EXECUTION_MODE_REAL_BROWSER},
                 notes=[f"real browser entry-visibility check failed: {reason}"],
             )
@@ -268,7 +363,7 @@ async def execute_test_case_with_playwright(
             case_kind=case_type,
             execution_mode=EXECUTION_MODE_REAL_BROWSER,
             requires_human_authorization=True,
-            actions=[_action(1, "confirm_entry_visible", "completed", result={"entry_visible": True})],
+            actions=[_action(1, "confirm_entry_visible", "completed", result={"entry_visible": True, "attempts": attempts})],
             page_feedback={
                 "observed": True,
                 "summary": f"入口已确认可见（真实浏览器，风险等级={risk_level or 'high'}）",
@@ -345,5 +440,6 @@ async def execute_test_case_with_playwright(
 
 __all__ = [
     "EXECUTION_MODE_REAL_BROWSER",
+    "_resolve_visibility_from_candidates",
     "execute_test_case_with_playwright",
 ]

@@ -28,6 +28,7 @@ def generate_test_case(
     confidence: str,
     element_text: str | None = None,
     element_locator: str | None = None,
+    locator_candidates: list[dict] | None = None,
     page_url: str | None = None,
 ) -> dict:
     """
@@ -44,6 +45,7 @@ def generate_test_case(
         confidence: Classification confidence
         element_text: Element text
         element_locator: Element locator/selector
+        locator_candidates: Ranked locator candidates (L2 pool, P0-1)
         page_url: Page URL
 
     Returns:
@@ -64,6 +66,7 @@ def generate_test_case(
             "metadata": {
                 "feature_type": feature_type,
                 "confidence": confidence,
+                "locator_candidates": locator_candidates,
             },
         }
 
@@ -98,6 +101,7 @@ def generate_test_case(
                 "confidence": confidence,
                 "element_text": element_text,
                 "element_locator": element_locator,
+                "locator_candidates": locator_candidates,
             },
         }
 
@@ -106,6 +110,7 @@ def generate_test_case(
         feature_type=feature_type,
         element_text=element_text,
         element_locator=element_locator,
+        locator_candidates=locator_candidates,
         page_url=page_url,
     )
 
@@ -124,6 +129,7 @@ def generate_test_case(
             "confidence": confidence,
             "element_text": element_text,
             "element_locator": element_locator,
+            "locator_candidates": locator_candidates,
         },
     }
 
@@ -132,6 +138,7 @@ def _generate_test_steps(
     feature_type: str,
     element_text: str | None,
     element_locator: str | None,
+    locator_candidates: list[dict] | None,
     page_url: str | None,
 ) -> list[dict]:
     """
@@ -141,6 +148,7 @@ def _generate_test_steps(
         feature_type: Feature type
         element_text: Element text
         element_locator: Element locator
+        locator_candidates: Ranked locator candidates (L2 pool, P0-1)
         page_url: Page URL
 
     Returns:
@@ -167,6 +175,7 @@ def _generate_test_steps(
                 "step": 3,
                 "action": "click",
                 "target": locator,
+                "locator_candidates": locator_candidates,
                 "description": f"点击{element_text or '查询'}按钮",
             },
             {
@@ -196,6 +205,7 @@ def _generate_test_steps(
                 "step": 3,
                 "action": "click",
                 "target": locator,
+                "locator_candidates": locator_candidates,
                 "description": f"点击{element_text or '重置'}按钮",
             },
             {
@@ -219,6 +229,7 @@ def _generate_test_steps(
                 "step": 2,
                 "action": "click",
                 "target": locator,
+                "locator_candidates": locator_candidates,
                 "description": f"点击{element_text or '详情'}按钮",
             },
             {
@@ -241,6 +252,7 @@ def _generate_test_steps(
                 "step": 2,
                 "action": "click",
                 "target": locator,
+                "locator_candidates": locator_candidates,
                 "description": f"点击{element_text or '导出'}按钮",
             },
             {
@@ -263,6 +275,7 @@ def _generate_test_steps(
                 "step": 2,
                 "action": "click",
                 "target": locator,
+                "locator_candidates": locator_candidates,
                 "description": f"点击Tab: {element_text}",
             },
             {
@@ -285,6 +298,7 @@ def _generate_test_steps(
                 "step": 2,
                 "action": "click",
                 "target": locator,
+                "locator_candidates": locator_candidates,
                 "description": f"点击{element_text or '弹窗'}按钮",
             },
             {
@@ -308,6 +322,7 @@ def _generate_test_steps(
                 "step": 2,
                 "action": "click",
                 "target": locator,
+                "locator_candidates": locator_candidates,
                 "description": f"点击{element_text or feature_type}",
             },
             {

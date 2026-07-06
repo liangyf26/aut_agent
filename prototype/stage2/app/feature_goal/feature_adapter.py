@@ -41,6 +41,7 @@ class FeatureAdapter:
         parent_goal_id: str,
         element_text: str | None = None,
         element_locator: str | None = None,
+        locator_candidates: list[dict] | None = None,
     ) -> str:
         """
         Register a feature discovery goal.
@@ -53,6 +54,7 @@ class FeatureAdapter:
             parent_goal_id: Parent goal ID (page discovery goal)
             element_text: Element text content
             element_locator: Element selector/locator
+            locator_candidates: Ranked locator candidates (L2 pool, P0-1)
 
         Returns:
             Goal ID string
@@ -72,6 +74,7 @@ class FeatureAdapter:
             "risk_level": risk_level,
             "element_text": element_text,
             "element_locator": element_locator,
+            "locator_candidates": locator_candidates,
             "parent_page_id": page_id,
         }
 
@@ -169,6 +172,7 @@ class FeatureAdapter:
         confidence: str,
         element_text: str | None = None,
         element_locator: str | None = None,
+        locator_candidates: list[dict] | None = None,
     ) -> str:
         """
         Attach feature metadata evidence.
@@ -180,6 +184,7 @@ class FeatureAdapter:
             confidence: Classification confidence
             element_text: Element text
             element_locator: Element locator
+            locator_candidates: Ranked locator candidates (L2 pool, P0-1)
 
         Returns:
             Evidence ID string
@@ -192,6 +197,7 @@ class FeatureAdapter:
             "confidence": confidence,
             "element_text": element_text,
             "element_locator": element_locator,
+            "locator_candidates": locator_candidates,
         }
 
         evidence = self.engine.attach_evidence(
