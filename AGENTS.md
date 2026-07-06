@@ -34,6 +34,7 @@
 - `prototype/stage2/app/execution_goal/execution_runner.py` vs `real_browser_runner.py`: 阶段E 执行分两种模式——`execution_runner.py` 是默认的 fixture 模拟执行（`execution_mode="fixture_simulated"`，不驱动浏览器）；`real_browser_runner.py` 是 2026-07-04 验证过的真实 Playwright 执行分支（`execution_mode="real_browser"`），已针对真实苏源系统跑通，但还只是可选模块，未合并为默认路径
 - `prototype/stage2/app/execution_goal/locator_trier.py`: P0-2 L2 定位器尝试引擎，按置信度降序遍历 Stage D 产出的 `locator_candidates`，首个命中的候选执行点击/填写动作，全部失败时抛出 `AllCandidatesFailed`
 - `prototype/stage2/app/execution_goal/preflight.py`: P0-3 Stage E 前置检查，启动时运行 capability routing 决定 L1-L4 各层可用性，写入 `routing_summary.json`
+- `prototype/stage2/app/execution_goal/browser_use_executor.py`: P0-4 Browser Use 统一执行器，提供 `execute_with_browser_use()` 入口和 `BrowserUseSafety` 安全约束层，供阶段 B/C/D/E 适配调用
 - `prototype/stage2/templates/`: 项目级执行模板、基线、schema、locator hints
 - `prototype/stage2/app/verification/suyuan_shared_actions.py`: 溯源样本的 wizard / drawer 共享动作族
 - `prototype/stage2/app/verification/suyuan_submit_dialog_actions.py`: 溯源样本的 upload / submit dialog 共享动作族

@@ -10,6 +10,12 @@ projects the run onto the existing iteration layer for failure clusters,
 retry planning and the next-round decision (技术方案 §2.6).
 """
 
+from .browser_use_executor import (
+    BrowserUseResult,
+    BrowserUseSafety,
+    execute_with_browser_use,
+    safety_for_stage,
+)
 from .execution_adapter import ExecutionAdapter
 from .execution_runner import simulate_test_case_execution, ExecutionOutcome
 from .loader import load_execution_goals_from_test_cases
@@ -17,11 +23,15 @@ from .orchestrator import ExecutionGoalOrchestrator
 from .preflight import ExecutionLayerAvailability, run_execution_preflight
 
 __all__ = [
+    "BrowserUseResult",
+    "BrowserUseSafety",
     "ExecutionAdapter",
     "ExecutionGoalOrchestrator",
     "ExecutionLayerAvailability",
     "ExecutionOutcome",
+    "execute_with_browser_use",
     "load_execution_goals_from_test_cases",
     "run_execution_preflight",
+    "safety_for_stage",
     "simulate_test_case_execution",
 ]

@@ -118,6 +118,14 @@ _Avoid_: 直接使用单个 target、失败后不做候选回退
 Stage E 启动时运行的 capability routing 检查，决定 L1（静态快照）、L2（候选池）、L3（ARIA）和 L4（Browser Use）各层在本次执行中是否可用。检查结果写入 `routing_summary.json`（P0-3）。
 _Avoid_: 不做检查直接执行、跳过 L4 能力门禁、无 routing_summary 落盘
 
+**L3 ARIA 语义匹配 (L3 ARIA Semantic Matching)**:
+L2 候选全部失败时，消费 Playwright 原生 `page.getByRole()` / `page.getByText()` / `page.getByLabel()` 做语义级定位。纯 Playwright，不引入 LLM（P0-5）。
+_Avoid_: 候选失败直接报错、跳过 ARIA 直接调 LLM
+
+**Browser Use 统一执行器 (Unified Browser Use Executor)**:
+L4 语义接管层的统一入口 `execute_with_browser_use()`，接受 instruction、`BrowserUseSafety` 约束和 `context`（阶段/目标/已尝试策略），返回 `BrowserUseResult`。`write_allowed=False` 时仅允许导航和观察，禁用点击/填写/提交（P0-4）。
+_Avoid_: 各阶段各自造 Browser Use 封装、无统一安全层、高风险操作绕过门禁
+
 **泛化回归测试护栏 (Generalization Regression Guardrail)**:
 在继续抽象模板、动作族或接入新系统前，用于锁定模板动作名、registry contract、共享动作 handler 输入输出、policy bridge 等关键行为的一组回归测试。
 _Avoid_: 先拆再说、无护栏泛化

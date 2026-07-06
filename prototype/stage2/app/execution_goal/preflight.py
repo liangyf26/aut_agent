@@ -122,8 +122,9 @@ def _run_full_preflight(
     verification_ok = verification_route is not None and verification_route.allowed
 
     l4_blocked = (
-        "P0-4 Browser Use executor not yet implemented — L4 unavailable regardless "
-        "of capability probe status."
+        "P0-4 Browser Use executor and P0-5 cascade (L3 ARIA + L4 Browser Use) "
+        "are implemented. L4 is available when capability preflight confirms "
+        "Browser Use readiness and a model profile is provided."
     )
     notes: list[str] = [
         "Stage E capability preflight complete.",
@@ -135,8 +136,8 @@ def _run_full_preflight(
     ]
     if verification_ok:
         notes.append(
-            "When P0-4 Browser Use executor is available, this profile's verification route "
-            "will allow L4 fallback."
+            "This profile's verification route allows L4 Browser Use fallback "
+            "in the L1→L2→L3→L4 cascade."
         )
 
     layers = ExecutionLayerAvailability(

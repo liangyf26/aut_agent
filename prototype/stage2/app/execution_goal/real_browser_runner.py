@@ -41,6 +41,7 @@ from .execution_runner import (
 )
 from .locator_trier import (
     AllCandidatesFailed,
+    _try_l3_aria,
     _try_locator_candidates,
 )
 
@@ -116,15 +117,182 @@ async def _resolve_visibility_from_candidates(
             return True, attempts
     return False, attempts
 
+# ── L1→L2→L3→L4 cascade ────────────────────────────────────────────────
+
+async def _resolve_with_cascade(
+    page: "Page",
+    item: dict[str, Any],
+    *,
+    action: str,
+    cascade_context: dict[str, Any],
+) -> tuple[dict[str, Any], str | None]:
+    target = item.get("target")
+    candidates = item.get("locator_candidates")
+    cascade_notes: list[str] = []
+    l2_attempts: list[dict[str, Any]] = []
+
+    # When no candidates AND no cascade_context, fall back to the old
+    # direct click/fill path — preserve backward compatibility with
+    # callers that predate P0-1's candidate pool.
+    if not candidates:
+        if cascade_context:
+            pass  # go through L3→L4 cascade
+        else:
+            await _do_action(page.locator(str(target)).first, action, item)
+            return {"ok": True, "tried_candidates": False}, None
+
+    if candidates:
+        try:
+            loc, selector, meta = await _try_locator_candidates(
+                page, candidates, timeout_ms=_DEFAULT_STEP_TIMEOUT_MS
+            )
+            await _do_action(loc, action, item)
+            result = {
+                "ok": True,
+                "layer": "l2",
+                "tried_candidates": True,
+                "winning_strategy": meta["strategy"],
+                "winning_selector": selector,
+                "attempts": meta["attempts"],
+            }
+            return result, None
+        except AllCandidatesFailed as exc:
+            cascade_notes.append(f"L2 candidate pool exhausted: {exc}")
+            l2_attempts = [{"reason": "all_l2_candidates_failed", "detail": str(exc)}]
+
+    element_text = _extract_element_text(item)
+    l3_result = await _try_l3_aria(
+        page,
+        element_text=element_text,
+        candidates=candidates,
+        target_tag=_extract_tag(item),
+        timeout_ms=_DEFAULT_STEP_TIMEOUT_MS,
+    )
+    if l3_result is not None:
+        loc, selector, l3_meta = l3_result
+        await _do_action(loc, action, item)
+        result = {
+            "ok": True,
+            "layer": "l3",
+            "tried_candidates": True,
+            "winning_strategy": l3_meta["strategy"],
+            "winning_selector": selector,
+            "attempts": l2_attempts,
+            "l3_attempts": l3_meta.get("attempts", []),
+            "cascade_notes": cascade_notes + ["L3 ARIA matched."],
+        }
+        return result, None
+    cascade_notes.append("L3 ARIA did not match.")
+
+    if cascade_context:
+        l4_result = await _try_l4_browser_use(
+            page, item, action=action, cascade_context=cascade_context,
+        )
+        if l4_result is not None:
+            return l4_result, None
+        cascade_notes.append("L4 Browser Use did not match or was unavailable.")
+
+    result = {
+        "ok": False,
+        "reason": "all_locator_layers_failed",
+        "cascade_notes": cascade_notes,
+    }
+    return result, "locator_unstable"
+
+
+async def _do_action(loc: Any, action: str, item: dict[str, Any]) -> None:
+    if action == "fill":
+        await loc.fill(str(item.get("value") or ""), timeout=_DEFAULT_STEP_TIMEOUT_MS)
+    else:
+        await loc.click(timeout=_DEFAULT_STEP_TIMEOUT_MS)
+
+
+def _extract_element_text(item: dict[str, Any]) -> str | None:
+    desc = str(item.get("description") or "")
+    import re as _re
+    for prefix in ("点击", "填写"):
+        if desc.startswith(prefix):
+            desc = desc[len(prefix):]
+            if desc.endswith("按钮"):
+                desc = desc[:-2]
+            return desc.strip() or None
+    target = str(item.get("target") or "")
+    m = _re.search(r'has-text\("([^"]+)"\)', target)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _extract_tag(item: dict[str, Any]) -> str | None:
+    target = str(item.get("target") or "")
+    import re as _re
+    m = _re.match(r"^(\w+)", target)
+    return m.group(1) if m else None
+
+
+async def _try_l4_browser_use(
+    page: "Page",
+    item: dict[str, Any],
+    *,
+    action: str,
+    cascade_context: dict[str, Any],
+) -> dict[str, Any] | None:
+    model_name = cascade_context.get("model_name")
+    cdp_url = cascade_context.get("cdp_url")
+    screenshots_dir = cascade_context.get("screenshots_dir")
+    if not model_name or not cdp_url:
+        return None
+
+    from .browser_use_executor import BrowserUseSafety, execute_with_browser_use
+
+    desc = item.get("description") or f"{action}操作"
+    instruction = (
+        f"在当前页面上{desc}。如果需要点击某个元素，请尝试用附近的文字或 aria-label 来定位。"
+    )
+    safety = BrowserUseSafety(write_allowed=action != "fill", max_steps=4)
+    try:
+        br_result = await execute_with_browser_use(
+            page=page,
+            instruction=instruction,
+            context={
+                "stage": "execution_verification",
+                "cdp_url": cdp_url,
+                "risk_level": cascade_context.get("risk_level") or "low",
+            },
+            safety=safety,
+            model_name=model_name,
+            screenshots_dir=screenshots_dir,
+        )
+    except Exception:
+        return None
+
+    if not br_result.ok:
+        return None
+
+    return {
+        "ok": True,
+        "layer": "l4",
+        "tried_candidates": True,
+        "winning_strategy": "browser_use_fallback",
+        "winning_selector": br_result.instruction,
+        "browser_use_actions": br_result.actions,
+        "browser_use_model": br_result.model,
+        "cascade_notes": [f"L4 Browser Use engaged (model={br_result.model})."],
+    }
+
 
 async def _run_executable_steps(
-    page: "Page", steps: list[dict[str, Any]]
+    page: "Page", steps: list[dict[str, Any]], *, cascade_context: dict[str, Any] | None = None
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Run each Stage D step via Playwright. Returns (actions, failure_reason).
 
+    When ``cascade_context`` is provided, locator resolution falls through
+    L1 (static) → L2 (candidate pool) → L3 (ARIA semantic) → L4 (Browser
+    Use). Without it, only L1+L2 are used (backward-compatible).
+
     failure_reason is None when every step completed.
     """
-
+    cascade_context = cascade_context or {}
     actions: list[dict[str, Any]] = []
     for idx, item in enumerate(steps, start=1):
         action_name = str(item.get("action") or f"step_{idx}")
@@ -136,53 +304,19 @@ async def _run_executable_steps(
                     await page.goto(str(target), wait_until="domcontentloaded", timeout=_DEFAULT_STEP_TIMEOUT_MS)
                 result = {"ok": True, "url": page.url}
             elif action_name == "fill":
-                _candidates = item.get("locator_candidates")
-                if _candidates:
-                    try:
-                        loc, selector, meta = await _try_locator_candidates(
-                            page, _candidates, timeout_ms=_DEFAULT_STEP_TIMEOUT_MS
-                        )
-                        await loc.fill(str(item.get("value") or ""), timeout=_DEFAULT_STEP_TIMEOUT_MS)
-                        result = {
-                            "ok": True,
-                            "tried_candidates": True,
-                            "winning_strategy": meta["strategy"],
-                            "winning_selector": selector,
-                            "attempts": meta["attempts"],
-                        }
-                    except AllCandidatesFailed:
-                        duration_ms = int((time.perf_counter() - started) * 1000)
-                        actions.append(
-                            _action(idx, action_name, "failed", duration_ms=duration_ms, result={"ok": False, "reason": "all_locator_candidates_failed"})
-                        )
-                        return actions, "locator_unstable"
-                else:
-                    await page.fill(str(target), str(item.get("value") or ""), timeout=_DEFAULT_STEP_TIMEOUT_MS)
-                    result = {"ok": True}
+                result, reason = await _resolve_with_cascade(
+                    page, item, action="fill", cascade_context=cascade_context,
+                )
+                if reason is not None:
+                    actions.append(_action(idx, action_name, "failed", duration_ms=int((time.perf_counter() - started) * 1000), result=result))
+                    return actions, reason
             elif action_name == "click":
-                _candidates = item.get("locator_candidates")
-                if _candidates:
-                    try:
-                        loc, selector, meta = await _try_locator_candidates(
-                            page, _candidates, timeout_ms=_DEFAULT_STEP_TIMEOUT_MS
-                        )
-                        await loc.click(timeout=_DEFAULT_STEP_TIMEOUT_MS)
-                        result = {
-                            "ok": True,
-                            "tried_candidates": True,
-                            "winning_strategy": meta["strategy"],
-                            "winning_selector": selector,
-                            "attempts": meta["attempts"],
-                        }
-                    except AllCandidatesFailed:
-                        duration_ms = int((time.perf_counter() - started) * 1000)
-                        actions.append(
-                            _action(idx, action_name, "failed", duration_ms=duration_ms, result={"ok": False, "reason": "all_locator_candidates_failed"})
-                        )
-                        return actions, "locator_unstable"
-                else:
-                    await page.click(str(target), timeout=_DEFAULT_STEP_TIMEOUT_MS)
-                    result = {"ok": True}
+                result, reason = await _resolve_with_cascade(
+                    page, item, action="click", cascade_context=cascade_context,
+                )
+                if reason is not None:
+                    actions.append(_action(idx, action_name, "failed", duration_ms=int((time.perf_counter() - started) * 1000), result=result))
+                    return actions, reason
             elif action_name == "wait_for":
                 await page.wait_for_selector(str(target), timeout=_DEFAULT_STEP_TIMEOUT_MS)
                 result = {"ok": True}
@@ -242,6 +376,7 @@ async def execute_test_case_with_playwright(
     goal_id: str | None = None,
     screenshots_dir: Path,
     injected_failure: str | None = None,
+    cascade_context: dict[str, Any] | None = None,
 ) -> ExecutionOutcome:
     """Real-browser counterpart to ``simulate_test_case_execution``.
 
@@ -391,7 +526,7 @@ async def execute_test_case_with_playwright(
                 notes=[f"injected failure for verification: {injected_failure}"],
             )
 
-        actions, failure_reason = await _run_executable_steps(page, steps)
+        actions, failure_reason = await _run_executable_steps(page, steps, cascade_context=cascade_context)
         screenshot_ref = await _capture_screenshot(page, screenshots_dir, f"{test_case_id}.png")
 
         if failure_reason is not None:
