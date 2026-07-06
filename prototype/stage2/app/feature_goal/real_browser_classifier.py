@@ -236,9 +236,14 @@ async def classify_features_with_playwright(
         risk_level = feature.get("risk_level", "low")
         element_text = feature.get("name")
         evidence = feature.get("evidence", {})
+        # Use the raw DOM text for locator construction (may be empty for
+        # icon-only elements); the display name (feature["name"]) can be a
+        # Python-generated fallback like "可见控件 1" that no DOM element
+        # actually contains.
+        raw_text = str(evidence.get("raw_text") or "")
         element_locator = _build_stable_locator(
             tag=evidence.get("tag") or "",
-            text=element_text or "",
+            text=raw_text,
             el_id=evidence.get("id") or "",
             role=evidence.get("role") or "",
             css_path=evidence.get("css_path") or "",
