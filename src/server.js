@@ -537,8 +537,9 @@ async function handleApi(req, res, pathname) {
     return true;
   }
 
-  if (req.method === 'GET' && pathnameAfter === '/api/stage2/test-center/e2e-progress') {
-    const runId = url.searchParams.get('runId') || '';
+  if (req.method === 'GET' && pathname === '/api/stage2/test-center/e2e-progress') {
+    const progressUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    const runId = progressUrl.searchParams.get('runId') || '';
     if (!SAFE_RUN_ID_PATTERN.test(runId)) {
       sendError(res, 400, 'Invalid runId.');
       return true;
