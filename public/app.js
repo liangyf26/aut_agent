@@ -1365,8 +1365,6 @@ function render() {
   renderStage2Overview();
   renderStage2RunDetail();
   renderTabs();
-  // 测试中心面板需要实时刷新（E2E 轮询驱动）
-  renderStage2TestCenterTab();
 }
 
 function renderWorkspaceChrome() {
@@ -2845,10 +2843,10 @@ function renderTestCenterE2eSection() {
   const runningStatus = progress?.status === 'running' || running;
 
   return `
-    <section class="stage2-table-card">
+    <section class="stage2-table-card" data-e2e-progress-root>
       <div class="stage2-section-head">
         <h3>端到端全流程测试</h3>
-        ${runningStatus && currentStage ? `<span class="tag pulse">运行中：${stageOrderIds.indexOf(currentStage) + 1}/4</span>` : ''}
+        <span data-e2e-head-tag>${runningStatus && currentStage ? `<span class="tag pulse">运行中：${stageOrderIds.indexOf(currentStage) + 1}/4</span>` : ''}</span>
       </div>
       <p class="stage2-help-text">依次跑通菜单发现→页面发现→功能点发现→执行，每一步自动把产物路径传给下一步；任意一步失败或需人工介入即停止，不会继续往后跑。</p>
       <div class="stage2-field-grid">
@@ -2876,23 +2874,25 @@ function renderTestCenterE2eSection() {
           const isCurrent = currentStage === stageId && runningStatus;
           const notRun = !step && !isCurrent;
           const dur = step ? ` · ${formatTestCenterDuration(step.durationMs)}` : '';
-          const verdict = step ? testCenterVerdictTag(step.evaluation?.verdict, step.evaluation?.reason) : (isCurrent ? '进行中...' : '');
+          const verdict = step ? testCenterVerdictTag(step.evaluation?.verdict, step.evaluation?.reason) : (isCurrent ? '进行中...' : '未运行');
           return `
-            <article class="stage2-timeline-step ${notRun ? '' : 'current'} ${isCurrent ? 'pulse' : ''}">
+            <article class="stage2-timeline-step ${notRun ? '' : 'current'} ${isCurrent ? 'pulse' : ''}" data-e2e-step-index="${index}">
               <span>步骤 ${index + 1}</span>
               <strong>${escapeHtml(stageLabel)}${dur}</strong>
-              ${notRun ? '<small>未运行</small>' : `<small>${verdict}</small>`}
+              <small>${verdict}</small>
             </article>
           `;
         }).join('')}
       </div>
-      ${result?.stoppedReason ? `<p class="stage2-help-text">停止原因：${escapeHtml(result.stoppedReason)}</p>` : ''}
-      ${(steps || []).map((step) => `
-        <details class="stage2-work-card">
-          <summary>${escapeHtml(TEST_CENTER_STAGE_ORDER.find((item) => item.id === step.stageId)?.label || step.stageId)} 详情</summary>
-          ${renderTestCenterStageResult(step)}
-        </details>
-      `).join('')}
+      <p class="stage2-help-text" data-e2e-stop-reason>${result?.stoppedReason ? `停止原因：${escapeHtml(result.stoppedReason)}` : ''}</p>
+      <div data-e2e-details>
+        ${(steps || []).map((step) => `
+          <details class="stage2-work-card" data-e2e-stage-id="${escapeHtml(step.stageId)}">
+            <summary>${escapeHtml(TEST_CENTER_STAGE_ORDER.find((item) => item.id === step.stageId)?.label || step.stageId)} 详情</summary>
+            ${renderTestCenterStageResult(step)}
+          </details>
+        `).join('')}
+      </div>
     </section>
   `;
 }
@@ -2962,23 +2962,23 @@ async function runTestCenterE2e() {
     });
     const runId = startPayload.runId;
 
-    // Poll for real-time progress
+    // Poll for real-time progress — use incremental DOM update, not full render
     let pollTimer = null;
     await new Promise((resolve) => {
       const poll = async () => {
         try {
           const resp = await api(`/api/stage2/test-center/e2e-progress?runId=${encodeURIComponent(runId)}`);
           state.testCenter.e2eProgress = resp;
+          refreshE2eProgress();
           if (resp.status === 'completed' || resp.status === 'failed') {
             if (pollTimer) clearTimeout(pollTimer);
             state.testCenter.e2eResult = resp;
             state.testCenter.e2eRunning = false;
             state.testCenter.e2eProgress = null;
             saveState.textContent = resp.stoppedAt ? `端到端测试在「${resp.stoppedAt}」阶段停止` : '端到端测试全部通过';
-            render();
+            refreshE2eProgress();
             resolve();
           } else {
-            render();
             pollTimer = setTimeout(poll, 1500);
           }
         } catch (err) {
@@ -2998,6 +2998,77 @@ async function runTestCenterE2e() {
     state.testCenter.e2eRunning = false;
     state.testCenter.e2eProgress = null;
     render();
+  }
+}
+
+function refreshE2eProgress() {
+  const panel = document.querySelector('#stage2TestcenterPanel');
+  if (!panel) return;
+  const e2eSection = panel.querySelector('[data-e2e-progress-root]');
+  if (!e2eSection) return;
+  const progress = state.testCenter.e2eProgress;
+  const result = state.testCenter.e2eResult;
+  const steps = progress?.steps || result?.steps || [];
+  const currentStage = progress?.currentStage;
+  const running = state.testCenter.e2eRunning;
+  const stageOrderIds = ['menu', 'page', 'feature', 'execution'];
+
+  // Update button state
+  const btn = panel.querySelector('[data-test-center-run-e2e]');
+  if (btn) {
+    btn.disabled = running;
+    btn.textContent = running ? '运行中...' : '开始端到端测试';
+  }
+
+  // Update heading status tag
+  const headTag = e2eSection.querySelector('[data-e2e-head-tag]');
+  if (headTag) {
+    headTag.innerHTML = running && currentStage ? `<span class="tag pulse">运行中：${stageOrderIds.indexOf(currentStage) + 1}/4</span>` : (result ? '已完成' : '');
+  }
+
+  // Update timeline steps — patch existing DOM, don't rebuild
+  e2eSection.querySelectorAll('.stage2-timeline-step').forEach((el) => {
+    const stepIdx = Number(el.getAttribute('data-e2e-step-index'));
+    const stageId = stageOrderIds[stepIdx];
+    const step = steps.find((s) => s.stageId === stageId);
+    const isCurrent = currentStage === stageId && running;
+    const dur = step ? ` · ${formatTestCenterDuration(step.durationMs)}` : '';
+    const vText = step
+      ? testCenterVerdictTag(step.evaluation?.verdict, step.evaluation?.reason)
+      : (isCurrent ? '进行中...' : '未运行');
+    el.classList.toggle('current', !!step || isCurrent);
+    el.classList.toggle('pulse', !!isCurrent);
+    const strong = el.querySelector('strong');
+    if (strong) strong.textContent = (TEST_CENTER_STAGE_ORDER.find((i) => i.id === stageId)?.label || stageId) + dur;
+    const small = el.querySelector('small');
+    if (small) small.innerHTML = vText;
+  });
+
+  // Append new detail panels — never remove already-open ones
+  const detailsContainer = e2eSection.querySelector('[data-e2e-details]');
+  if (detailsContainer) {
+    const existingIds = new Set();
+    detailsContainer.querySelectorAll('details').forEach((el) => {
+      existingIds.add(el.getAttribute('data-e2e-stage-id'));
+    });
+    steps.forEach((step) => {
+      if (!existingIds.has(step.stageId)) {
+        const detail = document.createElement('details');
+        detail.className = 'stage2-work-card';
+        detail.setAttribute('data-e2e-stage-id', step.stageId);
+        detail.innerHTML = `
+          <summary>${escapeHtml(TEST_CENTER_STAGE_ORDER.find((item) => item.id === step.stageId)?.label || step.stageId)} 详情</summary>
+          ${renderTestCenterStageResult(step)}
+        `;
+        detailsContainer.appendChild(detail);
+      }
+    });
+  }
+
+  // Update stop reason
+  const stopReasonEl = e2eSection.querySelector('[data-e2e-stop-reason]');
+  if (stopReasonEl) {
+    stopReasonEl.textContent = result?.stoppedReason ? `停止原因：${result.stoppedReason}` : '';
   }
 }
 

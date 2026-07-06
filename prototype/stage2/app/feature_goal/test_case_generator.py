@@ -159,7 +159,7 @@ def _generate_test_steps(
             {
                 "step": 2,
                 "action": "fill",
-                "target": "input[name='keyword']",
+                "target": "input[type='text']:visible, input:not([type]):visible, textarea:visible",
                 "value": "测试",
                 "description": "填写查询条件",
             },
@@ -188,7 +188,7 @@ def _generate_test_steps(
             {
                 "step": 2,
                 "action": "fill",
-                "target": "input[name='keyword']",
+                "target": "input[type='text']:visible, input:not([type]):visible, textarea:visible",
                 "value": "测试",
                 "description": "填写查询条件",
             },
@@ -201,7 +201,7 @@ def _generate_test_steps(
             {
                 "step": 4,
                 "action": "verify",
-                "target": "input[name='keyword']",
+                "target": "input[type='text']:visible, input:not([type]):visible, textarea:visible",
                 "expected": "",
                 "description": "验证表单已清空",
             },
