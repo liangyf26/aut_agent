@@ -399,9 +399,8 @@ const GOAL_CHAIN_STAGES = {
       if (mode === 'real_browser') {
         args.push('--cdp-url', normalizeCdpUrl(params.cdpUrl));
       }
-      if (params.runId) {
-        args.push('--execution-goal-run-id', requireSafeId(params.runId, 'runId'));
-      }
+      const executionRunId = params.runId || `execution_goal_${mode}_run`;
+      args.push('--execution-goal-run-id', requireSafeId(executionRunId, 'runId'));
       args.push('--execution-goal-max-rounds', String(requireInt(params.maxRounds, 'maxRounds', 1, 20, 1)));
       return args;
     },
@@ -455,7 +454,11 @@ async function runGoalChainStage(stageId, params = {}, dependencies = {}) {
     }
   }
 
-  const runId = params.runId ? requireSafeId(params.runId, 'runId') : defaultRunIdFor(stageId);
+  const runId = params.runId
+    ? requireSafeId(params.runId, 'runId')
+    : (stageId === 'execution' && params.mode)
+      ? `execution_goal_${params.mode}_run`
+      : defaultRunIdFor(stageId);
   const outputDir = stage.outputDir(runId, stage2Dir);
   const runSummary = await readJsonIfExists(path.join(outputDir, 'run_summary.json'));
   const humanTakeover = await readJsonIfExists(path.join(outputDir, 'human_takeover.json'));

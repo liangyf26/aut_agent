@@ -130,7 +130,10 @@ async def _run_executable_steps(
                 return actions, "evidence_incomplete"
         except Exception as exc:  # noqa: BLE001 - real browser call, any failure is a step failure
             duration_ms = int((time.perf_counter() - started) * 1000)
-            reason = "page_load_timeout" if "Timeout" in type(exc).__name__ else "assertion_failed"
+            if "Timeout" in type(exc).__name__:
+                reason = "page_load_timeout" if action_name == "navigate" else "locator_unstable"
+            else:
+                reason = "assertion_failed"
             actions.append(
                 _action(
                     idx,
