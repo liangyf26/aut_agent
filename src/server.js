@@ -23,12 +23,19 @@ const {
   TestCenterInputError,
   UNIT_TEST_SUITES,
   GOAL_CHAIN_STAGES,
+  TEST_CENTER_DIR,
+  createRunId,
   listTestCenterRuns,
   persistTestCenterRun,
   resolveTestCenterArtifact,
   runGoalChainEndToEnd,
+  runGoalChainEndToEndAsync,
   runGoalChainStage,
-  runUnitTestSuite
+  runUnitTestSuite,
+  writeJson,
+  readJsonIfExists,
+  nowIso,
+  SAFE_RUN_ID_PATTERN
 } = require('./stage2TestCenter');
 const {
   analyzeV3Run,
@@ -57,6 +64,7 @@ const {
 
 const PORT = Number(process.env.PORT || 4173);
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
+const STAGE2_DIR = path.join(__dirname, '..', 'artifacts', 'stage2');
 
 const mimeTypes = {
   '.html': 'text/html; charset=utf-8',
@@ -491,6 +499,60 @@ async function handleApi(req, res, pathname) {
       sendJson(res, 200, { result, runId: persisted.runId });
     } catch (error) {
       sendTestCenterError(res, error);
+    }
+    return true;
+  }
+
+  // -----------------------------------------------------------------------
+  // E2E 实时进度：异步启动 + 轮询
+  // -----------------------------------------------------------------------
+  if (req.method === 'POST' && pathname === '/api/stage2/test-center/start-goal-chain-e2e') {
+    try {
+      const body = await readJson(req);
+      const runId = createRunId();
+      const runDir = path.join(TEST_CENTER_DIR, runId);
+      await fs.mkdir(runDir, { recursive: true });
+      const progressFile = path.join(runDir, 'progress.json');
+      await writeJson(progressFile, { status: 'running', currentStage: null, steps: [], createdAt: nowIso() });
+
+      // Fire-and-forget: run E2E in background, updating progress file as we go
+      runGoalChainEndToEndAsync(body.params || {}, {
+        stage2Dir: STAGE2_DIR,
+        onE2eProgress: async (payload) => {
+          await writeJson(progressFile, { ...payload, updatedAt: nowIso() });
+        }
+      }).then(async (finalResult) => {
+        await writeJson(progressFile, { ...finalResult, status: 'completed', updatedAt: nowIso() });
+        await persistTestCenterRun('端到端全流程测试', finalResult, { testCenterDir: TEST_CENTER_DIR, runId, runDir });
+      }).catch(async (error) => {
+        await writeJson(progressFile, {
+          status: 'failed', error: error.message, steps: [], stoppedAt: 'startup', stoppedReason: error.message, updatedAt: nowIso()
+        });
+      });
+
+      sendJson(res, 200, { runId });
+    } catch (error) {
+      sendTestCenterError(res, error);
+    }
+    return true;
+  }
+
+  if (req.method === 'GET' && pathnameAfter === '/api/stage2/test-center/e2e-progress') {
+    const runId = url.searchParams.get('runId') || '';
+    if (!SAFE_RUN_ID_PATTERN.test(runId)) {
+      sendError(res, 400, 'Invalid runId.');
+      return true;
+    }
+    try {
+      const progressFile = path.join(TEST_CENTER_DIR, runId, 'progress.json');
+      const progress = await readJsonIfExists(progressFile);
+      if (!progress) {
+        sendError(res, 404, 'Progress not found for this runId.');
+        return true;
+      }
+      sendJson(res, 200, progress);
+    } catch (error) {
+      sendError(res, 500, `Failed to read progress: ${error.message}`);
     }
     return true;
   }

@@ -562,6 +562,19 @@ function evaluateGoalLoopStepResult({ stageId, exitCode, runSummary, humanTakeov
 // ---------------------------------------------------------------------------
 
 async function runGoalChainEndToEnd(params = {}, dependencies = {}) {
+  return _runGoalChainEndToEndInternal(params, dependencies, null);
+}
+
+async function runGoalChainEndToEndAsync(params = {}, dependencies = {}) {
+  return new Promise((resolve, reject) => {
+    _runGoalChainEndToEndInternal(params, dependencies, (payload) => {
+      // progress callback fires after each stage — the caller persists it
+      dependencies.onE2eProgress?.(payload);
+    }).then(resolve).catch(reject);
+  });
+}
+
+async function _runGoalChainEndToEndInternal(params = {}, dependencies = {}, onProgress) {
   const sharedRunId = params.runId ? requireSafeId(params.runId, 'runId') : null;
   const steps = [];
   let previousChainOutputPath = null;
@@ -573,6 +586,10 @@ async function runGoalChainEndToEnd(params = {}, dependencies = {}) {
       cdpUrl: params.cdpUrl,
       runId: sharedRunId
     };
+
+    if (onProgress) {
+      onProgress({ status: 'running', currentStage: stageId, currentLabel: stage.label, steps: [...steps] });
+    }
 
     if (stageId === 'page') {
       stageParams.menuEntriesPath = previousChainOutputPath;
@@ -587,29 +604,40 @@ async function runGoalChainEndToEnd(params = {}, dependencies = {}) {
     try {
       stepResult = await runGoalChainStage(stageId, stageParams, dependencies);
     } catch (error) {
-      steps.push({
-        stageId,
-        label: stage.label,
-        evaluation: { verdict: 'failed', reason: error.message },
-        error: error.message
-      });
-      return { steps, stoppedAt: stageId, stoppedReason: error.message };
+      const finalResult = {
+        steps: [...steps, {
+          stageId,
+          label: stage.label,
+          evaluation: { verdict: 'failed', reason: error.message },
+          error: error.message
+        }],
+        stoppedAt: stageId,
+        stoppedReason: error.message
+      };
+      if (onProgress) onProgress({ ...finalResult, status: 'completed' });
+      return finalResult;
     }
 
     steps.push(stepResult);
 
     if (stepResult.evaluation.verdict !== 'passed') {
-      return { steps, stoppedAt: stageId, stoppedReason: stepResult.evaluation.reason };
+      const finalResult = { steps, stoppedAt: stageId, stoppedReason: stepResult.evaluation.reason };
+      if (onProgress) onProgress({ ...finalResult, status: 'completed' });
+      return finalResult;
     }
 
     previousChainOutputPath = stepResult.chainOutputPath;
     if (stage.chainOutputKey && !previousChainOutputPath) {
       const reason = `${stage.label} 未在 stdout 中返回 ${stage.chainOutputKey}，无法继续下一阶段。`;
-      return { steps, stoppedAt: stageId, stoppedReason: reason };
+      const finalResult = { steps, stoppedAt: stageId, stoppedReason: reason };
+      if (onProgress) onProgress({ ...finalResult, status: 'completed' });
+      return finalResult;
     }
   }
 
-  return { steps, stoppedAt: null, stoppedReason: null };
+  const finalResult = { steps, stoppedAt: null, stoppedReason: null };
+  if (onProgress) onProgress({ ...finalResult, status: 'completed' });
+  return finalResult;
 }
 
 // ---------------------------------------------------------------------------
@@ -618,8 +646,8 @@ async function runGoalChainEndToEnd(params = {}, dependencies = {}) {
 
 async function persistTestCenterRun(kindLabel, payload, options = {}) {
   const dir = options.testCenterDir || TEST_CENTER_DIR;
-  const runId = createRunId();
-  const runDir = path.join(dir, runId);
+  const runId = options.runId || createRunId();
+  const runDir = options.runDir || path.join(dir, runId);
   const record = {
     schemaVersion: 'stage2_test_center_run.v1',
     runId,
@@ -666,12 +694,19 @@ module.exports = {
   UNIT_TEST_SUITES,
   GOAL_CHAIN_STAGES,
   GOAL_CHAIN_ORDER,
+  TEST_CENTER_DIR,
+  createRunId,
   parseJUnitXml,
   runUnitTestSuite,
   runGoalChainStage,
   runGoalChainEndToEnd,
+  runGoalChainEndToEndAsync,
   evaluateGoalLoopStepResult,
   persistTestCenterRun,
   listTestCenterRuns,
-  resolveTestCenterArtifact
+  resolveTestCenterArtifact,
+  writeJson,
+  readJsonIfExists,
+  nowIso,
+  SAFE_RUN_ID_PATTERN
 };

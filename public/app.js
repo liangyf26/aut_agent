@@ -188,6 +188,8 @@ const state = {
     goalChainStageForms: {},
     e2eForm: { cdpUrl: 'http://localhost:9222', executionMode: 'fixture_simulated' },
     e2eResult: null,
+    e2eProgress: null,
+    e2ePollTimer: null,
     e2eRunning: false
   }
 };
@@ -2828,17 +2830,23 @@ function renderTestCenterStageSection() {
 function renderTestCenterE2eSection() {
   const form = state.testCenter.e2eForm;
   const result = state.testCenter.e2eResult;
+  const progress = state.testCenter.e2eProgress;
   const running = state.testCenter.e2eRunning;
   const stageOrderIds = ['menu', 'page', 'feature', 'execution'];
   const stepById = {};
-  (result?.steps || []).forEach((step) => {
+  // Merge completed steps from result OR progress (for real-time updates)
+  const steps = result?.steps || progress?.steps || [];
+  steps.forEach((step) => {
     stepById[step.stageId] = step;
   });
+  const currentStage = progress?.currentStage;
+  const runningStatus = progress?.status === 'running' || running;
 
   return `
     <section class="stage2-table-card">
       <div class="stage2-section-head">
         <h3>端到端全流程测试</h3>
+        ${runningStatus && currentStage ? `<span class="tag pulse">运行中：${stageOrderIds.indexOf(currentStage) + 1}/4</span>` : ''}
       </div>
       <p class="stage2-help-text">依次跑通菜单发现→页面发现→功能点发现→执行，每一步自动把产物路径传给下一步；任意一步失败或需人工介入即停止，不会继续往后跑。</p>
       <div class="stage2-field-grid">
@@ -2857,17 +2865,18 @@ function renderTestCenterE2eSection() {
         </label>
       </div>
       <div class="inline-actions">
-        <button class="primary-action compact-action" data-test-center-run-e2e type="button" ${running || state.pendingAction ? 'disabled' : ''}>${running ? '运行中...' : '开始端到端测试'}</button>
+        <button class="primary-action compact-action" data-test-center-run-e2e type="button" ${running ? 'disabled' : ''}>${running ? '运行中...' : '开始端到端测试'}</button>
       </div>
       <div class="stage2-timeline-line">
         ${stageOrderIds.map((stageId, index) => {
           const step = stepById[stageId];
           const stageLabel = TEST_CENTER_STAGE_ORDER.find((item) => item.id === stageId)?.label || stageId;
-          const notRun = !step;
-          const dur = notRun ? '' : ` · ${formatTestCenterDuration(step.durationMs)}`;
-          const verdict = notRun ? '' : testCenterVerdictTag(step.evaluation?.verdict, step.evaluation?.reason);
+          const isCurrent = currentStage === stageId && runningStatus;
+          const notRun = !step && !isCurrent;
+          const dur = step ? ` · ${formatTestCenterDuration(step.durationMs)}` : '';
+          const verdict = step ? testCenterVerdictTag(step.evaluation?.verdict, step.evaluation?.reason) : (isCurrent ? '进行中...' : '');
           return `
-            <article class="stage2-timeline-step ${notRun ? '' : 'current'}">
+            <article class="stage2-timeline-step ${notRun ? '' : 'current'} ${isCurrent ? 'pulse' : ''}">
               <span>步骤 ${index + 1}</span>
               <strong>${escapeHtml(stageLabel)}${dur}</strong>
               ${notRun ? '<small>未运行</small>' : `<small>${verdict}</small>`}
@@ -2876,7 +2885,7 @@ function renderTestCenterE2eSection() {
         }).join('')}
       </div>
       ${result?.stoppedReason ? `<p class="stage2-help-text">停止原因：${escapeHtml(result.stoppedReason)}</p>` : ''}
-      ${(result?.steps || []).map((step) => `
+      ${(steps || []).map((step) => `
         <details class="stage2-work-card">
           <summary>${escapeHtml(TEST_CENTER_STAGE_ORDER.find((item) => item.id === step.stageId)?.label || step.stageId)} 详情</summary>
           ${renderTestCenterStageResult(step)}
@@ -2940,18 +2949,52 @@ async function runTestCenterStage(stageId) {
 
 async function runTestCenterE2e() {
   state.testCenter.e2eRunning = true;
+  state.testCenter.e2eProgress = null;
+  state.testCenter.e2ePollTimer = null;
   render();
   try {
-    const payload = await api('/api/stage2/test-center/run-goal-chain-e2e', {
+    // Start the async E2E run
+    const startPayload = await api('/api/stage2/test-center/start-goal-chain-e2e', {
       method: 'POST',
       body: JSON.stringify({ params: { ...state.testCenter.e2eForm } })
     });
-    state.testCenter.e2eResult = payload.result;
-    saveState.textContent = payload.result.stoppedAt ? `端到端测试在「${payload.result.stoppedAt}」阶段停止` : '端到端测试全部通过';
+    const runId = startPayload.runId;
+
+    // Poll for real-time progress
+    let pollTimer = null;
+    await new Promise((resolve) => {
+      const poll = async () => {
+        try {
+          const resp = await api(`/api/stage2/test-center/e2e-progress?runId=${encodeURIComponent(runId)}`);
+          state.testCenter.e2eProgress = resp;
+          if (resp.status === 'completed' || resp.status === 'failed') {
+            if (pollTimer) clearTimeout(pollTimer);
+            state.testCenter.e2eResult = resp;
+            state.testCenter.e2eRunning = false;
+            state.testCenter.e2eProgress = null;
+            saveState.textContent = resp.stoppedAt ? `端到端测试在「${resp.stoppedAt}」阶段停止` : '端到端测试全部通过';
+            render();
+            resolve();
+          } else {
+            render();
+            pollTimer = setTimeout(poll, 1500);
+          }
+        } catch (err) {
+          if (pollTimer) clearTimeout(pollTimer);
+          state.testCenter.e2eRunning = false;
+          state.testCenter.e2eProgress = null;
+          saveState.textContent = '进度查询失败：' + err.message;
+          render();
+          resolve();
+        }
+      };
+      pollTimer = setTimeout(poll, 500);
+      state.testCenter.e2ePollTimer = () => clearTimeout(pollTimer);
+    });
   } catch (error) {
     saveState.textContent = error.message;
-  } finally {
     state.testCenter.e2eRunning = false;
+    state.testCenter.e2eProgress = null;
     render();
   }
 }
