@@ -125,3 +125,34 @@ Use the default five-label triage vocabulary: `needs-triage`, `needs-info`, `rea
 ### Domain docs
 
 This repo uses a single-context domain layout: root `CONTEXT.md` plus ADRs under `docs/adr/`. See `docs/agents/domain.md`.
+
+## GitHub 认证与操作
+
+Docker 环境无法使用 SSH，所有 GitHub 操作须走 HTTPS + Personal Access Token。
+
+**Token 位置：** `/opt/data/.github_pat`（明文，Space 重启不丢）
+
+**环境变量（已设置）：**
+- `GITHUB_TOKEN` — GitHub Personal Access Token
+- `GH_TOKEN` — gh CLI 使用的 Token
+
+**Git 凭据（已配置）：**
+- `/opt/data/.git-credentials` — git credential store（oauth2 格式）
+- 仓库已配置 `credential.helper store`
+
+**远程仓库：** `https://github.com/liangyf26/aut_agent.git`（origin）
+**默认分支：** `main`
+**GitHub 用户：** liangyf26
+
+**常用命令：**
+```bash
+# Push
+git push origin main
+
+# gh CLI（已认证）
+gh issue list --repo liangyf26/aut_agent
+gh pr list --repo liangyf26/aut_agent
+
+# 如遇认证失败，确认 Token 有效：
+cat /opt/data/.github_pat
+```
