@@ -3140,8 +3140,9 @@ async function runTestCenterE2e() {
           refreshE2eProgress();
           if (resp.status === 'completed' || resp.status === 'failed') {
             if (pollTimer) clearTimeout(pollTimer);
-            state.testCenter.e2eResult = resp;
             state.testCenter.e2eRunning = false;
+            state.testCenter.e2ePollTimer = null;
+            state.testCenter.e2eResult = resp;
             state.testCenter.e2eProgress = null;
             saveState.textContent = resp.stoppedAt ? `端到端测试在「${resp.stoppedAt}」阶段停止` : '端到端测试全部通过';
             refreshE2eProgress();
@@ -3200,7 +3201,7 @@ function refreshE2eProgress() {
   const btn = panel.querySelector('[data-test-center-run-e2e]');
   if (btn) {
     btn.disabled = running;
-    btn.textContent = running ? '运行中...' : '开始端到端测试';
+    btn.textContent = running ? '运行中...' : (result ? '已完成' : '开始端到端测试');
   }
 
   // Update heading status tag

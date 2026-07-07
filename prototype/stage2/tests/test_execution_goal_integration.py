@@ -721,10 +721,10 @@ def test_run_until_stable_real_browser_mode_always_stops_after_one_round():
 
         original_run = orchestrator_module.ExecutionGoalOrchestrator.run
 
-        async def _patched_run(self, *, mode, page=None, screenshots_dir=None, injected_failures=None):
+        async def _patched_run(self, *, mode, page=None, screenshots_dir=None, injected_failures=None, safety_policy="low_risk_only"):
             if mode != "real_browser":
                 return await original_run(
-                    self, mode=mode, page=page, screenshots_dir=screenshots_dir, injected_failures=injected_failures
+                    self, mode=mode, page=page, screenshots_dir=screenshots_dir, injected_failures=injected_failures, safety_policy=safety_policy
                 )
             return await self.execute_all_async(runner=_fake_runner, injected_failures=injected_failures)
 

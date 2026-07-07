@@ -293,6 +293,7 @@ class ExecutionGoalOrchestrator:
         page: Any = None,
         screenshots_dir: Path | None = None,
         injected_failures: dict[str, str] | None = None,
+        safety_policy: str = "low_risk_only",
     ) -> list[ExecutionOutcome]:
         """Run every queued execution goal via either execution mode.
 
@@ -333,6 +334,7 @@ class ExecutionGoalOrchestrator:
                     goal_id=goal_id,
                     screenshots_dir=screenshots_dir,
                     injected_failure=injected_failure,
+                    cascade_context={"safety_policy": safety_policy} if safety_policy != "low_risk_only" else None,
                 )
 
             return await self.execute_all_async(runner=runner, injected_failures=injected_failures)
@@ -349,6 +351,7 @@ class ExecutionGoalOrchestrator:
         screenshots_dir: Path | None = None,
         injected_failures: dict[str, str] | None = None,
         allow_real_browser_retry: bool = False,
+        safety_policy: str = "low_risk_only",
     ) -> list[dict[str, Any]]:
         """Run round 1, then keep auto-advancing through retryable failures
         (方案 §13 exit=retry) within THIS process, up to ``max_rounds``.
@@ -406,6 +409,7 @@ class ExecutionGoalOrchestrator:
                 page=page,
                 screenshots_dir=screenshots_dir,
                 injected_failures=round_injected_failures,
+                safety_policy=safety_policy,
             )
             # Scoped to THIS round's goal_ids only: the engine never deletes
             # a prior round's terminal goal, it accumulates a new one

@@ -406,8 +406,9 @@ async def execute_test_case_with_playwright(
     # BEFORE any Playwright call — a mislabeled high-risk case must be
     # refused here exactly as it is in the fixture path.
     if case_type == "executable" and risk_level == "high":
-        safety_policy = (cascade_context or {}).get("safety_policy") or "low_risk_only"
-        if safety_policy == "test_env_full_access":
+        _sp = (cascade_context or {}).get("safety_policy") or "low_risk_only"
+        print(f"[real_browser] tc={test_case_id} risk=high safety_policy={_sp} cascade_context={cascade_context}", file=__import__("sys").stderr)
+        if _sp == "test_env_full_access":
             pass  # allowed — proceed to execution
         else:
             return ExecutionOutcome(

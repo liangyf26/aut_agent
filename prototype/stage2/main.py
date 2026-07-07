@@ -789,7 +789,7 @@ async def run_execution_goal_entrypoint(
                     raise RuntimeError("未发现可用页面，无法执行 execution_goal real_browser 模式")
                 page = pages[0]
                 screenshots_dir = output_dir / "screenshots"
-                rounds = await _run_and_export(page=page, screenshots_dir=screenshots_dir)
+                rounds = await _run_and_export(page=page, screenshots_dir=screenshots_dir, safety_policy=safety_policy)
             finally:
                 await browser.close()
 
@@ -1043,6 +1043,7 @@ async def run_feature_goal_entrypoint(
     """
 
     import json
+    import sys
 
     from playwright.async_api import async_playwright
 
@@ -1078,7 +1079,8 @@ async def run_feature_goal_entrypoint(
     all_test_cases: list[dict[str, Any]] = []
     pages_to_rescan: list[dict] = list(reachable_entries)
     auto_round = 0
-    MAX_AUTO_ROUNDS = 2
+    MAX_AUTO_ROUNDS = 3
+    all_unrecognized: list[dict] = []
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.connect_over_cdp(cdp_url)
@@ -1088,6 +1090,7 @@ async def run_feature_goal_entrypoint(
             while auto_round <= MAX_AUTO_ROUNDS and pages_to_rescan:
                 round_test_cases: list[dict[str, Any]] = []
                 next_pages: list[dict] = []
+                round_unrecognized: list[dict] = []
 
                 for entry in pages_to_rescan:
                     page_id = entry["page_id"]
@@ -1097,20 +1100,19 @@ async def run_feature_goal_entrypoint(
                         await page.wait_for_timeout(1500)
 
                     if auto_round > 0 and model_name:
-                        # Browser Use re-classification for unrecognized controls
+                        print(f"[auto-round {auto_round}] 启动 Browser Use 复分类: {entry.get('page_title') or page_id}", file=sys.stderr)
                         from prototype.stage2.app.execution_goal.browser_use_executor import (
                             BrowserUseSafety, execute_with_browser_use,
                         )
                         page_title = await page.title()
-                        page_text = (await page.inner_text("body"))[:500] if False else ""
                         instruction = (
                             f"当前页面标题：{page_title}。\n"
-                            "请浏览页面上所有可见的输入控件（input、select、textarea），"
-                            "对每个控件判断其功能类型：file_upload(文件上传)、date_picker(日期选择)、"
+                            "请浏览页面，找到所有可见的输入控件（input、select、textarea），"
+                            "对每个控件判断其功能：file_upload(文件上传)、date_picker(日期选择)、"
                             "text_input(文本输入)、cascader(级联选择下拉)、dropdown(普通下拉)、"
                             "submit(提交按钮)、number_input(数字输入)。\n"
-                            "返回 JSON: {\"controls\": [{\"tag\": \"...\", \"type\": \"...\", "
-                            "\"text\": \"...\", \"feature_type\": \"...\", \"risk_level\": \"low|high\"}]}"
+                            "只返回 JSON: {\"controls\": [{\"tag\": \"input\", \"type\": \"text\","
+                            "\"text\": \"控件描述\", \"feature_type\": \"text_input\"}]}"
                         )
                         try:
                             result = await execute_with_browser_use(
@@ -1120,19 +1122,36 @@ async def run_feature_goal_entrypoint(
                                 model_name=model_name,
                             )
                             if result.ok:
-                                import json as _json
-                                actions_text = str(result.actions)
-                                m = __import__("re").search(r'\{[^{}]*"controls"\s*:\s*\[[^\]]*\][^{}]*\}', actions_text)
+                                print(f"  [auto-round {auto_round}] Browser Use OK, actions={len(result.actions)}", file=sys.stderr)
+                                import json as _json, re as _re
+                                # Try to find JSON in any action content
+                                all_text = ""
+                                for act in result.actions:
+                                    if isinstance(act, dict):
+                                        all_text += str(act.get("content", "")) + " " + str(act.get("entry", "")) + " "
+                                    else:
+                                        all_text += str(act) + " "
+                                m = _re.search(r'\{"controls"\s*:\s*\[.*?\]\}', all_text, _re.DOTALL)
+                                if not m:
+                                    m = _re.search(r'\{[^{}]*"controls"\s*:\s*\[[^\]]*\][^{}]*\}', all_text)
                                 if m:
-                                    data = _json.loads(m.group(0))
-                                    for ctrl in data.get("controls", []):
-                                        ft = ctrl.get("feature_type")
-                                        if ft and ft != "other":
-                                            from prototype.stage2.app.v3_real_browser import register_feature_type
-                                            keywords = [ctrl.get("text", ""), ctrl.get("tag", ""), ctrl.get("type", "")]
-                                            register_feature_type(ft, [k for k in keywords if k])
-                        except Exception:
-                            pass
+                                    try:
+                                        data = _json.loads(m.group(0))
+                                        for ctrl in data.get("controls", []):
+                                            ft = ctrl.get("feature_type")
+                                            if ft and ft != "other":
+                                                from prototype.stage2.app.v3_real_browser import register_feature_type
+                                                keywords = [ctrl.get("text", ""), ctrl.get("tag", ""), ctrl.get("type", "")]
+                                                register_feature_type(ft, [k for k in keywords if k])
+                                                print(f"  [auto-round {auto_round}] 注册新类型: {ft} ← {keywords}", file=sys.stderr)
+                                    except _json.JSONDecodeError as je:
+                                        print(f"  [auto-round {auto_round}] JSON 解析失败: {je} [{m.group(0)[:120]}]", file=sys.stderr)
+                                else:
+                                    print(f"  [auto-round {auto_round}] 未找到 JSON controls [{all_text[:200]}]", file=sys.stderr)
+                            else:
+                                print(f"  [auto-round {auto_round}] Browser Use 失败: ok=False, reason={result.failure_reason}", file=sys.stderr)
+                        except Exception as exc:
+                            print(f"  [auto-round {auto_round}] Browser Use 异常: {type(exc).__name__}: {exc}", file=sys.stderr)
                         await page.wait_for_timeout(500)
 
                     page_goal = engine.register_goal(
@@ -1154,17 +1173,23 @@ async def run_feature_goal_entrypoint(
                     )
                     round_test_cases.extend(test_cases)
 
-                    # Check if this page still has unrecognized controls
-                    from prototype.stage2.app.v3_real_browser import (
-                        get_unrecognized_controls, clear_unrecognized_controls,
-                    )
-                    remaining = [c for c in get_unrecognized_controls() if c.get("page_id") == page_id]
-                    if remaining:
-                        next_pages.append(entry)
-                    clear_unrecognized_controls()
+                # AFTER all pages in this round — check for unrecognized controls
+                from prototype.stage2.app.v3_real_browser import get_unrecognized_controls, clear_unrecognized_controls
 
-                all_test_cases = round_test_cases  # last round wins (has most complete classification)
-                if not next_pages:
+                round_unrecognized = get_unrecognized_controls()
+                if round_unrecognized:
+                    all_unrecognized = round_unrecognized
+                    # Group by page_id to know which pages need re-scan
+                    pages_with_unrecognized = {c.get("page_id") for c in round_unrecognized if c.get("page_id")}
+                    next_pages = [e for e in pages_to_rescan if e.get("page_id") in pages_with_unrecognized]
+                    if auto_round == 0:
+                        print(f"[auto-round {auto_round}] {len(round_unrecognized)} 个控件未识别, "
+                              f"{len(pages_with_unrecognized)} 个页面将进入 Browser Use 复分类",
+                              file=sys.stderr)
+                clear_unrecognized_controls()
+
+                all_test_cases = round_test_cases
+                if not next_pages or not model_name:
                     break
                 pages_to_rescan = next_pages
                 auto_round += 1
@@ -1186,9 +1211,9 @@ async def run_feature_goal_entrypoint(
     orchestrator._test_cases = all_test_cases
     run_summary_path = orchestrator.export_goal_summary()
 
-    from prototype.stage2.app.v3_real_browser import get_unrecognized_controls, clear_unrecognized_controls
+    from prototype.stage2.app.v3_real_browser import clear_unrecognized_controls
 
-    unrecognized = get_unrecognized_controls()
+    unrecognized = all_unrecognized
     if unrecognized:
         unrecognized_path = output_dir / "unrecognized_controls.json"
         import json as _json
@@ -1210,6 +1235,8 @@ async def run_feature_goal_entrypoint(
         "unrecognized_controls": len(unrecognized),
         "unrecognized_controls_path": str(unrecognized_path) if unrecognized else None,
         "auto_rounds": auto_round,
+        "auto_rounds_completed": f"经过 {auto_round + 1} 轮分类（含 {auto_round} 次 Browser Use 复分类），"
+                                f"还有 {len(unrecognized)} 个控件无法识别。" if unrecognized else None,
     }
 
 
