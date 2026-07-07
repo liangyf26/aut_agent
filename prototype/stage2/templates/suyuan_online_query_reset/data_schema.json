@@ -1,0 +1,19 @@
+{
+  "schema_version": "0.2.0",
+  "strategy": "baseline_plus_safe_variation",
+  "field_rules": {
+    "start_date": {
+      "path": "query_form.start_date",
+      "strategy": "iso_date_today",
+      "format": "%Y-%m-%d"
+    },
+    "end_date": {
+      "path": "query_form.end_date",
+      "strategy": "iso_date_today",
+      "format": "%Y-%m-%d"
+    }
+  },
+  "notes": [
+    "This query-reset sample exercises the date-range filters that are currently visible on the real online-record page and does not perform any real submission."
+  ]
+}

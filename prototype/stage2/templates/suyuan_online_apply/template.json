@@ -1,0 +1,120 @@
+{
+  "template_name": "suyuan_online_apply",
+  "version": "0.1.0",
+  "page_entry": {
+    "name": "线上备案申请",
+    "url": "https://www.zbsykj.com:19096/record/online"
+  },
+  "feature_point": {
+    "name": "线上申请备案",
+    "type": "新增"
+  },
+  "execution_path": "new_application",
+  "steps": [
+    {
+      "id": "run_apply_wizard",
+      "kind": "flow",
+      "action": "run_apply_wizard",
+      "description": "进入线上备案申请并完成协议签署向导"
+    },
+    {
+      "id": "select_initial_plant",
+      "kind": "action",
+      "action": "select_drawer_option",
+      "args": {
+        "label": "备案品种",
+        "data_ref": "initial_form.plant_name"
+      }
+    },
+    {
+      "id": "select_initial_register_type",
+      "kind": "action",
+      "action": "select_drawer_option",
+      "args": {
+        "label": "备案类型",
+        "data_ref": "initial_form.register_type_text"
+      }
+    },
+    {
+      "id": "check_initial_promise",
+      "kind": "action",
+      "action": "ensure_drawer_checkbox",
+      "args": {
+        "label_text": "本人承诺"
+      }
+    },
+    {
+      "id": "submit_initial_form",
+      "kind": "action",
+      "action": "expand_cultivation_form"
+    },
+    {
+      "id": "fill_cultivation_template",
+      "kind": "action",
+      "action": "fill_success_template",
+      "args": {
+        "data_ref": "cultivation_template"
+      }
+    },
+    {
+      "id": "upload_required_files",
+      "kind": "action",
+      "action": "upload_drawer_required_files",
+      "args": {
+        "files_ref": "generated_files"
+      }
+    },
+    {
+      "id": "submit_cultivation_form",
+      "kind": "action",
+      "action": "expand_cultivation_form"
+    },
+    {
+      "id": "select_filing_dept",
+      "kind": "action",
+      "action": "select_submit_dialog_dept",
+      "args": {
+        "data_ref": "filing_submit.dept_label"
+      }
+    },
+    {
+      "id": "upload_apply_form",
+      "kind": "action",
+      "action": "upload_submit_dialog_apply_file",
+      "args": {
+        "file_ref": "generated_files.apply_file"
+      }
+    },
+    {
+      "id": "submit_filing_dialog",
+      "kind": "action",
+      "action": "submit_filing_dialog"
+    }
+  ],
+  "success_rules": {
+    "ui_texts": [
+      "提交完成，待备案登记/监管单位登记备案"
+    ],
+    "network_rules": [
+      {
+        "method": "POST",
+        "path_contains": "/prod-api/zwsy/registration/apply/dept",
+        "response_contains": "\"code\":200"
+      }
+    ]
+  },
+  "failure_rules": {
+    "message_keywords": [
+      "操作失败",
+      "无法新增备案信息",
+      "primaryValues array can not be null or empty",
+      "请先勾选",
+      "失败",
+      "异常"
+    ]
+  },
+  "notes": [
+    "当前模板只覆盖线上备案申请的已验证成功路径。",
+    "待处理记录和继续操作路径仍由项目级脚本逻辑处理，后续再抽成独立 flow。"
+  ]
+}

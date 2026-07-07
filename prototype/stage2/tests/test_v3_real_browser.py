@@ -1,0 +1,1642 @@
+from __future__ import annotations
+
+import asyncio
+import shutil
+import sys
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parents[3]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from prototype.stage2.app.v3_orchestrator import V3RunConfig  # noqa: E402
+from prototype.stage2.app.v3_real_browser import (  # noqa: E402
+    BROWSER_USE_DETERMINISTIC_TOOL_FIRST_MAX_STEPS,
+    BROWSER_USE_TOOL_RESULT_PREVIEW_LIMIT,
+    TEST_ENV_FULL_ACCESS_POLICY,
+    build_menu_discovery_artifacts,
+    _ensure_online_apply_upload_samples,
+    _browser_use_history_result,
+    _browser_use_history_is_success,
+    _dedupe_page_exploration,
+    _browser_use_handover_task,
+    _choose_final_dialog_unit,
+    _final_dialog_unit_options_from_visible_text,
+    _infer_feature_type,
+    _merge_browser_use_handover,
+    _normalize_page_url,
+    _plan_side_effect_actions,
+    _resolve_playwright_target_page,
+    _target_handover_reasons,
+    _online_apply_repair_plan,
+    _should_block_for_login_text,
+    _snapshot_is_blank,
+    _side_effect_execution_result,
+    _restore_target_page_start,
+    _target_page_restore_plan,
+    _return_to_start_url_after_menu_leaf,
+    _return_to_start_url_after_browser_use_handover,
+    _normalize_playwright_menu_shell,
+    _click_playwright_menu_candidate,
+)
+
+
+class _FakeBodyLocator:
+    def __init__(self, page: "_FakePlaywrightPage") -> None:
+        self.page = page
+
+    async def inner_text(self, timeout: int = 0) -> str:
+        return self.page.body_text
+
+
+class _FakePlaywrightPage:
+    def __init__(self, url: str, body_text: str) -> None:
+        self.url = url
+        self.body_text = body_text
+        self.goto_calls: list[str] = []
+
+    async def bring_to_front(self) -> None:
+        return None
+
+    async def wait_for_load_state(self, state: str) -> None:
+        return None
+
+    async def wait_for_timeout(self, timeout: int) -> None:
+        return None
+
+    async def goto(self, url: str, wait_until: str = "") -> None:
+        self.goto_calls.append(url)
+        self.url = url
+
+    def locator(self, selector: str) -> _FakeBodyLocator:
+        assert selector == "body"
+        return _FakeBodyLocator(self)
+
+
+class _FakePlaywrightContext:
+    def __init__(self, pages: list[_FakePlaywrightPage]) -> None:
+        self.pages = pages
+
+
+class _FakePlaywrightBrowser:
+    def __init__(self, pages: list[_FakePlaywrightPage]) -> None:
+        self.contexts = [_FakePlaywrightContext(pages)]
+
+
+def test_low_risk_only_blocks_side_effect_candidates() -> None:
+    plan = _plan_side_effect_actions(
+        {
+            "controls": [
+                {"text": "删除", "tag": "button", "type": "", "candidate_index": 0},
+                {"text": "保存", "tag": "button", "type": "", "candidate_index": 1},
+            ]
+        },
+        V3RunConfig(),
+    )
+
+    assert plan["selected"] == []
+    assert {item["action_type"] for item in plan["skipped"]} == {"delete", "save"}
+    assert all(
+        item["policy_decision"]["reason_code"] == "requires_test_env_full_access"
+        for item in plan["skipped"]
+    )
+
+
+def test_full_access_selects_allowlisted_actions_with_caps() -> None:
+    config = V3RunConfig(
+        metadata={
+            "safety_policy": TEST_ENV_FULL_ACCESS_POLICY,
+            "allowed_side_effect_actions": ["delete", "save", "approve", "submit"],
+            "max_side_effect_actions": 3,
+            "max_side_effect_actions_per_type": 1,
+        }
+    )
+
+    plan = _plan_side_effect_actions(
+        {
+            "controls": [
+                {"text": "删除", "tag": "button", "candidate_index": 0},
+                {"text": "再次删除", "tag": "button", "candidate_index": 1},
+                {"text": "审批", "tag": "button", "candidate_index": 2},
+                {"text": "保存", "tag": "button", "candidate_index": 3},
+                {"text": "提交", "tag": "button", "candidate_index": 4},
+                {"text": "新增", "tag": "button", "candidate_index": 5},
+            ]
+        },
+        config,
+    )
+
+    assert [item["action_type"] for item in plan["selected"]] == ["delete", "approve", "save"]
+    assert [item["execution_order"] for item in plan["selected"]] == [1, 2, 3]
+    skipped_reasons = {item["policy_decision"]["reason_code"] for item in plan["skipped"]}
+    assert "side_effect_per_type_limit_reached" in skipped_reasons
+    assert "side_effect_total_limit_reached" in skipped_reasons
+    assert "action_not_allowlisted" in skipped_reasons
+
+
+def test_side_effect_result_contains_audit_contract_fields() -> None:
+    action = {
+        "action_id": "side_effect_001_delete",
+        "action_type": "delete",
+        "control_label": "删除",
+        "risk_level": "high",
+        "policy_decision": {
+            "decision": "allowed",
+            "reason_code": "test_env_full_access_allowlisted",
+        },
+    }
+
+    result = _side_effect_execution_result(
+        action,
+        status="side_effect_executed",
+        started_at="2026-06-25T00:00:00Z",
+        before_ref="side_effect_001_before",
+        after_ref="side_effect_001_after",
+        before_state={"url": "https://example.test/list"},
+        after_state={
+            "url": "https://example.test/list",
+            "visible_text_sample": "删除成功",
+            "dialog_events": [{"type": "confirm", "handled": "accepted"}],
+        },
+        click_result={"dialog_events": []},
+        failure_reason=None,
+    )
+
+    assert result["action_type"] == "delete"
+    assert result["control_label"] == "删除"
+    assert result["risk_level"] == "high"
+    assert result["policy_decision"]["decision"] == "allowed"
+    assert result["before_screenshot_ref"] == "side_effect_001_before"
+    assert result["after_screenshot_ref"] == "side_effect_001_after"
+    assert result["status"] == "side_effect_executed"
+    assert result["failure_reason"] is None
+    assert result["dialog_events"] == [{"type": "confirm", "handled": "accepted"}]
+
+
+def test_side_effect_feature_type_inference_keeps_distinct_actions() -> None:
+    assert _infer_feature_type("审批", "button", "") == "approve"
+    assert _infer_feature_type("保存", "button", "") == "save"
+    assert _infer_feature_type("提交", "button", "") == "submit"
+    assert _infer_feature_type("删除", "button", "") == "delete"
+    assert _infer_feature_type("我要申请备案", "button", "") == "create"
+    assert _infer_feature_type("申请备案", "button", "") == "create"
+    assert _infer_feature_type("线上备案申请", "a", "") == "navigation"
+
+
+def test_menu_discovery_artifacts_capture_success_failure_permission_and_evidence() -> None:
+    bundle = build_menu_discovery_artifacts(
+        start_url="https://example.test/index",
+        menu_candidates=[
+            {
+                "discovery_id": "m1",
+                "text": "业务办理",
+                "level": 1,
+                "expandable": True,
+                "locator": "[data-menu='business']",
+                "screenshot_id": "menu_initial",
+            },
+            {
+                "discovery_id": "m2",
+                "parent_id": "m1",
+                "text": "线上备案申请",
+                "level": 2,
+                "href": "/online/apply",
+                "locator": "[data-menu='online-apply']",
+                "screenshot_id": "menu_m1_after_expand",
+            },
+            {
+                "discovery_id": "m3",
+                "text": "备案查询",
+                "level": 1,
+                "href": "/record-query",
+                "locator": "[data-menu='query']",
+                "screenshot_id": "menu_initial",
+            },
+            {
+                "discovery_id": "m4",
+                "text": "系统管理",
+                "level": 1,
+                "expandable": True,
+                "disabled": True,
+                "locator": "[data-menu='system']",
+                "screenshot_id": "menu_initial",
+            },
+            {
+                "discovery_id": "m5",
+                "text": "报表中心",
+                "level": 1,
+                "expandable": True,
+                "locator": "[data-menu='report']",
+                "screenshot_id": "menu_initial",
+            },
+        ],
+        traversal_events=[
+            {
+                "event": "expand",
+                "menu_id": "m1",
+                "status": "success",
+                "screenshot_ref": "menu_m1_after_expand",
+            },
+            {
+                "event": "expand",
+                "menu_id": "m4",
+                "status": "permission_blocked",
+                "failure_reason": "permission_denied",
+            },
+            {
+                "event": "expand",
+                "menu_id": "m5",
+                "status": "failed",
+                "failure_reason": "no_child_menu_appeared",
+                "screenshot_ref": "menu_m5_expand_failed",
+            },
+        ],
+        screenshots=[
+            {"screenshot_id": "menu_initial", "relative_path": "screenshots/menu_initial.png"},
+            {
+                "screenshot_id": "menu_m1_after_expand",
+                "relative_path": "screenshots/menu_m1_after_expand.png",
+            },
+            {
+                "screenshot_id": "menu_m5_expand_failed",
+                "relative_path": "screenshots/menu_m5_expand_failed.png",
+            },
+        ],
+    )
+
+    entries = bundle["menu_entries"]
+    assert bundle["menu_tree"]["root_count"] == 4
+    assert bundle["menu_tree"]["status"] == "incomplete"
+    assert [entry["text"] for entry in entries if entry["is_leaf"]] == [
+        "线上备案申请",
+        "备案查询",
+    ]
+    assert next(entry for entry in entries if entry["text"] == "业务办理")["status"] == "expanded"
+    assert (
+        next(entry for entry in entries if entry["text"] == "系统管理")["status"]
+        == "permission_blocked"
+    )
+    assert next(entry for entry in entries if entry["text"] == "报表中心")[
+        "failure_reason"
+    ] == "no_child_menu_appeared"
+    assert next(entry for entry in entries if entry["text"] == "线上备案申请")[
+        "menu_path"
+    ] == ["业务办理", "线上备案申请"]
+    assert bundle["menu_traversal_log"][2]["screenshot_ref"] == "menu_m5_expand_failed"
+    assert bundle["screenshots_index"]["screenshots"][1]["stage"] == "menu_discovery"
+
+
+def test_menu_discovery_artifacts_tolerate_self_referential_expanded_parent() -> None:
+    bundle = build_menu_discovery_artifacts(
+        start_url="https://example.test/index",
+        menu_candidates=[
+            {
+                "discovery_id": "menu_4",
+                "text": "备案管理",
+                "level": 1,
+                "expandable": True,
+                "locator": "[data-stage2-menu-id='menu_4']",
+                "screenshot_id": "menu_initial",
+            },
+            {
+                "discovery_id": "menu_4",
+                "parent_id": "menu_4",
+                "text": "备案管理 线上备案申请",
+                "level": 2,
+                "expandable": True,
+                "locator": "[data-stage2-menu-id='menu_4']",
+                "screenshot_id": "menu_4_after_expand",
+            },
+            {
+                "discovery_id": "menu_12",
+                "parent_id": "menu_4",
+                "text": "线上备案申请",
+                "level": 2,
+                "href": "/online/apply",
+                "locator": "[data-stage2-menu-id='menu_12']",
+                "screenshot_id": "menu_4_after_expand",
+            },
+        ],
+        traversal_events=[
+            {
+                "event": "expand",
+                "menu_id": "menu_4",
+                "status": "success",
+                "screenshot_ref": "menu_4_after_expand",
+            }
+        ],
+        screenshots=[
+            {"screenshot_id": "menu_initial", "relative_path": "screenshots/menu_initial.png"},
+            {
+                "screenshot_id": "menu_4_after_expand",
+                "relative_path": "screenshots/menu_4_after_expand.png",
+            },
+        ],
+    )
+
+    entries = bundle["menu_entries"]
+    assert any(entry["text"] == "线上备案申请" for entry in entries)
+    assert bundle["menu_tree"]["root_count"] == 1
+    assert bundle["menu_tree"]["nodes"][0]["children"][0]["text"] == "线上备案申请"
+
+
+def test_menu_discovery_prefers_routed_duplicate_over_unrouted_clone() -> None:
+    bundle = build_menu_discovery_artifacts(
+        start_url="https://example.test/index",
+        menu_candidates=[
+            {
+                "discovery_id": "menu_1",
+                "text": "饮片生产",
+                "level": 1,
+                "expandable": True,
+                "locator": "[data-stage2-menu-id='menu_1']",
+            },
+            {
+                "discovery_id": "menu_2",
+                "parent_id": "menu_1",
+                "text": "线上备案申请",
+                "level": 2,
+                "href": "/record/online",
+                "locator": "[data-stage2-menu-id='menu_2']",
+                "screenshot_id": "menu_1_after_expand",
+            },
+            {
+                "discovery_id": "menu_3",
+                "parent_id": "menu_1",
+                "text": "线上备案申请",
+                "level": 2,
+                "href": "",
+                "locator": "[data-stage2-menu-id='menu_3']",
+                "screenshot_id": "menu_1_after_expand",
+            },
+        ],
+        traversal_events=[
+            {
+                "event": "expand",
+                "menu_id": "menu_1",
+                "status": "success",
+                "screenshot_ref": "menu_1_after_expand",
+            }
+        ],
+        screenshots=[],
+    )
+
+    online_entries = [
+        entry for entry in bundle["menu_entries"] if entry["text"] == "线上备案申请"
+    ]
+    assert len(online_entries) == 1
+    assert online_entries[0]["route_hint"] == "/record/online"
+
+
+def test_page_exploration_dedupes_home_aliases_and_keeps_duplicate_features() -> None:
+    pages, features = _dedupe_page_exploration(
+        [
+            {
+                "page_id": "menu_page_001",
+                "name": "追本溯源管理平台",
+                "url": "https://www.zbsykj.com:19096/",
+                "status": "reachable",
+                "screenshot_refs": ["logo_home"],
+            },
+            {
+                "page_id": "menu_page_002",
+                "name": "首页",
+                "url": "https://www.zbsykj.com:19096/index",
+                "status": "reachable",
+                "screenshot_refs": ["home"],
+            },
+            {
+                "page_id": "menu_page_003",
+                "name": "线上备案申请",
+                "url": "https://www.zbsykj.com:19096/record/online",
+                "status": "reachable",
+                "screenshot_refs": ["online"],
+            },
+        ],
+        [
+            {"feature_id": "feature_001", "page_id": "menu_page_001"},
+            {"feature_id": "feature_002", "page_id": "menu_page_002"},
+            {"feature_id": "feature_003", "page_id": "menu_page_003"},
+        ],
+    )
+
+    assert _normalize_page_url("https://www.zbsykj.com:19096/") == (
+        "https://www.zbsykj.com:19096/index"
+    )
+    assert [page["name"] for page in pages] == ["首页", "线上备案申请"]
+    assert [feature["feature_id"] for feature in features] == [
+        "feature_001",
+        "feature_002",
+        "feature_003",
+    ]
+    assert [feature["page_id"] for feature in features] == [
+        "menu_page_002",
+        "menu_page_002",
+        "menu_page_003",
+    ]
+
+
+def test_blank_snapshot_is_not_treated_as_visible_page() -> None:
+    assert _snapshot_is_blank({"title": "", "links": [], "controls": [], "visibleTextSample": ""})
+    assert not _snapshot_is_blank(
+        {"title": "", "links": [], "controls": [], "visibleTextSample": "欢迎进入首页"}
+    )
+
+
+def test_resolve_target_page_reloads_matching_url_when_body_is_blank() -> None:
+    page = _FakePlaywrightPage("https://www.zbsykj.com:19096/index", "")
+    resolved = asyncio.run(
+        _resolve_playwright_target_page(
+            _FakePlaywrightBrowser([page]),
+            "https://www.zbsykj.com:19096/index",
+        )
+    )
+
+    assert resolved is page
+    assert page.goto_calls == ["https://www.zbsykj.com:19096/index"]
+
+
+def test_prioritized_target_triggers_browser_use_handover_when_uncovered() -> None:
+    config = V3RunConfig(metadata={"prioritized_targets": ["线上备案申请"]})
+
+    reasons = _target_handover_reasons(
+        config,
+        menu_entries=[{
+            "menu_id": "menu_online_apply",
+            "text": "线上备案申请",
+            "menu_path": ["备案管理", "线上备案申请"],
+            "is_leaf": True,
+            "status": "discovered",
+        }],
+        pages=[{
+            "page_id": "menu_page_004",
+            "name": "线上备案申请",
+            "status": "unreachable",
+            "failure_reason": "blank_page_after_navigation",
+        }],
+        features=[],
+    )
+
+    assert reasons == [{
+        "target": "线上备案申请",
+        "reason": "target_page_uncovered",
+        "matched_menu_entry_ids": ["menu_online_apply"],
+        "matched_page_ids": ["menu_page_004"],
+        "matched_feature_ids": [],
+    }]
+
+
+def test_visible_target_control_does_not_suppress_browser_use_handover() -> None:
+    config = V3RunConfig(metadata={"prioritized_targets": ["线上备案申请"]})
+
+    reasons = _target_handover_reasons(
+        config,
+        menu_entries=[{
+            "menu_id": "menu_online_apply",
+            "text": "线上备案申请",
+            "menu_path": ["备案管理", "线上备案申请"],
+            "is_leaf": True,
+            "status": "discovered",
+        }],
+        pages=[{
+            "page_id": "menu_page_002",
+            "name": "线上备案申请",
+            "status": "reachable",
+            "url": "https://example.test/record/online",
+        }],
+        features=[{
+            "feature_id": "feature_online_apply_label",
+            "page_id": "menu_page_002",
+            "name": "线上备案申请",
+            "feature_type": "navigation",
+            "verification_strategy": "playwright_visible_control",
+        }, {
+            "feature_id": "feature_apply_button",
+            "page_id": "menu_page_002",
+            "name": "我要申请备案",
+            "feature_type": "view",
+            "verification_strategy": "playwright_visible_control",
+        }],
+    )
+
+    assert reasons == [{
+        "target": "线上备案申请",
+        "reason": "target_page_uncovered",
+        "matched_menu_entry_ids": ["menu_online_apply"],
+        "matched_page_ids": ["menu_page_002"],
+        "matched_feature_ids": ["feature_online_apply_label"],
+    }]
+
+
+def test_side_effect_policy_gate_target_feature_does_not_suppress_browser_use_handover() -> None:
+    config = V3RunConfig(metadata={"prioritized_targets": ["线上备案申请"]})
+
+    reasons = _target_handover_reasons(
+        config,
+        menu_entries=[{
+            "menu_id": "menu_online_apply",
+            "text": "线上备案申请",
+            "menu_path": ["备案管理", "线上备案申请"],
+            "is_leaf": True,
+            "status": "discovered",
+        }],
+        pages=[{
+            "page_id": "menu_page_002",
+            "name": "线上备案申请",
+            "status": "reachable",
+            "url": "https://example.test/record/online",
+        }],
+        features=[{
+            "feature_id": "feature_online_apply_label",
+            "page_id": "menu_page_002",
+            "name": "线上备案申请",
+            "feature_type": "create",
+            "verification_strategy": "side_effect_policy_gate",
+            "source": "playwright.light_interaction",
+        }, {
+            "feature_id": "feature_apply_button",
+            "page_id": "menu_page_002",
+            "name": "我要申请备案",
+            "feature_type": "create",
+            "verification_strategy": "side_effect_policy_gate",
+            "source": "playwright.light_interaction",
+        }],
+    )
+
+    assert reasons == [{
+        "target": "线上备案申请",
+        "reason": "target_page_uncovered",
+        "matched_menu_entry_ids": ["menu_online_apply"],
+        "matched_page_ids": ["menu_page_002"],
+        "matched_feature_ids": ["feature_online_apply_label"],
+    }]
+
+
+def test_browser_use_handover_task_instructs_full_online_apply_submission() -> None:
+    config = V3RunConfig(
+        start_url="https://www.zbsykj.com:19096/index",
+        safety_policy=TEST_ENV_FULL_ACCESS_POLICY,
+        allowed_side_effect_actions=["create", "submit", "save"],
+    )
+
+    task = _browser_use_handover_task(
+        config,
+        ["线上备案申请"],
+        [{"target": "线上备案申请", "reason": "target_page_uncovered"}],
+    )
+
+    assert "script_prefill_form" in task
+    assert "script_upload_sample_files" in task
+    assert "script_repair_required_fields" in task
+    assert "script_select_required_dropdowns" in task
+    assert "script_submit_form" in task
+    assert "最终提交一次备案申请" in task
+
+
+def test_browser_use_handover_task_keeps_low_risk_policy_out_of_final_submit_path() -> None:
+    task = _browser_use_handover_task(
+        V3RunConfig(
+            start_url="https://www.zbsykj.com:19096/index",
+            safety_policy="low_risk_only",
+            allowed_side_effect_actions=[],
+        ),
+        ["线上备案申请"],
+        [{"target": "线上备案申请", "reason": "target_page_uncovered"}],
+    )
+
+    assert "当前安全策略未同时允许 create/submit/save" in task
+    assert "不要调用 script_submit_form" in task
+    assert "最终提交一次备案申请" not in task
+    assert "再调用 script_submit_form 重试一次" not in task
+    assert "前端校验状态" in task
+
+
+def test_browser_use_handover_task_avoids_seed_propagation_license_branch() -> None:
+    task = _browser_use_handover_task(
+        V3RunConfig(
+            start_url="https://www.zbsykj.com:19096/index",
+            safety_policy=TEST_ENV_FULL_ACCESS_POLICY,
+            allowed_side_effect_actions=["create", "submit", "save"],
+        ),
+        ["线上备案申请"],
+        [{"target": "线上备案申请", "reason": "target_page_uncovered"}],
+    )
+
+    assert "育苗方式" in task
+    assert "育苗地点" in task
+    assert "多级 cascader（最多四级）" in task
+    assert "不要选择“种子繁殖”" in task
+    assert "种子采集许可证号" in task
+    assert "不要用 evaluate/JS 直接给下拉输入框赋值" in task
+    assert "分蘗繁殖" in task or "炼苗" in task or "其他" in task
+
+
+def test_browser_use_handover_task_tells_agent_not_to_repeat_manual_cascader_clicks() -> None:
+    task = _browser_use_handover_task(
+        V3RunConfig(
+            start_url="https://www.zbsykj.com:19096/index",
+            safety_policy=TEST_ENV_FULL_ACCESS_POLICY,
+            allowed_side_effect_actions=["create", "submit", "save"],
+        ),
+        ["线上备案申请"],
+        [{"target": "线上备案申请", "reason": "target_page_uncovered"}],
+    )
+
+    assert "不要反复手工点击 cascader" in task
+    assert "script_prefill_form" in task
+
+
+def test_target_page_restore_plan_prefers_matched_menu_route_hint() -> None:
+    config = V3RunConfig(start_url="https://www.zbsykj.com:19096/index")
+    plan = _target_page_restore_plan(
+        config,
+        [{"target": "线上备案申请", "matched_menu_entry_ids": ["menu_online_apply"]}],
+        {
+            "menu_entries": [
+                {
+                    "menu_id": "menu_online_apply",
+                    "text": "线上备案申请",
+                    "route_hint": "/record/online",
+                    "menu_path": ["业务办理", "线上备案申请"],
+                    "is_leaf": True,
+                }
+            ]
+        },
+        {"pages": []},
+    )
+
+    assert plan == {
+        "target": "线上备案申请",
+        "source": "menu_entry_route_hint",
+        "menu_id": "menu_online_apply",
+        "url": "https://www.zbsykj.com:19096/record/online",
+        "route_hint": "/record/online",
+        "menu_path": ["业务办理", "线上备案申请"],
+    }
+
+
+def test_restore_target_page_start_navigates_route_hint_before_browser_use() -> None:
+    class _Page:
+        def __init__(self) -> None:
+            self.url = "https://www.zbsykj.com:19096/index"
+            self.goto_calls: list[str] = []
+
+        async def goto(self, url: str, wait_until: str = "", timeout: int = 0) -> None:
+            self.goto_calls.append(url)
+            self.url = url
+
+        async def wait_for_load_state(self, state: str, timeout: int = 0) -> None:
+            return None
+
+        async def wait_for_timeout(self, timeout: int) -> None:
+            return None
+
+    page = _Page()
+    result = asyncio.run(
+        _restore_target_page_start(
+            page,
+            V3RunConfig(start_url="https://www.zbsykj.com:19096/index"),
+            [{"target": "线上备案申请", "matched_menu_entry_ids": ["menu_online_apply"]}],
+            {
+                "menu_entries": [
+                    {
+                        "menu_id": "menu_online_apply",
+                        "text": "线上备案申请",
+                        "route_hint": "/record/online",
+                        "is_leaf": True,
+                    }
+                ]
+            },
+            {"pages": []},
+        )
+    )
+
+    assert page.goto_calls == ["https://www.zbsykj.com:19096/record/online"]
+    assert result["ok"] is True
+    assert result["method"] == "goto"
+    assert result["plan"]["source"] == "menu_entry_route_hint"
+
+
+def test_menu_leaf_page_exploration_returns_to_home_after_each_page() -> None:
+    class _Page:
+        def __init__(self) -> None:
+            self.goto_calls: list[str] = []
+            self.wait_calls: list[str] = []
+
+        async def goto(self, url: str, wait_until: str = "", timeout: int = 0) -> None:
+            self.goto_calls.append(url)
+
+        async def wait_for_load_state(self, state: str, timeout: int = 0) -> None:
+            self.wait_calls.append(state)
+
+        async def wait_for_timeout(self, timeout: int) -> None:
+            return None
+
+    page = _Page()
+    result = asyncio.run(
+        _return_to_start_url_after_menu_leaf(
+            page,
+            V3RunConfig(start_url="https://www.zbsykj.com:19096/index"),
+            menu_id="menu_7",
+            page_id="menu_page_002",
+        )
+    )
+
+    assert result == {
+        "event": "return_to_home_after_menu_leaf",
+        "status": "completed",
+        "menu_id": "menu_7",
+        "page_entry_id": "menu_page_002",
+        "url": "https://www.zbsykj.com:19096/index",
+        "method": "goto_start_url",
+    }
+    assert page.goto_calls == ["https://www.zbsykj.com:19096/index"]
+    assert "domcontentloaded" in page.wait_calls
+
+
+def test_browser_use_handover_returns_to_home_after_target_flow() -> None:
+    class _Page:
+        def __init__(self) -> None:
+            self.goto_calls: list[str] = []
+
+        async def goto(self, url: str, wait_until: str = "", timeout: int = 0) -> None:
+            self.goto_calls.append(url)
+
+        async def wait_for_load_state(self, state: str, timeout: int = 0) -> None:
+            return None
+
+        async def wait_for_timeout(self, timeout: int) -> None:
+            return None
+
+    page = _Page()
+    result = asyncio.run(
+        _return_to_start_url_after_browser_use_handover(
+            page,
+            V3RunConfig(start_url="https://www.zbsykj.com:19096/index"),
+            targets=["线上备案申请"],
+        )
+    )
+
+    assert result["event"] == "return_to_home_after_browser_use_handover"
+    assert result["status"] == "completed"
+    assert result["targets"] == ["线上备案申请"]
+    assert result["url"] == "https://www.zbsykj.com:19096/index"
+    assert page.goto_calls == ["https://www.zbsykj.com:19096/index"]
+
+
+def test_browser_use_handover_caps_steps_and_limits_feedback_calls() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    agent_block = source[source.index("agent = Agent(") : source.index("screenshots.append(")]
+    task = _browser_use_handover_task(
+        V3RunConfig(
+            start_url="https://www.zbsykj.com:19096/index",
+            safety_policy=TEST_ENV_FULL_ACCESS_POLICY,
+            allowed_side_effect_actions=["create", "submit", "save"],
+        ),
+        ["线上备案申请"],
+        [{"target": "线上备案申请", "reason": "target_page_uncovered"}],
+    )
+
+    assert BROWSER_USE_DETERMINISTIC_TOOL_FIRST_MAX_STEPS == 30
+    assert "agent.run(max_steps=BROWSER_USE_DETERMINISTIC_TOOL_FIRST_MAX_STEPS)" in source
+    assert "max_steps=BROWSER_USE_DETERMINISTIC_TOOL_FIRST_MAX_STEPS" not in agent_block
+    assert "确定性 script_* 工具优先" in task
+    assert "每个 script_* 工具最多调用一次" in task
+    assert "get_page_feedback 只在失败、最终确认或本轮结束时调用" in task
+
+
+def test_browser_use_tool_timing_preview_keeps_dropdown_diagnostics_visible() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+
+    assert BROWSER_USE_TOOL_RESULT_PREVIEW_LIMIT == 4000
+    assert '"result_preview": _text(result)[:BROWSER_USE_TOOL_RESULT_PREVIEW_LIMIT]' in source
+
+
+def test_browser_use_handover_writes_standard_action_and_network_evidence() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    handover_block = source[
+        source.index("async def _run_browser_use_target_handover")
+        : source.index("def _browser_use_handover_failure")
+    ]
+
+    assert 'run_dir / "action_log.jsonl"' in handover_block
+    assert '"schema_version": "stage2_action_log.v1"' in handover_block
+    assert '"executor": "browser_use_playwright_tool"' in handover_block
+    assert 'run_dir / "network_events.json"' in handover_block
+    assert '"schema_version": "stage2_network_events.v1"' in handover_block
+
+
+def test_prefill_script_clears_element_plus_message_boxes_before_dropdown_clicks() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    prefill_block = source[source.index("async def script_prefill_form") : source.index("async def script_select_required_dropdowns")]
+
+    assert "clear_blocking_overlays" in prefill_block
+    assert ".el-message-box__wrapper" in source
+
+
+def test_prefill_script_returns_phase_timings_without_breaking_legacy_keys() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    prefill_block = source[source.index("async def script_prefill_form") : source.index("async def script_select_required_dropdowns")]
+    dropdown_block = source[source.index("async def select_required_online_apply_dropdowns") : source.index("async def prefill_visible_online_apply_fields")]
+
+    assert "run_prefill_phase" in prefill_block
+    assert '"phases": phases' in prefill_block
+    assert '"plain_prefill_initial"' in prefill_block
+    assert '"native_controls"' in prefill_block
+    assert '"plain_prefill_after_native_controls"' in prefill_block
+    assert '"duration_ms"' in prefill_block
+    assert '"prefill": first_fill_result' in prefill_block
+    assert '"dropdowns": dropdown_result' in prefill_block
+    assert '"expanded_prefill": second_fill_result' in prefill_block
+    assert "control_timings" in dropdown_block
+    assert "timed_control" in dropdown_block
+    assert '"control_id"' in dropdown_block
+    assert '"duration_ms"' in dropdown_block
+
+
+def test_prefill_dropdown_selection_prefers_active_form_and_enabled_widgets() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dropdown_block = source[source.index("async def select_required_online_apply_dropdowns") : source.index("async def prefill_visible_online_apply_fields")]
+
+    assert "active_form_root" in dropdown_block
+    assert "item_has_enabled_widget" in dropdown_block
+    assert ".el-dialog:not([style*='display: none']), .el-drawer__wrapper:not([style*='display: none'])" in source
+
+
+def test_dropdown_widget_detection_does_not_reject_select_because_of_disabled_descendant() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dropdown_block = source[source.index("async def select_required_online_apply_dropdowns") : source.index("async def repair_online_apply_required_fields")]
+
+    assert "widget_is_disabled" in dropdown_block
+    assert 'widget.locator("[disabled],.is-disabled,[aria-disabled=' not in dropdown_block
+
+
+def test_online_apply_upload_samples_are_real_named_files() -> None:
+    tmp_dir = ROOT_DIR / "prototype" / "stage2" / "tests" / "_tmp_upload_samples"
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    try:
+        samples = _ensure_online_apply_upload_samples(tmp_dir)
+
+        assert set(samples) == {"personnel", "image", "attachment", "acceptance", "application"}
+        assert samples["personnel"].name == "人员信息表1.xls"
+        assert samples["image"].name == "备案图片01.jpg"
+        assert samples["attachment"].name == "附件11.doc"
+        assert samples["acceptance"].name == "验收文件00.pdf"
+        assert samples["application"].name == "备案申请表.pdf"
+        assert samples["personnel"].read_bytes().startswith(b"PK")
+        assert samples["image"].read_bytes().startswith(b"\xff\xd8")
+        assert samples["attachment"].read_bytes().startswith(b"PK")
+        assert samples["acceptance"].read_bytes().startswith(b"%PDF")
+        assert samples["application"].read_bytes().startswith(b"%PDF")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_browser_use_handover_defines_deterministic_upload_tool() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+
+    assert "async def script_upload_sample_files" in source
+    assert "set_input_files" in source
+    assert "input[type=file]" in source
+    assert "label_text_for_file_input" in source
+    assert "育苗人员信息表|人员信息表|人员" in source
+    assert "备案图片|图片|照片" in source
+    assert "附件|doc|docx|word" in source
+    assert "验收文件|验收文件00|验收" in source
+    assert '("attachment", samples["attachment"])' in source
+    assert "native_upload_existing_file_name" in source
+    assert '{"personnel", "image", "attachment", "acceptance"}' in source
+    assert "input_count" in source
+
+
+def test_browser_use_handover_defines_required_field_repair_tool() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    task = _browser_use_handover_task(
+        V3RunConfig(
+            start_url="https://www.zbsykj.com:19096/index",
+            safety_policy=TEST_ENV_FULL_ACCESS_POLICY,
+            allowed_side_effect_actions=["create", "submit", "save"],
+        ),
+        ["线上备案申请"],
+        [{"target": "线上备案申请", "reason": "target_page_uncovered"}],
+    )
+
+    assert "async def script_repair_required_fields" in source
+    assert "repair_online_apply_required_fields" in source
+    assert "育苗开始日期" in source
+    assert "验收日期" in source
+    assert "验收监管单位" in source
+    assert "验收文件" in source
+    assert "不要再自行编写 evaluate/JS" in task
+
+
+def test_online_apply_dropdown_prefill_skips_already_selected_controls() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dropdown_block = source[source.index("async def select_required_online_apply_dropdowns") : source.index("async def prefill_visible_online_apply_fields")]
+
+    assert "already_has_selected_value" in dropdown_block
+    assert "already_selected" in dropdown_block
+
+
+def test_online_apply_required_field_repair_targets_acceptance_unit_not_record_unit() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    repair_block = source[source.index("async def repair_online_apply_required_fields") : source.index("async def prefill_visible_online_apply_fields")]
+
+    assert "/备案监管单位/" not in repair_block
+    assert "setItemInput([/验收监管单位/]" not in repair_block
+    assert 'acceptance_unit_result = await timed_control(' in source
+    assert '"acceptanceUnit"' in source
+    assert '"acceptanceUnit": acceptance_unit_result' in source
+    assert 'label_texts=["验收监管单位"]' in source
+    assert 'label_texts: list[str] | None = None' in source
+
+
+def test_online_apply_seedling_method_uses_exact_label_not_section_heading() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dropdown_block = source[source.index("async def select_required_online_apply_dropdowns") : source.index("async def repair_online_apply_required_fields")]
+
+    assert 'label_texts=["育苗方式"]' in dropdown_block
+    assert 're.compile(r"育苗方式|繁殖方式|seedling|breeding", re.I)' in dropdown_block
+    assert 're.compile(r"育苗方式|繁殖方式|育苗|seedling|breeding", re.I)' not in dropdown_block
+
+
+def test_online_apply_prefill_avoids_text_filling_for_dropdown_date_and_cascader_fields() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    prefill_block = source[source.index("async def prefill_visible_online_apply_fields") : source.index("@tools.action(description=\"[脚本内部工具] 预填写表单")]
+
+    assert "return '测试监管单位'" not in prefill_block
+    assert "return '2026-06-01'" not in prefill_block
+    assert "生产地点|地址|详细地址" not in prefill_block
+    assert "const isDateInput = Boolean(el.closest('.el-date-editor'))" in prefill_block
+    assert "const isWidgetInput = Boolean(el.closest('.el-select,.el-cascader'))" in prefill_block
+
+
+def test_online_apply_prefill_avoids_unknown_text_for_labeled_dropdown_controls() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    prefill_block = source[source.index("async def prefill_visible_online_apply_fields") : source.index("@tools.action(description=\"[脚本内部工具] 预填写表单")]
+
+    assert "const looksLikeChoiceField" in prefill_block
+    assert "验收监管单位" in prefill_block
+    assert "备案品种" in prefill_block
+    assert "if (el.disabled || !el.offsetParent || isWidgetInput || isDateInput || isChoiceField || el.readOnly)" in prefill_block
+
+
+def test_online_apply_date_repair_uses_picker_selection_instead_of_text_fill() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    repair_block = source[source.index("async def repair_online_apply_required_fields") : source.index("async def prefill_visible_online_apply_fields")]
+    date_skill_block = source[
+        source.index("async def select_required_online_apply_dates")
+        : source.index("async def repair_online_apply_required_fields")
+    ]
+
+    assert "async def repair_required_dates" in repair_block
+    assert "return await select_required_online_apply_dates(target_page)" in repair_block
+    assert "await input_locator.fill(value" not in date_skill_block
+    assert "await input_locator.type(value" not in date_skill_block
+    assert "setItemInput([/育苗开始日期/, /开始日期/], '2026-06-01', 'dates');" not in date_skill_block
+    assert "setItemInput([/验收日期/], '2026-06-15', 'dates');" not in date_skill_block
+    assert ".el-picker-panel" in date_skill_block
+    assert "await day_cell.click(timeout=2500)" in date_skill_block
+
+
+def test_online_apply_date_repair_skips_dates_that_already_have_values() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    date_skill_block = source[
+        source.index("async def select_required_online_apply_dates")
+        : source.index("async def repair_online_apply_required_fields")
+    ]
+
+    assert "existing_value = _text(await input_locator.input_value(timeout=800))" in date_skill_block
+    assert '"skipped": "already_selected"' in date_skill_block
+    assert "if existing_value:" in date_skill_block
+
+
+def test_online_apply_prefill_selects_required_dates_before_first_submit() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    prefill_tool_block = source[source.index("async def script_prefill_form") : source.index("@tools.action(description=\"[脚本内部工具] 用 Playwright 直接点击备案申请表必填下拉项")]
+
+    assert "native_date_controls" in prefill_tool_block
+    assert "select_required_online_apply_dates(target_page)" in prefill_tool_block
+    assert '"dates": date_result' in prefill_tool_block
+
+
+def test_online_apply_date_skill_is_reusable_for_prefill_and_repair() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+
+    assert "async def select_required_online_apply_dates(target_page: Any) -> list[dict[str, Any]]:" in source
+    date_skill_block = source[
+        source.index("async def select_required_online_apply_dates")
+        : source.index("async def repair_online_apply_required_fields")
+    ]
+    assert '"育苗开始日期"' in date_skill_block
+    assert '"验收日期"' in date_skill_block
+    assert ".el-picker-panel:visible,.el-date-picker:visible" in date_skill_block
+    assert "await day_cell.click(timeout=2500)" in date_skill_block
+    assert '"skipped": "already_selected"' in date_skill_block
+    assert "await input_locator.fill(value" not in date_skill_block
+    assert "await input_locator.type(value" not in date_skill_block
+
+
+def test_online_apply_repair_block_defines_its_own_visible_text_helper() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    repair_block = source[source.index("async def repair_online_apply_required_fields") : source.index("async def prefill_visible_online_apply_fields")]
+
+    assert "async def visible_text(locator: Any) -> str:" in repair_block
+    assert "return _text(await locator.inner_text(timeout=800))" in repair_block
+
+
+def test_online_apply_repair_plan_targets_only_reported_validation_categories() -> None:
+    date_only = _online_apply_repair_plan(["育苗开始日期不能为空", "验收日期不能为空"])
+    upload_only = _online_apply_repair_plan(["验收文件不能为空"])
+    dropdown_only = _online_apply_repair_plan(["验收监管单位不能为空", "育苗地点请选择"])
+    generic_location = _online_apply_repair_plan(["地点不能为空"])
+
+    assert date_only == {
+        "dates": True,
+        "dropdowns": False,
+        "uploads": False,
+        "reason": "validation_error_labels",
+    }
+    assert upload_only == {
+        "dates": False,
+        "dropdowns": False,
+        "uploads": True,
+        "reason": "validation_error_labels",
+    }
+    assert dropdown_only == {
+        "dates": False,
+        "dropdowns": True,
+        "uploads": False,
+        "reason": "validation_error_labels",
+    }
+    assert generic_location == {
+        "dates": False,
+        "dropdowns": True,
+        "uploads": False,
+        "reason": "validation_error_labels",
+    }
+
+
+def test_online_apply_repair_plan_falls_back_to_full_repair_without_validation_errors() -> None:
+    assert _online_apply_repair_plan([]) == {
+        "dates": True,
+        "dropdowns": True,
+        "uploads": True,
+        "reason": "no_validation_errors_available",
+    }
+
+
+def test_online_apply_required_field_repair_uses_conditional_plan() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    repair_block = source[source.index("async def repair_online_apply_required_fields") : source.index("async def prefill_visible_online_apply_fields")]
+
+    assert "validation_errors_before" in repair_block
+    assert "_online_apply_repair_plan(validation_errors_before)" in repair_block
+    assert 'if repair_plan["dates"]' in repair_block
+    assert 'if repair_plan["dropdowns"]' in repair_block
+    assert 'if repair_plan["uploads"]' in repair_block
+    assert '"skipped": "not_requested_by_validation_errors"' in repair_block
+
+
+def test_online_apply_seedling_address_uses_exact_cascader_selection() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dropdown_block = source[source.index("async def select_required_online_apply_dropdowns") : source.index("async def repair_online_apply_required_fields")]
+
+    assert "label_texts: list[str] | None = None" in dropdown_block
+    assert 'label_texts=["育苗地址", "育苗地点"]' in dropdown_block
+    assert 're.compile(r"育苗地点|育苗区域|育苗地址|种植地点|育苗.*地区|location|area", re.I)' not in dropdown_block
+    assert "max_depth: int = 4" in dropdown_block
+    assert ".el-cascader-panel .el-cascader-menu" in dropdown_block
+    assert "wait_for_visible_cascader_menu_count" in dropdown_block
+    assert "timeout_ms: int = 2500" in dropdown_block
+    assert "next_menu_visible" in dropdown_block
+    assert '"reason": "terminal_level_not_reached"' in dropdown_block
+    assert '"trace": trace' in dropdown_block
+    assert "committed_after_click = await already_has_selected_value(matched_item)" in dropdown_block
+    assert "if committed_after_click:" in dropdown_block
+    assert "committed_value = await already_has_selected_value(matched_item)" in dropdown_block
+    assert '"selected_value": committed_value' in dropdown_block
+    assert '"reason": None if committed_value else "option_not_found"' in dropdown_block
+
+
+def test_online_apply_acceptance_unit_uses_exact_dropdown_label_and_select_triggers() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dropdown_block = source[source.index("async def select_required_online_apply_dropdowns") : source.index("async def repair_online_apply_required_fields")]
+
+    assert 'label_texts=["验收监管单位"]' in dropdown_block
+    assert "input[placeholder*='请选择']" in dropdown_block
+    assert '.el-select .el-input__wrapper' in dropdown_block
+    assert "async def collect_form_item_diagnostics" in dropdown_block
+    assert '"diagnostics": await collect_form_item_diagnostics' in dropdown_block
+    assert '"candidate_labels"' in dropdown_block
+    assert '"widget_labels"' in dropdown_block
+    assert '"expected_labels"' in dropdown_block
+    assert "neighbor_form_items" in dropdown_block
+    assert "find_labeled_form_item" in dropdown_block
+    assert "find_field_by_placeholder" in dropdown_block
+    assert 'placeholder_texts=["请选择验收监管单位"]' in dropdown_block
+    assert ".el-select__wrapper" in dropdown_block
+    assert ".el-select__placeholder" in dropdown_block
+    assert ".el-select__selected-item" in dropdown_block
+
+
+def test_online_apply_acceptance_unit_supports_vue_treeselect_controls() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dropdown_block = source[source.index("async def select_required_online_apply_dropdowns") : source.index("async def repair_online_apply_required_fields")]
+
+    assert ".vue-treeselect" in dropdown_block
+    assert ".vue-treeselect__control" in dropdown_block
+    assert ".vue-treeselect__placeholder" in dropdown_block
+    assert ".vue-treeselect__input" in dropdown_block
+    assert ".vue-treeselect__single-value" in dropdown_block
+    assert ".vue-treeselect__option:not(.vue-treeselect__option--disabled)" in dropdown_block
+    assert ".vue-treeselect__label-container" in dropdown_block
+    assert "广西壮族自治区林业局|林业局|监管" in dropdown_block
+
+
+def test_online_apply_acceptance_unit_can_find_visible_placeholder_text_trigger() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dropdown_block = source[source.index("async def select_required_online_apply_dropdowns") : source.index("async def repair_online_apply_required_fields")]
+
+    assert "visible_placeholder_triggers" in dropdown_block
+    assert ".el-select__placeholder" in dropdown_block
+    assert ".el-select__selected-item" in dropdown_block
+    assert "contains(normalize-space(.), '{placeholder}')" in dropdown_block
+    assert "matched_trigger_is_value_reader" in dropdown_block
+    assert "await already_has_selected_value(matched_item)" in dropdown_block
+
+
+def test_online_apply_dropdown_failure_diagnostics_include_matched_label_details() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dropdown_block = source[source.index("async def select_required_online_apply_dropdowns") : source.index("async def repair_online_apply_required_fields")]
+
+    assert '"matched_label_diagnostics"' in dropdown_block
+    assert '"selector_counts"' in dropdown_block
+    assert '"trigger_candidates"' in dropdown_block
+    assert '"placeholder_candidates"' in dropdown_block
+    assert '"outer_html_preview"' in dropdown_block
+
+
+def test_online_apply_handover_forbids_manual_evaluate_after_dropdown_tools_fail() -> None:
+    task = _browser_use_handover_task(
+        V3RunConfig(
+            start_url="https://www.zbsykj.com:19096/index",
+            safety_policy=TEST_ENV_FULL_ACCESS_POLICY,
+            allowed_side_effect_actions=["create", "submit", "save"],
+        ),
+        ["线上备案申请"],
+        [{"target": "线上备案申请", "reason": "target_page_uncovered"}],
+    )
+
+    assert "vue-treeselect" in task
+    assert "如果验收监管单位仍未提交成功，立即结束并报告失败" in task
+    assert "不要再尝试 evaluate" in task
+
+
+def test_online_apply_dropdown_option_not_found_returns_diagnostics() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dropdown_block = source[source.index("async def select_required_online_apply_dropdowns") : source.index("async def repair_online_apply_required_fields")]
+
+    assert '"reason": "option_not_found"' in dropdown_block
+    assert '"diagnostics": await collect_form_item_diagnostics(' in dropdown_block
+    assert "placeholder_texts," in dropdown_block
+
+
+def test_final_record_dialog_uses_element_plus_select_triggers_and_diagnostics() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dialog_block = source[
+        source.index("async def complete_online_apply_final_record_dialog")
+        : source.index("@tools.action(description=\"[脚本内部工具] 上传线上备案申请 4 处所需样本文件")
+    ]
+
+    assert ".el-select__wrapper" in dialog_block
+    assert ".el-select__placeholder" in dialog_block
+    assert "collect_dialog_select_diagnostics" in dialog_block
+    assert '"trigger_candidates"' in dialog_block
+    assert '"option_candidates"' in dialog_block
+    assert '"dialog_text"' in dialog_block
+
+
+def test_final_record_dialog_can_find_visible_placeholder_text_trigger() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dialog_block = source[
+        source.index("async def complete_online_apply_final_record_dialog")
+        : source.index("@tools.action(description=\"[脚本内部工具] 上传线上备案申请 4 处所需样本文件")
+    ]
+
+    assert "dialog_select_trigger_selectors" in dialog_block
+    assert "visible_placeholder_triggers" in dialog_block
+    assert "contains(normalize-space(.), '请选择备案登记/监管单位')" in dialog_block
+    assert "click_dialog_select_trigger" in dialog_block
+    assert ".el-input" in dialog_block
+
+
+def test_final_record_dialog_extracts_unit_options_from_visible_select_text() -> None:
+    text = """
+    请选择备案登记/监管单位
+    广西壮族自治区林业局
+    柳州市林业局
+    融水县林业局
+    钦州市林业局
+    """
+
+    options = _final_dialog_unit_options_from_visible_text(text)
+
+    assert options == [
+        "广西壮族自治区林业局",
+        "柳州市林业局",
+        "融水县林业局",
+        "钦州市林业局",
+    ]
+    assert _choose_final_dialog_unit(["柳州市林业局", "广西壮族自治区林业局"]) == "广西壮族自治区林业局"
+
+
+def test_browser_use_handover_mentions_four_upload_slots_with_matching_files() -> None:
+    task = _browser_use_handover_task(
+        V3RunConfig(
+            start_url="https://www.zbsykj.com:19096/index",
+            safety_policy=TEST_ENV_FULL_ACCESS_POLICY,
+            allowed_side_effect_actions=["create", "submit", "save"],
+        ),
+        ["线上备案申请"],
+        [{"target": "线上备案申请", "reason": "target_page_uncovered"}],
+    )
+
+    assert "4 处上传" in task
+    assert "人员信息表 xls" in task
+    assert "备案图片 jpg" in task
+    assert "附件 doc" in task
+    assert "验收文件 pdf" in task
+
+
+def test_browser_use_handover_defines_final_record_dialog_tool_without_native_file_picker() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    task = _browser_use_handover_task(
+        V3RunConfig(
+            start_url="https://www.zbsykj.com:19096/index",
+            safety_policy=TEST_ENV_FULL_ACCESS_POLICY,
+            allowed_side_effect_actions=["create", "submit", "save"],
+        ),
+        ["线上备案申请"],
+        [{"target": "线上备案申请", "reason": "target_page_uncovered"}],
+    )
+
+    assert "async def script_complete_final_record_dialog" in source
+    assert "complete_online_apply_final_record_dialog" in source
+    assert "备案申请表.pdf" in source
+    assert "set_input_files" in source
+    assert "不要点击弹窗里的“上传文件”按钮" in task
+    assert "script_complete_final_record_dialog" in task
+
+
+def test_final_record_dialog_skips_existing_application_upload_and_disabled_submit() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dialog_block = source[
+        source.index("async def complete_online_apply_final_record_dialog")
+        : source.index("@tools.action(description=\"[脚本内部工具] 上传线上备案申请 4 处所需样本文件")
+    ]
+
+    assert "existing_application_name = await native_upload_existing_file_name(file_input)" in dialog_block
+    assert '"skipped": "already_uploaded"' in dialog_block
+    assert "native_button_is_disabled(button)" in dialog_block
+    assert '"reason": "submit_button_disabled"' in dialog_block
+
+
+def test_final_record_dialog_reselects_unit_when_submit_remains_disabled() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dialog_block = source[
+        source.index("async def complete_online_apply_final_record_dialog")
+        : source.index("@tools.action(description=\"[脚本内部工具] 上传线上备案申请 4 处所需样本文件")
+    ]
+
+    assert "current_dialog_unit_value" in dialog_block
+    assert "click_submit_button" in dialog_block
+    assert "wait_for_submit_enabled" in dialog_block
+    assert "submit_disabled_retry" in dialog_block
+    assert '"reselect_attempts"' in dialog_block
+    assert '"committed_value"' in dialog_block
+    assert '"submit_enabled_after_wait"' in dialog_block
+
+
+def test_final_record_dialog_clicks_real_option_and_requires_commit_confirmation() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dialog_block = source[
+        source.index("async def complete_online_apply_final_record_dialog")
+        : source.index("@tools.action(description=\"[脚本内部工具] 上传线上备案申请 4 处所需样本文件")
+    ]
+
+    assert "unit_option_selectors" in dialog_block
+    assert ".vue-treeselect__option" in dialog_block
+    assert ".vue-treeselect__label" in dialog_block
+    assert ".el-select-dropdown__item" in dialog_block
+    assert "click_visible_unit_option" in dialog_block
+    assert "unit_not_committed" in dialog_block
+    assert 'result["ok"] = bool(result.get("ok") and result.get("commit_confirmed"))' in dialog_block
+
+
+def test_final_record_dialog_avoids_treeselect_arrow_click_area() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    dialog_block = source[
+        source.index("async def complete_online_apply_final_record_dialog")
+        : source.index("@tools.action(description=\"[脚本内部工具] 上传线上备案申请 4 处所需样本文件")
+    ]
+
+    assert "click_unit_option_safely" in dialog_block
+    assert ".vue-treeselect__label-container" in dialog_block
+    assert ".vue-treeselect__option-arrow-container" in dialog_block
+    assert "safe_x = min(max(48" in dialog_block
+    assert 'position={"x": safe_x, "y": safe_y}' in dialog_block
+    assert '"safe_offset_avoiding_arrow"' in dialog_block
+
+
+def test_online_apply_upload_mapping_prefers_pdf_for_acceptance_and_doc_for_attachment() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    upload_block = source[source.index("async def upload_online_apply_sample_files") : source.index("@tools.action(description=\"[脚本内部工具] 上传线上备案申请 4 处所需样本文件")]
+
+    assert 'return "attachment", samples["attachment"]' in upload_block
+    assert 'return "acceptance", samples["acceptance"]' in upload_block
+    assert 're.search(r"附件|doc|docx|word", hint, re.I)' in upload_block
+    assert 're.search(r"验收文件|验收文件00|验收", hint, re.I)' in upload_block
+    assert '("attachment", samples["attachment"])' in upload_block
+    assert '("acceptance", samples["acceptance"])' in upload_block
+
+
+def test_online_apply_upload_mapping_checks_acceptance_before_generic_attachment_tokens() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    upload_block = source[source.index("def sample_for(") : source.index("uploaded: list[dict[str, Any]] = []")]
+
+    acceptance_pos = upload_block.index('if re.search(r"验收文件|验收文件00|验收", hint, re.I):')
+    attachment_pos = upload_block.index('if re.search(r"附件|doc|docx|word", hint, re.I):')
+    personnel_pos = upload_block.index('if re.search(r"育苗人员信息表|人员信息表|人员|xls|xlsx|excel|表格", hint, re.I):')
+    assert acceptance_pos < attachment_pos
+    assert attachment_pos < personnel_pos
+
+
+def test_online_apply_upload_label_extraction_prefers_field_label_over_helper_text() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    upload_block = source[source.index("async def upload_online_apply_sample_files") : source.index("@tools.action(description=\"[脚本内部工具] 上传线上备案申请 4 处所需样本文件")]
+
+    assert "querySelector('.el-form-item__label')" in upload_block
+    assert "querySelector('.title')" in upload_block
+    assert "querySelector('.el-upload__text')" not in upload_block
+
+
+def test_online_apply_upload_thumbnail_sentinel_only_skips_image_slot() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    upload_block = source[source.index("async def upload_online_apply_sample_files") : source.index("@tools.action(description=\"[脚本内部工具] 上传线上备案申请 4 处所需样本文件")]
+
+    assert 'existing_name == "__stage2_existing_upload_image__" and kind != "image"' in upload_block
+    assert '"ignored_thumbnail_sentinel_for_non_image_slot"' in upload_block
+
+
+def test_online_apply_upload_remembers_uploaded_kinds_before_dom_detection() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    state_pos = source.index("uploaded_kinds_in_session: set[str] = set()")
+    upload_block = source[source.index("async def upload_online_apply_sample_files") : source.index("@tools.action(description=\"[脚本内部工具] 上传线上备案申请 4 处所需样本文件")]
+
+    assert state_pos < source.index("async def upload_online_apply_sample_files")
+    session_skip_pos = upload_block.index("if kind in uploaded_kinds_in_session:")
+    dom_detection_pos = upload_block.index("existing_name = await native_upload_existing_file_name(file_input)")
+    assert session_skip_pos < dom_detection_pos
+    assert '"skipped": "already_uploaded_in_session"' in upload_block
+    assert "uploaded_kinds_in_session.add(kind)" in upload_block
+    assert '{"already_uploaded", "already_uploaded_in_session"}' in upload_block
+
+
+def test_online_apply_submit_prioritizes_final_trace_button_before_generic_confirm() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    submit_block = source[source.index("async def script_submit_form") : source.index("llm = ChatOpenAI(")]
+
+    assert "信息纳入溯源系统" in submit_block
+    assert "纳入溯源系统" in submit_block
+    assert "buttonRank" in submit_block
+    trace_rank_pos = submit_block.index("text.includes('信息纳入溯源系统')")
+    confirm_rank_pos = submit_block.index("text.includes('确定')")
+    assert trace_rank_pos < confirm_rank_pos
+    assert "candidates.sort" in submit_block
+
+
+def test_online_apply_submit_preserves_final_dialog_containers() -> None:
+    source = Path("prototype/stage2/app/v3_real_browser.py").read_text(encoding="utf-8")
+    submit_block = source[source.index("async def script_submit_form") : source.index("llm = ChatOpenAI(")]
+
+    assert "preserve_business_dialogs=True" in submit_block
+    assert "document.querySelectorAll('.el-picker-panel,.el-select-dropdown,.el-calendar,.el-popover')" in submit_block
+    assert "document.querySelectorAll('.el-overlay" not in submit_block
+    assert ".el-message-box" not in submit_block
+
+
+def test_browser_use_handover_payload_merges_into_unified_artifacts() -> None:
+    page_bundle = {
+        "pages": [],
+        "features": [],
+        "page_exploration_log": [],
+        "screenshots_index": {"schema_version": "stage2_v3_run.v1", "screenshots": [], "items": []},
+    }
+    handover = {
+        "status": "completed",
+        "pages": [{"page_id": "browser_use_target_001", "name": "线上备案申请"}],
+        "features": [{
+            "feature_id": "browser_use_target_001_flow",
+            "page_id": "browser_use_target_001",
+            "name": "线上备案申请目标接管流程",
+        }],
+        "case_execution_results": [{
+            "case_id": "browser_use_target_001_flow_case",
+            "feature_id": "browser_use_target_001_flow",
+            "status": "passed",
+        }],
+        "page_exploration_log": [{"event": "browser_use_handover", "status": "completed"}],
+        "screenshots_index": {
+            "schema_version": "stage2_v3_run.v1",
+            "screenshots": [{"screenshot_id": "browser_use_target_001"}],
+            "items": [{"screenshot_id": "browser_use_target_001"}],
+        },
+    }
+
+    merged = _merge_browser_use_handover(page_bundle, handover)
+
+    assert [page["page_id"] for page in merged["pages"]] == ["browser_use_target_001"]
+    assert [feature["feature_id"] for feature in merged["features"]] == [
+        "browser_use_target_001_flow"
+    ]
+    assert merged["case_execution_results"][0]["case_id"] == "browser_use_target_001_flow_case"
+    assert merged["page_exploration_log"][0]["event"] == "browser_use_handover"
+    assert merged["screenshots_index"]["items"][0]["screenshot_id"] == "browser_use_target_001"
+
+
+def test_browser_use_history_failure_is_not_imported_as_passed() -> None:
+    feedback = """
+    Final Result:
+    ## 线上备案申请全流程测试总结
+    失败原因：
+    1. 验收监管单位仍为空（form_item_not_found）
+    2. 育苗地点有红框错误
+    结论：测试未能成功提交备案申请。
+    Judge Verdict: FAIL
+    Failure Reason: The final form still shows validation errors.
+    """
+
+    result = _browser_use_history_result(feedback)
+
+    assert result["status"] == "failed"
+    assert result["verdict"] == "failed"
+    assert result["failure_reason"] == "browser_use_handover_failed"
+    assert result["manual_confirmation_required"] is True
+
+
+def test_browser_use_history_success_requires_positive_done_signal() -> None:
+    feedback = "Final Result: 已成功提交备案申请。Judge Verdict: PASS"
+
+    result = _browser_use_history_result(feedback)
+
+    assert result["status"] == "passed"
+    assert result["verdict"] == "passed"
+    assert result["failure_reason"] is None
+    assert result["manual_confirmation_required"] is False
+
+
+def test_browser_use_history_treats_later_confirmed_success_as_recovered_passed() -> None:
+    feedback = """
+    ActionResult(extracted_content='{"ok": false, "submit": {"ok": false, "reason": "submit_button_disabled"}}')
+    INFO Step 15: Eval: 最终提交弹窗显示“提交成功”，提示“提交完成，待备案登记/监管单位登记备案”。
+    Network evidence: POST /prod-api/zwsy/registration/apply/dept status=200
+    ActionResult(is_done=True, success=True, extracted_content='提交成功')
+    """
+
+    result = _browser_use_history_result(feedback)
+
+    assert result["status"] == "recovered_passed"
+    assert result["verdict"] == "passed"
+    assert result["failure_reason"] is None
+    assert result["manual_confirmation_required"] is False
+    assert result["recovered_from"] == "browser_use_intermediate_failure"
+
+
+def test_browser_use_history_recovered_passed_counts_as_handover_success() -> None:
+    result = {
+        "status": "recovered_passed",
+        "verdict": "passed",
+        "failure_reason": None,
+        "manual_confirmation_required": False,
+    }
+
+    assert _browser_use_history_is_success(result) is True
+
+
+def test_browser_use_history_failed_status_with_passed_verdict_is_not_success() -> None:
+    result = {
+        "status": "failed",
+        "verdict": "passed",
+        "failure_reason": "browser_use_handover_failed",
+        "manual_confirmation_required": True,
+    }
+
+    assert _browser_use_history_is_success(result) is False
+
+
+def test_login_residual_text_does_not_block_when_menu_evidence_exists() -> None:
+    menu_bundle = {
+        "menu_entries": [
+            {
+                "menu_id": "menu_1",
+                "text": "溯源管理",
+                "is_leaf": False,
+                "status": "expanded",
+            },
+            {
+                "menu_id": "menu_2",
+                "text": "线上备案申请",
+                "is_leaf": True,
+                "status": "discovered",
+                "route_hint": "/record/online",
+            },
+        ]
+    }
+
+    assert _should_block_for_login_text("登录 密码 大写锁定已打开", menu_bundle) is False
+
+
+def test_collapsed_business_menu_does_not_report_login_required() -> None:
+    menu_bundle = {
+        "menu_entries": [
+            {
+                "menu_id": "menu_1",
+                "text": "备案管理线上备案申请",
+                "is_leaf": False,
+                "expandable": True,
+                "status": "expansion_failed",
+                "failure_reason": "element is outside of the viewport",
+            },
+            {
+                "menu_id": "menu_2",
+                "text": "溯源管理",
+                "is_leaf": False,
+                "expandable": True,
+                "status": "expansion_failed",
+                "failure_reason": "element is outside of the viewport",
+            },
+        ]
+    }
+
+    assert _should_block_for_login_text("欢迎您 登录使用追本溯源管理平台 密码", menu_bundle) is False
+
+
+def test_normalize_menu_shell_expands_collapsed_sidebar_before_menu_scan() -> None:
+    class _Page:
+        def __init__(self) -> None:
+            self.evaluate_calls: list[str] = []
+
+        async def evaluate(self, script: str) -> dict[str, object]:
+            self.evaluate_calls.append(script)
+            return {
+                "attempted": True,
+                "expanded": True,
+                "reason": "clicked_sidebar_toggle",
+                "collapsedBefore": True,
+                "collapsedAfter": False,
+            }
+
+        async def wait_for_timeout(self, timeout: int) -> None:
+            return None
+
+    page = _Page()
+    result = asyncio.run(_normalize_playwright_menu_shell(page))
+
+    assert result["attempted"] is True
+    assert result["expanded"] is True
+    assert result["reason"] == "clicked_sidebar_toggle"
+    assert "el-menu--collapse" in page.evaluate_calls[0]
+
+
+def test_menu_candidate_click_falls_back_to_safe_dom_point_when_locator_is_offscreen() -> None:
+    class _Locator:
+        async def scroll_into_view_if_needed(self, timeout: int = 0) -> None:
+            return None
+
+        async def click(self, timeout: int = 0) -> None:
+            raise RuntimeError("element is outside of the viewport")
+
+    class _LocatorFactory:
+        @property
+        def first(self) -> _Locator:
+            return _Locator()
+
+    class _Page:
+        def __init__(self) -> None:
+            self.evaluate_args: list[object] = []
+
+        def locator(self, selector: str) -> _LocatorFactory:
+            assert selector == "[data-stage2-menu-id='menu_2']"
+            return _LocatorFactory()
+
+        async def evaluate(self, script: str, arg: object) -> dict[str, object]:
+            self.evaluate_args.append(arg)
+            return {"ok": True, "method": "dom_label_safe_point_click", "x": 48, "y": 24}
+
+    page = _Page()
+    result = asyncio.run(_click_playwright_menu_candidate(page, "menu_2"))
+
+    assert result["method"] == "dom_label_safe_point_click"
+    assert "outside of the viewport" in result["fallback_after"]
+    assert page.evaluate_args == ["menu_2"]

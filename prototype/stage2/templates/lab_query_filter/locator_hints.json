@@ -1,0 +1,6 @@
+{
+  "query_input": "#queryInput",
+  "status_select": "#statusSelect",
+  "search_button": "#searchButton",
+  "query_summary": "#querySummary"
+}

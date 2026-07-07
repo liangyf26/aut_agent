@@ -1,0 +1,4638 @@
+const crypto = require('crypto');
+const { execFile } = require('child_process');
+const fsSync = require('fs');
+const fs = require('fs/promises');
+const path = require('path');
+const { promisify } = require('util');
+
+const ROOT_DIR = path.join(__dirname, '..');
+const DEFAULT_STAGE2_RUNS_DIR = path.join(ROOT_DIR, 'artifacts', 'stage2', 'runs');
+const DEFAULT_CDP_URL = 'http://localhost:9222/';
+const DEFAULT_MODEL_PROFILES_PATH = path.join(ROOT_DIR, 'config', 'stage2-model-profiles.json');
+const SAFE_ID_PATTERN = /^[A-Za-z0-9_-]{1,120}$/;
+const LOCAL_CDP_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
+const DEFAULT_PYTHON_COMMAND = process.env.STAGE2_PYTHON || process.env.PYTHON || 'python';
+const DEFAULT_PYTHON_TIMEOUT_MS = 30 * 60 * 1000;
+const SAFETY_POLICY_LOW_RISK_ONLY = 'low_risk_only';
+const SAFETY_POLICY_TEST_ENV_FULL_ACCESS = 'test_env_full_access';
+const DEFAULT_FULL_ACCESS_ACTIONS = ['create', 'edit', 'submit', 'delete', 'approve', 'save', 'remove'];
+const execFileAsync = promisify(execFile);
+
+const ARTIFACTS = {
+  run_manifest: 'run_manifest.json',
+  input_config: 'input_config.json',
+  progress_events: 'progress_events.jsonl',
+  current_status: 'current_status.json',
+  preflight_result: 'preflight_result.json',
+  system_map: 'system_map.json',
+  navigation_tree: 'navigation_tree.json',
+  menu_tree: 'menu_tree.json',
+  menu_entries: 'menu_entries.json',
+  menu_traversal_log: 'menu_traversal_log.jsonl',
+  page_exploration_log: 'page_exploration_log.jsonl',
+  action_log: 'action_log.jsonl',
+  network_events: 'network_events.json',
+  page_entries: 'page_entries.json',
+  feature_points: 'feature_points.json',
+  discovery_review: 'discovery_review.json',
+  generated_test_cases: 'generated_test_cases.json',
+  execution_results: 'execution_results.json',
+  screenshots_index: 'screenshots_index.json',
+  failure_summary: 'failure_summary.json',
+  round_analysis: 'round_analysis.json',
+  failure_clusters: 'failure_clusters.json',
+  improvement_candidates: 'improvement_candidates.json',
+  next_round_plan: 'next_round_plan.json',
+  human_tasks: 'human_tasks.json',
+  promotion_candidates: 'promotion_candidates.json',
+  model_comparison: 'model_comparison.json',
+  python_execution: 'python_execution.json',
+  browser_use_tool_timings: 'browser_use_tool_timings.jsonl',
+  run_report_json: path.join('reports', 'run_report.json'),
+  run_report_md: path.join('reports', 'run_report.md')
+};
+
+class Stage2V3InputError extends Error {
+  constructor(message, statusCode = 400) {
+    super(message);
+    this.name = 'Stage2V3InputError';
+    this.statusCode = statusCode;
+  }
+}
+
+function nowIso() {
+  return toShanghaiIso(new Date());
+}
+
+function toShanghaiIso(date) {
+  const local = new Date(date.getTime() + 8 * 60 * 60 * 1000);
+  return `${local.toISOString().replace('Z', '')}+08:00`;
+}
+
+function createRunId(now = new Date()) {
+  const stamp = toShanghaiIso(now)
+    .replace(/[-:]/g, '')
+    .replace('T', '_')
+    .slice(0, 15);
+  return `stage2_v3_${stamp}_${crypto.randomBytes(4).toString('hex')}`;
+}
+
+function ensureSafeId(value, label = 'id') {
+  const text = String(value || '').trim();
+  if (!SAFE_ID_PATTERN.test(text)) {
+    throw new Stage2V3InputError(`${label} 只能包含字母、数字、下划线或连字符。`);
+  }
+  return text;
+}
+
+function getRunsDir(options = {}) {
+  return options.runsDir || DEFAULT_STAGE2_RUNS_DIR;
+}
+
+function getRunDir(runId, options = {}) {
+  const safeRunId = ensureSafeId(runId, 'runId');
+  return path.join(getRunsDir(options), safeRunId);
+}
+
+function ensureRunDirInsideRunsDir(runsDir, runDir) {
+  const root = path.resolve(runsDir);
+  const target = path.resolve(runDir);
+  const relative = path.relative(root, target);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new Stage2V3InputError('删除目标必须位于 v3 runs 目录内。');
+  }
+}
+
+function artifactPath(runDir, artifactKey) {
+  const relativePath = ARTIFACTS[artifactKey];
+  if (!relativePath) {
+    throw new Stage2V3InputError('不支持的 v3 artifact key。', 404);
+  }
+  return path.join(runDir, relativePath);
+}
+
+function relativeArtifact(filePath) {
+  return path.relative(ROOT_DIR, filePath).replace(/\\/g, '/');
+}
+
+function buildArtifactHref(runId, artifactKey) {
+  return `/api/stage2/v3/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifactKey)}`;
+}
+
+function artifactRefs(runId) {
+  return Object.fromEntries(Object.keys(ARTIFACTS).map((key) => [
+    key,
+    { key, href: buildArtifactHref(runId, key) }
+  ]));
+}
+
+function normalizeText(value, fallback = '') {
+  const text = String(value || '').trim();
+  return text || fallback;
+}
+
+function normalizeOptionalText(value) {
+  const text = String(value || '').trim();
+  return text || null;
+}
+
+function roundDisplayName(roundId) {
+  const match = String(roundId || '').match(/(\d+)$/);
+  if (!match) {
+    return '本轮';
+  }
+  return `第 ${Number(match[1])} 轮`;
+}
+
+function formatErrorWithCause(error) {
+  const message = error?.message || String(error || 'unknown error');
+  const cause = error?.cause;
+  if (!cause) {
+    return message;
+  }
+  const causeMessage = cause.message || String(cause);
+  return causeMessage && !message.includes(causeMessage)
+    ? `${message}; cause: ${causeMessage}`
+    : message;
+}
+
+function normalizeModelProfileId(value) {
+  return String(value || '').trim().replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 120);
+}
+
+function normalizeArray(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item || '').trim()).filter(Boolean);
+  }
+  if (typeof value === 'string') {
+    return value.split(/[,;\s]+/).map((item) => item.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function normalizeTextList(value) {
+  if (Array.isArray(value)) {
+    return value
+      .flatMap((item) => normalizeTextList(item))
+      .filter(Boolean);
+  }
+  if (value === null || value === undefined) {
+    return [];
+  }
+  return String(value)
+    .split(/\r?\n|[;,，、]/)
+    .map((item) => item.trim())
+    .filter((item) => item.length >= 2);
+}
+
+function uniqueTextList(...values) {
+  return [...new Set(values.flatMap((value) => normalizeTextList(value)))];
+}
+
+function modelProfilesConfigPath(options = {}) {
+  return options.configPath
+    || options.modelProfileConfigPath
+    || process.env.STAGE2_MODEL_PROFILES_PATH
+    || DEFAULT_MODEL_PROFILES_PATH;
+}
+
+function redactModelProfile(profile) {
+  return {
+    id: profile.id,
+    label: profile.label,
+    provider: profile.provider,
+    baseUrl: profile.baseUrl,
+    base_url: profile.baseUrl,
+    model: profile.model,
+    browserUseMode: profile.browserUseMode,
+    browser_use_mode: profile.browserUseMode,
+    apiKeyConfigured: Boolean(profile.apiKey),
+    api_key_configured: Boolean(profile.apiKey)
+  };
+}
+
+function loadStage2ModelProfiles(options = {}) {
+  const configPath = modelProfilesConfigPath(options);
+  if (!fsSync.existsSync(configPath)) {
+    return {
+      schema_version: 'stage2_model_profiles.v1',
+      config_path: configPath,
+      profiles: []
+    };
+  }
+  const payload = JSON.parse(fsSync.readFileSync(configPath, 'utf8'));
+  const profiles = (payload.profiles || []).map((profile) => {
+    const id = normalizeModelProfileId(profile.id || profile.name || profile.model);
+    const apiKeyEnv = normalizeOptionalText(profile.apiKeyEnv || profile.api_key_env);
+    return {
+      id,
+      label: normalizeText(profile.label || profile.name, id),
+      provider: normalizeText(profile.provider || profile.type, 'openai_compatible'),
+      baseUrl: normalizeText(profile.baseUrl || profile.base_url, '').replace(/\/$/, ''),
+      apiKey: normalizeText(profile.apiKey || profile.api_key || (apiKeyEnv ? process.env[apiKeyEnv] : ''), ''),
+      apiKeyEnv,
+      model: normalizeText(profile.model, id),
+      browserUseMode: normalizeOptionalText(profile.browserUseMode || profile.browser_use_mode)
+    };
+  }).filter((profile) => profile.id);
+  return {
+    schema_version: 'stage2_model_profiles.v1',
+    config_path: configPath,
+    profiles
+  };
+}
+
+function selectModelProfiles(selectedIds, availableProfiles) {
+  const byId = new Map((availableProfiles || []).map((profile) => [profile.id, profile]));
+  return selectedIds.map((id) => byId.get(id)).filter(Boolean).map(redactModelProfile);
+}
+
+function normalizeHttpUrl(value, fieldName, fallback = null) {
+  const raw = normalizeText(value, fallback || '');
+  if (!raw) {
+    return null;
+  }
+  try {
+    const url = new URL(raw);
+    if (!['http:', 'https:'].includes(url.protocol)) {
+      throw new Error('invalid protocol');
+    }
+    return url.toString();
+  } catch {
+    throw new Stage2V3InputError(`${fieldName} 必须是 http(s) URL。`);
+  }
+}
+
+function normalizeCdpUrl(value) {
+  const urlText = normalizeHttpUrl(value, 'cdpUrl', DEFAULT_CDP_URL);
+  const url = new URL(urlText);
+  if (process.env.STAGE2_ALLOW_REMOTE_CDP !== '1' && !LOCAL_CDP_HOSTS.has(url.hostname)) {
+    throw new Stage2V3InputError('cdpUrl 只允许 localhost、127.0.0.1 或 ::1；如需远程调试端口，请先显式配置白名单。');
+  }
+  return url.toString();
+}
+
+function normalizeInputConfig(body = {}, options = {}) {
+  const systemName = normalizeText(body.systemName || body.system_name || body.targetName, '未命名系统');
+  const entryUrl = normalizeHttpUrl(body.entryUrl || body.entry_url || body.homeUrl || body.pageUrl, 'entryUrl');
+  const safetyPolicy = normalizeSafetyPolicy(body.safetyPolicy || body.safety_policy);
+  const configuredProfiles = options.modelProfiles || loadStage2ModelProfiles(options).profiles;
+  const selectedModelProfileIds = normalizeArray(
+    body.modelProfileIds
+      || body.model_profile_ids
+      || body.selectedModelProfileIds
+      || body.selected_model_profile_ids
+      || body.modelProfiles
+      || body.model_profiles
+      || body.model
+  ).map(normalizeModelProfileId).filter(Boolean);
+  const selectedModelProfiles = selectModelProfiles(selectedModelProfileIds, configuredProfiles);
+  const allowedSideEffectActions = normalizeAllowedSideEffectActions(
+    body.allowedSideEffectActions
+      || body.allowed_side_effect_actions
+      || body.allowedSideEffects
+      || body.allowed_side_effects
+      || body.sideEffectAllowlist
+      || body.side_effect_allowlist
+  );
+  const prioritizedTargets = uniqueTextList(
+    body.prioritizedTargets,
+    body.prioritized_targets,
+    body.targetNames,
+    body.target_names,
+    body.pageTargets,
+    body.page_targets
+  ).slice(0, 20);
+  const waivedTargets = uniqueTextList(
+    body.waivedTargets,
+    body.waived_targets,
+    body.waivedPageTargets,
+    body.waived_page_targets
+  ).slice(0, 20);
+  const fullAccessConfirmed = body.fullAccessConfirmed === true
+    || body.full_access_confirmed === true
+    || body.safetyPolicyConfirmed === true
+    || body.safety_policy_confirmed === true;
+  if (safetyPolicy === SAFETY_POLICY_TEST_ENV_FULL_ACCESS && !fullAccessConfirmed) {
+    throw new Stage2V3InputError('测试环境全权限模式必须先在运行中心明确确认，不能静默启用副作用动作。');
+  }
+
+  return {
+    schema_version: 'stage2_input_config.v3',
+    system_name: systemName,
+    entry_url: entryUrl,
+    cdp_url: normalizeCdpUrl(body.cdpUrl || body.cdp_url),
+    execution_mode: normalizeExecutionMode(body.executionMode || body.execution_mode),
+    test_account_note: normalizeOptionalText(body.testAccountNote || body.test_account_note || body.accountNotes),
+    login_mode: normalizeText(body.loginMode || body.login_mode, 'human_takeover_or_existing_session'),
+    scope: normalizeOptionalText(body.scope || body.scopeText || body.explorationScope),
+    safety_policy: safetyPolicy,
+    full_access_confirmed: safetyPolicy === SAFETY_POLICY_TEST_ENV_FULL_ACCESS && fullAccessConfirmed,
+    allowed_side_effect_actions: safetyPolicy === SAFETY_POLICY_TEST_ENV_FULL_ACCESS
+      ? (allowedSideEffectActions.length ? allowedSideEffectActions : DEFAULT_FULL_ACCESS_ACTIONS)
+      : [],
+    prioritized_targets: prioritizedTargets,
+    waived_targets: waivedTargets,
+    selected_model_profile_ids: selectedModelProfileIds,
+    selected_model_profiles: selectedModelProfiles,
+    max_pages: normalizeInteger(body.maxPages || body.max_pages, 30, 1, 200),
+    max_features_per_page: normalizeInteger(body.maxFeaturesPerPage || body.max_features_per_page, 30, 1, 200),
+    auto_continue: body.autoContinue === true || body.auto_continue === true,
+    created_from: normalizeText(body.createdFrom || body.created_from, 'run_center_v3')
+  };
+}
+
+function normalizeSafetyPolicy(value) {
+  const policy = normalizeText(value, SAFETY_POLICY_LOW_RISK_ONLY).toLowerCase().replace(/-/g, '_');
+  if (['test_env_full_access', 'full_access', 'testing_full_access', 'test_full_access'].includes(policy)) {
+    return SAFETY_POLICY_TEST_ENV_FULL_ACCESS;
+  }
+  return SAFETY_POLICY_LOW_RISK_ONLY;
+}
+
+function normalizeAllowedSideEffectActions(value) {
+  const rawItems = Array.isArray(value)
+    ? value
+    : typeof value === 'string'
+      ? value.split(/[,\s;]+/)
+      : [];
+  const aliases = new Map([
+    ['approval', 'approve'],
+    ['audit', 'approve'],
+    ['confirm', 'submit'],
+    ['new', 'create'],
+    ['add', 'create'],
+    ['update', 'edit'],
+    ['remove', 'delete']
+  ]);
+  const allowed = new Set(['create', 'edit', 'submit', 'delete', 'approve', 'save', 'remove', '*']);
+  const normalized = [];
+  const seen = new Set();
+  for (const item of rawItems) {
+    const token = normalizeText(item, '').toLowerCase().replace(/-/g, '_');
+    const canonical = aliases.get(token) || token;
+    if (!canonical || !allowed.has(canonical) || seen.has(canonical)) {
+      continue;
+    }
+    seen.add(canonical);
+    normalized.push(canonical);
+  }
+  return normalized;
+}
+
+function normalizeInteger(value, fallback, min, max) {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < min || number > max) {
+    throw new Stage2V3InputError(`数值参数必须是 ${min} 到 ${max} 之间的整数。`);
+  }
+  return number;
+}
+
+function normalizeExecutionMode(value) {
+  const mode = normalizeText(value, 'real_browser');
+  if (['contract_placeholder', 'placeholder', 'safe_placeholder'].includes(mode)) {
+    return 'contract_only';
+  }
+  if (!['real_browser', 'contract_only'].includes(mode)) {
+    throw new Stage2V3InputError('executionMode 仅支持 real_browser 或 contract_only。');
+  }
+  return mode;
+}
+
+async function pathExists(targetPath) {
+  try {
+    await fs.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function directorySize(targetPath) {
+  let total = 0;
+  const entries = await fs.readdir(targetPath, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    const entryPath = path.join(targetPath, entry.name);
+    if (entry.isDirectory()) {
+      total += await directorySize(entryPath);
+      continue;
+    }
+    if (!entry.isFile()) {
+      continue;
+    }
+    const stat = await fs.stat(entryPath).catch(() => null);
+    total += stat?.size || 0;
+  }
+  return total;
+}
+
+async function readJsonIfExists(filePath) {
+  try {
+    const raw = await fs.readFile(filePath, 'utf8');
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function readTextIfExists(filePath) {
+  try {
+    return await fs.readFile(filePath, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+async function readProgressEventsIfExists(filePath, limit = 20) {
+  try {
+    const raw = await fs.readFile(filePath, 'utf8');
+    return raw
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return { type: 'unparseable_progress_event', raw: line };
+        }
+      })
+      .slice(-limit);
+  } catch {
+    return [];
+  }
+}
+
+async function readJsonRequired(filePath, message) {
+  const value = await readJsonIfExists(filePath);
+  if (!value) {
+    throw new Stage2V3InputError(message, 404);
+  }
+  return value;
+}
+
+async function writeJson(filePath, payload) {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+}
+
+async function copyTextFileIfExists(sourcePath, targetPath) {
+  if (!(await pathExists(sourcePath))) {
+    return false;
+  }
+  await fs.mkdir(path.dirname(targetPath), { recursive: true });
+  await fs.copyFile(sourcePath, targetPath);
+  return true;
+}
+
+async function checkBrowserPreflight(cdpUrl = DEFAULT_CDP_URL, options = {}) {
+  const normalizedCdpUrl = normalizeCdpUrl(cdpUrl);
+  const timeoutMs = normalizeInteger(options.timeoutMs || options.timeout_ms, 3000, 500, 30000);
+  const checkedAt = nowIso();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const buildUrl = (relativePath) => {
+    const base = new URL(normalizedCdpUrl);
+    return new URL(relativePath, `${base.origin}/`).toString();
+  };
+  try {
+    const versionResponse = await fetch(buildUrl('/json/version'), {
+      signal: controller.signal,
+      cache: 'no-store'
+    });
+    if (!versionResponse.ok) {
+      throw new Error(`CDP /json/version 返回 HTTP ${versionResponse.status}`);
+    }
+    const version = await versionResponse.json();
+    let targetCount = null;
+    try {
+      const listResponse = await fetch(buildUrl('/json/list'), {
+        signal: controller.signal,
+        cache: 'no-store'
+      });
+      if (listResponse.ok) {
+        const targets = await listResponse.json();
+        targetCount = Array.isArray(targets) ? targets.length : null;
+      }
+    } catch {
+      targetCount = null;
+    }
+    return {
+      ok: true,
+      status: 'connected',
+      cdpUrl: normalizedCdpUrl,
+      browser: version.Browser || '',
+      protocolVersion: version['Protocol-Version'] || '',
+      webSocketDebuggerUrl: version.webSocketDebuggerUrl || '',
+      targetCount,
+      checkedAt,
+      message: version.Browser
+        ? `已连接 ${version.Browser}`
+        : '已连接 Chrome DevTools Protocol。'
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: error.name === 'AbortError' ? 'timeout' : 'unreachable',
+      cdpUrl: normalizedCdpUrl,
+      checkedAt,
+      message: error.name === 'AbortError'
+        ? `CDP 预检超时：${normalizedCdpUrl}`
+        : `CDP 不可用：${error.message}`
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function postModelProbe(profile, body, options = {}) {
+  const timeoutMs = normalizeInteger(options.timeoutMs || options.timeout_ms, 3000, 500, 30000);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const endpoint = new URL('chat/completions', `${profile.baseUrl.replace(/\/$/, '')}/`).toString();
+    const headers = { 'Content-Type': 'application/json' };
+    if (profile.apiKey) {
+      headers.Authorization = `Bearer ${profile.apiKey}`;
+    }
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      signal: controller.signal,
+      headers,
+      body: JSON.stringify({
+        model: profile.model,
+        messages: [{ role: 'user', content: 'Return {"ok": true}.' }],
+        max_tokens: 32,
+        ...body
+      })
+    });
+    if (!response.ok) {
+      return { ok: false, reason: `HTTP ${response.status}` };
+    }
+    const payload = await response.json().catch(() => ({}));
+    return { ok: true, payload };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: error.name === 'AbortError' ? 'timeout' : error.message
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function preflightModelProfile(profile, options = {}) {
+  const checkedAt = nowIso();
+  if (profile.provider !== 'openai_compatible') {
+    return {
+      id: profile.id,
+      label: profile.label,
+      provider: profile.provider,
+      model: profile.model,
+      status: 'unsupported',
+      checked_at: checkedAt,
+      capability_tags: {},
+      checks: { provider: { ok: false, reason: '当前仅支持 OpenAI-compatible 模型预检。' } },
+      profile: redactModelProfile(profile)
+    };
+  }
+  const plain = await postModelProbe(profile, {}, options);
+  const jsonObject = plain.ok ? await postModelProbe(profile, {
+    response_format: { type: 'json_object' }
+  }, options) : { ok: false, reason: plain.reason };
+  const jsonSchema = plain.ok ? await postModelProbe(profile, {
+    response_format: {
+      type: 'json_schema',
+      json_schema: {
+        name: 'stage2_model_preflight',
+        schema: {
+          type: 'object',
+          properties: { ok: { type: 'boolean' } },
+          required: ['ok'],
+          additionalProperties: false
+        }
+      }
+    }
+  }, options) : { ok: false, reason: plain.reason };
+  const tools = plain.ok ? await postModelProbe(profile, {
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'ping',
+        description: 'Capability probe ping.',
+        parameters: {
+          type: 'object',
+          properties: {},
+          additionalProperties: false
+        }
+      }
+    }]
+  }, options) : { ok: false, reason: plain.reason };
+  const capabilityTags = {
+    chat_completion: plain.ok,
+    json_object_response_format: jsonObject.ok,
+    json_schema_response_format: jsonSchema.ok,
+    tool_calling: tools.ok,
+    browser_use_chatopenai_structured: plain.ok
+      && jsonSchema.ok
+      && profile.browserUseMode === 'chatopenai_structured'
+  };
+  return {
+    id: profile.id,
+    label: profile.label,
+    provider: profile.provider,
+    model: profile.model,
+    status: plain.ok ? 'available' : 'unavailable',
+    checked_at: checkedAt,
+    capability_tags: capabilityTags,
+    checks: {
+      chat_completion: { ok: plain.ok, reason: plain.reason || null },
+      json_object_response_format: { ok: jsonObject.ok, reason: jsonObject.reason || null },
+      json_schema_response_format: { ok: jsonSchema.ok, reason: jsonSchema.reason || null },
+      tool_calling: { ok: tools.ok, reason: tools.reason || null },
+      browser_use: {
+        ok: capabilityTags.browser_use_chatopenai_structured,
+        mode: profile.browserUseMode || null
+      }
+    },
+    profile: redactModelProfile(profile)
+  };
+}
+
+async function checkStage2ModelProfiles(options = {}) {
+  const config = loadStage2ModelProfiles(options);
+  const profiles = [];
+  for (const profile of config.profiles) {
+    profiles.push(await preflightModelProfile(profile, options));
+  }
+  return {
+    schema_version: 'stage2_model_profile_preflight.v1',
+    config_path: config.config_path,
+    checked_at: nowIso(),
+    profiles
+  };
+}
+
+async function appendEvent(runDir, event) {
+  await fs.mkdir(runDir, { recursive: true });
+  await fs.appendFile(
+    path.join(runDir, ARTIFACTS.progress_events),
+    `${JSON.stringify({ at: nowIso(), ...event })}\n`,
+    'utf8'
+  );
+}
+
+function buildManifest({ runId, inputConfig, status, createdAt, updatedAt, rounds = [] }) {
+  return {
+    schema_version: 'stage2_run_manifest.v3',
+    run_id: runId,
+    system_name: inputConfig.system_name,
+    entry_url: inputConfig.entry_url,
+    cdp_url: inputConfig.cdp_url,
+    safety_policy: inputConfig.safety_policy,
+    execution_mode: inputConfig.execution_mode,
+    full_access_confirmed: inputConfig.full_access_confirmed,
+    allowed_side_effect_actions: inputConfig.allowed_side_effect_actions,
+    prioritized_targets: inputConfig.prioritized_targets || [],
+    waived_targets: inputConfig.waived_targets || [],
+    selected_model_profile_ids: inputConfig.selected_model_profile_ids,
+    selected_model_profiles: inputConfig.selected_model_profiles,
+    status,
+    created_at: createdAt,
+    updated_at: updatedAt,
+    started_at: null,
+    finished_at: null,
+    current_round_id: rounds.at(-1)?.round_id || null,
+    rounds,
+    artifact_paths: {}
+  };
+}
+
+function withArtifactPaths(manifest, runDir) {
+  return {
+    ...manifest,
+    artifact_paths: Object.fromEntries(Object.entries(ARTIFACTS).map(([key, relativePath]) => [
+      key,
+      relativeArtifact(path.join(runDir, relativePath))
+    ]))
+  };
+}
+
+async function readManifest(runId, options = {}) {
+  const runDir = getRunDir(runId, options);
+  const manifest = await readJsonRequired(
+    path.join(runDir, ARTIFACTS.run_manifest),
+    'v3 run 不存在。'
+  );
+  return { runDir, manifest };
+}
+
+async function saveManifest(runDir, manifest) {
+  const nextManifest = withArtifactPaths(manifest, runDir);
+  await writeJson(path.join(runDir, ARTIFACTS.run_manifest), nextManifest);
+  return nextManifest;
+}
+
+function buildCurrentStatus(manifest, phase, message, extra = {}) {
+  return {
+    schema_version: 'stage2_current_status.v3',
+    run_id: manifest.run_id,
+    status: manifest.status,
+    phase,
+    current_round_id: manifest.current_round_id,
+    message,
+    updated_at: manifest.updated_at,
+    ...extra
+  };
+}
+
+function summarizeItems(items) {
+  return Array.isArray(items) ? items.length : 0;
+}
+
+function artifactItems(payload, ...keys) {
+  if (!payload) {
+    return [];
+  }
+  if (Array.isArray(payload)) {
+    return payload;
+  }
+  for (const key of keys) {
+    if (Array.isArray(payload[key])) {
+      return payload[key];
+    }
+  }
+  return Array.isArray(payload.items) ? payload.items : [];
+}
+
+function numberOrZero(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function summarizeExecution(items = []) {
+  const byStatus = {};
+  for (const item of items) {
+    const status = item.status || 'unknown';
+    byStatus[status] = (byStatus[status] || 0) + 1;
+  }
+  const passed = (byStatus.passed || 0)
+    + (byStatus.real_passed || 0)
+    + (byStatus.side_effect_executed || 0);
+  const failed = (byStatus.failed || 0)
+    + (byStatus.real_failed || 0)
+    + (byStatus.login_required || 0)
+    + (byStatus.side_effect_failed || 0);
+  const skipped = (byStatus.skipped || 0)
+    + (byStatus.skipped_no_executor || 0)
+    + (byStatus.skipped_not_observed || 0)
+    + (byStatus.skipped_by_policy || 0)
+    + (byStatus.blocked_by_executor || 0);
+  const blocked = (byStatus.blocked_by_policy || 0)
+    + (byStatus.skipped_by_policy || 0)
+    + (byStatus.blocked_by_executor || 0);
+  const recentEvidence = items
+    .filter((item) => {
+      const screenshots = Array.isArray(item.screenshot_refs) ? item.screenshot_refs : [];
+      const feedback = Array.isArray(item.page_feedback) ? item.page_feedback : [];
+      const actions = Array.isArray(item.actions) ? item.actions : [];
+      return screenshots.length || feedback.length || actions.length || item.failure_reason;
+    })
+    .slice(0, 5)
+    .map((item) => ({
+      testCaseId: item.test_case_id || item.case_id || null,
+      featurePointId: item.feature_point_id || item.feature_id || null,
+      status: item.status || 'unknown',
+      verdict: item.verdict || null,
+      executionMode: item.execution_mode || null,
+      actionCount: Array.isArray(item.actions) ? item.actions.length : 0,
+      pageFeedback: Array.isArray(item.page_feedback) ? item.page_feedback.slice(0, 3) : [],
+      screenshotRefs: Array.isArray(item.screenshot_refs) ? item.screenshot_refs.slice(0, 4) : [],
+      failureReason: item.failure_reason || null,
+      manualConfirmationRequired: Boolean(item.manual_confirmation_required)
+    }));
+  return {
+    total: items.length,
+    passed,
+    failed,
+    skipped,
+    blocked,
+    needs_review: byStatus.needs_review || 0,
+    by_status: byStatus,
+    recentEvidence
+  };
+}
+
+function summarizeModelComparison(payload = null) {
+  const items = Array.isArray(payload?.items) ? payload.items : [];
+  return {
+    total: Number(payload?.total ?? items.length ?? 0),
+    completed: Number(payload?.completed ?? items.filter((item) => item.status === 'completed').length ?? 0),
+    failed: Number(payload?.failed ?? items.filter((item) => item.status === 'failed').length ?? 0),
+    ranking: Array.isArray(payload?.ranking) ? payload.ranking : [],
+    items
+  };
+}
+
+function normalizeTargetTracking(payload) {
+  const items = Array.isArray(payload)
+    ? payload
+    : Array.isArray(payload?.items)
+      ? payload.items
+      : [];
+  const counts = items.reduce((acc, item) => {
+    const status = item.status || 'unknown';
+    acc[status] = (acc[status] || 0) + 1;
+    return acc;
+  }, {});
+  return {
+    schema_version: 'stage2_target_tracking.v3',
+    total: items.length,
+    found: counts.found || 0,
+    missed: counts.missed || 0,
+    waived: counts.waived || 0,
+    items
+  };
+}
+
+function buildPublicRun(runDir, manifest, artifacts = {}) {
+  const executionItems = artifacts.execution_results?.items || [];
+  const menuEntryItems = artifactItems(artifacts.menu_entries, 'menu_entries');
+  const menuLeafCount = menuEntryItems.filter((item) => item && item.is_leaf).length;
+  const materializedPageEntryCount = summarizeItems(artifacts.page_entries?.items);
+  const candidatePageEntryCount = Math.max(
+    menuLeafCount,
+    numberOrZero(artifacts.menu_entries?.leaf_count),
+    materializedPageEntryCount
+  );
+  const countExplanation = artifacts.round_analysis?.count_explanation || {
+    menu_leaf_vs_page_entries: `${menuLeafCount} menu leaves attempted; ${materializedPageEntryCount} page entries recorded.`,
+    candidate_page_entries: `${candidatePageEntryCount} candidate page entries are available from menu leaves; ${materializedPageEntryCount} have been materialized as page_entries records.`,
+    page_entries_vs_candidates: `${materializedPageEntryCount} materialized page entries out of ${candidatePageEntryCount} candidate page entries.`
+  };
+  const targetTracking = normalizeTargetTracking(artifacts.round_analysis?.target_tracking);
+  const executionMode = artifacts.current_status?.execution_mode || manifest.execution_mode || null;
+  const currentStatus = artifacts.current_status || buildCurrentStatus(
+    manifest,
+    manifest.status || 'unknown',
+    'run 状态摘要不可用。'
+  );
+  const recentEvents = Array.isArray(artifacts.progress_events) ? artifacts.progress_events : [];
+  return {
+    runId: manifest.run_id,
+    systemName: manifest.system_name,
+    entryUrl: manifest.entry_url,
+    status: manifest.status,
+    executionMode,
+    safetyPolicy: manifest.safety_policy || artifacts.input_config?.safety_policy || SAFETY_POLICY_LOW_RISK_ONLY,
+    allowedSideEffectActions: manifest.allowed_side_effect_actions
+      || artifacts.input_config?.allowed_side_effect_actions
+      || [],
+    prioritizedTargets: manifest.prioritized_targets
+      || artifacts.input_config?.prioritized_targets
+      || [],
+    waivedTargets: manifest.waived_targets
+      || artifacts.input_config?.waived_targets
+      || [],
+    modelProfileIds: manifest.selected_model_profile_ids
+      || artifacts.input_config?.selected_model_profile_ids
+      || [],
+    modelProfiles: manifest.selected_model_profiles
+      || artifacts.input_config?.selected_model_profiles
+      || [],
+    fullAccessConfirmed: Boolean(manifest.full_access_confirmed || artifacts.input_config?.full_access_confirmed),
+    currentRoundId: manifest.current_round_id,
+    createdAt: manifest.created_at,
+    updatedAt: manifest.updated_at,
+    startedAt: manifest.started_at,
+    finishedAt: manifest.finished_at,
+    currentStatus,
+    currentPageLabel: currentStatus.current_page || null,
+    currentExecutorLabel: currentStatus.current_executor || currentStatus.current_skill || null,
+    currentStepLabel: currentStatus.current_step || null,
+    currentTargetLabel: currentStatus.current_target || null,
+    latestMessage: currentStatus.message || null,
+    recentEvents,
+    operability: makeRunOperability(manifest, artifacts, currentStatus),
+    rounds: manifest.rounds || [],
+    summary: {
+      menuEntries: summarizeItems(menuEntryItems),
+      menuLeaves: menuLeafCount,
+      candidatePageEntries: candidatePageEntryCount,
+      materializedPageEntries: materializedPageEntryCount,
+      menuRoots: numberOrZero(artifacts.menu_tree?.root_count),
+      browserTargets: numberOrZero(
+        artifacts.preflight_result?.browser_target_count
+        || artifacts.round_analysis?.coverage?.browser_target_count
+      ),
+      pageEntries: candidatePageEntryCount,
+      featurePoints: summarizeItems(artifacts.feature_points?.items),
+      generatedTestCases: summarizeItems(artifacts.generated_test_cases?.items),
+      execution: summarizeExecution(executionItems),
+      pendingHumanTasks: (artifacts.human_tasks?.items || []).filter((item) => item.status === 'pending').length,
+      targetTracking: {
+        total: targetTracking.total,
+        found: targetTracking.found,
+        missed: targetTracking.missed,
+        waived: targetTracking.waived
+      },
+      nextDecision: artifacts.next_round_plan?.decision || null,
+      executionMode,
+      safetyPolicy: manifest.safety_policy || artifacts.input_config?.safety_policy || SAFETY_POLICY_LOW_RISK_ONLY,
+      countExplanation,
+      modelComparison: summarizeModelComparison(artifacts.model_comparison)
+    },
+    modelComparison: artifacts.model_comparison || null,
+    targetTracking,
+    missedTargets: targetTracking.items
+      .filter((item) => item.status === 'missed')
+      .map((item) => item.target)
+      .filter(Boolean),
+    foundTargets: targetTracking.items
+      .filter((item) => item.status === 'found')
+      .map((item) => item.target)
+      .filter(Boolean),
+    artifacts: artifactRefs(manifest.run_id)
+  };
+}
+
+async function loadRunArtifacts(runDir) {
+  const keys = [
+    'input_config',
+    'current_status',
+    'preflight_result',
+    'menu_tree',
+    'menu_entries',
+    'page_entries',
+    'feature_points',
+    'generated_test_cases',
+    'execution_results',
+    'round_analysis',
+    'next_round_plan',
+    'human_tasks',
+    'promotion_candidates',
+    'model_comparison',
+    'network_events',
+    'run_report_json'
+  ];
+  const entries = await Promise.all(keys.map(async (key) => [
+    key,
+    await readJsonIfExists(artifactPath(runDir, key))
+  ]));
+  return {
+    ...Object.fromEntries(entries),
+    menu_traversal_log: await readTextIfExists(path.join(runDir, ARTIFACTS.menu_traversal_log)),
+    page_exploration_log: await readTextIfExists(path.join(runDir, ARTIFACTS.page_exploration_log)),
+    action_log: await readTextIfExists(path.join(runDir, ARTIFACTS.action_log)),
+    progress_events: await readProgressEventsIfExists(path.join(runDir, ARTIFACTS.progress_events))
+  };
+}
+
+function actionName(action) {
+  const aliases = {
+    'continue-next-round': 'continue_next_round',
+    'generate-report': 'generate_report',
+    'analyze-round': 'analyze_round',
+    'save-human-task': 'save_human_task'
+  };
+  return aliases[action] || String(action || '').replace(/-/g, '_');
+}
+
+function operationStatusForRun(run) {
+  if (!run) {
+    return 'failed';
+  }
+  if (run.status === 'failed') {
+    return 'failed';
+  }
+  if (['waiting_human'].includes(run.status)) {
+    return 'blocked';
+  }
+  if (['running'].includes(run.status)) {
+    return 'running';
+  }
+  if (['queued', 'planned'].includes(run.status)) {
+    return 'queued';
+  }
+  return 'succeeded';
+}
+
+function nextActionForRun(run) {
+  if (!run) {
+    return '检查运行中心错误并重试。';
+  }
+  const pendingTasks = run.summary?.pendingHumanTasks || 0;
+  if (run.status === 'draft') {
+    return '启动自动评测。';
+  }
+  if (run.status === 'waiting_human') {
+    return pendingTasks > 0
+      ? '请在运行中心完成人工确认或审核任务后继续。'
+      : '请确认下一轮计划后继续。';
+  }
+  if (run.status === 'failed') {
+    return '查看 preflight_result、python_execution、execution_results 和 progress_events，修复后重试。';
+  }
+  if (run.status === 'running') {
+    return '等待执行器推进，或刷新查看最新进度。';
+  }
+  if (run.status === 'queued') {
+    return '下一轮已入队，等待执行器启动或刷新查看最新进度。';
+  }
+  if (run.status === 'paused') {
+    return '可以继续、停止或查看当前证据。';
+  }
+  if (run.status === 'planned') {
+    return '等待执行器推进下一轮。';
+  }
+  if (run.status === 'completed') {
+    return '生成报告，或创建新的更大范围 run。';
+  }
+  if (run.status === 'stopped') {
+    return 'run 已停止，可查看报告或创建新 run。';
+  }
+  return '查看运行中心建议的下一步动作。';
+}
+
+function diagnosticArtifactsForRun(run) {
+  if (!run || run.status !== 'failed') {
+    return [];
+  }
+  return ['preflight_result', 'python_execution', 'execution_results', 'progress_events', 'browser_use_tool_timings']
+    .map((key) => ({
+      key,
+      label: key,
+      href: run.artifacts?.[key]?.href || null
+    }));
+}
+
+function makeOperationFeedback(action, run, overrides = {}) {
+  const status = overrides.status || operationStatusForRun(run);
+  const message = overrides.message || run?.latestMessage || '操作已提交。';
+  return {
+    schema_version: 'stage2_v3_operation_feedback.v1',
+    action: actionName(action),
+    status,
+    tone: overrides.tone || (
+      status === 'failed' ? 'error' : status === 'blocked' ? 'warning' : status === 'running' ? 'info' : 'success'
+    ),
+    message,
+    nextAction: overrides.nextAction || nextActionForRun(run),
+    diagnosticArtifacts: overrides.diagnosticArtifacts || diagnosticArtifactsForRun(run),
+    error: overrides.error || (status === 'failed'
+      ? {
+          code: run?.currentStatus?.phase || run?.status || 'failed',
+          message
+        }
+      : null)
+  };
+}
+
+function makeRunOperability(manifest, artifacts = {}, currentStatus = null) {
+  const failureReason = artifacts.preflight_result?.checks?.python_orchestrator?.failure_reason
+    || artifacts.execution_results?.items?.find((item) => item.failure_reason)?.failure_reason
+    || null;
+  if (failureReason === 'python_executor_unavailable') {
+    return {
+      kind: 'executor_unavailable',
+      actionable: false,
+      reason: 'Python 执行器不可用，真实浏览器 run 不能继续执行。',
+      blocker: failureReason
+    };
+  }
+  if (manifest.status === 'stopped') {
+    return {
+      kind: 'read_only_v3_run',
+      actionable: false,
+      reason: 'run 已停止，仅可查看产物和报告。',
+      blocker: 'stopped'
+    };
+  }
+  if (manifest.status === 'completed' && currentStatus?.phase === 'next_round_not_required') {
+    return {
+      kind: 'read_only_v3_run',
+      actionable: false,
+      reason: 'run 当前目标已完成，无需继续操作。',
+      blocker: 'goal_completed'
+    };
+  }
+  return {
+    kind: 'actionable_v3_run',
+    actionable: true,
+    reason: '可通过运行中心提交启动、暂停、复盘、人工任务或报告动作。',
+    blocker: null
+  };
+}
+
+async function createV3Run(body = {}, options = {}) {
+  const runsDir = getRunsDir(options);
+  const runId = createRunId();
+  const runDir = path.join(runsDir, runId);
+  const createdAt = nowIso();
+  const inputConfig = normalizeInputConfig(body, options);
+  const manifest = buildManifest({
+    runId,
+    inputConfig,
+    status: 'draft',
+    createdAt,
+    updatedAt: createdAt,
+    rounds: []
+  });
+
+  await fs.mkdir(runDir, { recursive: true });
+  await writeJson(path.join(runDir, ARTIFACTS.input_config), inputConfig);
+  const savedManifest = await saveManifest(runDir, manifest);
+  await writeJson(path.join(runDir, ARTIFACTS.current_status), buildCurrentStatus(
+    savedManifest,
+    'draft',
+    'run 草稿已创建，等待启动。'
+  ));
+  await writeJson(path.join(runDir, ARTIFACTS.human_tasks), {
+    schema_version: 'stage2_human_tasks.v3',
+    items: []
+  });
+  await appendEvent(runDir, { type: 'run_created', run_id: runId, status: 'draft' });
+
+  const run = buildPublicRun(runDir, savedManifest, await loadRunArtifacts(runDir));
+  return {
+    run,
+    operation: makeOperationFeedback('create_run', run, {
+      status: 'succeeded',
+      message: 'v3 run 草稿已创建，等待启动。'
+    })
+  };
+}
+
+async function listV3Runs(options = {}) {
+  const runsDir = getRunsDir(options);
+  await fs.mkdir(runsDir, { recursive: true });
+  const dirents = await fs.readdir(runsDir, { withFileTypes: true });
+  const runs = [];
+  for (const dirent of dirents) {
+    if (!dirent.isDirectory() || !SAFE_ID_PATTERN.test(dirent.name)) {
+      continue;
+    }
+    const runDir = path.join(runsDir, dirent.name);
+    const manifest = await readJsonIfExists(path.join(runDir, ARTIFACTS.run_manifest));
+    if (!manifest?.schema_version?.startsWith('stage2_run_manifest.v3')) {
+      continue;
+    }
+    runs.push(buildPublicRun(runDir, manifest, await loadRunArtifacts(runDir)));
+  }
+  runs.sort((left, right) => String(right.createdAt || '').localeCompare(String(left.createdAt || '')));
+  return { runs };
+}
+
+function normalizeDeleteRunIds(body = {}) {
+  const source = body.runIds
+    ?? body.run_ids
+    ?? body.ids
+    ?? body.runId
+    ?? body.run_id
+    ?? [];
+  const values = normalizeArray(source);
+  return [...new Set(values.map((value) => ensureSafeId(value, 'runId')))];
+}
+
+async function deleteV3Runs(body = {}, options = {}) {
+  const runsDir = getRunsDir(options);
+  await fs.mkdir(runsDir, { recursive: true });
+  const deleteAll = Boolean(body.all || body.deleteAll || body.delete_all);
+  const runIds = deleteAll
+    ? (await listV3Runs(options)).runs.map((run) => run.runId)
+    : normalizeDeleteRunIds(body);
+
+  if (!deleteAll && runIds.length === 0) {
+    throw new Stage2V3InputError('请选择要删除的 v3 run。');
+  }
+
+  const deletedRunIds = [];
+  const missingRunIds = [];
+  let freedBytes = 0;
+
+  for (const runId of runIds) {
+    const runDir = getRunDir(runId, options);
+    ensureRunDirInsideRunsDir(runsDir, runDir);
+    if (!(await pathExists(runDir))) {
+      missingRunIds.push(runId);
+      continue;
+    }
+    freedBytes += await directorySize(runDir);
+    await fs.rm(runDir, { recursive: true, force: true });
+    deletedRunIds.push(runId);
+  }
+
+  const listed = await listV3Runs(options);
+  return {
+    schema_version: 'stage2_v3_run_deletion.v1',
+    requestedRunIds: runIds,
+    deletedRunIds,
+    missingRunIds,
+    deletedCount: deletedRunIds.length,
+    freedBytes,
+    runs: listed.runs,
+    operation: {
+      schema_version: 'stage2_v3_operation_feedback.v1',
+      action: 'delete_runs',
+      status: 'succeeded',
+      tone: 'success',
+      message: `已删除 ${deletedRunIds.length} 个历史 run，释放 ${freedBytes} 字节。`,
+      nextAction: '刷新 run 列表或创建新的 run。',
+      diagnosticArtifacts: [],
+      error: null
+    }
+  };
+}
+
+async function getV3Run(runId, options = {}) {
+  const { runDir, manifest } = await readManifest(runId, options);
+  const artifacts = await loadRunArtifacts(runDir);
+  return { run: buildPublicRun(runDir, manifest, artifacts), artifacts };
+}
+
+function makePreflightResult(manifest, inputConfig, executionMode = 'contract_only') {
+  const isContractOnly = executionMode === 'contract_only';
+  return {
+    schema_version: 'stage2_preflight_result.v3',
+    run_id: manifest.run_id,
+    execution_mode: executionMode,
+    status: isContractOnly ? 'contract_only' : 'pending_real_browser',
+    checks: {
+      input_config: { ok: true },
+      cdp_url: { ok: true, url: inputConfig.cdp_url },
+      python_orchestrator: {
+        ok: !isContractOnly,
+        reason: isContractOnly
+          ? '本次按 contract_only 模式只生成 v3 产物契约，不执行真实浏览器。'
+          : '准备调用 Python v3 orchestrator 执行真实浏览器链路。'
+      }
+    },
+    created_at: nowIso()
+  };
+}
+
+function makeDiscoveryArtifacts(manifest, inputConfig) {
+  const pageEntry = {
+    page_entry_id: 'page_home',
+    name: `${inputConfig.system_name}首页`,
+    url: inputConfig.entry_url,
+    menu_path: [inputConfig.system_name],
+    page_type: 'unknown',
+    discovery_depth: 0,
+    status: inputConfig.entry_url ? 'pending_executor' : 'needs_input',
+    source: 'run_center_v3.input_config',
+    screenshot_refs: []
+  };
+  const systemMap = {
+    schema_version: 'stage2_system_map.v3',
+    run_id: manifest.run_id,
+    root: {
+      name: inputConfig.system_name,
+      url: inputConfig.entry_url,
+      status: pageEntry.status
+    },
+    nodes: [pageEntry],
+    generated_by: 'node.stage2V3RunCenter'
+  };
+  const navigationTree = {
+    schema_version: 'stage2_navigation_tree.v3',
+    run_id: manifest.run_id,
+    items: [{
+      id: pageEntry.page_entry_id,
+      label: pageEntry.name,
+      url: pageEntry.url,
+      children: []
+    }]
+  };
+  const pageEntries = {
+    schema_version: 'stage2_page_entries.v3',
+    items: [pageEntry]
+  };
+  return { systemMap, navigationTree, pageEntries };
+}
+
+function makeEmptyMenuArtifacts(status = 'not_available') {
+  const menuTree = {
+    schema_version: 'stage2_menu_tree.v1',
+    status,
+    root_count: 0,
+    entry_count: 0,
+    leaf_count: 0,
+    nodes: [],
+    notes: ['本轮未产出第一轮菜单遍历结果。']
+  };
+  const menuEntries = {
+    schema_version: 'stage2_menu_entries.v1',
+    items: [],
+    menu_entries: [],
+    entry_count: 0,
+    leaf_count: 0
+  };
+  return { menuTree, menuEntries, menuTraversalLog: '' };
+}
+
+function normalizeMenuEntries(payload) {
+  const items = artifactItems(payload, 'menu_entries')
+    .filter((item) => item && typeof item === 'object');
+  return {
+    schema_version: payload?.schema_version || 'stage2_menu_entries.v1',
+    ...payload,
+    items,
+    menu_entries: items,
+    entry_count: numberOrZero(payload?.entry_count) || items.length,
+    leaf_count: numberOrZero(payload?.leaf_count) || items.filter((item) => item.is_leaf).length
+  };
+}
+
+function inferFeatureTypes(inputConfig) {
+  const text = [
+    inputConfig.system_name,
+    inputConfig.scope,
+    inputConfig.test_account_note
+  ].filter(Boolean).join(' ');
+  const featureTypes = [
+    ['navigation', '页面入口可达性检查', 'safe_auto'],
+    ['query', '默认查询或筛选检查', 'safe_auto']
+  ];
+  if (/详情|明细|查看/.test(text)) {
+    featureTypes.push(['detail', '详情查看检查', 'safe_auto']);
+  }
+  if (/导出|下载/.test(text)) {
+    featureTypes.push(['export', '导出入口检查', 'safe_auto']);
+  }
+  if (/新增|创建|录入|编辑|删除|审批|提交|发布/.test(text)) {
+    featureTypes.push(['unknown', '高风险入口人工审核', 'requires_review']);
+  }
+  return featureTypes;
+}
+
+function makeFeatureArtifacts(inputConfig) {
+  const items = inferFeatureTypes(inputConfig).map(([featureType, title, policy], index) => ({
+    feature_point_id: `feature_${String(index + 1).padStart(3, '0')}`,
+    page_entry_id: 'page_home',
+    name: title,
+    feature_type: featureType,
+    risk_level: policy === 'safe_auto' ? 'low' : 'high',
+    auto_verifiable: policy === 'safe_auto',
+    verification_strategy: policy === 'safe_auto' ? `${featureType}_minimal_path` : 'manual_review_required',
+    source: 'run_center_v3.heuristic_seed',
+    confidence: policy === 'safe_auto' ? 0.55 : 0.35,
+    review_status: policy === 'safe_auto' ? 'auto_included' : 'pending'
+  }));
+
+  return {
+    schema_version: 'stage2_feature_points.v3',
+    items
+  };
+}
+
+function makeDiscoveryReview(featurePoints) {
+  return {
+    schema_version: 'stage2_discovery_review.v3',
+    review_mode: 'default_safe_policy',
+    page_decisions: [{ page_entry_id: 'page_home', decision: 'include', reason: '来自 run 输入入口。' }],
+    feature_decisions: featurePoints.items.map((item) => ({
+      feature_point_id: item.feature_point_id,
+      decision: item.auto_verifiable ? 'include' : 'needs_human_review',
+      reason: item.auto_verifiable ? '低风险启发式功能点。' : '疑似高风险或未知动作，需要界面化人工审核。'
+    }))
+  };
+}
+
+function makeGeneratedTestCases(featurePoints) {
+  const items = featurePoints.items.map((feature) => ({
+    test_case_id: `case_${feature.feature_point_id.replace(/^feature_/, '')}`,
+    feature_point_id: feature.feature_point_id,
+    title: `${feature.feature_point_id} · ${feature.name} - 最小执行路径`,
+    type_template: feature.feature_type,
+    preconditions: ['使用当前测试账号已登录会话。', '从所属页面入口标准起点开始。'],
+    steps: feature.auto_verifiable
+      ? [
+        { action: 'open_page_entry', target: feature.page_entry_id },
+        { action: 'observe_default_state', target: feature.feature_point_id },
+        { action: 'capture_key_evidence', target: feature.feature_point_id }
+      ]
+      : [
+        { action: 'show_manual_review_task', target: feature.feature_point_id }
+      ],
+    expected_feedback: feature.auto_verifiable
+      ? ['页面可达且无明显前端错误。']
+      : ['人工在运行中心确认风险、数据和操作方式。'],
+    risk_policy: feature.auto_verifiable ? 'safe_auto' : 'manual_review_required',
+    assertions: feature.auto_verifiable ? ['page_loaded', 'visible_feedback_collected'] : [],
+    requires_human_confirmation: !feature.auto_verifiable
+  }));
+  return {
+    schema_version: 'stage2_generated_test_cases.v3',
+    items
+  };
+}
+
+function makeExecutionResults(testCases, reason = 'contract_only_mode') {
+  return {
+    schema_version: 'stage2_execution_results.v3',
+    items: testCases.items.map((testCase) => ({
+      test_case_id: testCase.test_case_id,
+      feature_point_id: testCase.feature_point_id,
+      title: testCase.title,
+      name: testCase.title,
+      status: testCase.requires_human_confirmation ? 'needs_review' : 'skipped',
+      verdict: testCase.requires_human_confirmation
+        ? '需要人工确认后才能执行。'
+        : '已生成执行型测试用例，但本轮未执行真实浏览器动作。',
+      actions: [],
+      page_feedback: [],
+      screenshot_refs: [],
+      failure_reason: testCase.requires_human_confirmation
+        ? 'manual_review_required'
+        : reason,
+      manual_confirmation_required: Boolean(testCase.requires_human_confirmation)
+    }))
+  };
+}
+
+function makeScreenshotsIndex() {
+  return {
+    schema_version: 'stage2_screenshots_index.v3',
+    items: [],
+    notes: ['Node v3 API 未直接驱动浏览器，截图由 Python v3 执行器接入后填充。']
+  };
+}
+
+function groupFailures(executionResults) {
+  const groups = new Map();
+  for (const result of executionResults.items || []) {
+    if (['passed', 'real_passed', 'side_effect_executed'].includes(result.status)) {
+      continue;
+    }
+    const key = result.failure_reason || result.status || 'unknown';
+    if (!groups.has(key)) {
+      groups.set(key, []);
+    }
+    groups.get(key).push(result.test_case_id);
+  }
+  return [...groups.entries()].map(([reason, caseIds], index) => ({
+    cluster_id: `cluster_${String(index + 1).padStart(3, '0')}`,
+    reason,
+    test_case_ids: caseIds,
+    count: caseIds.length
+  }));
+}
+
+function extractScopeTargets(inputConfig = {}) {
+  const explicit = uniqueTextList(
+    inputConfig.prioritized_targets,
+    inputConfig.prioritizedTargets,
+    inputConfig.target_names,
+    inputConfig.targetNames,
+    inputConfig.page_targets,
+    inputConfig.pageTargets
+  );
+  const scope = normalizeOptionalText(
+    inputConfig.scope
+      || inputConfig.scopeText
+      || inputConfig.explorationScope
+      || inputConfig.exploration_scope
+  );
+  const targets = [...explicit];
+  if (!scope) {
+    return targets.slice(0, 20);
+  }
+  const quoted = [...scope.matchAll(/[“"']([^”"']{2,80})[”"']/g)]
+    .map((match) => normalizeOptionalText(match[1]))
+    .filter(Boolean);
+  for (const target of quoted) {
+    if (!targets.includes(target)) {
+      targets.push(target);
+    }
+  }
+  if (explicit.length && !quoted.length) {
+    return targets.slice(0, 20);
+  }
+  if (!quoted.length && !/[页面入口]/.test(scope)) {
+    return targets.slice(0, 20);
+  }
+  const cleaned = scope
+    .replace(/[“"'][^”"']{2,80}[”"']/g, ' ')
+    .replace(/优先|完成|页面|入口|覆盖|测试|请|先|进行|的|和|、|，|。/g, ' ')
+    .split(/\s+/)
+    .map((item) => normalizeOptionalText(item))
+    .filter((item) => item && item.length >= 2);
+  for (const target of cleaned) {
+    if (!targets.includes(target)) {
+      targets.push(target);
+    }
+  }
+  return targets.slice(0, 20);
+}
+
+function itemMatchesScopeTarget(item, target) {
+  const haystack = [
+    item.name,
+    item.title,
+    item.url,
+    item.route_hint,
+    item.text,
+    item.menu_path,
+    item.feature_type,
+    item.page_type,
+    item.semantic_page_type,
+    item.source
+  ]
+    .flat()
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  return haystack.includes(String(target || '').toLowerCase());
+}
+
+function extractWaivedTargets(inputConfig = {}) {
+  return uniqueTextList(
+    inputConfig.waived_targets,
+    inputConfig.waivedTargets,
+    inputConfig.waived_page_targets,
+    inputConfig.waivedPageTargets
+  );
+}
+
+function menuEntryMatchItem(entry) {
+  return {
+    ...entry,
+    name: entry.name || entry.text,
+    title: entry.title || entry.text,
+    url: entry.url || entry.route_hint
+  };
+}
+
+function targetMatchRecord(kind, item) {
+  if (kind === 'menu_entry') {
+    return {
+      kind,
+      menu_id: item.menu_id || item.id || '',
+      text: item.text || item.name || item.title || '',
+      menu_path: item.menu_path || [],
+      route_hint: item.route_hint || '',
+      screenshot_refs: item.screenshot_refs || []
+    };
+  }
+  if (kind === 'page_entry') {
+    return {
+      kind,
+      page_entry_id: item.page_entry_id || item.page_id || '',
+      name: item.name || item.title || '',
+      url: item.url || '',
+      menu_path: item.menu_path || []
+    };
+  }
+  return {
+    kind,
+    feature_point_id: item.feature_point_id || item.feature_id || '',
+    page_entry_id: item.page_entry_id || item.page_id || '',
+    name: item.name || item.title || '',
+    feature_type: item.feature_type || ''
+  };
+}
+
+function buildTargetTracking(inputConfig, pageEntries, featurePoints, menuEntries = { items: [] }) {
+  const waivedTargets = extractWaivedTargets(inputConfig);
+  const targets = [...new Set([...extractScopeTargets(inputConfig), ...waivedTargets])].slice(0, 20);
+  const pages = pageEntries.items || [];
+  const features = featurePoints.items || [];
+  const menus = artifactItems(menuEntries, 'items', 'menu_entries');
+  return targets.map((target) => {
+    if (waivedTargets.includes(target)) {
+      return {
+        target,
+        status: 'waived',
+        waived: true,
+        matched_items: [],
+        matched_menu_entry_ids: [],
+        matched_page_ids: [],
+        matched_feature_ids: [],
+        evidence_quality: 'waived_by_user',
+        missed_reason: null
+      };
+    }
+    const menuMatches = menus.filter((item) => itemMatchesScopeTarget(menuEntryMatchItem(item), target));
+    const pageMatches = pages.filter((item) => itemMatchesScopeTarget(item, target));
+    const featureMatches = features.filter((item) => itemMatchesScopeTarget(item, target));
+    if (menuMatches.length || pageMatches.length || featureMatches.length) {
+      return {
+        target,
+        status: 'found',
+        waived: false,
+        matched_items: [
+          ...menuMatches.map((item) => targetMatchRecord('menu_entry', item)),
+          ...pageMatches.map((item) => targetMatchRecord('page_entry', item)),
+          ...featureMatches.map((item) => targetMatchRecord('feature_point', item))
+        ],
+        matched_menu_entry_ids: menuMatches.map((item) => item.menu_id || item.id).filter(Boolean),
+        matched_page_ids: pageMatches.map((item) => item.page_entry_id || item.page_id).filter(Boolean),
+        matched_feature_ids: featureMatches.map((item) => item.feature_point_id || item.feature_id).filter(Boolean),
+        evidence_quality: menuMatches.length ? 'high' : 'medium',
+        missed_reason: null
+      };
+    }
+    return {
+      target,
+      status: 'missed',
+      waived: false,
+      matched_items: [],
+      matched_menu_entry_ids: [],
+      matched_page_ids: [],
+      matched_feature_ids: [],
+      evidence_quality: 'low',
+      missed_reason: 'not_found_in_menu_or_page_artifacts',
+      evidence: {
+        searched_sources: ['menu_text', 'menu_path', 'route_hint', 'page_entries', 'feature_points'],
+        menu_entry_count: menus.length,
+        page_count: pages.length,
+        feature_count: features.length
+      }
+    };
+  });
+}
+
+function findMissingScopeTargets(targetTracking) {
+  return (Array.isArray(targetTracking) ? targetTracking : [])
+    .filter((item) => item.status === 'missed')
+    .map((item) => item.target)
+    .filter(Boolean);
+}
+
+function pageStatusIsReachable(page = {}) {
+  return !['unreachable', 'failed', 'blank'].includes(String(page.status || '').trim());
+}
+
+function isPageVisiblePlaceholderFeature(feature = {}) {
+  const featureType = String(feature.feature_type || feature.type || '').trim();
+  const strategy = String(feature.verification_strategy || '').trim();
+  const name = String(feature.name || feature.title || '').trim();
+  return featureType === 'view'
+    && strategy === 'playwright_page_visible'
+    && /页面可见性验证|page visible|page visibility/i.test(name);
+}
+
+function isShallowPlaywrightTargetFeature(feature = {}) {
+  const featureType = String(feature.feature_type || feature.type || '').trim();
+  const strategy = String(feature.verification_strategy || '').trim();
+  const source = String(feature.source || '').trim();
+  if (strategy === 'side_effect_policy_gate' && source.startsWith('playwright')) {
+    return true;
+  }
+  return isPageVisiblePlaceholderFeature(feature)
+    || (strategy === 'playwright_visible_control' && ['view', 'navigation'].includes(featureType));
+}
+
+function findUncoveredFoundScopeTargets(targetTracking, pageEntries, featurePoints) {
+  const pages = pageEntries.items || [];
+  const features = featurePoints.items || [];
+  const pageById = new Map();
+  for (const page of pages) {
+    for (const id of [page.page_entry_id, page.page_id].filter(Boolean)) {
+      pageById.set(id, page);
+    }
+  }
+  const featureById = new Map();
+  for (const feature of features) {
+    for (const id of [feature.feature_point_id, feature.feature_id].filter(Boolean)) {
+      featureById.set(id, feature);
+    }
+  }
+  return (Array.isArray(targetTracking) ? targetTracking : [])
+    .filter((item) => item.status === 'found' && !item.waived)
+    .filter((item) => {
+      const matchedPageIds = Array.isArray(item.matched_page_ids) ? item.matched_page_ids : [];
+      const matchedFeatureIds = Array.isArray(item.matched_feature_ids) ? item.matched_feature_ids : [];
+      const matchedPages = matchedPageIds.map((id) => pageById.get(id)).filter(Boolean);
+      const hasReachablePage = matchedPages.some(pageStatusIsReachable);
+      const hasDeepMatchedFeature = matchedFeatureIds.some((id) => {
+        const feature = featureById.get(id);
+        return feature && !isShallowPlaywrightTargetFeature(feature);
+      });
+      return !hasReachablePage || !hasDeepMatchedFeature;
+    })
+    .map((item) => item.target)
+    .filter(Boolean);
+}
+
+function buildHumanTasks(featurePoints, executionResults, nextRoundPlan = null) {
+  const tasks = [];
+  const reviewFeatures = (featurePoints.items || []).filter((item) => item.review_status === 'pending');
+  if (reviewFeatures.length) {
+    tasks.push({
+      task_id: 'task_review_feature_points',
+      task_type: 'review_feature_points',
+      title: '审核高风险或未知功能点',
+      reason: '发现疑似新增、编辑、删除、审批、提交等动作，不能由 AI 单独授权。',
+      input_refs: ['feature_points', 'discovery_review'],
+      ui_schema: {
+        kind: 'table_review',
+        selectable: true,
+        columns: ['name', 'feature_type', 'risk_level', 'verification_strategy']
+      },
+      status: 'pending',
+      result_artifact: null
+    });
+  }
+
+  const skipped = (executionResults.items || []).filter((item) => [
+    'contract_only_mode',
+    'python_v3_executor_not_connected',
+    'python_v3_orchestrator_failed',
+    'python_v3_orchestrator_timeout',
+    'python_executor_unavailable',
+    'python_returned_safe_placeholder'
+  ].includes(item.failure_reason));
+  if (skipped.length) {
+    tasks.push({
+      task_id: 'task_connect_executor_or_confirm_plan',
+      task_type: 'review_next_round_plan',
+      title: '处理真实浏览器执行阻塞',
+      reason: '本轮没有获得真实浏览器执行证据，请检查执行模式、Python v3 orchestrator、CDP 地址或人工确认下一步。',
+      input_refs: ['generated_test_cases', 'execution_results', 'next_round_plan'],
+      ui_schema: {
+        kind: 'decision',
+        actions: ['confirm_after_executor_ready', 'pause', 'stop']
+      },
+      status: 'pending',
+      result_artifact: null
+    });
+  }
+
+  if (nextRoundPlan?.requires_human_approval && !tasks.some((item) => item.task_id === 'task_connect_executor_or_confirm_plan')) {
+    tasks.push({
+      task_id: 'task_review_next_round_plan',
+      task_type: 'review_next_round_plan',
+      title: '审核下一轮计划',
+      reason: '下一轮计划需要人工确认后继续。',
+      input_refs: ['round_analysis', 'next_round_plan'],
+      ui_schema: { kind: 'decision', actions: ['approve', 'revise', 'stop'] },
+      status: 'pending',
+      result_artifact: null
+    });
+  }
+
+  return {
+    schema_version: 'stage2_human_tasks.v3',
+    items: tasks
+  };
+}
+
+function makeRoundAnalysis({
+  manifest,
+  inputConfig = {},
+  pageEntries,
+  featurePoints,
+  testCases,
+  executionResults,
+  screenshotsIndex,
+  menuEntries
+}) {
+  const executionSummary = summarizeExecution(executionResults.items || []);
+  const failureClusters = groupFailures(executionResults);
+  const targetTracking = buildTargetTracking(inputConfig, pageEntries, featurePoints, menuEntries);
+  const missingScopeTargets = findMissingScopeTargets(targetTracking);
+  const uncoveredScopeTargets = findUncoveredFoundScopeTargets(targetTracking, pageEntries, featurePoints);
+  const continuationTargets = [...new Set([...missingScopeTargets, ...uncoveredScopeTargets])];
+  const menuItems = artifactItems(menuEntries, 'items', 'menu_entries');
+  const menuLeafCount = menuItems.filter((item) => item && item.is_leaf).length;
+  const materializedPageEntryCount = summarizeItems(pageEntries.items);
+  const candidatePageEntryCount = Math.max(
+    menuLeafCount,
+    numberOrZero(menuEntries.leaf_count),
+    materializedPageEntryCount
+  );
+  const browserTargetCount = numberOrZero(executionResults.browser_target_count || 0);
+  if (missingScopeTargets.length) {
+    failureClusters.push({
+      cluster_id: `cluster_${String(failureClusters.length + 1).padStart(3, '0')}`,
+      reason: 'scope_target_not_found',
+      test_case_ids: [],
+      count: missingScopeTargets.length,
+      target_texts: missingScopeTargets,
+      suggestion: `本轮未发现用户指定目标：${missingScopeTargets.join('、')}。请扩大探索或先在浏览器展开/进入目标菜单后继续。`
+    });
+  }
+  if (uncoveredScopeTargets.length) {
+    failureClusters.push({
+      cluster_id: `cluster_${String(failureClusters.length + 1).padStart(3, '0')}`,
+      reason: 'scope_target_discovered_but_uncovered',
+      test_case_ids: [],
+      count: uncoveredScopeTargets.length,
+      target_texts: uncoveredScopeTargets,
+      suggestion: `本轮已发现目标但未进入可验证页面或未识别功能点：${uncoveredScopeTargets.join('、')}。下一轮应优先进入这些页面并补齐功能点扫描。`
+    });
+  }
+  const humanTaskReasons = failureClusters
+    .filter((cluster) => [
+      'manual_review_required',
+      'contract_only_mode',
+      'python_v3_executor_not_connected',
+      'python_v3_orchestrator_failed',
+      'python_executor_unavailable',
+      'python_returned_safe_placeholder',
+      'scope_target_not_found',
+      'scope_target_discovered_but_uncovered'
+    ].includes(cluster.reason))
+    .map((cluster) => cluster.reason);
+
+  const analysis = {
+    schema_version: 'stage2_round_analysis.v3',
+    round_id: manifest.current_round_id || 'round_001',
+    goal: '建立 v3 run 级发现、用例生成、执行结果和复盘产物闭环。',
+    coverage_summary: {
+      page_entries: summarizeItems(pageEntries.items),
+      feature_points: summarizeItems(featurePoints.items),
+      generated_test_cases: summarizeItems(testCases.items),
+      execution: executionSummary
+    },
+    failure_summary: {
+      total_clusters: failureClusters.length,
+      clusters: failureClusters
+    },
+    not_executed_reasons: [...new Set(failureClusters.map((item) => item.reason))],
+    evidence_quality: {
+      screenshot_count: summarizeItems(screenshotsIndex.items),
+      has_action_log: false,
+      status: summarizeItems(screenshotsIndex.items) > 0 ? 'partial' : 'missing_executor_evidence'
+    },
+    human_tasks: humanTaskReasons,
+    improvement_candidates: [
+      {
+        candidate_id: 'improve_connect_python_v3_orchestrator',
+        scope: 'runtime',
+        title: '确保真实浏览器执行链路产出可复核证据',
+        confidence: 0.95,
+        evidence_refs: ['execution_results']
+      }
+    ],
+    analysis_mode: 'deterministic_rule_review',
+    ai_provider_status: 'not_connected',
+    review_errors: [{
+      code: 'ai_review_not_attempted',
+      message: '本产物由规则复盘生成，尚未完成可追踪的 AI 复盘模型调用。'
+    }],
+    scope_targets: extractScopeTargets(inputConfig),
+    missing_scope_targets: missingScopeTargets,
+    uncovered_scope_targets: uncoveredScopeTargets,
+    target_tracking: targetTracking,
+    count_explanation: {
+      menu_leaf_vs_page_entries: `${menuLeafCount} menu leaves attempted; ${materializedPageEntryCount} page entries recorded.`,
+      candidate_page_entries: `${candidatePageEntryCount} candidate page entries are available from menu leaves; ${materializedPageEntryCount} have been materialized as page_entries records.`,
+      page_entries_vs_candidates: `${materializedPageEntryCount} materialized page entries out of ${candidatePageEntryCount} candidate page entries.`,
+      page_entries_vs_feature_points: `${materializedPageEntryCount} page entries yielded ${summarizeItems(featurePoints.items)} feature points after default-visible and light-interaction scanning.`,
+      browser_targets: `${browserTargetCount} browser targets are diagnostic CDP targets, not discovered business pages.`
+    },
+    confidence: 0.72
+  };
+
+  if (missingScopeTargets.length) {
+    analysis.improvement_candidates.unshift({
+      candidate_id: 'improve_scope_target_discovery',
+      scope: 'discovery',
+      title: `补齐目标页面发现：${missingScopeTargets.join('、')}`,
+      confidence: 0.98,
+      evidence_refs: ['input_config', 'page_entries', 'feature_points']
+    });
+  }
+  if (uncoveredScopeTargets.length) {
+    analysis.improvement_candidates.unshift({
+      candidate_id: 'improve_scope_target_page_coverage',
+      scope: 'discovery',
+      title: `补齐目标页面覆盖：${uncoveredScopeTargets.join('、')}`,
+      confidence: 0.96,
+      evidence_refs: ['page_entries', 'feature_points', 'execution_results']
+    });
+  }
+  const continuationReasons = new Set([
+    'scope_target_not_found',
+    'scope_target_discovered_but_uncovered'
+  ]);
+  const blockingFailureClusters = failureClusters.filter((cluster) => (
+    !continuationReasons.has(cluster.reason)
+  ));
+  const canAutoContinue = continuationTargets.length > 0 && blockingFailureClusters.length === 0;
+
+  const nextRoundPlan = {
+    schema_version: 'stage2_next_round_plan.v3',
+    current_round_id: analysis.round_id,
+    should_continue: canAutoContinue,
+    decision: canAutoContinue ? 'auto_continue' : failureClusters.length ? 'wait_human_review' : 'stop_goal_completed',
+    next_round_goal: missingScopeTargets.length
+      ? `继续寻找用户指定目标页面：${missingScopeTargets.join('、')}。`
+      : uncoveredScopeTargets.length
+      ? `优先进入已发现但未覆盖的目标页面：${uncoveredScopeTargets.join('、')}。`
+      : failureClusters.length
+      ? '处理执行阻塞后，重新执行低风险用例并补齐截图证据。'
+      : '本 run 已完成当前范围。',
+    target_page_entry_ids: (pageEntries.items || []).map((item) => item.page_entry_id),
+    target_feature_point_ids: (featurePoints.items || [])
+      .filter((item) => item.auto_verifiable)
+      .map((item) => item.feature_point_id),
+    target_search_goals: missingScopeTargets,
+    planned_improvements: analysis.improvement_candidates,
+    analysis_refs: {
+      target_tracking: 'round_analysis.target_tracking'
+    },
+    risk_level: 'low',
+    requires_human_approval: blockingFailureClusters.length > 0
+  };
+
+  return {
+    analysis,
+    failureClusters: {
+      schema_version: 'stage2_failure_clusters.v3',
+      items: failureClusters
+    },
+    improvementCandidates: {
+      schema_version: 'stage2_improvement_candidates.v3',
+      items: analysis.improvement_candidates
+    },
+    nextRoundPlan,
+    humanTasks: buildHumanTasks(featurePoints, executionResults, nextRoundPlan)
+  };
+}
+
+function makeFailureSummary(failureClusters) {
+  return {
+    schema_version: 'stage2_failure_summary.v3',
+    total_clusters: failureClusters.items.length,
+    items: failureClusters.items
+  };
+}
+
+function evidenceRefsForItem(item = {}) {
+  return [
+    ...(Array.isArray(item.screenshot_refs) ? item.screenshot_refs : []),
+    ...(Array.isArray(item.evidence_refs) ? item.evidence_refs : [])
+  ].filter(Boolean);
+}
+
+function controlSkillFromAction(action = {}) {
+  const name = normalizeText(action.action || action.type || action.name, '');
+  const field = normalizeText(action.field || action.target || action.label, '');
+  const haystack = `${name} ${field}`.toLowerCase();
+  if (/cascader|address|location|育苗地点|育苗地址|地址/.test(haystack)) {
+    return {
+      skill_key: 'cascader_select',
+      friendly_name: '四级地址选择',
+      plain_description: '系统已经能按层级依次选择省、市、区、社区这类多级地址控件。',
+      beginner_next_action: '可在同项目相似地址控件上直接复用；如果换系统，请先人工审核一次。'
+    };
+  }
+  if (/upload|file|上传|人员信息表|图片|附件|验收文件/.test(haystack)) {
+    return {
+      skill_key: 'file_upload',
+      friendly_name: '文件上传',
+      plain_description: '系统已经能按字段名称选择对应样本文件，并避免同一上传位重复上传。',
+      beginner_next_action: '检查样本文件是否适合当前页面，再保存为本项目上传控件经验。'
+    };
+  }
+  if (/date|picker|日期/.test(haystack)) {
+    return {
+      skill_key: 'date_picker',
+      friendly_name: '日期选择',
+      plain_description: '系统已经能优先使用日期控件自身面板选择日期，而不是直接硬填文本。',
+      beginner_next_action: '确认日期规则没有业务限制后，可复用到同项目其他日期字段。'
+    };
+  }
+  if (/dialog|final|提交备案|备案登记|最终弹窗/.test(haystack)) {
+    return {
+      skill_key: 'final_submit_dialog',
+      friendly_name: '最终确认弹窗',
+      plain_description: '系统已经能处理最终确认弹窗中的监管单位选择、申请表上传和提交按钮状态。',
+      beginner_next_action: '先人工确认这是测试环境，再决定是否允许最终提交。'
+    };
+  }
+  if (/select|dropdown|treeselect|combobox|下拉|监管单位|育苗方式|请选择/.test(haystack)) {
+    return {
+      skill_key: 'dropdown_select',
+      friendly_name: '下拉框选择',
+      plain_description: '系统已经能打开下拉框并从真实选项中选择值，减少 AI 临场猜测。',
+      beginner_next_action: '可保存为本项目控件技能；平台级复用前需要人工审核。'
+    };
+  }
+  return null;
+}
+
+function makeControlSkillCandidates(resultItems) {
+  const byKey = new Map();
+  for (const result of resultItems) {
+    if (!['passed', 'real_passed', 'side_effect_executed'].includes(result.status)) {
+      continue;
+    }
+    for (const action of Array.isArray(result.actions) ? result.actions : []) {
+      const skill = controlSkillFromAction(action);
+      if (!skill) {
+        continue;
+      }
+      const existing = byKey.get(skill.skill_key);
+      const evidence = [
+        'execution_results',
+        ...(Array.isArray(result.screenshot_refs) ? result.screenshot_refs : [])
+      ];
+      if (existing) {
+        existing.asset_value.success_count += 1;
+        existing.evidence_refs = [...new Set(existing.evidence_refs.concat(evidence))];
+        continue;
+      }
+      byKey.set(skill.skill_key, {
+        candidate_id: `project_control_skill_${skill.skill_key}`,
+        layer: 'project',
+        asset_type: 'control_skill',
+        title: `控件技能：${skill.friendly_name}`,
+        friendly_name: skill.friendly_name,
+        plain_description: skill.plain_description,
+        reuse_level_label: '本项目可直接复用',
+        beginner_next_action: skill.beginner_next_action,
+        asset_value: {
+          skill_key: skill.skill_key,
+          success_count: 1,
+          source_actions: [action.action || action.type || action.name || 'unknown']
+        },
+        evidence_refs: evidence,
+        confidence: 0.82,
+        requires_human_approval: false,
+        auto_apply: false
+      });
+    }
+  }
+  return Array.from(byKey.values());
+}
+
+function makePromotionCandidates({
+  manifest = {},
+  pageEntries = { items: [] },
+  featurePoints = { items: [] },
+  testCases = { items: [] },
+  executionResults = { items: [] },
+  roundAnalysis = {}
+} = {}) {
+  const pageItems = artifactItems(pageEntries, 'page_entries');
+  const featureItems = artifactItems(featurePoints, 'feature_points');
+  const caseItems = artifactItems(testCases, 'test_cases');
+  const resultItems = artifactItems(executionResults, 'results');
+  const passedResults = resultItems.filter((item) => ['passed', 'real_passed', 'side_effect_executed'].includes(item.status));
+  const failedOrSkippedResults = resultItems.filter((item) => item.failure_reason || ['failed', 'real_failed', 'skipped', 'skipped_by_policy', 'blocked_by_policy', 'needs_review'].includes(item.status));
+  const candidates = [];
+  candidates.push(...makeControlSkillCandidates(passedResults));
+
+  for (const page of pageItems.slice(0, 8)) {
+    candidates.push({
+      candidate_id: `project_page_alias_${page.page_entry_id || normalizeModelProfileId(page.name || 'page')}`,
+      layer: 'project',
+      asset_type: 'alias',
+      title: `沉淀页面别名：${page.name || page.page_entry_id}`,
+      asset_value: {
+        page_entry_id: page.page_entry_id,
+        name: page.name,
+        menu_path: page.menu_path || [],
+        url: page.url || manifest.entry_url || null
+      },
+      evidence_refs: evidenceRefsForItem(page).concat(['page_entries']),
+      confidence: typeof page.confidence === 'number' ? page.confidence : 0.78,
+      requires_human_approval: false,
+      auto_apply: false
+    });
+  }
+
+  for (const feature of featureItems.slice(0, 8)) {
+    const locatorCandidates = Array.isArray(feature.locator_candidates) ? feature.locator_candidates : [];
+    candidates.push({
+      candidate_id: `project_stable_locator_${feature.feature_point_id || normalizeModelProfileId(feature.name || 'feature')}`,
+      layer: 'project',
+      asset_type: 'stable_locator',
+      title: `沉淀稳定定位线索：${feature.name || feature.feature_point_id}`,
+      asset_value: {
+        page_entry_id: feature.page_entry_id,
+        feature_point_id: feature.feature_point_id,
+        feature_type: feature.feature_type || 'unknown',
+        locator_candidates: locatorCandidates,
+        fallback_locator_hint: feature.name || feature.feature_point_id
+      },
+      evidence_refs: evidenceRefsForItem(feature).concat(['feature_points', 'execution_results']),
+      confidence: typeof feature.confidence === 'number' ? feature.confidence : 0.7,
+      requires_human_approval: false,
+      auto_apply: false
+    });
+  }
+
+  if (caseItems.length || failedOrSkippedResults.length) {
+    candidates.push({
+      candidate_id: 'project_test_data_suggestions',
+      layer: 'project',
+      asset_type: 'test_data_suggestion',
+      title: '沉淀下一轮测试数据与人工录入建议',
+      asset_value: {
+        case_count: caseItems.length,
+        blocked_or_skipped_reasons: [...new Set(failedOrSkippedResults.map((item) => item.failure_reason || item.status).filter(Boolean))],
+        suggested_source: '从已通过路径、失败断言和人工确认项中补齐可复用测试数据。'
+      },
+      evidence_refs: ['generated_test_cases', 'execution_results', 'human_tasks'],
+      confidence: passedResults.length ? 0.76 : 0.62,
+      requires_human_approval: false,
+      auto_apply: false
+    });
+  }
+
+  if ((roundAnalysis.improvement_candidates || []).length || resultItems.length) {
+    candidates.push({
+      candidate_id: 'platform_promotion_requires_review',
+      layer: 'platform',
+      asset_type: 'platform_baseline_candidate',
+      title: '平台级基线晋升候选需人工审批',
+      asset_value: {
+        source_run_id: manifest.run_id || null,
+        candidate_scope: 'locators_aliases_waits_and_test_data',
+        auto_apply_policy: 'disabled'
+      },
+      evidence_refs: ['round_analysis', 'promotion_candidates', 'run_report_json'],
+      confidence: 0.65,
+      requires_human_approval: true,
+      auto_apply: false
+    });
+  }
+
+  return {
+    schema_version: 'stage2_promotion_candidates.v3',
+    generated_at: nowIso(),
+    source_run_id: manifest.run_id || null,
+    policy: {
+      project_level_candidates_may_be_saved: true,
+      platform_level_requires_human_approval: true,
+      auto_apply_platform_candidates: false
+    },
+    items: candidates
+  };
+}
+
+function parseJsonFromProcessOutput(stdout) {
+  const text = String(stdout || '').trim();
+  if (!text) {
+    return null;
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start !== -1 && end > start) {
+      try {
+        return JSON.parse(text.slice(start, end + 1));
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
+async function resolvePythonCommand(options = {}) {
+  if (options.pythonRunner) {
+    return options.pythonCommand || DEFAULT_PYTHON_COMMAND;
+  }
+  const bundledPython = process.env.USERPROFILE
+    ? path.join(process.env.USERPROFILE, '.cache', 'codex-runtimes', 'codex-primary-runtime', 'dependencies', 'python', 'python.exe')
+    : null;
+  const candidates = [
+    options.pythonCommand,
+    process.env.STAGE2_PYTHON,
+    process.env.PYTHON,
+    bundledPython,
+    DEFAULT_PYTHON_COMMAND
+  ].filter(Boolean);
+  const seen = new Set();
+  const errors = [];
+  for (const command of candidates) {
+    if (seen.has(command)) {
+      continue;
+    }
+    seen.add(command);
+    try {
+      if (path.isAbsolute(command) && !(await pathExists(command))) {
+        errors.push(`${command}: 不存在`);
+        continue;
+      }
+      const result = await execFileAsync(command, [
+        '-c',
+        'import sys,json; print(json.dumps({"major":sys.version_info[0],"minor":sys.version_info[1]}))'
+      ], { cwd: ROOT_DIR, timeout: 8000, windowsHide: true });
+      const version = JSON.parse(String(result.stdout || '').trim());
+      if (version.major > 3 || (version.major === 3 && version.minor >= 10)) {
+        return command;
+      }
+      errors.push(`${command}: Python ${version.major}.${version.minor} 低于 3.10`);
+    } catch (error) {
+      errors.push(`${command}: ${error.message}`);
+    }
+  }
+  throw new Stage2V3InputError(`找不到可运行第二阶段 v3 的 Python 3.10+：${errors.join('；')}`, 500);
+}
+
+async function runPythonV3Orchestrator({ runId, runsDir, runDir, inputConfig, body, roundId }, options = {}) {
+  return runPythonV3OrchestratorAttempt({ runId, runsDir, runDir, inputConfig, body, roundId }, options);
+}
+
+async function runSequentialModelAttempts(context, options = {}) {
+  const { runId, runDir, inputConfig } = context;
+  const selectedModelIds = inputConfig.selected_model_profile_ids || [];
+  const profilesById = new Map((inputConfig.selected_model_profiles || []).map((profile) => [profile.id, profile]));
+  const sharedConfigSignature = sharedRunConfigSignature(inputConfig);
+  const attemptsRoot = path.join(runDir, 'model_attempts');
+  const items = [];
+  let representativeResult = null;
+  for (let index = 0; index < selectedModelIds.length; index += 1) {
+    const modelProfileId = selectedModelIds[index];
+    const attemptRunId = `${runId}__model_${String(index + 1).padStart(2, '0')}_${ensureSafeId(modelProfileId, 'modelProfileId')}`;
+    await appendEvent(runDir, {
+      type: 'model_attempt_started',
+      run_id: runId,
+      attempt_run_id: attemptRunId,
+      model_profile_id: modelProfileId,
+      index: index + 1
+    });
+    const processResult = await runPythonV3OrchestratorAttempt({
+      ...context,
+      runId: attemptRunId,
+      artifactRoot: attemptsRoot,
+      modelProfileId
+    }, options);
+    const item = await summarizeModelAttempt({
+      processResult,
+      modelProfile: profilesById.get(modelProfileId) || { id: modelProfileId },
+      modelProfileId,
+      sharedConfigSignature,
+      index
+    });
+    items.push(item);
+    await appendEvent(runDir, {
+      type: 'model_attempt_finished',
+      run_id: runId,
+      attempt_run_id: attemptRunId,
+      model_profile_id: modelProfileId,
+      status: item.status,
+      failure_reason: item.failure_reason || null
+    });
+    if (processResult.ok && !representativeResult) {
+      representativeResult = processResult;
+    }
+  }
+  const comparison = buildModelComparisonSummary({
+    runId,
+    inputConfig,
+    sharedConfigSignature,
+    items
+  });
+  await writeJson(path.join(runDir, ARTIFACTS.model_comparison), comparison);
+  if (representativeResult) {
+    return {
+      ...representativeResult,
+      modelComparison: comparison
+    };
+  }
+  const firstFailure = items[0] || {};
+  return {
+    ok: false,
+    failureReason: firstFailure.failure_reason || 'all_model_attempts_failed',
+    command: '',
+    args: [],
+    artifactRoot: attemptsRoot,
+    startedAt: comparison.started_at,
+    finishedAt: comparison.finished_at,
+    exitCode: null,
+    stdout: '',
+    stderr: firstFailure.error || 'All selected model attempts failed.',
+    error: firstFailure.error || 'All selected model attempts failed.',
+    modelComparison: comparison
+  };
+}
+
+async function runPythonV3OrchestratorAttempt({ runId, runsDir, runDir, inputConfig, body, roundId, artifactRoot: artifactRootOverride, modelProfileId }, options = {}) {
+  const executionMode = normalizeExecutionMode(body.executionMode || body.execution_mode || 'real_browser');
+  const artifactRoot = artifactRootOverride || runsDir;
+  const command = await resolvePythonCommand(options);
+  const args = [
+    '-m',
+    'prototype.stage2.main',
+    '--run-v3',
+    '--v3-run-id',
+    runId,
+    '--v3-round-id',
+    roundId,
+    '--v3-round-stage',
+    roundId === 'round_001' ? 'menu_discovery' : 'page_feature_verification',
+    '--v3-artifact-root',
+    artifactRoot,
+    '--v3-execution-mode',
+    executionMode,
+    '--v3-reuse-run-dir',
+    '--target-name',
+    inputConfig.system_name,
+    '--page-url',
+    inputConfig.entry_url,
+    '--cdp-url',
+    inputConfig.cdp_url,
+    '--v3-max-pages',
+    String(normalizeInteger(body.maxPages || body.max_pages, inputConfig.max_pages, 1, 200)),
+    '--v3-max-features-per-page',
+    String(normalizeInteger(
+      body.maxFeaturesPerPage || body.max_features_per_page,
+      inputConfig.max_features_per_page,
+      1,
+      200
+    )),
+    '--v3-safety-policy',
+    inputConfig.safety_policy || SAFETY_POLICY_LOW_RISK_ONLY
+  ];
+  if (inputConfig.scope) {
+    args.push('--v3-scope', inputConfig.scope);
+  }
+  for (const target of inputConfig.prioritized_targets || []) {
+    args.push('--v3-prioritized-target', target);
+  }
+  for (const target of inputConfig.waived_targets || []) {
+    args.push('--v3-waived-target', target);
+  }
+  for (const action of inputConfig.allowed_side_effect_actions || []) {
+    args.push('--v3-allow-side-effect-action', action);
+  }
+  const profileIds = modelProfileId
+    ? [modelProfileId]
+    : inputConfig.selected_model_profile_ids || [];
+  for (const profileId of profileIds) {
+    args.push('--v3-model-profile', profileId);
+  }
+  if (body.useLiveDiscovery !== false && body.use_live_discovery !== false) {
+    args.push('--v3-use-live-discovery');
+  }
+  if (body.model) {
+    args.push('--model', String(body.model));
+  }
+
+  await fs.mkdir(artifactRoot, { recursive: true });
+  const timeoutMs = normalizeInteger(
+    body.timeoutMs || body.timeout_ms,
+    options.pythonTimeoutMs || DEFAULT_PYTHON_TIMEOUT_MS,
+    1000,
+    60 * 60 * 1000
+  );
+  const startedAt = nowIso();
+  let result;
+  try {
+    if (options.pythonRunner) {
+      result = await options.pythonRunner({ command, args, cwd: ROOT_DIR, artifactRoot, runsDir, runDir, timeoutMs });
+    } else {
+      result = await execFileAsync(command, args, {
+        cwd: ROOT_DIR,
+        timeout: timeoutMs,
+        windowsHide: true,
+        maxBuffer: 20 * 1024 * 1024
+      });
+    }
+  } catch (error) {
+    const stderr = String(error.stderr || error.message || '');
+    const finishedAt = nowIso();
+    const isTimeout = Boolean(
+      error.killed
+      || error.signal === 'SIGTERM'
+      || /timed?\s*out|timeout/i.test(error.message || '')
+    );
+    const failureReason = error.code === 'ENOENT'
+      ? 'python_executor_unavailable'
+      : isTimeout
+        ? 'python_v3_orchestrator_timeout'
+        : 'python_v3_orchestrator_failed';
+    const timeoutMessage = isTimeout
+      ? `Python v3 orchestrator 超过 ${formatDurationMinutes(timeoutMs)} 执行上限，平台已终止本轮真实浏览器执行。`
+      : null;
+    const timeoutDiagnostics = isTimeout ? summarizePythonExecutionLog(stderr) : null;
+    return {
+      ok: false,
+      failureReason,
+      command,
+      args,
+      artifactRoot,
+      startedAt,
+      finishedAt,
+      exitCode: typeof error.code === 'number' ? error.code : null,
+      stdout: String(error.stdout || ''),
+      stderr,
+      error: timeoutMessage || error.message || stderr || failureReason,
+      timeoutMs: isTimeout ? timeoutMs : null,
+      timeoutDiagnostics
+    };
+  }
+
+  const stdout = String(result?.stdout || '');
+  const stderr = String(result?.stderr || '');
+  const parsed = parseJsonFromProcessOutput(stdout);
+  return {
+    ok: true,
+    command,
+    args,
+    artifactRoot,
+    startedAt,
+    finishedAt: nowIso(),
+    exitCode: 0,
+    stdout,
+    stderr,
+    result: parsed
+  };
+}
+
+function sharedRunConfigSignature(inputConfig = {}) {
+  const stable = {
+    system_name: inputConfig.system_name,
+    entry_url: inputConfig.entry_url,
+    cdp_url: inputConfig.cdp_url,
+    scope: inputConfig.scope,
+    safety_policy: inputConfig.safety_policy,
+    allowed_side_effect_actions: inputConfig.allowed_side_effect_actions || [],
+    prioritized_targets: inputConfig.prioritized_targets || [],
+    waived_targets: inputConfig.waived_targets || [],
+    max_pages: inputConfig.max_pages,
+    max_features_per_page: inputConfig.max_features_per_page
+  };
+  return crypto.createHash('sha256').update(JSON.stringify(stable)).digest('hex').slice(0, 16);
+}
+
+async function summarizeModelAttempt({
+  processResult,
+  modelProfile,
+  modelProfileId,
+  sharedConfigSignature,
+  index
+}) {
+  const pyRunDir = processResult.ok ? await findPythonRunDir(processResult) : null;
+  const pageEntries = normalizePythonPageEntries(
+    await readPythonJson(pyRunDir, ARTIFACTS.page_entries),
+    { system_name: '', entry_url: '' }
+  );
+  const featurePoints = normalizePythonFeaturePoints(await readPythonJson(pyRunDir, ARTIFACTS.feature_points));
+  const testCases = normalizePythonTestCases(await readPythonJson(pyRunDir, ARTIFACTS.generated_test_cases));
+  const executionResults = normalizePythonExecutionResults(
+    await readPythonJson(pyRunDir, ARTIFACTS.execution_results),
+    testCases,
+    featurePoints
+  );
+  const menuEntries = normalizeMenuEntries(
+    await readPythonJson(pyRunDir, ARTIFACTS.menu_entries) || makeEmptyMenuArtifacts().menuEntries
+  );
+  const roundAnalysis = await readPythonJson(pyRunDir, ARTIFACTS.round_analysis) || {};
+  const execution = summarizeExecution(executionResults.items || []);
+  const coverage = {
+    menu_entries: summarizeItems(artifactItems(menuEntries, 'items', 'menu_entries')),
+    page_entries: summarizeItems(pageEntries.items || []),
+    feature_points: summarizeItems(featurePoints.items || []),
+    generated_cases: summarizeItems(testCases.items || []),
+    executed_cases: execution.total
+  };
+  return {
+    attempt_id: `model_attempt_${String(index + 1).padStart(2, '0')}`,
+    model_profile_id: modelProfileId,
+    model_profile: redactModelProfile(modelProfile),
+    shared_config_signature: sharedConfigSignature,
+    status: processResult.ok ? 'completed' : 'failed',
+    started_at: processResult.startedAt,
+    finished_at: processResult.finishedAt,
+    elapsed_ms: elapsedMs(processResult.startedAt, processResult.finishedAt),
+    failure_reason: processResult.ok ? null : processResult.failureReason,
+    error: processResult.ok ? null : processResult.error,
+    capability_preflight: {
+      profile: redactModelProfile(modelProfile),
+      selected_for_attempt: true
+    },
+    coverage,
+    execution,
+    evidence_quality: evidenceQualityForAttempt(executionResults, roundAnalysis),
+    stability: stabilityForAttempt(processResult, execution),
+    compatibility_issues: compatibilityIssuesForAttempt(processResult, roundAnalysis),
+    artifacts: {
+      run_dir: pyRunDir,
+      stdout: processResult.stdout || '',
+      stderr: processResult.stderr || ''
+    }
+  };
+}
+
+function buildModelComparisonSummary({ runId, inputConfig, sharedConfigSignature, items }) {
+  const startedTimes = items.map((item) => item.started_at).filter(Boolean).sort();
+  const finishedTimes = items.map((item) => item.finished_at).filter(Boolean).sort();
+  return {
+    schema_version: 'stage2_model_comparison.v1',
+    run_id: runId,
+    generated_at: nowIso(),
+    started_at: startedTimes[0] || null,
+    finished_at: finishedTimes[finishedTimes.length - 1] || null,
+    shared_config_signature: sharedConfigSignature,
+    selected_model_profile_ids: inputConfig.selected_model_profile_ids || [],
+    total: items.length,
+    completed: items.filter((item) => item.status === 'completed').length,
+    failed: items.filter((item) => item.status === 'failed').length,
+    items,
+    ranking: [...items]
+      .sort((left, right) => modelAttemptScore(right) - modelAttemptScore(left))
+      .map((item, index) => ({
+        rank: index + 1,
+        model_profile_id: item.model_profile_id,
+        score: modelAttemptScore(item),
+        status: item.status,
+        summary: `${item.coverage.page_entries} 页面 / ${item.coverage.feature_points} 功能点 / ${item.execution.passed} 通过 / ${item.execution.failed} 失败`
+      }))
+  };
+}
+
+function modelAttemptScore(item) {
+  if (item.status !== 'completed') {
+    return -1;
+  }
+  return (item.coverage.page_entries * 2)
+    + item.coverage.feature_points
+    + item.execution.passed
+    - item.execution.failed
+    - item.execution.skipped;
+}
+
+function elapsedMs(startedAt, finishedAt) {
+  const start = new Date(startedAt || 0).getTime();
+  const finish = new Date(finishedAt || 0).getTime();
+  return Number.isFinite(start) && Number.isFinite(finish) && start > 0 && finish >= start
+    ? finish - start
+    : null;
+}
+
+function formatDurationMinutes(ms) {
+  const minutes = Math.max(1, Math.round((Number(ms) || 0) / 60000));
+  return `${minutes} 分钟`;
+}
+
+function stripAnsi(text) {
+  return String(text || '').replace(/\u001b\[[0-9;]*m/g, '');
+}
+
+function summarizePythonExecutionLog(stderr = '') {
+  const text = stripAnsi(stderr).replace(/\r/g, '');
+  const steps = [...text.matchAll(/Step\s+(\d+):/g)].map((match) => Number(match[1])).filter(Number.isFinite);
+  const goals = [...text.matchAll(/Next goal:\s*(.+)/g)].map((match) => match[1].trim()).filter(Boolean);
+  const toolErrors = [...text.matchAll(/Action '([^']+)' failed with error:\s*(.+)/g)]
+    .map((match) => ({
+      action: match[1],
+      error: match[2].trim()
+    }));
+  const actionLines = text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => /\b(script_[a-zA-Z0-9_]+|click|type|done)\b/.test(line));
+  const lastToolError = toolErrors.at(-1) || null;
+  return {
+    observed_step_count: steps.length,
+    last_step: steps.length ? Math.max(...steps) : null,
+    last_goal: goals.at(-1) || null,
+    last_action_line: actionLines.at(-1) || null,
+    last_tool_error: lastToolError,
+    repeated_last_tool_error_count: lastToolError
+      ? toolErrors.filter((item) => item.action === lastToolError.action && item.error === lastToolError.error).length
+      : 0
+  };
+}
+
+function evidenceQualityForAttempt(executionResults, roundAnalysis = {}) {
+  if (roundAnalysis.evidence_quality) {
+    return roundAnalysis.evidence_quality;
+  }
+  const items = executionResults.items || [];
+  const withScreenshots = items.filter((item) => (item.screenshot_refs || []).length).length;
+  return {
+    screenshot_backed_results: withScreenshots,
+    total_results: items.length,
+    summary: items.length
+      ? `${withScreenshots}/${items.length} execution results include screenshot evidence.`
+      : 'No execution evidence was produced.'
+  };
+}
+
+function stabilityForAttempt(processResult, execution) {
+  if (!processResult.ok) {
+    return { status: 'failed', score: 0 };
+  }
+  const total = execution.total || 0;
+  const unstable = execution.failed + execution.skipped;
+  return {
+    status: unstable ? 'partial' : 'stable',
+    score: total ? Math.max(0, Math.round(((total - unstable) / total) * 100)) / 100 : 0
+  };
+}
+
+function compatibilityIssuesForAttempt(processResult, roundAnalysis = {}) {
+  const issues = [];
+  if (!processResult.ok) {
+    issues.push({
+      code: processResult.failureReason || 'model_attempt_failed',
+      message: processResult.error || processResult.stderr || 'Model attempt failed.'
+    });
+  }
+  for (const error of roundAnalysis.review_errors || []) {
+    issues.push(error);
+  }
+  return issues;
+}
+
+async function findPythonRunDir(processResult) {
+  const explicit = processResult.result?.run_dir;
+  if (explicit && await pathExists(explicit)) {
+    return explicit;
+  }
+  const artifactPaths = processResult.result?.artifact_paths || {};
+  for (const value of Object.values(artifactPaths)) {
+    if (value) {
+      const dir = path.dirname(value);
+      if (await pathExists(dir)) {
+        return dir;
+      }
+    }
+  }
+  const dirents = await fs.readdir(processResult.artifactRoot, { withFileTypes: true }).catch(() => []);
+  const directories = dirents.filter((item) => item.isDirectory()).map((item) => path.join(processResult.artifactRoot, item.name));
+  return directories[0] || null;
+}
+
+async function readPythonJson(pyRunDir, fileName) {
+  return pyRunDir ? readJsonIfExists(path.join(pyRunDir, fileName)) : null;
+}
+
+function normalizePythonPageEntries(payload, inputConfig) {
+  if (payload?.schema_version === 'stage2_page_entries.v3' && Array.isArray(payload.items)) {
+    return payload;
+  }
+  const pages = Array.isArray(payload)
+    ? payload
+    : payload?.pages || payload?.page_entries || payload?.items || [];
+  return {
+    schema_version: 'stage2_page_entries.v3',
+    items: pages.map((page, index) => ({
+      page_entry_id: page.page_entry_id || page.page_id || `page_${String(index + 1).padStart(3, '0')}`,
+      name: page.name || page.title || `${inputConfig.system_name}页面${index + 1}`,
+      url: page.url || inputConfig.entry_url,
+      menu_path: page.menu_path || [inputConfig.system_name],
+      page_type: page.page_type || page.semantic_page_type || 'unknown',
+      discovery_depth: Number.isInteger(page.discovery_depth) ? page.discovery_depth : index === 0 ? 0 : 1,
+      status: page.status || 'reachable',
+      source: page.source || 'python_v3_orchestrator',
+      evidence: page.evidence || {},
+      screenshot_refs: page.screenshot_refs || page.screenshots || []
+    }))
+  };
+}
+
+function normalizePythonFeaturePoints(payload) {
+  if (payload?.schema_version === 'stage2_feature_points.v3' && Array.isArray(payload.items)) {
+    return payload;
+  }
+  const features = payload?.features || payload?.feature_points || payload?.items || [];
+  return {
+    schema_version: 'stage2_feature_points.v3',
+    items: features.map((feature, index) => {
+      const risk = feature.risk_level || 'low';
+      return {
+        feature_point_id: feature.feature_point_id || feature.feature_id || `feature_${String(index + 1).padStart(3, '0')}`,
+        page_entry_id: feature.page_entry_id || feature.page_id || 'page_home',
+        name: feature.name || feature.title || `功能点${index + 1}`,
+        feature_type: feature.feature_type || feature.type || 'unknown',
+        risk_level: risk,
+        auto_verifiable: feature.auto_verifiable !== false && risk === 'low',
+        verification_strategy: feature.verification_strategy || `${feature.feature_type || 'unknown'}_minimal_path`,
+        locator_candidates: feature.locator_candidates || [],
+        source: feature.source || 'python_v3_orchestrator',
+        confidence: typeof feature.confidence === 'number' ? feature.confidence : 0.7,
+        review_status: feature.review_status || (risk === 'low' ? 'auto_included' : 'pending')
+      };
+    })
+  };
+}
+
+function normalizePythonTestCases(payload) {
+  if (payload?.schema_version === 'stage2_generated_test_cases.v3' && Array.isArray(payload.items)) {
+    return payload;
+  }
+  const cases = payload?.cases || payload?.test_cases || payload?.items || [];
+  return {
+    schema_version: 'stage2_generated_test_cases.v3',
+    items: cases.map((testCase, index) => ({
+      test_case_id: testCase.test_case_id || testCase.case_id || `case_${String(index + 1).padStart(3, '0')}`,
+      feature_point_id: testCase.feature_point_id || testCase.feature_id || '',
+      title: testCase.title || testCase.name || `执行型用例${index + 1}`,
+      type_template: testCase.type_template || testCase.case_type || 'unknown',
+      preconditions: testCase.preconditions || [],
+      steps: testCase.steps || [],
+      expected_feedback: testCase.expected_feedback || [testCase.expected_result].filter(Boolean),
+      risk_policy: testCase.risk_policy || (testCase.auto_allowed === false ? 'manual_review_required' : 'safe_auto'),
+      assertions: testCase.assertions || [],
+      requires_human_confirmation: Boolean(testCase.requires_human_confirmation || testCase.auto_allowed === false)
+    }))
+  };
+}
+
+function normalizePythonExecutionResults(payload, testCases = { items: [] }, featurePoints = { items: [] }) {
+  const results = payload?.schema_version === 'stage2_execution_results.v3' && Array.isArray(payload.items)
+    ? payload.items
+    : payload?.results || payload?.items || [];
+  const caseById = new Map((testCases.items || []).map((item) => [item.test_case_id, item]));
+  const featureById = new Map((featurePoints.items || []).map((item) => [item.feature_point_id, item]));
+  return {
+    schema_version: 'stage2_execution_results.v3',
+    items: results.map((result) => {
+      const testCaseId = result.test_case_id || result.case_id || '';
+      const testCase = caseById.get(testCaseId) || {};
+      const featurePointId = result.feature_point_id
+        || result.feature_id
+        || testCase.feature_point_id
+        || '';
+      const feature = featureById.get(featurePointId) || {};
+      const featureLabel = featurePointId
+        ? `${featurePointId}${feature.name ? ` · ${feature.name}` : ''}`
+        : '';
+      const rawTitle = result.title
+        || result.name
+        || result.case_title
+        || testCase.title
+        || '';
+      const title = featureLabel && rawTitle && !rawTitle.includes(featurePointId)
+        ? `${featureLabel} · ${rawTitle}`
+        : rawTitle || featureLabel || testCaseId;
+      let status = result.status || 'unknown';
+      let failureReason = result.failure_reason || null;
+      let manualConfirmationRequired = Boolean(result.manual_confirmation_required);
+      if (status === 'passed_safe_placeholder') {
+        status = 'skipped';
+        failureReason = 'python_returned_safe_placeholder';
+        manualConfirmationRequired = true;
+      } else if (status === 'blocked_by_policy') {
+        failureReason = failureReason || 'blocked_by_policy';
+        manualConfirmationRequired = true;
+      } else if (status === 'side_effect_failed') {
+        failureReason = failureReason || 'side_effect_failed';
+      }
+      const pageFeedback = result.page_feedback || [result.visible_feedback].filter(Boolean);
+      const unresolvedRequiredFields = Array.isArray(pageFeedback)
+        && pageFeedback.some((item) => /不能为空/.test(String(item || '')));
+      if (unresolvedRequiredFields && ['passed', 'real_passed', 'side_effect_executed'].includes(status)) {
+        status = 'failed';
+        failureReason = failureReason || 'required_fields_unresolved';
+        manualConfirmationRequired = true;
+      }
+      const feedbackText = Array.isArray(pageFeedback) ? pageFeedback.join('\n') : String(pageFeedback || '');
+      const browserUseFailed = result.execution_mode === 'browser_use_takeover'
+        && /Judge Verdict:\s*(?:❌\s*)?FAIL|测试未能成功提交|未能成功提交|仍为空|红框错误|validation errors?|Failure Reason:|form_item_not_found/i.test(feedbackText);
+      if (browserUseFailed && ['passed', 'real_passed', 'side_effect_executed'].includes(status)) {
+        status = 'failed';
+        failureReason = failureReason || 'browser_use_handover_failed';
+        manualConfirmationRequired = true;
+      }
+      return {
+        test_case_id: testCaseId,
+        feature_point_id: featurePointId,
+        feature_id: featurePointId,
+        title,
+        name: title,
+        status,
+        verdict: result.verdict || result.message || '',
+        started_at: result.started_at || null,
+        finished_at: result.finished_at || null,
+        actions: result.actions || (result.action_type ? [{
+          action: result.action_type,
+          target: result.control_label || '',
+          policy_decision: result.policy_decision || null
+        }] : []),
+        page_feedback: pageFeedback,
+        screenshot_refs: result.screenshot_refs || result.evidence || [
+          result.before_screenshot_ref,
+          result.after_screenshot_ref
+        ].filter(Boolean),
+        network_refs: result.network_refs || [],
+        failure_reason: failureReason,
+        manual_confirmation_required: manualConfirmationRequired,
+        execution_mode: result.execution_mode || 'real_browser',
+        side_effect: result.action_type ? {
+          action_type: result.action_type,
+          control_label: result.control_label || '',
+          policy_decision: result.policy_decision || null,
+          before_screenshot_ref: result.before_screenshot_ref || null,
+          after_screenshot_ref: result.after_screenshot_ref || null,
+          url_before: result.url_before || null,
+          url_after: result.url_after || null,
+          dialog_events: result.dialog_events || []
+        } : null
+      };
+    })
+  };
+}
+
+function normalizePythonHumanTasks(payload) {
+  if (payload?.schema_version === 'stage2_human_tasks.v3' && Array.isArray(payload.items)) {
+    return payload;
+  }
+  const tasks = payload?.tasks || [];
+  return {
+    schema_version: 'stage2_human_tasks.v3',
+    items: tasks.map((task) => ({
+      task_id: task.task_id,
+      task_type: task.task_type || task.type || 'review_next_round_plan',
+      title: task.title || '人工处理任务',
+      reason: task.reason || task.ui_action || '需要在运行中心处理后继续。',
+      input_refs: task.input_refs || [],
+      ui_schema: task.ui_schema || { kind: 'decision', actions: ['approve', 'pause', 'stop'] },
+      status: task.status === 'open' ? 'pending' : task.status || 'pending',
+      result_artifact: task.result_artifact || null
+    }))
+  };
+}
+
+function artifactHasItems(payload, ...keys) {
+  return artifactItems(payload, ...keys).length > 0;
+}
+
+function isSeededPendingPageEntries(payload) {
+  const items = artifactItems(payload, 'items');
+  if (items.length !== 1) {
+    return false;
+  }
+  const [page] = items;
+  return page?.page_entry_id === 'page_home'
+    && page?.status === 'pending_executor'
+    && page?.source === 'run_center_v3.input_config';
+}
+
+function materializePageEntriesFromMenuEntries(menuEntries, inputConfig) {
+  const items = artifactItems(menuEntries, 'menu_entries')
+    .filter((item) => item && item.is_leaf && item.route_hint);
+  return {
+    schema_version: 'stage2_page_entries.v3',
+    items: items.map((item, index) => ({
+      page_entry_id: item.page_entry_id || item.page_id || `menu_page_${String(item.menu_id || index + 1).replace(/^menu_/, '').padStart(3, '0')}`,
+      name: item.text || item.name || `${inputConfig.system_name}页面${index + 1}`,
+      url: item.route_hint || item.url || inputConfig.entry_url,
+      menu_path: item.menu_path || [item.text || inputConfig.system_name],
+      page_type: item.page_type || 'menu_leaf',
+      discovery_depth: Array.isArray(item.menu_path) ? Math.max(item.menu_path.length - 1, 0) : 1,
+      status: 'discovered_from_menu',
+      source: item.source || 'playwright.menu_discovery',
+      screenshot_refs: item.screenshot_refs || []
+    }))
+  };
+}
+
+async function readPriorRealBrowserDiscovery(runDir, inputConfig, manifest) {
+  const sourceRealBrowser = await readJsonIfExists(path.join(runDir, 'source_real_browser.json')) || {};
+  const existingMenuTree = await readJsonIfExists(path.join(runDir, ARTIFACTS.menu_tree));
+  const existingMenuEntries = await readJsonIfExists(path.join(runDir, ARTIFACTS.menu_entries));
+  const existingPageEntries = await readJsonIfExists(path.join(runDir, ARTIFACTS.page_entries));
+  const existingFeaturePoints = await readJsonIfExists(path.join(runDir, ARTIFACTS.feature_points));
+  const existingTestCases = await readJsonIfExists(path.join(runDir, ARTIFACTS.generated_test_cases));
+  const existingScreenshotsIndex = await readJsonIfExists(path.join(runDir, ARTIFACTS.screenshots_index));
+  const seededDiscovery = makeDiscoveryArtifacts(manifest, inputConfig);
+  const emptyMenu = makeEmptyMenuArtifacts('failed');
+  const menuEntries = artifactHasItems(existingMenuEntries, 'items', 'menu_entries')
+    ? existingMenuEntries
+    : artifactHasItems(sourceRealBrowser.menu_entries, 'items', 'menu_entries')
+      ? normalizeMenuEntries(sourceRealBrowser.menu_entries)
+      : emptyMenu.menuEntries;
+  const menuMaterializedPageEntries = materializePageEntriesFromMenuEntries(menuEntries, inputConfig);
+  const sourcePageEntries = normalizePythonPageEntries(
+    sourceRealBrowser.page_entries || sourceRealBrowser.pages || sourceRealBrowser.pageEntries || null,
+    inputConfig
+  );
+  return {
+    systemMap: seededDiscovery.systemMap,
+    navigationTree: seededDiscovery.navigationTree,
+    menuTree: existingMenuTree || sourceRealBrowser.menu_tree || emptyMenu.menuTree,
+    menuEntries,
+    menuTraversalLog: await readTextIfExists(path.join(runDir, ARTIFACTS.menu_traversal_log))
+      || (Array.isArray(sourceRealBrowser.menu_traversal_log)
+        ? sourceRealBrowser.menu_traversal_log.map((item) => JSON.stringify(item)).join('\n')
+        : emptyMenu.menuTraversalLog),
+    pageEntries: artifactHasItems(existingPageEntries, 'items') && !isSeededPendingPageEntries(existingPageEntries)
+      ? existingPageEntries
+      : artifactHasItems(sourcePageEntries, 'items')
+        ? sourcePageEntries
+        : artifactHasItems(menuMaterializedPageEntries, 'items')
+          ? menuMaterializedPageEntries
+        : seededDiscovery.pageEntries,
+    featurePoints: artifactHasItems(existingFeaturePoints, 'items')
+      ? existingFeaturePoints
+      : makeFeatureArtifacts(inputConfig),
+    testCases: artifactHasItems(existingTestCases, 'items')
+      ? existingTestCases
+      : null,
+    screenshotsIndex: artifactHasItems(existingScreenshotsIndex, 'items', 'screenshots')
+      ? existingScreenshotsIndex
+      : makeScreenshotsIndex()
+  };
+}
+
+function currentExecutionContextFromRealBrowser(sourceRealBrowser = {}) {
+  const stack = sourceRealBrowser.executor_stack || sourceRealBrowser.executorStack || {};
+  const browserUse = stack.browser_use || stack.browserUse || {};
+  const playwright = stack.playwright || {};
+  const active = browserUse.status === 'used' ? browserUse : playwright;
+  const currentExecutor = active.current_executor
+    || active.currentExecutor
+    || active.current_skill
+    || active.currentSkill
+    || (browserUse.status === 'used' ? 'Browser Use' : 'Playwright');
+  const firstPage = (sourceRealBrowser.pages || sourceRealBrowser.page_entries || [])[0] || {};
+  return {
+    current_page: active.current_page
+      || active.currentPage
+      || firstPage.name
+      || firstPage.title
+      || null,
+    current_executor: currentExecutor,
+    current_skill: currentExecutor,
+    current_step: active.current_step
+      || active.currentStep
+      || (browserUse.status === 'used' ? '目标流程接管' : '页面入口探索'),
+    executor_stack: stack
+  };
+}
+
+function normalizePythonNextRoundPlan(payload, executionResults, roundId) {
+  const hasBlockingEvidenceGap = (executionResults.items || []).some((item) => [
+    'contract_only_mode',
+    'python_returned_safe_placeholder',
+    'python_v3_orchestrator_failed',
+    'python_executor_unavailable',
+    'cdp_connect_failed',
+    'playwright_missing',
+    'login_required',
+    'side_effect_failed'
+  ].includes(item.failure_reason) || [
+    'skipped_no_executor',
+    'skipped_not_observed',
+    'login_required',
+    'real_failed',
+    'failed',
+    'side_effect_failed'
+  ].includes(item.status));
+  if (payload?.schema_version === 'stage2_next_round_plan.v3' && !hasBlockingEvidenceGap) {
+    return payload;
+  }
+  return {
+    schema_version: 'stage2_next_round_plan.v3',
+    current_round_id: roundId,
+    should_continue: Boolean(payload?.should_continue || payload?.should_start_next_round) && !hasBlockingEvidenceGap,
+    decision: hasBlockingEvidenceGap
+      ? 'wait_human_review'
+      : payload?.decision || (payload?.status === 'blocked_waiting_human' ? 'wait_human_review' : payload?.should_start_next_round ? 'auto_continue' : 'stop_goal_completed'),
+    next_round_goal: hasBlockingEvidenceGap
+      ? '补齐真实浏览器执行证据后重新执行低风险用例。'
+      : payload?.next_round_goal || payload?.primary_reason || '继续下一轮自动评测。',
+    target_page_entry_ids: payload?.target_page_entry_ids || [],
+    target_feature_point_ids: payload?.target_feature_point_ids || [],
+    target_search_goals: payload?.target_search_goals || [],
+    planned_improvements: payload?.planned_improvements || payload?.recommended_actions || [],
+    analysis_refs: payload?.analysis_refs || {},
+    risk_level: payload?.risk_level || 'low',
+    requires_human_approval: Boolean(hasBlockingEvidenceGap || payload?.requires_human_approval || payload?.status === 'blocked_waiting_human')
+  };
+}
+
+async function updateRunStatus(runDir, manifest, status, phase, message, extra = {}) {
+  const updated = {
+    ...manifest,
+    status,
+    execution_mode: extra.execution_mode || manifest.execution_mode || null,
+    updated_at: nowIso()
+  };
+  const saved = await saveManifest(runDir, updated);
+  await writeJson(path.join(runDir, ARTIFACTS.current_status), buildCurrentStatus(saved, phase, message, extra));
+  await appendEvent(runDir, { type: 'status_changed', status, phase, message });
+  return saved;
+}
+
+async function persistContractOnlyArtifacts(runDir, manifest, inputConfig, executionMode = 'contract_only', options = {}) {
+  const preflightResult = makePreflightResult(manifest, inputConfig, executionMode);
+  const { systemMap, navigationTree, pageEntries } = makeDiscoveryArtifacts(manifest, inputConfig);
+  const { menuTree, menuEntries, menuTraversalLog } = makeEmptyMenuArtifacts('contract_only');
+  const featurePoints = makeFeatureArtifacts(inputConfig);
+  const discoveryReview = makeDiscoveryReview(featurePoints);
+  const testCases = makeGeneratedTestCases(featurePoints);
+  const executionResults = makeExecutionResults(testCases, 'contract_only_mode');
+  const screenshotsIndex = makeScreenshotsIndex();
+  const analysisPack = makeRoundAnalysis({
+    manifest,
+    inputConfig,
+    pageEntries,
+    featurePoints,
+    testCases,
+    executionResults,
+    screenshotsIndex,
+    menuEntries
+  });
+  await applyAiRoundReview(analysisPack, {
+    inputConfig,
+    pageEntries,
+    featurePoints,
+    testCases,
+    executionResults,
+    screenshotsIndex,
+    menuEntries
+  }, options);
+
+  await writeJson(path.join(runDir, ARTIFACTS.preflight_result), preflightResult);
+  await writeJson(path.join(runDir, ARTIFACTS.system_map), systemMap);
+  await writeJson(path.join(runDir, ARTIFACTS.navigation_tree), navigationTree);
+  await writeJson(path.join(runDir, ARTIFACTS.menu_tree), menuTree);
+  await writeJson(path.join(runDir, ARTIFACTS.menu_entries), menuEntries);
+  await fs.writeFile(path.join(runDir, ARTIFACTS.menu_traversal_log), menuTraversalLog, 'utf8');
+  await writeJson(path.join(runDir, ARTIFACTS.page_entries), pageEntries);
+  await writeJson(path.join(runDir, ARTIFACTS.feature_points), featurePoints);
+  await writeJson(path.join(runDir, ARTIFACTS.discovery_review), discoveryReview);
+  await writeJson(path.join(runDir, ARTIFACTS.generated_test_cases), testCases);
+  await writeJson(path.join(runDir, ARTIFACTS.execution_results), executionResults);
+  await writeJson(path.join(runDir, ARTIFACTS.screenshots_index), screenshotsIndex);
+  await persistAnalysisPack(runDir, analysisPack);
+  return analysisPack;
+}
+
+async function persistRealBrowserFailure(runDir, manifest, inputConfig, processResult, roundId) {
+  const pyRunDir = await findPythonRunDir(processResult).catch(() => null);
+  const priorDiscovery = await readPriorRealBrowserDiscovery(runDir, inputConfig, manifest);
+  const preflightResult = {
+    schema_version: 'stage2_preflight_result.v3',
+    run_id: manifest.run_id,
+    execution_mode: 'real_browser',
+    status: 'failed',
+    checks: {
+      input_config: { ok: true },
+      cdp_url: { ok: true, url: inputConfig.cdp_url },
+      python_orchestrator: {
+        ok: false,
+        reason: processResult.error || processResult.stderr || processResult.failureReason,
+        failure_reason: processResult.failureReason,
+        timeout_diagnostics: processResult.timeoutDiagnostics || null
+      }
+    },
+    command: { executable: processResult.command, args: processResult.args },
+    started_at: processResult.startedAt,
+    finished_at: processResult.finishedAt
+  };
+  const { systemMap, navigationTree, pageEntries, featurePoints, menuTree, menuEntries, menuTraversalLog } = priorDiscovery;
+  const discoveryReview = makeDiscoveryReview(featurePoints);
+  const testCases = priorDiscovery.testCases || makeGeneratedTestCases(featurePoints);
+  const blockedStatus = processResult.failureReason === 'python_v3_orchestrator_timeout'
+    ? 'blocked_by_executor'
+    : 'failed';
+  const executionResults = {
+    schema_version: 'stage2_execution_results.v3',
+    items: testCases.items.map((testCase) => ({
+      test_case_id: testCase.test_case_id,
+      feature_point_id: testCase.feature_point_id || null,
+      title: testCase.title || testCase.name || testCase.test_case_id,
+      name: testCase.title || testCase.name || testCase.test_case_id,
+      status: blockedStatus,
+      verdict: blockedStatus === 'blocked_by_executor'
+        ? `真实浏览器编排超时，本用例未形成单功能点结论：${processResult.error || processResult.failureReason}`
+        : `真实浏览器执行未完成：${processResult.error || processResult.failureReason}`,
+      started_at: processResult.startedAt,
+      finished_at: processResult.finishedAt,
+      actions: [],
+      page_feedback: [],
+      screenshot_refs: [],
+      network_refs: [],
+      failure_reason: processResult.failureReason,
+      manual_confirmation_required: true,
+      execution_mode: 'real_browser'
+    }))
+  };
+  const screenshotsIndex = priorDiscovery.screenshotsIndex;
+  const analysisPack = makeRoundAnalysis({
+    manifest,
+    inputConfig,
+    pageEntries,
+    featurePoints,
+    testCases,
+    executionResults,
+    screenshotsIndex,
+    menuEntries
+  });
+  analysisPack.nextRoundPlan.current_round_id = roundId;
+  analysisPack.nextRoundPlan.decision = 'wait_human_review';
+  analysisPack.nextRoundPlan.requires_human_approval = true;
+  analysisPack.nextRoundPlan.next_round_goal = '修复真实浏览器执行环境后重新启动本轮低风险执行。';
+  analysisPack.finalMessage = processResult.error || '真实浏览器执行失败，已写入可读错误和阻塞产物。';
+  analysisPack.currentStatusExtra = {
+    failure_reason: processResult.failureReason,
+    timeout_ms: processResult.timeoutMs || null,
+    timeout_diagnostics: processResult.timeoutDiagnostics || null,
+    current_step: processResult.timeoutDiagnostics?.last_step
+      ? `Browser Use Step ${processResult.timeoutDiagnostics.last_step}`
+      : null,
+    current_target: processResult.timeoutDiagnostics?.last_goal || null
+  };
+
+  await writeJson(path.join(runDir, ARTIFACTS.python_execution), processResult);
+  await writeJson(path.join(runDir, ARTIFACTS.preflight_result), preflightResult);
+  await writeJson(path.join(runDir, ARTIFACTS.system_map), systemMap);
+  await writeJson(path.join(runDir, ARTIFACTS.navigation_tree), navigationTree);
+  await writeJson(path.join(runDir, ARTIFACTS.menu_tree), menuTree);
+  await writeJson(path.join(runDir, ARTIFACTS.menu_entries), menuEntries);
+  await fs.writeFile(path.join(runDir, ARTIFACTS.menu_traversal_log), menuTraversalLog, 'utf8');
+  await writeJson(path.join(runDir, ARTIFACTS.page_entries), pageEntries);
+  await writeJson(path.join(runDir, ARTIFACTS.feature_points), featurePoints);
+  await writeJson(path.join(runDir, ARTIFACTS.discovery_review), discoveryReview);
+  await writeJson(path.join(runDir, ARTIFACTS.generated_test_cases), testCases);
+  await writeJson(path.join(runDir, ARTIFACTS.execution_results), executionResults);
+  await writeJson(path.join(runDir, ARTIFACTS.screenshots_index), screenshotsIndex);
+  if (pyRunDir) {
+    await copyTextFileIfExists(
+      path.join(pyRunDir, 'action_log.jsonl'),
+      path.join(runDir, ARTIFACTS.action_log)
+    );
+    await copyTextFileIfExists(
+      path.join(pyRunDir, 'network_events.json'),
+      path.join(runDir, ARTIFACTS.network_events)
+    );
+  }
+  await persistAnalysisPack(runDir, analysisPack);
+  return analysisPack;
+}
+
+async function persistRealBrowserArtifacts(runDir, manifest, inputConfig, processResult, roundId, options = {}) {
+  const pyRunDir = await findPythonRunDir(processResult);
+  const sourceRealBrowser = await readPythonJson(pyRunDir, 'source_real_browser.json') || {};
+  const pythonPreflight = await readPythonJson(pyRunDir, 'preflight_result.json');
+  const menuTree = await readPythonJson(pyRunDir, 'menu_tree.json') || makeEmptyMenuArtifacts().menuTree;
+  const menuEntries = await readPythonJson(pyRunDir, 'menu_entries.json') || makeEmptyMenuArtifacts().menuEntries;
+  const pageEntries = normalizePythonPageEntries(
+    await readPythonJson(pyRunDir, 'page_entries.json') || await readPythonJson(pyRunDir, 'pages.json'),
+    inputConfig
+  );
+  const featurePoints = normalizePythonFeaturePoints(
+    await readPythonJson(pyRunDir, 'feature_points.json') || await readPythonJson(pyRunDir, 'features.json')
+  );
+  const testCases = normalizePythonTestCases(
+    await readPythonJson(pyRunDir, 'generated_test_cases.json') || await readPythonJson(pyRunDir, 'cases.json')
+  );
+  const executionResults = normalizePythonExecutionResults(
+    await readPythonJson(pyRunDir, 'execution_results.json'),
+    testCases,
+    featurePoints
+  );
+  const screenshotsIndex = await readPythonJson(pyRunDir, 'screenshots_index.json') || {
+    schema_version: 'stage2_screenshots_index.v3',
+    items: [],
+    notes: ['Python v3 本轮未返回截图索引。']
+  };
+  const discoveryReview = makeDiscoveryReview(featurePoints);
+  const { systemMap, navigationTree } = makeDiscoveryArtifacts(manifest, inputConfig);
+  const pythonNextRoundPlan = await readPythonJson(pyRunDir, 'next_round_plan.json');
+  const analysisPack = makeRoundAnalysis({
+    manifest,
+    inputConfig,
+    pageEntries,
+    featurePoints,
+    testCases,
+    executionResults,
+    screenshotsIndex,
+    menuEntries
+  });
+  analysisPack.currentStatusExtra = currentExecutionContextFromRealBrowser(sourceRealBrowser);
+  const nodeNextRoundPlan = analysisPack.nextRoundPlan;
+  analysisPack.nextRoundPlan = normalizePythonNextRoundPlan(pythonNextRoundPlan, executionResults, roundId);
+  if (nodeNextRoundPlan.should_continue) {
+    analysisPack.nextRoundPlan = {
+      ...nodeNextRoundPlan,
+      current_round_id: roundId
+    };
+  }
+  analysisPack.humanTasks = normalizePythonHumanTasks(await readPythonJson(pyRunDir, 'human_tasks.json'));
+  if (analysisPack.nextRoundPlan.requires_human_approval) {
+    const existingTaskIds = new Set(analysisPack.humanTasks.items.map((item) => item.task_id));
+    if (!existingTaskIds.has('task_connect_executor_or_confirm_plan')) {
+      analysisPack.humanTasks.items.push(...buildHumanTasks(featurePoints, executionResults, analysisPack.nextRoundPlan).items);
+    }
+  }
+  await applyAiRoundReview(analysisPack, {
+    inputConfig,
+    pageEntries,
+    featurePoints,
+    testCases,
+    executionResults,
+    screenshotsIndex,
+    menuEntries
+  }, options);
+
+  await writeJson(path.join(runDir, ARTIFACTS.python_execution), { ...processResult, pythonRunDir: pyRunDir });
+  await writeJson(path.join(runDir, ARTIFACTS.preflight_result), {
+    schema_version: 'stage2_preflight_result.v3',
+    run_id: manifest.run_id,
+    execution_mode: 'real_browser',
+    status: 'completed',
+    browser_target_count: numberOrZero(
+      pythonPreflight?.browser_target_count
+      || pythonPreflight?.checks?.raw_cdp?.target_count
+      || pythonPreflight?.checks?.browser_targets?.count
+    ),
+    python_preflight: pythonPreflight || null,
+    checks: {
+      input_config: { ok: true },
+      cdp_url: { ok: true, url: inputConfig.cdp_url },
+      python_orchestrator: { ok: true, run_dir: pyRunDir }
+    },
+    command: { executable: processResult.command, args: processResult.args },
+    started_at: processResult.startedAt,
+    finished_at: processResult.finishedAt
+  });
+  await writeJson(path.join(runDir, ARTIFACTS.system_map), systemMap);
+  await writeJson(path.join(runDir, ARTIFACTS.navigation_tree), navigationTree);
+  await writeJson(path.join(runDir, ARTIFACTS.menu_tree), menuTree);
+  await writeJson(path.join(runDir, ARTIFACTS.menu_entries), normalizeMenuEntries(menuEntries));
+  await copyTextFileIfExists(
+    path.join(pyRunDir || '', 'menu_traversal_log.jsonl'),
+    path.join(runDir, ARTIFACTS.menu_traversal_log)
+  );
+  await copyTextFileIfExists(
+    path.join(pyRunDir || '', 'page_exploration_log.jsonl'),
+    path.join(runDir, ARTIFACTS.page_exploration_log)
+  );
+  await copyTextFileIfExists(
+    path.join(pyRunDir || '', 'action_log.jsonl'),
+    path.join(runDir, ARTIFACTS.action_log)
+  );
+  await copyTextFileIfExists(
+    path.join(pyRunDir || '', 'network_events.json'),
+    path.join(runDir, ARTIFACTS.network_events)
+  );
+  await writeJson(path.join(runDir, ARTIFACTS.page_entries), pageEntries);
+  await writeJson(path.join(runDir, ARTIFACTS.feature_points), featurePoints);
+  await writeJson(path.join(runDir, ARTIFACTS.discovery_review), discoveryReview);
+  await writeJson(path.join(runDir, ARTIFACTS.generated_test_cases), testCases);
+  await writeJson(path.join(runDir, ARTIFACTS.execution_results), executionResults);
+  await writeJson(path.join(runDir, ARTIFACTS.screenshots_index), screenshotsIndex);
+  await copyTextFileIfExists(path.join(pyRunDir || '', 'report.md'), path.join(runDir, ARTIFACTS.run_report_md));
+  await persistAnalysisPack(runDir, analysisPack);
+  return analysisPack;
+}
+
+async function startV3Run(runId, body = {}, options = {}) {
+  const { runDir, manifest } = await readManifest(runId, options);
+  const inputConfig = await readJsonRequired(path.join(runDir, ARTIFACTS.input_config), 'input_config 缺失。');
+  const executionMode = normalizeExecutionMode(body.executionMode || body.execution_mode || options.executionMode);
+  const roundId = body.roundId || body.round_id || manifest.current_round_id || 'round_001';
+  const startedAt = nowIso();
+  const nextRound = {
+    round_id: roundId,
+    goal: normalizeText(body.goal || body.roundGoal, '首轮 v3 自动发现与低风险用例生成'),
+    started_at: startedAt,
+    finished_at: null,
+    input_artifacts: ['input_config'],
+    output_artifacts: [],
+    status: 'running'
+  };
+  let runningManifest = {
+    ...manifest,
+    status: 'running',
+    execution_mode: executionMode,
+    started_at: manifest.started_at || startedAt,
+    updated_at: startedAt,
+    current_round_id: roundId,
+    rounds: [...(manifest.rounds || []).filter((item) => item.round_id !== roundId), nextRound]
+  };
+  runningManifest = await saveManifest(runDir, runningManifest);
+  await writeJson(path.join(runDir, ARTIFACTS.current_status), buildCurrentStatus(
+    runningManifest,
+    executionMode === 'real_browser' ? 'real_browser_execution' : 'running_contract_pipeline',
+    executionMode === 'real_browser'
+      ? (roundId === 'round_001'
+        ? '正在使用 Playwright 遍历第 1 轮菜单入口树。'
+        : '正在使用 Playwright 进入页面/功能点详细测试；必要时将由 Browser Use 接管。')
+      : '正在生成 v3 run 稳定产物契约，本轮不会执行真实浏览器。',
+    {
+      execution_mode: executionMode,
+      current_executor: executionMode === 'real_browser' ? 'Playwright' : 'contract_only',
+      current_skill: executionMode === 'real_browser' ? 'Playwright' : 'contract_only',
+      current_step: roundId === 'round_001' ? '菜单入口遍历' : '页面/功能点详细测试'
+    }
+  ));
+  await appendEvent(runDir, { type: 'run_started', run_id: runId, round_id: roundId, execution_mode: executionMode });
+
+  let analysisPack;
+  let executionFailed = false;
+  if (executionMode === 'contract_only') {
+    analysisPack = await persistContractOnlyArtifacts(runDir, runningManifest, inputConfig, executionMode, options);
+  } else {
+    const selectedModelIds = inputConfig.selected_model_profile_ids || [];
+    const processResult = selectedModelIds.length > 1
+      ? await runSequentialModelAttempts({
+        runId,
+        runsDir: getRunsDir(options),
+        runDir,
+        inputConfig,
+        body,
+        roundId
+      }, options)
+      : await runPythonV3Orchestrator({
+        runId,
+        runsDir: getRunsDir(options),
+        runDir,
+        inputConfig,
+        body,
+        roundId,
+        modelProfileId: selectedModelIds[0] || null
+      }, options);
+    if (processResult.ok) {
+      analysisPack = await persistRealBrowserArtifacts(runDir, runningManifest, inputConfig, processResult, roundId, options);
+    } else {
+      executionFailed = true;
+      analysisPack = await persistRealBrowserFailure(runDir, runningManifest, inputConfig, processResult, roundId);
+    }
+  }
+
+  const completedRound = {
+    ...nextRound,
+    finished_at: nowIso(),
+    output_artifacts: [
+      'preflight_result',
+      'system_map',
+      'navigation_tree',
+      'menu_tree',
+      'menu_entries',
+      'menu_traversal_log',
+      'page_entries',
+      'feature_points',
+      'discovery_review',
+      'generated_test_cases',
+      'execution_results',
+      'round_analysis',
+      'next_round_plan',
+      'human_tasks'
+    ],
+    status: executionFailed
+      ? 'failed'
+      : analysisPack.nextRoundPlan.requires_human_approval ? 'waiting_human' : 'completed'
+  };
+  const finalStatus = executionFailed
+    ? 'failed'
+    : analysisPack.nextRoundPlan.requires_human_approval ? 'waiting_human' : 'completed';
+  const roundName = roundDisplayName(roundId);
+  const finalMessage = executionFailed
+    ? (analysisPack.finalMessage || '真实浏览器执行失败，已写入可读错误和阻塞产物。')
+    : analysisPack.nextRoundPlan.requires_human_approval
+      ? `${roundName}产物已生成，等待运行中心人工确认下一步。`
+      : `${roundName}真实浏览器执行产物已生成。`;
+  const finalManifest = await updateRunStatus(
+    runDir,
+    {
+      ...runningManifest,
+      rounds: [...(runningManifest.rounds || []).filter((item) => item.round_id !== roundId), completedRound]
+    },
+    finalStatus,
+    executionFailed ? 'real_browser_execution_failed' : 'round_analysis',
+    finalMessage,
+    {
+      decision: analysisPack.nextRoundPlan.decision,
+      execution_mode: executionMode,
+      ...(analysisPack.currentStatusExtra || {})
+    }
+  );
+
+  const run = buildPublicRun(runDir, finalManifest, await loadRunArtifacts(runDir));
+  return { run, operation: makeOperationFeedback('start', run) };
+}
+
+async function persistAnalysisPack(runDir, analysisPack) {
+  await writeJson(path.join(runDir, ARTIFACTS.round_analysis), analysisPack.analysis);
+  await writeJson(path.join(runDir, ARTIFACTS.failure_clusters), analysisPack.failureClusters);
+  await writeJson(path.join(runDir, ARTIFACTS.improvement_candidates), analysisPack.improvementCandidates);
+  await writeJson(path.join(runDir, ARTIFACTS.next_round_plan), analysisPack.nextRoundPlan);
+  await writeJson(path.join(runDir, ARTIFACTS.human_tasks), analysisPack.humanTasks);
+  await writeJson(path.join(runDir, ARTIFACTS.failure_summary), makeFailureSummary(analysisPack.failureClusters));
+  const manifest = await readJsonIfExists(path.join(runDir, ARTIFACTS.run_manifest)) || {};
+  await writeJson(path.join(runDir, ARTIFACTS.promotion_candidates), makePromotionCandidates({
+    manifest,
+    pageEntries: await readJsonIfExists(path.join(runDir, ARTIFACTS.page_entries)) || { items: [] },
+    featurePoints: await readJsonIfExists(path.join(runDir, ARTIFACTS.feature_points)) || { items: [] },
+    testCases: await readJsonIfExists(path.join(runDir, ARTIFACTS.generated_test_cases)) || { items: [] },
+    executionResults: await readJsonIfExists(path.join(runDir, ARTIFACTS.execution_results)) || { items: [] },
+    roundAnalysis: analysisPack.analysis
+  }));
+}
+
+const AI_EVIDENCE_SAMPLE_LIMIT = 8;
+const AI_EVIDENCE_ISSUE_LIMIT = 12;
+
+function compactText(value, limit = 180) {
+  const text = normalizeOptionalText(value);
+  if (!text) {
+    return null;
+  }
+  return text.length > limit ? `${text.slice(0, limit)}...` : text;
+}
+
+function compactArray(values, limit = 3, mapper = (item) => item) {
+  return Array.isArray(values)
+    ? values.slice(0, limit).map(mapper).filter((item) => item !== null && item !== undefined)
+    : [];
+}
+
+function compactInputConfigForAi(inputConfig = {}) {
+  return {
+    system_name: inputConfig.system_name || null,
+    entry_url: inputConfig.entry_url || null,
+    execution_mode: inputConfig.execution_mode || null,
+    safety_policy: inputConfig.safety_policy || null,
+    prioritized_targets: compactArray(inputConfig.prioritized_targets, 10, (item) => compactText(item, 80)),
+    waived_targets: compactArray(inputConfig.waived_targets, 10, (item) => compactText(item, 80)),
+    selected_model_profile_ids: compactArray(inputConfig.selected_model_profile_ids, 5, (item) => compactText(item, 80)),
+    max_pages: inputConfig.max_pages || null,
+    max_features_per_page: inputConfig.max_features_per_page || null
+  };
+}
+
+function compactPageEntryForAi(item = {}) {
+  return {
+    page_entry_id: item.page_entry_id || item.id || null,
+    name: compactText(item.name || item.title || item.text, 100),
+    url: compactText(item.url || item.route_hint, 160),
+    menu_path: compactArray(item.menu_path, 5, (part) => compactText(part, 60)),
+    page_type: item.page_type || null,
+    status: item.status || null,
+    source: item.source || null,
+    failure_reason: compactText(item.failure_reason, 120),
+    screenshot_refs: compactArray(item.screenshot_refs, 3, (ref) => compactText(ref, 120))
+  };
+}
+
+function compactFeaturePointForAi(item = {}) {
+  return {
+    feature_point_id: item.feature_point_id || item.feature_id || item.id || null,
+    page_entry_id: item.page_entry_id || null,
+    name: compactText(item.name || item.title || item.text, 100),
+    feature_type: item.feature_type || item.type_template || null,
+    risk_level: item.risk_level || null,
+    auto_verifiable: item.auto_verifiable,
+    verification_strategy: compactText(item.verification_strategy, 120),
+    source: item.source || null,
+    confidence: item.confidence ?? null,
+    review_status: item.review_status || null
+  };
+}
+
+function compactTestCaseForAi(item = {}) {
+  return {
+    test_case_id: item.test_case_id || item.case_id || null,
+    feature_point_id: item.feature_point_id || item.feature_id || null,
+    title: compactText(item.title || item.name, 120),
+    type_template: item.type_template || null,
+    risk_policy: item.risk_policy || null,
+    step_count: Array.isArray(item.steps) ? item.steps.length : 0,
+    expected_feedback_count: Array.isArray(item.expected_feedback) ? item.expected_feedback.length : 0,
+    assertion_count: Array.isArray(item.assertions) ? item.assertions.length : 0,
+    requires_human_confirmation: Boolean(item.requires_human_confirmation)
+  };
+}
+
+function compactExecutionResultForAi(item = {}) {
+  return {
+    test_case_id: item.test_case_id || item.case_id || null,
+    feature_point_id: item.feature_point_id || item.feature_id || null,
+    title: compactText(item.title || item.name, 120),
+    status: item.status || 'unknown',
+    verdict: compactText(item.verdict || item.message, 160),
+    execution_mode: item.execution_mode || null,
+    action_count: Array.isArray(item.actions) ? item.actions.length : 0,
+    page_feedback: compactArray(item.page_feedback, 3, (feedback) => compactText(feedback, 120)),
+    screenshot_refs: compactArray(item.screenshot_refs, 4, (ref) => compactText(ref, 120)),
+    network_ref_count: Array.isArray(item.network_refs) ? item.network_refs.length : 0,
+    failure_reason: compactText(item.failure_reason, 120),
+    manual_confirmation_required: Boolean(item.manual_confirmation_required)
+  };
+}
+
+function compactMenuEntryForAi(item = {}) {
+  return {
+    menu_id: item.menu_id || item.menu_entry_id || item.id || null,
+    text: compactText(item.text || item.name || item.title, 100),
+    level: item.level ?? null,
+    parent_id: item.parent_id || null,
+    menu_path: compactArray(item.menu_path, 5, (part) => compactText(part, 60)),
+    is_leaf: Boolean(item.is_leaf),
+    status: item.status || null,
+    route_hint: compactText(item.route_hint || item.url_after || item.url, 160),
+    failure_reason: compactText(item.failure_reason, 120),
+    screenshot_refs: compactArray(item.screenshot_refs, 3, (ref) => compactText(ref, 120))
+  };
+}
+
+function compactScreenshotForAi(item = {}) {
+  return {
+    screenshot_id: item.screenshot_id || item.id || null,
+    label: compactText(item.label || item.name || item.stage, 120),
+    path: compactText(item.path || item.relative_path || item.file, 160)
+  };
+}
+
+function compactDraftAnalysisForAi(draftAnalysis = {}) {
+  return {
+    schema_version: draftAnalysis.schema_version || null,
+    round_id: draftAnalysis.round_id || null,
+    goal: compactText(draftAnalysis.goal, 200),
+    coverage_summary: draftAnalysis.coverage_summary || {},
+    failure_summary: draftAnalysis.failure_summary || {},
+    not_executed_reasons: compactArray(draftAnalysis.not_executed_reasons, 10, (item) => compactText(item, 100)),
+    evidence_quality: draftAnalysis.evidence_quality || {},
+    human_tasks: compactArray(draftAnalysis.human_tasks, 10, (item) => compactText(item, 100)),
+    improvement_candidates: compactArray(draftAnalysis.improvement_candidates, 10, (item) => ({
+      candidate_id: item.candidate_id || null,
+      scope: item.scope || null,
+      title: compactText(item.title, 140),
+      confidence: item.confidence ?? null,
+      evidence_refs: compactArray(item.evidence_refs, 6, (ref) => compactText(ref, 80))
+    })),
+    scope_targets: compactArray(draftAnalysis.scope_targets, 10, (item) => compactText(item, 100)),
+    missing_scope_targets: compactArray(draftAnalysis.missing_scope_targets, 10, (item) => compactText(item, 100)),
+    uncovered_scope_targets: compactArray(draftAnalysis.uncovered_scope_targets, 10, (item) => compactText(item, 100)),
+    target_tracking: compactArray(draftAnalysis.target_tracking, 10, (item) => ({
+      target: compactText(item.target, 100),
+      status: item.status || null,
+      waived: Boolean(item.waived),
+      evidence_quality: item.evidence_quality || null,
+      missed_reason: compactText(item.missed_reason, 120)
+    })),
+    count_explanation: draftAnalysis.count_explanation || {},
+    confidence: draftAnalysis.confidence ?? null
+  };
+}
+
+function summarizeFailureGroupsForAi(executionItems = []) {
+  const groups = new Map();
+  for (const item of executionItems) {
+    const status = item.status || 'unknown';
+    const reason = item.failure_reason || (
+      ['passed', 'real_passed', 'side_effect_executed'].includes(status)
+        ? null
+        : status
+    );
+    if (!reason && !item.manual_confirmation_required) {
+      continue;
+    }
+    const key = reason || 'manual_confirmation_required';
+    const group = groups.get(key) || {
+      reason: key,
+      count: 0,
+      statuses: {},
+      test_case_ids: [],
+      feature_point_ids: []
+    };
+    group.count += 1;
+    group.statuses[status] = (group.statuses[status] || 0) + 1;
+    if (group.test_case_ids.length < 8 && item.test_case_id) {
+      group.test_case_ids.push(item.test_case_id);
+    }
+    if (group.feature_point_ids.length < 8 && (item.feature_point_id || item.feature_id)) {
+      group.feature_point_ids.push(item.feature_point_id || item.feature_id);
+    }
+    groups.set(key, group);
+  }
+  return [...groups.values()]
+    .sort((a, b) => b.count - a.count)
+    .slice(0, AI_EVIDENCE_ISSUE_LIMIT);
+}
+
+function pickExecutionSamplesForAi(executionItems = []) {
+  const priority = executionItems.filter((item) => {
+    const status = item.status || '';
+    return item.failure_reason
+      || item.manual_confirmation_required
+      || /failed|skipped|blocked|review|timeout|error/i.test(status);
+  });
+  const seen = new Set();
+  return priority.concat(executionItems)
+    .filter((item) => {
+      const id = item.test_case_id || item.case_id || `${item.feature_point_id || ''}:${item.title || item.name || ''}`;
+      if (seen.has(id)) {
+        return false;
+      }
+      seen.add(id);
+      return true;
+    })
+    .slice(0, AI_EVIDENCE_SAMPLE_LIMIT)
+    .map(compactExecutionResultForAi);
+}
+
+function buildAiEvidenceBundle({ inputConfig, pageEntries, featurePoints, testCases, executionResults, screenshotsIndex, menuEntries }) {
+  const pageEntryItems = pageEntries.items || [];
+  const featureItems = featurePoints.items || [];
+  const testCaseItems = testCases.items || [];
+  const executionItems = executionResults.items || [];
+  const screenshotItems = screenshotsIndex.items || screenshotsIndex.screenshots || [];
+  const menuEntryItems = artifactItems(menuEntries, 'items', 'menu_entries');
+  return {
+    evidence_summary: {
+      input_config: compactInputConfigForAi(inputConfig),
+      counts: {
+        page_entries: pageEntryItems.length,
+        feature_points: featureItems.length,
+        generated_test_cases: testCaseItems.length,
+        execution_results: executionItems.length,
+        screenshots: screenshotItems.length,
+        menu_entries: menuEntryItems.length
+      },
+      execution: summarizeExecution(executionItems),
+      failure_groups: summarizeFailureGroupsForAi(executionItems)
+    },
+    page_entries: pageEntryItems.slice(0, AI_EVIDENCE_SAMPLE_LIMIT).map(compactPageEntryForAi),
+    feature_points: featureItems.slice(0, AI_EVIDENCE_SAMPLE_LIMIT).map(compactFeaturePointForAi),
+    generated_test_cases: testCaseItems.slice(0, AI_EVIDENCE_SAMPLE_LIMIT).map(compactTestCaseForAi),
+    execution_results: pickExecutionSamplesForAi(executionItems),
+    screenshots: screenshotItems.slice(0, AI_EVIDENCE_SAMPLE_LIMIT).map(compactScreenshotForAi),
+    menu_entries: menuEntryItems.slice(0, AI_EVIDENCE_SAMPLE_LIMIT).map(compactMenuEntryForAi),
+    artifact_refs: [
+      { key: 'input_config', artifact: 'input_config.json' },
+      { key: 'page_entries', artifact: 'page_entries.json' },
+      { key: 'feature_points', artifact: 'feature_points.json' },
+      { key: 'generated_test_cases', artifact: 'generated_test_cases.json' },
+      { key: 'execution_results', artifact: 'execution_results.json' },
+      { key: 'screenshots_index', artifact: 'screenshots_index.json' },
+      { key: 'menu_entries', artifact: 'menu_entries.json' },
+      { key: 'page_exploration_log', artifact: 'page_exploration_log.jsonl' }
+    ],
+    allowed_evidence_refs: [
+      'input_config',
+      'page_entries',
+      'feature_points',
+      'generated_test_cases',
+      'execution_results',
+      'screenshots_index',
+      'menu_entries',
+      'page_exploration_log'
+    ]
+  };
+}
+
+function selectedAiReviewProfile(inputConfig = {}, options = {}) {
+  const selectedIds = inputConfig.selected_model_profile_ids || [];
+  if (!selectedIds.length) {
+    return null;
+  }
+  const selectedId = selectedIds[0];
+  const persistedProfiles = inputConfig.selected_model_profiles || [];
+  const persisted = persistedProfiles.find((profile) => profile.id === selectedId) || {};
+  const configuredProfiles = options.modelProfiles || loadStage2ModelProfiles(options).profiles;
+  const configured = (configuredProfiles || []).find((profile) => profile.id === selectedId) || {};
+  const profile = {
+    ...persisted,
+    ...configured,
+    id: selectedId,
+    label: configured.label || persisted.label || selectedId,
+    provider: configured.provider || persisted.provider || 'openai_compatible',
+    baseUrl: configured.baseUrl || persisted.baseUrl || persisted.base_url || '',
+    model: configured.model || persisted.model || selectedId,
+    browserUseMode: configured.browserUseMode || persisted.browserUseMode || persisted.browser_use_mode || null
+  };
+  if (options.aiReviewRunner || (profile.provider === 'openai_compatible' && profile.baseUrl && profile.model)) {
+    return profile;
+  }
+  return null;
+}
+
+function parseJsonObjectFromText(text) {
+  const raw = String(text || '').trim();
+  if (!raw) {
+    return null;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    const candidate = fenced ? fenced[1] : raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1);
+    if (!candidate) {
+      return null;
+    }
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      return null;
+    }
+  }
+}
+
+async function defaultAiReviewRunner({ modelProfile, evidenceBundle, draftAnalysis, draftNextRoundPlan }) {
+  if (modelProfile.provider !== 'openai_compatible' || !modelProfile.baseUrl) {
+    throw new Error('当前仅支持 OpenAI-compatible AI 复盘模型。');
+  }
+  const endpoint = new URL('chat/completions', `${modelProfile.baseUrl.replace(/\/$/, '')}/`).toString();
+  const headers = { 'Content-Type': 'application/json' };
+  if (modelProfile.apiKey) {
+    headers.Authorization = `Bearer ${modelProfile.apiKey}`;
+  }
+  const timeoutMs = normalizeInteger(process.env.STAGE2_AI_REVIEW_TIMEOUT_MS, 60000, 1000, 10 * 60 * 1000);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let response;
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      signal: controller.signal,
+      headers,
+      body: JSON.stringify({
+        model: modelProfile.model,
+        temperature: 0,
+        response_format: { type: 'json_object' },
+        messages: [{
+          role: 'system',
+          content: '你是第二阶段自动化评测运行中心的复盘模型。只输出 JSON，不要输出 Markdown。'
+        }, {
+          role: 'user',
+          content: JSON.stringify({
+            task: '基于证据复盘本轮探索和执行结果，给出改进候选、经验沉淀和下一轮建议。',
+            required_json_shape: {
+              analysis_mode: 'ai_assisted_review',
+              confidence: 0.0,
+              coverage_summary: {},
+              failure_summary: {},
+              evidence_quality: {},
+              improvement_candidates: [{
+                candidate_id: 'string',
+                title: 'string',
+                evidence_refs: ['execution_results']
+              }],
+              learned_rules: ['string'],
+              next_round_recommendations: ['string']
+            },
+            evidence_bundle: evidenceBundle,
+            draft_analysis: compactDraftAnalysisForAi(draftAnalysis),
+            draft_next_round_plan: draftNextRoundPlan
+          })
+        }]
+      })
+    });
+    if (!response.ok) {
+      throw new Error(`AI 复盘模型返回 HTTP ${response.status}`);
+    }
+  } catch (error) {
+    throw new Error(
+      error.name === 'AbortError'
+        ? `AI 复盘模型调用超时：${timeoutMs}ms`
+        : formatErrorWithCause(error)
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+  const payload = await response.json().catch(() => ({}));
+  const content = payload.choices?.[0]?.message?.content || '';
+  const parsed = parseJsonObjectFromText(content);
+  if (!parsed) {
+    throw new Error('AI 复盘模型没有返回可解析 JSON。');
+  }
+  return parsed;
+}
+
+function validateAiReviewPayload(payload) {
+  return Boolean(
+    payload
+      && typeof payload === 'object'
+      && Array.isArray(payload.improvement_candidates)
+      && payload.improvement_candidates.every((item) => item && typeof item === 'object' && item.candidate_id && item.title)
+  );
+}
+
+function bindAiEvidenceToCandidates(candidates = [], allowedRefs = []) {
+  const allowed = new Set(allowedRefs);
+  return candidates.map((candidate) => {
+    const refs = Array.isArray(candidate.evidence_refs)
+      ? candidate.evidence_refs.filter((ref) => allowed.has(ref))
+      : [];
+    const evidenceBound = refs.length > 0;
+    return {
+      ...candidate,
+      evidence_refs: refs,
+      review_status: evidenceBound ? 'evidence_bound' : 'needs_evidence',
+      blocks_next_round: evidenceBound ? Boolean(candidate.blocks_next_round) : true
+    };
+  });
+}
+
+async function applyAiRoundReview(analysisPack, context, options = {}) {
+  const modelProfile = selectedAiReviewProfile(context.inputConfig, options);
+  const runner = typeof options.aiReviewRunner === 'function'
+    ? options.aiReviewRunner
+    : defaultAiReviewRunner;
+  if (!modelProfile) {
+    analysisPack.analysis.ai_provider_status = 'model_unavailable';
+    analysisPack.analysis.review_errors = [{
+      code: 'model_unavailable',
+      message: '未选择可用于 AI 复盘的模型 profile 或未配置 AI review runner，已使用规则复盘。'
+    }];
+    return analysisPack;
+  }
+
+  const evidenceBundle = buildAiEvidenceBundle(context);
+  let payload = null;
+  try {
+    payload = await runner({
+      modelProfile,
+      evidenceBundle,
+      draftAnalysis: analysisPack.analysis,
+      draftNextRoundPlan: analysisPack.nextRoundPlan
+    });
+  } catch (error) {
+    analysisPack.analysis.ai_provider_status = 'ai_review_failed';
+    analysisPack.analysis.review_errors = [{
+      code: 'ai_review_failed',
+      message: formatErrorWithCause(error)
+    }];
+    return analysisPack;
+  }
+  if (!validateAiReviewPayload(payload)) {
+    analysisPack.analysis.ai_provider_status = 'invalid_ai_output';
+    analysisPack.analysis.review_errors = [{
+      code: 'invalid_ai_output',
+      message: 'AI 复盘输出不符合结构化 schema，已使用规则复盘。'
+    }];
+    return analysisPack;
+  }
+
+  const candidates = bindAiEvidenceToCandidates(
+    payload.improvement_candidates,
+    evidenceBundle.allowed_evidence_refs
+  );
+  analysisPack.analysis = {
+    ...analysisPack.analysis,
+    ...payload,
+    schema_version: analysisPack.analysis.schema_version,
+    round_id: analysisPack.analysis.round_id,
+    analysis_mode: payload.analysis_mode || 'ai_assisted_review',
+    ai_provider_status: 'completed',
+    model_profile: redactModelProfile(modelProfile),
+    model_profile_id: modelProfile.id,
+    evidence_quality: payload.evidence_quality || analysisPack.analysis.evidence_quality,
+    coverage_summary: payload.coverage_summary || analysisPack.analysis.coverage_summary,
+    failure_summary: payload.failure_summary || analysisPack.analysis.failure_summary,
+    improvement_candidates: candidates,
+    learned_rules: Array.isArray(payload.learned_rules) ? payload.learned_rules : [],
+    next_round_recommendations: Array.isArray(payload.next_round_recommendations)
+      ? payload.next_round_recommendations
+      : [],
+    review_errors: []
+  };
+  analysisPack.nextRoundPlan = {
+    ...analysisPack.nextRoundPlan,
+    planned_improvements: candidates,
+    ai_review_status: 'completed'
+  };
+  return analysisPack;
+}
+
+async function isHumanApprovalSatisfied(runDir) {
+  const humanTasks = await readJsonIfExists(path.join(runDir, ARTIFACTS.human_tasks));
+  const items = Array.isArray(humanTasks?.items) ? humanTasks.items : [];
+  return items.length > 0 && items.every((item) => ['completed', 'approved', 'resolved'].includes(item.status));
+}
+
+async function setV3RunLifecycleStatus(runId, action, body = {}, options = {}) {
+  const { runDir, manifest } = await readManifest(runId, options);
+  const statusByAction = {
+    pause: 'paused',
+    resume: 'running',
+    stop: 'stopped'
+  };
+  const status = statusByAction[action];
+  if (!status) {
+    throw new Stage2V3InputError('不支持的 run 状态操作。');
+  }
+  const messageByAction = {
+    pause: 'run 已暂停。',
+    resume: 'run 已恢复，等待执行器继续推进。',
+    stop: 'run 已停止。'
+  };
+  const nextManifest = {
+    ...manifest,
+    finished_at: action === 'stop' ? nowIso() : manifest.finished_at
+  };
+  const saved = await updateRunStatus(
+    runDir,
+    nextManifest,
+    status,
+    action,
+    normalizeText(body.note, messageByAction[action]),
+    { operator_id: normalizeOptionalText(body.operatorId || body.operator_id) }
+  );
+  const run = buildPublicRun(runDir, saved, await loadRunArtifacts(runDir));
+  return { run, operation: makeOperationFeedback(action, run) };
+}
+
+async function analyzeV3Run(runId, options = {}) {
+  const { runDir, manifest } = await readManifest(runId, options);
+  const inputConfig = await readJsonIfExists(path.join(runDir, ARTIFACTS.input_config)) || {};
+  const pageEntries = await readJsonRequired(path.join(runDir, ARTIFACTS.page_entries), 'page_entries 缺失，不能复盘。');
+  const featurePoints = await readJsonRequired(path.join(runDir, ARTIFACTS.feature_points), 'feature_points 缺失，不能复盘。');
+  const testCases = await readJsonRequired(path.join(runDir, ARTIFACTS.generated_test_cases), 'generated_test_cases 缺失，不能复盘。');
+  const executionResults = await readJsonRequired(path.join(runDir, ARTIFACTS.execution_results), 'execution_results 缺失，不能复盘。');
+  const screenshotsIndex = await readJsonIfExists(path.join(runDir, ARTIFACTS.screenshots_index)) || makeScreenshotsIndex();
+  const menuEntries = await readJsonIfExists(path.join(runDir, ARTIFACTS.menu_entries)) || makeEmptyMenuArtifacts().menuEntries;
+
+  const analysisPack = makeRoundAnalysis({
+    manifest,
+    inputConfig,
+    pageEntries,
+    featurePoints,
+    testCases,
+    executionResults,
+    screenshotsIndex,
+    menuEntries
+  });
+  await applyAiRoundReview(analysisPack, {
+    inputConfig,
+    pageEntries,
+    featurePoints,
+    testCases,
+    executionResults,
+    screenshotsIndex,
+    menuEntries
+  }, options);
+  await persistAnalysisPack(runDir, analysisPack);
+  const aiAssisted = analysisPack.analysis.analysis_mode === 'ai_assisted_review'
+    && analysisPack.analysis.ai_provider_status === 'completed';
+  const aiReviewErrorMessage = !aiAssisted
+    ? normalizeOptionalText((analysisPack.analysis.review_errors || [])[0]?.message)
+    : '';
+  const saved = await updateRunStatus(
+    runDir,
+    manifest,
+    analysisPack.nextRoundPlan.requires_human_approval ? 'waiting_human' : 'completed',
+    aiAssisted ? 'ai_round_analysis' : 'rule_round_analysis',
+    aiAssisted
+      ? 'AI 复盘产物已生成，并已绑定支持证据。'
+      : `规则复盘产物已生成；AI 复盘不可用或已降级${aiReviewErrorMessage ? `：${aiReviewErrorMessage}` : '。'}`,
+    { decision: analysisPack.nextRoundPlan.decision }
+  );
+  const run = buildPublicRun(runDir, saved, await loadRunArtifacts(runDir));
+  return {
+    run,
+    operation: makeOperationFeedback('analyze_round', run),
+    roundAnalysis: analysisPack.analysis,
+    nextRoundPlan: analysisPack.nextRoundPlan,
+    humanTasks: analysisPack.humanTasks
+  };
+}
+
+async function saveHumanTaskResult(runId, body = {}, options = {}) {
+  const { runDir, manifest } = await readManifest(runId, options);
+  const taskId = ensureSafeId(body.taskId || body.task_id, 'taskId');
+  const humanTasksPath = path.join(runDir, ARTIFACTS.human_tasks);
+  const humanTasks = await readJsonIfExists(humanTasksPath) || { schema_version: 'stage2_human_tasks.v3', items: [] };
+  const taskIndex = (humanTasks.items || []).findIndex((item) => item.task_id === taskId);
+  if (taskIndex === -1) {
+    throw new Stage2V3InputError('人工任务不存在。', 404);
+  }
+  const resultDir = path.join(runDir, 'human_task_results');
+  const resultPath = path.join(resultDir, `${taskId}.json`);
+  const resultPayload = {
+    schema_version: 'stage2_human_task_result.v3',
+    task_id: taskId,
+    status: normalizeText(body.status, 'completed'),
+    operator_id: normalizeOptionalText(body.operatorId || body.operator_id),
+    note: normalizeOptionalText(body.note),
+    result: body.result && typeof body.result === 'object' ? body.result : {},
+    submitted_at: nowIso()
+  };
+  await writeJson(resultPath, resultPayload);
+  const nextItems = [...humanTasks.items];
+  nextItems[taskIndex] = {
+    ...nextItems[taskIndex],
+    status: resultPayload.status,
+    result_artifact: relativeArtifact(resultPath),
+    completed_at: resultPayload.submitted_at
+  };
+  const nextHumanTasks = { ...humanTasks, items: nextItems };
+  await writeJson(humanTasksPath, nextHumanTasks);
+  const pending = nextHumanTasks.items.filter((item) => item.status === 'pending').length;
+  const saved = await updateRunStatus(
+    runDir,
+    manifest,
+    pending ? manifest.status : 'ready_for_next_round',
+    'human_task_saved',
+    pending ? '人工任务结果已保存，仍有待处理任务。' : '人工任务已处理完毕，可继续下一轮。',
+    { pending_human_tasks: pending }
+  );
+  const run = buildPublicRun(runDir, saved, await loadRunArtifacts(runDir));
+  return { run, operation: makeOperationFeedback('save_human_task', run), humanTasks: nextHumanTasks };
+}
+
+const NEXT_ROUND_BLOCKERS = {
+  human_approval_required: {
+    message: '下一轮计划需要人工批准后才能继续。',
+    remediation: '请在运行中心完成人工确认或审核任务后继续。'
+  },
+  executor_unavailable: {
+    message: '执行器不可用，无法启动下一轮真实执行。',
+    remediation: '请检查后端 Python 执行器、运行中心服务和 Python 依赖后重试。'
+  },
+  browser_use_unavailable: {
+    message: 'Browser-use 能力不可用，无法执行智能浏览探索。',
+    remediation: '请安装或启用 Browser-use 相关依赖，或切换到可用模型/执行模式后重试。'
+  },
+  playwright_disconnected: {
+    message: 'Playwright/CDP 未连接，无法驱动真实浏览器。',
+    remediation: '请确认 Chrome 以 9222 调试端口启动、CDP URL 可访问，并保持已登录页面打开。'
+  },
+  model_unavailable: {
+    message: '所选大模型不可用，无法完成下一轮智能分析或报告生成。',
+    remediation: '请在运行中心刷新大模型预检，改选可用模型后重试。'
+  },
+  budget_exhausted: {
+    message: '下一轮预算或轮次上限已用尽。',
+    remediation: '请提高最大轮次/预算，或生成当前报告后创建新的更大范围 run。',
+    terminal: true
+  },
+  no_improvement: {
+    message: '复盘判断继续执行没有新增改进收益。',
+    remediation: '请查看改进候选；如仍需探索，请调整优先目标或扩大探索范围后新建 run。',
+    terminal: true
+  },
+  goal_completed: {
+    message: '当前目标已完成，无需进入下一轮；可生成报告或创建新的更大范围 run。',
+    remediation: '请生成报告，或创建新的更大范围 run。',
+    terminal: true
+  }
+};
+
+function normalizeNextRoundBlockerCode(value) {
+  const code = String(value || '').trim();
+  const aliases = {
+    human_review_required: 'human_approval_required',
+    wait_human_review: 'human_approval_required',
+    python_executor_unavailable: 'executor_unavailable',
+    python_unavailable: 'executor_unavailable',
+    browser_unavailable: 'playwright_disconnected',
+    cdp_unavailable: 'playwright_disconnected',
+    cdp_connect_failed: 'playwright_disconnected',
+    playwright_missing: 'playwright_disconnected',
+    stop_budget_exhausted: 'budget_exhausted',
+    resource_budget_exhausted: 'budget_exhausted',
+    stop_no_improvement: 'no_improvement',
+    stop_goal_completed: 'goal_completed'
+  };
+  return aliases[code] || code;
+}
+
+function firstPlanBlockerCode(nextRoundPlan = {}) {
+  const blockers = nextRoundPlan.prerequisite_blockers
+    || nextRoundPlan.prerequisiteBlockers
+    || nextRoundPlan.blockers
+    || [];
+  const first = Array.isArray(blockers) ? blockers[0] : blockers;
+  return normalizeNextRoundBlockerCode(
+    first?.code
+      || first?.reason
+      || nextRoundPlan.blocker_code
+      || nextRoundPlan.blockerCode
+  );
+}
+
+function makeNextRoundBlocker(code, nextRoundPlan = {}) {
+  const normalized = normalizeNextRoundBlockerCode(code);
+  const spec = NEXT_ROUND_BLOCKERS[normalized];
+  if (!spec) {
+    return null;
+  }
+  return {
+    code: normalized,
+    message: nextRoundPlan.blocker_message || nextRoundPlan.blockerMessage || spec.message,
+    remediation: nextRoundPlan.remediation_hint || nextRoundPlan.remediationHint || spec.remediation,
+    terminal: Boolean(spec.terminal)
+  };
+}
+
+function resolveNextRoundBlocker(nextRoundPlan = {}, { approved = false } = {}) {
+  const explicitBlocker = makeNextRoundBlocker(firstPlanBlockerCode(nextRoundPlan), nextRoundPlan);
+  if (explicitBlocker) {
+    return explicitBlocker;
+  }
+  if (nextRoundPlan.requires_human_approval && !approved) {
+    return makeNextRoundBlocker('human_approval_required', nextRoundPlan);
+  }
+  if (nextRoundPlan.decision === 'wait_human_review' && !approved) {
+    return makeNextRoundBlocker('human_approval_required', nextRoundPlan);
+  }
+  if (nextRoundPlan.decision === 'stop_budget_exhausted') {
+    return makeNextRoundBlocker('budget_exhausted', nextRoundPlan);
+  }
+  if (nextRoundPlan.decision === 'stop_no_improvement') {
+    return makeNextRoundBlocker('no_improvement', nextRoundPlan);
+  }
+  if (nextRoundPlan.decision === 'stop_goal_completed') {
+    return makeNextRoundBlocker('goal_completed', nextRoundPlan);
+  }
+  return null;
+}
+
+async function refreshStaleCompletedNextRoundPlan(runDir, manifest, inputConfig, nextRoundPlan) {
+  if (nextRoundPlan?.decision !== 'stop_goal_completed' || nextRoundPlan?.should_continue !== false) {
+    return nextRoundPlan;
+  }
+  const artifacts = await loadRunArtifacts(runDir);
+  const refreshed = makeRoundAnalysis({
+    manifest,
+    inputConfig,
+    pageEntries: artifacts.page_entries || { items: [] },
+    featurePoints: artifacts.feature_points || { items: [] },
+    testCases: artifacts.generated_test_cases || { items: [] },
+    executionResults: artifacts.execution_results || { items: [] },
+    screenshotsIndex: artifacts.screenshots_index || { items: [] },
+    menuEntries: artifacts.menu_entries || { items: [] }
+  });
+  if (!refreshed.nextRoundPlan.should_continue) {
+    return nextRoundPlan;
+  }
+  await persistAnalysisPack(runDir, refreshed);
+  await appendEvent(runDir, {
+    type: 'next_round_plan_refreshed',
+    previous_decision: nextRoundPlan.decision,
+    decision: refreshed.nextRoundPlan.decision,
+    reason: 'stale_goal_completed_recalculated_from_artifacts'
+  });
+  return refreshed.nextRoundPlan;
+}
+
+async function continueNextRound(runId, body = {}, options = {}) {
+  const { runDir, manifest } = await readManifest(runId, options);
+  const inputConfig = await readJsonIfExists(path.join(runDir, ARTIFACTS.input_config)) || {};
+  let nextRoundPlan = await readJsonRequired(path.join(runDir, ARTIFACTS.next_round_plan), 'next_round_plan 缺失。');
+  nextRoundPlan = await refreshStaleCompletedNextRoundPlan(runDir, manifest, inputConfig, nextRoundPlan);
+  const approved = body.approved === true || body.decision === 'approve' || await isHumanApprovalSatisfied(runDir);
+  const blocker = resolveNextRoundBlocker(nextRoundPlan, { approved });
+  if (blocker) {
+    const saved = await updateRunStatus(
+      runDir,
+      manifest,
+      blocker.terminal ? 'completed' : 'waiting_human',
+      'next_round_blocked',
+      blocker.message,
+      { decision: nextRoundPlan.decision, blocker_code: blocker.code }
+    );
+    const run = buildPublicRun(runDir, saved, await loadRunArtifacts(runDir));
+    return {
+      run,
+      operation: makeOperationFeedback('continue_next_round', run, {
+        status: 'blocked',
+        message: blocker.message,
+        nextAction: blocker.remediation,
+        error: {
+          code: blocker.code,
+          message: blocker.message,
+          remediation: blocker.remediation
+        }
+      }),
+      nextRoundPlan
+    };
+  }
+
+  const currentRounds = manifest.rounds || [];
+  const nextIndex = currentRounds.length + 1;
+  const roundId = `round_${String(nextIndex).padStart(3, '0')}`;
+  const round = {
+    round_id: roundId,
+    goal: normalizeText(body.goal, nextRoundPlan.next_round_goal || '继续执行下一轮低风险测试。'),
+    started_at: nowIso(),
+    finished_at: null,
+    input_artifacts: ['round_analysis', 'next_round_plan', 'human_tasks'],
+    output_artifacts: [],
+    status: 'queued'
+  };
+  await updateRunStatus(
+    runDir,
+    {
+      ...manifest,
+      current_round_id: roundId,
+      rounds: [...currentRounds, round]
+    },
+    'queued',
+    'next_round_queued',
+    '下一轮已入队，正在启动执行器。',
+    { next_round_id: roundId, decision: nextRoundPlan.decision }
+  );
+  await appendEvent(runDir, {
+    type: 'next_round_queued',
+    round_id: roundId,
+    decision: nextRoundPlan.decision,
+    target_search_goals: nextRoundPlan.target_search_goals || []
+  });
+  return startV3Run(runId, {
+    ...body,
+    roundId,
+    goal: round.goal,
+    executionMode: body.executionMode || body.execution_mode || manifest.execution_mode || inputConfig.execution_mode || 'real_browser',
+    maxPages: body.maxPages || body.max_pages || inputConfig.max_pages,
+    maxFeaturesPerPage: body.maxFeaturesPerPage || body.max_features_per_page || inputConfig.max_features_per_page
+  }, options);
+}
+
+function testCasesForFeature(testCaseItems, featurePointId) {
+  return testCaseItems.filter((item) => (item.feature_point_id || item.feature_id || '') === featurePointId);
+}
+
+function executionsForCase(executionItems, testCaseId) {
+  return executionItems.filter((item) => (item.test_case_id || item.case_id || '') === testCaseId);
+}
+
+function resultVerdict(result = {}) {
+  if (result.verdict) {
+    return result.verdict;
+  }
+  if (result.status) {
+    return result.status;
+  }
+  return 'not_executed';
+}
+
+function buildCoverageByPage({ menuEntries = { items: [] }, pageEntries = { items: [] }, featurePoints = { items: [] }, testCases = { items: [] }, executionResults = { items: [] } }) {
+  const menuItems = artifactItems(menuEntries, 'menu_entries');
+  const pageItems = artifactItems(pageEntries, 'page_entries');
+  const featureItems = artifactItems(featurePoints, 'feature_points');
+  const testCaseItems = artifactItems(testCases, 'test_cases');
+  const executionItems = artifactItems(executionResults, 'results');
+
+  return pageItems.map((page) => {
+    const pageMenuPath = Array.isArray(page.menu_path) ? page.menu_path : [];
+    const menuEntry = menuItems.find((item) => {
+      const itemPath = Array.isArray(item.menu_path) ? item.menu_path : [];
+      return item.page_entry_id === page.page_entry_id
+        || item.href === page.url
+        || (itemPath.length && pageMenuPath.length && itemPath.join(' / ') === pageMenuPath.join(' / '));
+    }) || null;
+    const pageFeatures = featureItems.filter((feature) => feature.page_entry_id === page.page_entry_id);
+    return {
+      menu_entry: menuEntry,
+      menu_path: pageMenuPath,
+      page,
+      features: pageFeatures.map((feature) => {
+        const cases = testCasesForFeature(testCaseItems, feature.feature_point_id);
+        return {
+          feature,
+          test_cases: cases.map((testCase) => {
+            const executions = executionsForCase(executionItems, testCase.test_case_id);
+            const latestExecution = executions[executions.length - 1] || null;
+            return {
+              test_case: testCase,
+              execution: latestExecution,
+              evidence: {
+                screenshot_refs: latestExecution?.screenshot_refs || [],
+                actions: latestExecution?.actions || [],
+                page_feedback: latestExecution?.page_feedback || []
+              },
+              verdict: latestExecution ? resultVerdict(latestExecution) : 'not_executed',
+              skipped_reason: latestExecution?.failure_reason || null
+            };
+          })
+        };
+      })
+    };
+  });
+}
+
+function buildSkippedAreas({ pageEntries = { items: [] }, featurePoints = { items: [] }, testCases = { items: [] }, executionResults = { items: [] }, humanTasks = { items: [] } }) {
+  const pageItems = artifactItems(pageEntries, 'page_entries');
+  const featureItems = artifactItems(featurePoints, 'feature_points');
+  const testCaseItems = artifactItems(testCases, 'test_cases');
+  const executionItems = artifactItems(executionResults, 'results');
+  const skippedStatuses = new Set(['skipped', 'skipped_no_executor', 'skipped_not_observed', 'skipped_by_policy', 'blocked_by_policy', 'needs_review', 'failed', 'real_failed', 'login_required']);
+  const executedCaseIds = new Set(executionItems.map((item) => item.test_case_id || item.case_id).filter(Boolean));
+  const skipped = [];
+
+  for (const result of executionItems) {
+    if (!skippedStatuses.has(result.status) && !result.failure_reason && !result.manual_confirmation_required) {
+      continue;
+    }
+    const testCase = testCaseItems.find((item) => item.test_case_id === result.test_case_id) || null;
+    const feature = featureItems.find((item) => item.feature_point_id === (result.feature_point_id || testCase?.feature_point_id)) || null;
+    const page = pageItems.find((item) => item.page_entry_id === feature?.page_entry_id) || null;
+    skipped.push({
+      kind: 'execution_result',
+      page_entry_id: page?.page_entry_id || null,
+      feature_point_id: feature?.feature_point_id || result.feature_point_id || null,
+      test_case_id: result.test_case_id || null,
+      title: testCase?.title || feature?.name || result.test_case_id || '未命名执行项',
+      status: result.status || 'unknown',
+      reason: result.failure_reason || result.status || 'needs_review',
+      evidence_refs: evidenceRefsForItem(result)
+    });
+  }
+
+  for (const testCase of testCaseItems) {
+    if (executedCaseIds.has(testCase.test_case_id)) {
+      continue;
+    }
+    const feature = featureItems.find((item) => item.feature_point_id === testCase.feature_point_id) || null;
+    skipped.push({
+      kind: 'not_executed_test_case',
+      page_entry_id: feature?.page_entry_id || null,
+      feature_point_id: feature?.feature_point_id || testCase.feature_point_id || null,
+      test_case_id: testCase.test_case_id,
+      title: testCase.title || testCase.test_case_id,
+      status: 'not_executed',
+      reason: testCase.requires_human_confirmation ? 'requires_human_confirmation' : 'no_execution_result',
+      evidence_refs: ['generated_test_cases']
+    });
+  }
+
+  for (const task of artifactItems(humanTasks, 'human_tasks')) {
+    if (task.status === 'completed') {
+      continue;
+    }
+    skipped.push({
+      kind: 'human_task',
+      page_entry_id: task.page_entry_id || null,
+      feature_point_id: task.feature_point_id || null,
+      test_case_id: task.test_case_id || null,
+      title: task.title || task.reason || '人工处理项',
+      status: task.status || 'pending',
+      reason: task.reason || 'human_task_pending',
+      evidence_refs: task.evidence_refs || ['human_tasks']
+    });
+  }
+
+  return skipped;
+}
+
+function buildModelComparisonCommentary(modelComparison = null) {
+  const summary = summarizeModelComparison(modelComparison);
+  const commentary = summary.items.map((item) => {
+    const coverage = item.coverage || {};
+    const execution = item.execution || {};
+    const evidenceQuality = item.evidence_quality || {};
+    const stability = item.stability || {};
+    const issues = item.compatibility_issues || [];
+    const parts = [
+      `覆盖 ${coverage.page_entries || 0} 个页面、${coverage.feature_points || 0} 个功能点`,
+      `通过 ${execution.passed || 0}、失败 ${execution.failed || 0}、跳过 ${execution.skipped || 0}`,
+      `耗时 ${item.elapsed_ms == null ? '未知' : `${item.elapsed_ms}ms`}`,
+      `证据质量 ${evidenceQuality.summary || evidenceQuality.status || '未评估'}`,
+      `稳定性 ${stability.status || 'unknown'}${typeof stability.score === 'number' ? `/${stability.score}` : ''}`
+    ];
+    if ((execution.failed || 0) > 0 || issues.length || item.status === 'failed') {
+      parts.push(`失败模式 ${issues.map((issue) => issue.code || issue.message).filter(Boolean).join(', ') || item.failure_reason || '存在失败用例'}`);
+      parts.push('适用性：需要人工复核失败原因后再扩大范围。');
+    } else {
+      parts.push('适用性：适合继续扩大同类页面遍历。');
+    }
+    return {
+      model_profile_id: item.model_profile_id,
+      status: item.status,
+      score: modelAttemptScore(item),
+      commentary: parts.join('；')
+    };
+  });
+  return {
+    ...summary,
+    commentary
+  };
+}
+
+function markdownValue(value) {
+  if (value == null || value === '') {
+    return '-';
+  }
+  if (Array.isArray(value)) {
+    return value.length ? value.join(' / ') : '-';
+  }
+  if (typeof value === 'object') {
+    return JSON.stringify(value);
+  }
+  return String(value);
+}
+
+function countJsonlLines(text) {
+  return String(text || '').split(/\r?\n/).filter((line) => line.trim()).length;
+}
+
+function makeEvidenceIndex({ screenshotsIndex, actionLog, networkEvents }) {
+  const screenshotItems = artifactItems(screenshotsIndex, 'items', 'screenshots');
+  const networkItems = artifactItems(networkEvents, 'items', 'events');
+  const actionLogCount = countJsonlLines(actionLog);
+  return {
+    screenshot_count: screenshotItems.length,
+    action_log_count: actionLogCount,
+    network_event_count: networkItems.length,
+    artifacts: [
+      { key: 'screenshots_index', file: 'screenshots_index.json', count: screenshotItems.length },
+      { key: 'action_log', file: 'action_log.jsonl', count: actionLogCount },
+      { key: 'network_events', file: 'network_events.json', count: networkItems.length }
+    ],
+    summary: `截图 ${screenshotItems.length} 条，操作日志 ${actionLogCount} 条，网络证据 ${networkItems.length} 条。`
+  };
+}
+
+function makeReport({ manifest, menuEntries, pageEntries, featurePoints, testCases, executionResults, screenshotsIndex, actionLog, networkEvents, roundAnalysis, nextRoundPlan, humanTasks, modelComparison, promotionCandidates }) {
+  const pageItems = artifactItems(pageEntries, 'page_entries');
+  const featureItems = artifactItems(featurePoints, 'feature_points');
+  const testCaseItems = artifactItems(testCases, 'test_cases');
+  const executionItems = artifactItems(executionResults, 'results');
+  const humanTaskItems = artifactItems(humanTasks, 'human_tasks');
+  const executionSummary = summarizeExecution(executionItems);
+  const coverageByPage = buildCoverageByPage({ menuEntries, pageEntries, featurePoints, testCases, executionResults });
+  const skippedAreas = buildSkippedAreas({ pageEntries, featurePoints, testCases, executionResults, humanTasks });
+  const modelComparisonReport = buildModelComparisonCommentary(modelComparison);
+  const evidenceIndex = makeEvidenceIndex({ screenshotsIndex, actionLog, networkEvents });
+  const reportJson = {
+    schema_version: 'stage2_run_report.v3',
+    run_id: manifest.run_id,
+    system_name: manifest.system_name,
+    generated_at: nowIso(),
+    summary: {
+      status: manifest.status,
+      safety_policy: manifest.safety_policy || SAFETY_POLICY_LOW_RISK_ONLY,
+      allowed_side_effect_actions: manifest.allowed_side_effect_actions || [],
+      page_entries: summarizeItems(pageItems),
+      feature_points: summarizeItems(featureItems),
+      generated_test_cases: summarizeItems(testCaseItems),
+      execution: executionSummary,
+      pending_human_tasks: humanTaskItems.filter((item) => item.status === 'pending').length,
+      next_decision: nextRoundPlan.decision
+    },
+    coverage_by_page: coverageByPage,
+    skipped_areas: skippedAreas,
+    evidence_index: evidenceIndex,
+    model_comparison: modelComparisonReport,
+    promotion_candidates: promotionCandidates,
+    sections: [
+      {
+        title: '运行概况',
+        facts: [
+          { label: 'run_id', value: manifest.run_id },
+          { label: 'status', value: manifest.status },
+          { label: 'safety_policy', value: manifest.safety_policy || SAFETY_POLICY_LOW_RISK_ONLY },
+          { label: 'allowed_side_effect_actions', value: (manifest.allowed_side_effect_actions || []).join(', ') || 'none' }
+        ]
+      },
+      { title: '覆盖与结果矩阵', items: coverageByPage },
+      { title: '未执行/阻断/需复核区域', items: skippedAreas },
+      { title: '页面入口发现', items: pageItems },
+      { title: '功能点识别', items: featureItems },
+      { title: '执行型测试用例', items: testCaseItems },
+      { title: '自动执行结果', items: executionItems },
+      { title: '执行证据索引', facts: [
+        { label: 'screenshots_index.json', value: evidenceIndex.screenshot_count },
+        { label: 'action_log.jsonl', value: evidenceIndex.action_log_count },
+        { label: 'network_events.json', value: evidenceIndex.network_event_count }
+      ], items: evidenceIndex.artifacts },
+      { title: '模型效果对比', items: modelComparisonReport.commentary || [] },
+      { title: '项目级沉淀候选', items: artifactItems(promotionCandidates, 'promotion_candidates') },
+      { title: 'AI 复盘与下一轮计划', facts: [{ label: 'decision', value: nextRoundPlan.decision }], items: roundAnalysis.improvement_candidates || [] },
+      { title: '人工确认项', items: humanTaskItems }
+    ]
+  };
+
+  const coverageLines = coverageByPage.flatMap((pageBlock) => {
+    const header = `- ${markdownValue(pageBlock.page.name || pageBlock.page.page_entry_id)} (${markdownValue(pageBlock.page.page_entry_id)}) · 菜单: ${markdownValue(pageBlock.menu_path)}`;
+    const featureLines = pageBlock.features.flatMap((featureBlock) => {
+      const feature = featureBlock.feature;
+      const caseLines = featureBlock.test_cases.map((caseBlock) => {
+        const screenshots = caseBlock.evidence.screenshot_refs || [];
+        return `    - 用例 ${markdownValue(caseBlock.test_case.title || caseBlock.test_case.test_case_id)}: ${markdownValue(caseBlock.verdict)} · 证据 ${markdownValue(screenshots)}`;
+      });
+      return [
+        `  - 功能点 ${markdownValue(feature.name || feature.feature_point_id)} [${markdownValue(feature.feature_type)}]`,
+        ...(caseLines.length ? caseLines : ['    - 暂无执行型用例'])
+      ];
+    });
+    return [header, ...(featureLines.length ? featureLines : ['  - 暂无功能点'])];
+  });
+  const skippedLines = skippedAreas.length
+    ? skippedAreas.map((item) => `- [${markdownValue(item.status)}] ${markdownValue(item.title)} · 原因: ${markdownValue(item.reason)} · 证据: ${markdownValue(item.evidence_refs)}`)
+    : ['- 暂无未执行、阻断或需复核区域。'];
+  const modelLines = modelComparisonReport.items.length
+    ? modelComparisonReport.commentary.map((item) => `- ${markdownValue(item.model_profile_id)}: ${markdownValue(item.commentary)}`)
+    : ['- 本 run 未配置多模型对比。'];
+  const promotionLines = artifactItems(promotionCandidates, 'promotion_candidates').length
+    ? artifactItems(promotionCandidates, 'promotion_candidates').map((item) => `- [${markdownValue(item.layer)} / ${markdownValue(item.asset_type)}] ${markdownValue(item.title)} · confidence ${markdownValue(item.confidence)} · auto_apply ${markdownValue(item.auto_apply)}`)
+    : ['- 暂无沉淀候选。'];
+  const evidenceLines = evidenceIndex.artifacts.map((item) => (
+    `- ${markdownValue(item.file)}: ${markdownValue(item.count)} 条`
+  ));
+
+  const md = [
+    `# ${manifest.system_name} 第二阶段 v3 运行报告`,
+    '',
+    `- Run ID: ${manifest.run_id}`,
+    `- 状态: ${manifest.status}`,
+    `- 安全策略: ${manifest.safety_policy || SAFETY_POLICY_LOW_RISK_ONLY}`,
+    `- 副作用白名单: ${(manifest.allowed_side_effect_actions || []).join(', ') || '无'}`,
+    `- 页面入口: ${reportJson.summary.page_entries}`,
+    `- 功能点: ${reportJson.summary.feature_points}`,
+    `- 执行型测试用例: ${reportJson.summary.generated_test_cases}`,
+    `- 执行结果: passed ${executionSummary.passed}, failed ${executionSummary.failed}, skipped ${executionSummary.skipped}, needs_review ${executionSummary.needs_review}`,
+    `- 下一轮决策: ${nextRoundPlan.decision}`,
+    '',
+    '## 说明',
+    '',
+    '本报告由 Node.js v3 Run API 基于稳定 artifact 契约生成。`real_browser` 模式会调用 Python v3 orchestrator 获取真实浏览器证据；`contract_only` 或执行失败时，报告会明确标注未获得真实执行证据。',
+    '',
+    '## 覆盖与结果矩阵',
+    '',
+    ...(coverageLines.length ? coverageLines : ['- 暂无页面覆盖数据。']),
+    '',
+    '## 未执行/阻断/需复核区域',
+    '',
+    ...skippedLines,
+    '',
+    '## 执行证据索引',
+    '',
+    ...evidenceLines,
+    '',
+    '## 模型效果对比',
+    '',
+    ...modelLines,
+    '',
+    '## 项目级沉淀候选',
+    '',
+    ...promotionLines,
+    '',
+    '## 人工确认项',
+    '',
+    ...(humanTaskItems.length ? humanTaskItems.map((item) => `- [${item.status}] ${item.title}: ${item.reason}`) : ['- 暂无人工确认项。'])
+  ].join('\n');
+
+  return { reportJson, md };
+}
+
+async function generateV3Report(runId, options = {}) {
+  const { runDir, manifest } = await readManifest(runId, options);
+  const menuEntries = await readJsonIfExists(path.join(runDir, ARTIFACTS.menu_entries)) || { items: [] };
+  const pageEntries = await readJsonIfExists(path.join(runDir, ARTIFACTS.page_entries)) || { items: [] };
+  const featurePoints = await readJsonIfExists(path.join(runDir, ARTIFACTS.feature_points)) || { items: [] };
+  const testCases = await readJsonIfExists(path.join(runDir, ARTIFACTS.generated_test_cases)) || { items: [] };
+  const executionResults = await readJsonIfExists(path.join(runDir, ARTIFACTS.execution_results)) || { items: [] };
+  const screenshotsIndex = await readJsonIfExists(path.join(runDir, ARTIFACTS.screenshots_index)) || { items: [] };
+  const actionLog = await readTextIfExists(path.join(runDir, ARTIFACTS.action_log));
+  const networkEvents = await readJsonIfExists(path.join(runDir, ARTIFACTS.network_events)) || { items: [] };
+  const roundAnalysis = await readJsonIfExists(path.join(runDir, ARTIFACTS.round_analysis)) || { improvement_candidates: [] };
+  const nextRoundPlan = await readJsonIfExists(path.join(runDir, ARTIFACTS.next_round_plan)) || { decision: 'unknown' };
+  const humanTasks = await readJsonIfExists(path.join(runDir, ARTIFACTS.human_tasks)) || { items: [] };
+  const modelComparison = await readJsonIfExists(path.join(runDir, ARTIFACTS.model_comparison)) || { items: [] };
+  const promotionCandidates = makePromotionCandidates({
+    manifest,
+    pageEntries,
+    featurePoints,
+    testCases,
+    executionResults,
+    roundAnalysis
+  });
+  const { reportJson, md } = makeReport({
+    manifest,
+    menuEntries,
+    pageEntries,
+    featurePoints,
+    testCases,
+    executionResults,
+    screenshotsIndex,
+    actionLog,
+    networkEvents,
+    roundAnalysis,
+    nextRoundPlan,
+    humanTasks,
+    modelComparison,
+    promotionCandidates
+  });
+  await writeJson(path.join(runDir, ARTIFACTS.promotion_candidates), promotionCandidates);
+  await writeJson(path.join(runDir, ARTIFACTS.run_report_json), reportJson);
+  await fs.writeFile(path.join(runDir, ARTIFACTS.run_report_md), `${md}\n`, 'utf8');
+  const saved = await updateRunStatus(runDir, manifest, manifest.status, 'reporting', 'run 报告已生成。');
+  const run = buildPublicRun(runDir, saved, await loadRunArtifacts(runDir));
+  return { run, operation: makeOperationFeedback('generate_report', run), report: reportJson };
+}
+
+async function resolveV3RunArtifact(runId, artifactKey, options = {}) {
+  const { runDir } = await readManifest(runId, options);
+  const filePath = artifactPath(runDir, artifactKey);
+  if (!(await pathExists(filePath))) {
+    return null;
+  }
+  return {
+    key: artifactKey,
+    path: filePath,
+    fileName: path.basename(filePath)
+  };
+}
+
+module.exports = {
+  ARTIFACTS,
+  Stage2V3InputError,
+  analyzeV3Run,
+  checkBrowserPreflight,
+  checkStage2ModelProfiles,
+  continueNextRound,
+  createV3Run,
+  deleteV3Runs,
+  generateV3Report,
+  getV3Run,
+  listV3Runs,
+  resolveV3RunArtifact,
+  saveHumanTaskResult,
+  setV3RunLifecycleStatus,
+  startV3Run
+};

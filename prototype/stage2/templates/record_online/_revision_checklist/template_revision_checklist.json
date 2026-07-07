@@ -1,0 +1,189 @@
+{
+  "schema_version": "template_revision_checklist.v1",
+  "template_name": "record_online",
+  "generated_at": "2026-06-23T16:04:33+00:00",
+  "sources": {
+    "template_dir": "C:\\project\\aut_agent\\prototype\\stage2\\templates\\record_online",
+    "discovery_dir": "C:\\project\\aut_agent\\artifacts\\stage2\\live_discovery_record_online",
+    "candidate_review_path": "C:\\project\\aut_agent\\artifacts\\stage2\\human_loop\\20260624_000355_suyuan_recording\\candidate_template_review.json"
+  },
+  "summary": {
+    "candidate_feature_count": 9,
+    "candidate_step_count": 1,
+    "recommended_locator_count": 9,
+    "mapped_field_count": 0,
+    "needs_review_field_count": 0
+  },
+  "file_actions": [
+    {
+      "file": "template.json",
+      "action": "replace page_entry / feature_point / steps from suggested patch if they are better than current scaffold",
+      "reason": "Combines current template, discovery candidates, and recording candidates into one revision target."
+    },
+    {
+      "file": "locator_hints.json",
+      "action": "copy recommended locators and candidate texts, then trim unstable CSS selectors manually",
+      "reason": "Discovery and recording already captured the first batch of candidate locators."
+    },
+    {
+      "file": "baseline.json",
+      "action": "keep page context and optional observed URLs; add only the minimum defaults actually needed",
+      "reason": "Avoid overfilling baseline values before the feature flow is stable."
+    },
+    {
+      "file": "data_schema.json",
+      "action": "adopt mapped field rules first; leave unresolved fields for manual confirmation",
+      "reason": "Candidate review can already provide usable field_rules and field_constraints fragments."
+    }
+  ],
+  "template_json_patch": {
+    "page_entry": {
+      "name": "线上备案申请",
+      "url": "https://www.zbsykj.com:19096/record/online",
+      "observed_urls": [
+        "https://www.zbsykj.com:19096/",
+        "https://www.zbsykj.com:19096/record/online"
+      ],
+      "evidence": {
+        "discovery_title": "追本溯源管理平台",
+        "discovery_source": "playwright.live_page",
+        "current_template_url": "https://www.zbsykj.com:19096/",
+        "semantic_page_type": "查询列表页",
+        "semantic_page_type_confidence": "high",
+        "entry_role": "seed_entry"
+      }
+    },
+    "feature_point": {
+      "name": "开始日期",
+      "type": "查询",
+      "alternatives": [
+        {
+          "name": "我要申请备案",
+          "feature_type": "新增",
+          "occurrence_count": 1
+        },
+        {
+          "name": "搜索",
+          "feature_type": "查询",
+          "occurrence_count": 1
+        },
+        {
+          "name": "重置",
+          "feature_type": "查询",
+          "occurrence_count": 1
+        },
+        {
+          "name": "开始日期",
+          "feature_type": "查询",
+          "occurrence_count": 1
+        },
+        {
+          "name": "结束日期",
+          "feature_type": "查询",
+          "occurrence_count": 1
+        },
+        {
+          "name": "请选择",
+          "feature_type": "查询",
+          "occurrence_count": 1
+        },
+        {
+          "name": "请选择备案类型",
+          "feature_type": "查询",
+          "occurrence_count": 1
+        },
+        {
+          "name": "请选择核准状态",
+          "feature_type": "查询",
+          "occurrence_count": 1
+        }
+      ],
+      "selection_reason": "best discovery candidate by feature type and occurrence"
+    },
+    "steps": [
+      {
+        "id": "recorded_step_001",
+        "kind": "navigation",
+        "action": "navigate_to_url",
+        "args": {
+          "url": "https://www.zbsykj.com:19096/record/online"
+        }
+      }
+    ],
+    "notes_append": [
+      "discovery_note: 发现结果来自真实页面受控遍历。",
+      "discovery_note: 页面入口优先使用 canonical_url 生成稳定 ID，并保留 dedupe_basis 作为后续人工审核依据。",
+      "discovery_note: 同 URL 的 hash / volatile query 变体会在 canonical_url 与 generalized_url 层统一，减少重复入口。",
+      "discovery_note: 同源链接使用独立页面探测，避免扰动当前已登录主页面。",
+      "discovery_note: 当前会额外落盘 navigation_nodes.json、navigation_tree.json 与 page_semantic_summary.json，作为新系统第一次接入时的系统地图视图。"
+    ]
+  },
+  "locator_hints_patch": {
+    "recommended_locators": {
+      "我要申请备案": "div.app-wrapper.hideSidebar:nth-of-type(1) > div.main-container.hasTagsView:nth-of-type(2) > section.app-main > div.app-container > button.el-button.el-button--primary",
+      "搜索": "div.app-container > form.el-form.el-form--inline > div.el-form-item.el-form-item--medium:nth-of-type(5) > div.el-form-item__content > button.el-button.ml20:nth-of-type(1)",
+      "重置": "div.app-container > form.el-form.el-form--inline > div.el-form-item.el-form-item--medium:nth-of-type(5) > div.el-form-item__content > button.el-button.el-button--default:nth-of-type(2)",
+      "开始日期": "form.el-form.el-form--inline > div.el-form-item.el-form-item--medium:nth-of-type(2) > div.el-form-item__content > div.el-date-editor.el-range-editor > input.el-range-input:nth-of-type(1)",
+      "结束日期": "form.el-form.el-form--inline > div.el-form-item.el-form-item--medium:nth-of-type(2) > div.el-form-item__content > div.el-date-editor.el-range-editor > input.el-range-input:nth-of-type(2)",
+      "请选择": "div.el-pagination > span.el-pagination__sizes:nth-of-type(2) > div.el-select.el-select--mini > div.el-input.el-input--mini:nth-of-type(1) > input.el-tooltip.el-input__inner",
+      "请选择备案类型": "div.el-form-item.el-form-item--medium:nth-of-type(4) > div.el-form-item__content > div.el-select.el-select--medium > div.el-input.el-input--medium:nth-of-type(1) > input.el-tooltip.el-input__inner",
+      "请选择核准状态": "div.el-form-item.el-form-item--medium:nth-of-type(3) > div.el-form-item__content > div.el-select.el-select--medium > div.el-input.el-input--medium:nth-of-type(1) > input.el-tooltip.el-input__inner",
+      "请输入品种名称": "div.el-form-item__content > div > div.el-select.el-select--medium > div.el-input.el-input--medium:nth-of-type(1) > input.el-tooltip.el-input__inner"
+    },
+    "bootstrap_hints": {
+      "candidate_button_texts": [],
+      "candidate_field_labels": [],
+      "candidate_dialog_titles": []
+    }
+  },
+  "baseline_patch": {
+    "page_entry": {
+      "name": "线上备案申请",
+      "url": "https://www.zbsykj.com:19096/record/online",
+      "observed_urls": [
+        "https://www.zbsykj.com:19096/",
+        "https://www.zbsykj.com:19096/record/online"
+      ]
+    }
+  },
+  "data_schema_patch": {
+    "schema_version": "human_recording_candidate_schema.v1",
+    "strategy": "baseline_plus_safe_variation",
+    "field_rules": {},
+    "field_constraints": {},
+    "field_samples": {},
+    "baseline_candidate_form_patch": {}
+  },
+  "review_items": [
+    {
+      "title": "确认页面语义初分",
+      "detail": "discovery 当前把该页面初分为 查询列表页（confidence=high），请确认模板是否应该收敛在这个页面类型上。",
+      "target_file": "template.json",
+      "status": "ready"
+    },
+    {
+      "title": "确认 feature_point.name",
+      "detail": "建议优先使用 开始日期，同时参考 alternatives 列表。",
+      "target_file": "template.json",
+      "status": "needs_review"
+    },
+    {
+      "title": "替换 bootstrap steps",
+      "detail": "可从 candidate_steps 中采用 1 条建议步骤替换当前 bootstrap 占位步骤。",
+      "target_file": "template.json",
+      "status": "ready"
+    },
+    {
+      "title": "整理 locator hints",
+      "detail": "discovery 已提供 9 条候选 locator，建议优先保留稳定文本或语义定位，谨慎直接采用长 CSS 路径。",
+      "target_file": "locator_hints.json",
+      "status": "needs_review"
+    },
+    {
+      "title": "确认本模板只锁定一个功能点",
+      "detail": "discovery 当前发现了 9 个候选功能点，需要明确本模板到底收敛到哪一个。",
+      "target_file": "template.json",
+      "status": "needs_review"
+    }
+  ]
+}

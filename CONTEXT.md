@@ -1,0 +1,221 @@
+# AI Agent 软件自动化评测平台
+
+面向第三方软件项目验收场景的 AI Agent 评测系统，辅助甲方验收乙方交付的软件系统。
+
+## Language
+
+### 核心业务概念
+
+**评测项目 (Assessment Project)**:
+一次完整的第三方软件验收评测任务，包含被测系统信息、需求文档、测试计划、执行结果和评测报告。
+_Avoid_: 测试项目、验收任务
+
+**被测系统 (System Under Test / SUT)**:
+乙方交付、待验收的目标软件系统，包含其访问地址、登录凭据和版本信息。
+_Avoid_: 目标系统、被测软件
+
+**测试账号 (Test Account)**:
+用于访问被测系统并执行自动化评测的账号。第二阶段仅验证所提供测试账号权限范围内可见、可达、可操作的页面入口和功能点，不默认推断缺失角色的覆盖范围。
+_Avoid_: 角色组、权限模型、全量账号矩阵
+
+**登录接管模式 (Login Handoff Mode)**:
+当被测系统无法由 Agent 自动完成登录时，由人工先完成登录，Agent 再从已登录首页或当前已登录页面开始执行自动遍历与测试的运行模式。
+_Avoid_: 全自动登录、统一登录编排
+
+**验收项 (Acceptance Criterion)**:
+合同或需求说明书中明确规定的、可判断是否满足的具体验收条件。
+_Avoid_: 验收标准、验收条件
+
+### 需求层级
+
+**功能模块 (Feature Module)**:
+被测系统中一组相关功能的逻辑集合，如"订单管理"、"用户权限"。
+_Avoid_: 模块、功能组
+
+**页面入口 (Page Entry)**:
+被测系统中可被导航访问的菜单项、页面入口或功能入口，是自动遍历阶段识别导航结构的基本单元。
+_Avoid_: 菜单、导航点、入口页
+
+**功能点 (Feature Point)**:
+功能模块下的一个具体可测功能，可由页面入口、页面元素和操作路径推断得出，表示用户可感知、可独立触发、可独立验证结果的一次业务交互目标，而不是单个输入框、按钮或展示控件本身。
+_Avoid_: 功能项、功能需求
+
+**功能点类型模板 (Feature Point Type Template)**:
+第二阶段针对导航、查询、详情、新增、编辑、删除、导出、切换等不同类型功能点定义的最小验证模板。每类功能点默认只验证一条基础路径，不做复杂业务分支穷举。
+_Avoid_: 自由发挥验证、全分支覆盖、无限模板
+
+**测试场景 (Test Scenario)**:
+从功能点派生出的一条具体测试路径，描述特定角色在特定条件下执行特定操作的过程。
+_Avoid_: 测试场景用例、场景用例
+
+**测试用例 (Test Case)**:
+可直接执行的最小测试单元，包含前置条件、操作步骤、预期结果和优先级（P0/P1/P2）。
+_Avoid_: 用例、测试案例
+
+**执行型测试用例 (Execution-Oriented Test Case)**:
+第二阶段围绕单个功能点，在探索与执行过程中即时生成并落盘的结构化测试用例，至少包含测试目标、前置条件、执行步骤、页面反馈、自动判定结果和人工确认标记。
+_Avoid_: 离线批量用例、标准验收用例
+
+### 执行层
+
+**页面地图 (Page Map)**:
+Web Explorer Agent 对被测系统探索后生成的结构化描述，记录页面层级、导航关系、关键元素的定位器和功能入口。
+_Avoid_: 页面结构、站点地图
+
+**探索边界 (Exploration Boundary)**:
+第二阶段自动遍历的停止边界。系统仅在当前测试账号权限范围内，对菜单入口、默认可见功能点和轻量交互后显式出现的功能点做有限深度探索，不做深层数据穷举。
+_Avoid_: 全量遍历、穷举覆盖、无限探索
+
+**已发现但未覆盖目标 (Discovered but Uncovered Target)**:
+用户指定的优先目标已经在菜单入口或页面入口中出现，但对应页面不可达、白屏、缺少功能点或尚未形成可执行验证结果。它属于下一轮继续探索目标，不等于当前范围已完成。
+_Avoid_: 已完成目标、无需继续、目标未发现
+
+**增量发现 (Incremental Discovery)**:
+第二阶段对页面入口清单、功能点清单、执行型测试用例和测试过程日志采用边探索边发现、边执行边落盘、最终统一汇总报告的工作模式，而不是先全量扫描后统一执行。
+_Avoid_: 一次性扫描、离线汇总、批处理发现
+
+**人工审核开关 (Human Review Gate)**:
+第二阶段在发现阶段结束后可选地暂停，由人工审核页面入口清单和功能点清单并进行禁用、补充或重命名，然后再进入验证阶段。原型阶段默认允许发现后自动继续执行。
+_Avoid_: 强制人工审批、完全无复核入口
+
+**发现审核回填补丁 (Discovery Review Patch)**:
+第二阶段 discovery 完成后允许通过 `discovery_review_patch.json` 对页面入口和功能点执行忽略、重命名和字段修正。该补丁属于人工审核结果的最小结构化表达，后续 discovery 复用与 verification 初始化应优先消费补丁后的结果，而不是继续沿用未修订的原始清单。
+_Avoid_: 只改报告不改源清单、人工审核结果不落盘、审核后与后续执行脱节
+
+**沉淀分层 (Knowledge Promotion Layering)**:
+第二阶段对运行过程中的经验修正和资产沉淀分为三层：运行时临时修正、项目级沉淀、平台级基线沉淀。运行时临时修正仅作用于当前任务；项目级沉淀可自动落盘；平台级基线沉淀必须经过人工审核后才能晋升。
+_Avoid_: 直接写入全局基线、无审核共享经验
+
+**两段式执行 (Two-Phase Execution)**:
+第二阶段将自动评测流程拆分为发现阶段和验证阶段。发现阶段负责有限深度探索并产出页面入口清单和功能点清单；验证阶段负责按发现结果逐个执行单功能点验证并生成执行证据与状态结果。
+_Avoid_: 混合执行、边发现边深度验证、单轮全做
+
+**受控探索 (Controlled Exploration)**:
+第二阶段对 Browser Use 的使用边界。Browser Use 可用于发现阶段的页面理解、入口推断和功能点推断；验证阶段默认由 Playwright 确定性执行，仅在明确标记为视觉兜底场景时允许 Browser Use 参与。
+_Avoid_: 自由端到端执行、全程 Agent 操作、无边界工具调用
+
+**失败簇 (Failure Cluster)**:
+验证阶段中具有相同或相似失败表征、失败原因或修复策略的一组失败案例，用于支持主代理在循环优化阶段做统一归因、批量修正和技能沉淀。
+_Avoid_: 单点失败、零散报错、逐条人工分析
+
+**视觉兜底 (Visual Fallback)**:
+当 Playwright 基于结构化定位器无法稳定完成页面理解或元素定位时，经规则或人工标记后启用的受控 Browser Use 辅助路径。视觉兜底不是验证阶段的默认执行方式。
+_Avoid_: 默认视觉执行、随意接管、无审核兜底
+
+**复用动作族 (Reusable Action Family)**:
+第二阶段在验证层中，从复杂真实流程里抽出的可重复注册、可重复组合的一组共享动作实现。复用动作族通过 `TemplateActionRegistry` 组装，位于通用模板动作与项目级胶水之间，用于降低“项目专用大脚本”比例。
+_Avoid_: 项目专用大脚本、整流硬编码
+
+**泛化回归测试护栏 (Generalization Regression Guardrail)**:
+在继续抽象模板、动作族或接入新系统前，用于锁定模板动作名、registry contract、共享动作 handler 输入输出、policy bridge 等关键行为的一组回归测试。
+_Avoid_: 先拆再说、无护栏泛化
+
+**前置测试数据 (Prerequisite Test Data)**:
+执行某个功能点验证前已存在于测试环境中的业务数据、状态数据或关联数据。第二阶段默认不负责自主构造复杂业务前置数据，仅验证当前环境和已有测试数据下可见、可达、可操作的功能点，并在报告中明确标记因缺少前置数据而未验证的部分。
+_Avoid_: 自动造数、全链路数据编排、隐式前提
+
+**高风险操作 (High-Risk Action)**:
+会造成真实业务数据变更、审批流推进、外部通知触发、资金或库存状态变化的系统操作，第二阶段默认禁止自动执行，只有项目级白名单才允许在测试环境中自动提交。
+_Avoid_: 危险动作、破坏性操作、自动提交
+
+**执行证据 (Execution Evidence)**:
+测试用例执行过程中记录的可追溯材料，包括操作日志、页面截图、网络请求、失败原因和 Agent 判断依据。
+_Avoid_: 测试截图、执行日志
+
+**关键步骤截图 (Key-Step Screenshot)**:
+第二阶段围绕页面入口进入、功能点开始执行、关键页面反馈和异常场景所采集的截图型执行证据，用于支持人工复核。
+_Avoid_: 全量逐步截图、任意截图
+
+**测试结论 (Test Verdict)**:
+对单条测试用例执行结果的判定，分为：明确通过、明确失败（功能缺陷）、疑似环境问题、需人工确认。
+_Avoid_: 测试结果、执行结果
+
+**探索式状态分类 (Exploratory Status Classification)**:
+第二阶段用于描述页面入口和功能点验证结果的状态体系，强调可达性、可操作性、流程走通性、未执行原因和人工确认标记，而不是直接给出业务验收通过/失败结论。
+_Avoid_: 自动验收结论、业务通过率
+
+**目标循环 (Goal Loop)**:
+第二阶段面向单个菜单、页面或功能点的自进化执行单元。每个目标围绕“尝试 -> 失败分类 -> 套路动作 -> 经验沉淀 -> 再尝试”循环推进，直到目标达成或达到最大轮数。它是运行时自进化的基本单位，不等于整轮 run。
+_Avoid_: 一次性全链路跑通、脚本级单次成功、把整轮 run 当成唯一优化单元
+
+**失败分类 (Failure Classification)**:
+第二阶段对探索和验证失败原因的预置归类方式。分类结果必须稳定、可复用，并直接驱动下一次目标尝试所采用的套路动作。
+_Avoid_: 自由文本总结、每次临时发明新分类、无法复用的长段分析
+
+**套路动作 (Playbook Action)**:
+针对某一类失败分类预先定义的固定动作序列，例如扩大菜单候选、归一化菜单壳、重试页面恢复、补充截图证据、启用语义接管或生成人工任务。它是目标循环中的执行策略，不是自由发挥。
+_Avoid_: 临时拍脑袋动作、无分类的随机重试、把修代码当作第一反应
+
+**运行态进度视图 (Runtime Progress View)**:
+第二阶段运行时面向监控、调试和人工接管的过程可视化层，展示当前阶段、当前步骤、当前轮次、当前对象、近期事件、阻塞原因和下一步动作，并持续落盘 `progress_events.jsonl`、`current_status.json`、`phase_summary.json`。
+_Avoid_: 仅看浏览器动作、只在最终报告里复盘、无实时状态
+
+**运行中心 (Run Center)**:
+当前 Node.js 主平台首页和后续平台 UI 的操作工作台，聚合当前项目阶段摘要、项目级近期事件、第二阶段运行摘要、orchestration session 摘要、人工录制候选审阅摘要、基线冻结摘要和选中 run 详情，并提供打开关键 artifact 与受控恢复动作入口；当前通过 `GET /api/stage2/overview` 从 `artifacts/stage2/` 聚合读取，执行 `mark-human-takeover-resolved` 后会立即重算 session 级聚合，避免会话状态滞后到下一次自动刷新。
+_Avoid_: 只看首页表单、只看浏览器窗口、把 run 产物散落在多个入口里
+
+**候选模板审阅包 (Candidate Template Review Package)**:
+人工录制会话在候选模板草稿之外额外生成的审阅型结构化产物，当前原型对应 `candidate_template_review.json`。它面向项目实施者确认字段映射、alias 草案、候选定位器和项目字段上下文，而不是直接拿来执行。
+_Avoid_: 最终模板、直接执行脚本、只看草稿不看映射确认
+
+**控件原生交互优先 (Native Control Interaction First)**:
+真实浏览器执行表单时，对下拉列表、日期选择器、多级下拉/cascader、上传控件等复合控件，必须优先通过控件本身的点击、展开、选择、上传流程完成。通用文本预填只能作用于普通输入框；复合控件不能先写入“测试数据”等自由文本，因为最终校验通常要求值来自控件选项或上传状态。
+_Avoid_: 文本硬填下拉值、直接写日期字符串、中间层 cascader 当作完成、按帮助说明而非字段 label 选择上传文件
+
+**菜单壳归一化 (Menu Shell Normalization)**:
+真实浏览器菜单遍历前，对折叠侧栏、过窄菜单栏、只露出汉堡按钮等应用外壳状态做恢复，使业务菜单先处于可扫描、可点击状态。若已登录首页和业务菜单文本存在，但菜单点击失败原因是视口外或折叠导致不可交互，应归类为菜单交互问题，而不是 `login_required`。
+_Avoid_: 把“登录使用”欢迎语误判为登录页、隐藏菜单文本当作可点击菜单、菜单视口外失败直接要求人工重新登录
+
+**表格固定列重复渲染 (Fixed-Column Duplicate Rendering)**:
+真实浏览器验证表格行内操作按钮（如"详情"）的可见性时，若表格启用了固定列（如 Element Plus 的 fixed-right column），同一按钮会在可滚动主体和固定浮层里各渲染一份，前者是 `visibility: hidden` 的占位副本。只检查第一个 DOM 匹配（如 `page.is_visible(selector)` 的默认行为）会命中隐藏副本并误判为不可见，必须遍历全部匹配元素判断"是否有任意一个可见"。
+_Avoid_: 只查 `.first`/默认匹配就判定不可见、把表格固定列的隐藏副本当作唯一副本
+
+**模板 bootstrap 草稿 (Template Bootstrap Scaffold)**:
+第二阶段为具体目标页面收敛模板时提供的最小骨架。当前通过 `python -m prototype.stage2.main --bootstrap-template ...` 生成，自动创建 `template.json`、`baseline.json`、`data_schema.json`、`locator_hints.json`，通常在系统地图探索之后使用，用于把已选页面正式收敛为模板。
+_Avoid_: 最终模板、完整自动生成模板、一步到位的回归脚本
+
+**系统地图探索 (System Map Exploration)**:
+第二阶段为新系统第一次接入提供的前置探索入口。当前通过 `python -m prototype.stage2.main --explore-system-map ...` 先生成最小导航模板，再执行 live discovery，产出 `navigation_tree.json`、`navigation_nodes.json`、`page_semantic_summary.json`、`page_entries.json`、`feature_points.json` 等系统地图产物，用于先理解系统入口结构和页面类型初分，再决定后续模板收敛目标。
+_Avoid_: 最终模板、完整真实菜单真相、完全替代人工审核
+
+**模板修订清单 (Template Revision Checklist)**:
+第二阶段在第一轮 discovery / human recording 之后生成的半自动修订建议包。当前通过 `python -m prototype.stage2.main --template-revision-checklist --template <template_name>` 生成，输出按 `template.json`、`locator_hints.json`、`baseline.json`、`data_schema.json` 分组的建议片段和待确认项，帮助测试人员在第二轮更快完成模板收敛。
+_Avoid_: 自动直接改模板、完全替代人工判断、另起一套执行模板格式
+
+**编排会话视图 (Orchestration Session View)**:
+第二阶段围绕同一个 `orchestration_stream_id` 对多轮 run 做出的 session 级聚合视图。当前原型会在 `artifacts/stage2/sessions/` 下落盘 `index.json`、`session_summary.json`、`session_timeline.json`，并由运行中心优先消费，用于展示跨轮次状态、待人工处理 run 和恢复入口。
+_Avoid_: 只看单个 run、每次都临时扫描推导、session 与 run 语义混写
+
+**人工接管恢复包 (Human Takeover Packet)**:
+当运行命中人工审核或人工接管条件时生成的结构化续跑说明，至少包含当前 run、待处理动作、下一轮目标阶段、恢复命令和备注，当前原型对应产物为 `human_takeover.json`。
+_Avoid_: 口头交接、仅靠终端日志恢复、无结构化续跑上下文
+
+**人工处理记录 (Human Takeover Resolution)**:
+对 `human_takeover.json` 的后续人工处理结果所做的结构化记录，当前原型对应 `human_takeover_resolution.json`，至少包含 operator、note、ready_to_resume 和 handled actions。它只表达“人工已处理 / 允许继续”的状态，不等价于“系统问题已被自动判定解决”。
+_Avoid_: 用 resolution 覆盖原始阻塞上下文、直接回写 success、把人工确认误写成自动结论
+
+**沉淀候选审阅摘要 (Promotion Review Summary)**:
+第二阶段对 `promotion_candidates.json` 中候选沉淀项做出的汇总型判断，当前通过 `promotion_candidate_summary` 表达，至少覆盖审阅状态、晋升目标、证据要求、基线冻结候选和待补跟进项。它用于运行中心、日报和报告层的人工决策入口，不等于平台级自动晋升。
+_Avoid_: 自动批准、平台级最终结论、只看单条候选不看汇总
+
+**跨系统验证矩阵 (Cross-System Validation Matrix)**:
+第二阶段在 G4 中引入的统一验证汇总骨架，用于把不同模板族、不同系统样本和不同执行模式的 validation 结果放进同一份结构化矩阵中比较与归档。当前原型已支持把 `lab_*` 本地模板族与 `suyuan_*` 样本汇总到 `artifacts/stage2/validation_matrix/` 下的 json / markdown 产物中；默认目标已包含 `suyuan_online_query_reset` 与 `suyuan_online_detail_view` 两个 connected 样本。但这仍属于跨系统验证的准备阶段，而不是“已完成多个真实业务系统验证”。
+_Avoid_: 单次 validation 结果、平台日报、已完成跨真实系统泛化
+
+### 交付物
+
+**评测报告 (Assessment Report)**:
+评测项目的最终交付文档，以需求→用例→执行结果的可追溯链路为主体，附缺陷清单和覆盖率统计。
+_Avoid_: 测试报告、验收报告
+
+**运行日报 (Daily Run Report)**:
+平台周期性汇总当前阶段沉淀的能力、建议晋升到平台级的规则或技能、以及尚需继续观察的问题清单的运营型报告。
+_Avoid_: 单次执行日志、正式验收报告
+
+**缺陷 (Defect)**:
+被测系统中经测试发现的、与验收项或功能说明不符的问题，附复现步骤、严重程度和整改建议。
+_Avoid_: Bug、问题、故障
+
+**测试资产 (Test Asset)**:
+评测项目沉淀的可复用产物，包括测试用例、成功执行后生成的 Playwright 代码和失败用例的复现代码片段。
+_Avoid_: 测试代码、测试产物

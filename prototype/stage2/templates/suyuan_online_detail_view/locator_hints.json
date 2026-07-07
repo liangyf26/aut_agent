@@ -1,0 +1,8 @@
+{
+  "detail_button": {
+    "preferred": [
+      "tbody > tr.el-table__row td.el-table_1_column_11.is-center > div.cell > button.el-button.el-button--text",
+      "button.el-button.el-button--text:has-text('详情')"
+    ]
+  }
+}

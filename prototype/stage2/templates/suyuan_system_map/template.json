@@ -1,0 +1,48 @@
+{
+  "template_name": "suyuan_system_map",
+  "version": "0.2.0-draft",
+  "page_entry": {
+    "name": "追本溯源管理系统系统入口",
+    "url": "https://www.zbsykj.com:19096/"
+  },
+  "feature_point": {
+    "name": "追本溯源管理系统系统地图探索",
+    "type": "导航"
+  },
+  "execution_path": "bootstrap_navigation",
+  "steps": [
+    {
+      "id": "open_bootstrap_page",
+      "kind": "navigation",
+      "action": "navigate_to_url",
+      "args": {
+        "url_ref": "page_entry.url",
+        "wait_ms": 1500
+      }
+    },
+    {
+      "id": "capture_bootstrap_landing",
+      "kind": "artifact",
+      "action": "capture_named_screenshot",
+      "args": {
+        "file_name": "bootstrap_landing.png",
+        "full_page": true
+      }
+    }
+  ],
+  "success_rules": {
+    "notes": [
+      "Bootstrap scaffold does not declare executable success rules yet.",
+      "As long as the page can be opened and the landing screenshot can be captured, the first smoke run is treated as reachable."
+    ]
+  },
+  "notes": [
+    "This scaffold is intentionally minimal. Replace the placeholder steps with real interaction steps after live discovery or human recording review.",
+    "Recommended next actions: run --routing-summary, then --live-discovery, then revise template.json and locator_hints.json before deeper connected validation."
+  ],
+  "bootstrap": {
+    "status": "draft_needs_discovery_review",
+    "scenario_kind": "navigation",
+    "created_at": "2026-06-23T23:48:40"
+  }
+}

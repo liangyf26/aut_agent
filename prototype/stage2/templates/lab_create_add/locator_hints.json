@@ -1,0 +1,6 @@
+{
+  "create_name": "#createName",
+  "create_type": "#createType",
+  "create_button": "#createButton",
+  "create_summary": "#createSummary"
+}

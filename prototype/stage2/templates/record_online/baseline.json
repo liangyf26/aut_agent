@@ -1,0 +1,13 @@
+{
+  "page_entry": {
+    "name": "线上备案申请",
+    "url": "https://www.zbsykj.com:19096/"
+  },
+  "bootstrap": {
+    "status": "draft_needs_manual_refinement",
+    "scenario_kind": "create",
+    "feature_name": "线上备案申请新增流程草稿",
+    "feature_type": "新增",
+    "created_at": "2026-06-24T00:02:18"
+  }
+}

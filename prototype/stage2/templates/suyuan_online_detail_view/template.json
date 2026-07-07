@@ -1,0 +1,70 @@
+{
+  "template_name": "suyuan_online_detail_view",
+  "version": "0.1.0",
+  "page_entry": {
+    "name": "线上备案申请详情区",
+    "url": "https://www.zbsykj.com:19096/record/online"
+  },
+  "feature_point": {
+    "name": "线上备案申请详情查看",
+    "type": "查看"
+  },
+  "execution_path": "view_online_record_detail",
+  "steps": [
+    {
+      "id": "open_online_page",
+      "kind": "navigation",
+      "action": "navigate_to_url",
+      "args": {
+        "url_ref": "page_entry.url",
+        "wait_ms": 1200
+      }
+    },
+    {
+      "id": "open_first_detail",
+      "kind": "action",
+      "action": "click_by_locator",
+      "args": {
+        "locator_hint_key": "detail_button",
+        "wait_ms": 1800
+      }
+    },
+    {
+      "id": "assert_detail_primary_action",
+      "kind": "assertion",
+      "action": "assert_text_visible",
+      "args": {
+        "text": "去支付",
+        "exact": true
+      }
+    },
+    {
+      "id": "assert_detail_secondary_action",
+      "kind": "assertion",
+      "action": "assert_text_visible",
+      "args": {
+        "text": "修 改",
+        "exact": true
+      }
+    },
+    {
+      "id": "capture_detail_view_result",
+      "kind": "artifact",
+      "action": "capture_named_screenshot",
+      "args": {
+        "file_name": "detail_view_result.png",
+        "full_page": true
+      }
+    }
+  ],
+  "success_rules": {
+    "ui_texts": [
+      "去支付",
+      "修 改"
+    ]
+  },
+  "notes": [
+    "This is the third real-system template sample for the same online-record page.",
+    "The first cut keeps the verification scope conservative: open the first visible detail row and assert that the detail drawer actions become visible."
+  ]
+}

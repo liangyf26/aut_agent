@@ -1,0 +1,98 @@
+{
+  "template_name": "suyuan_online_query_reset",
+  "version": "0.2.0",
+  "page_entry": {
+    "name": "线上备案申请查询区",
+    "url": "https://www.zbsykj.com:19096/record/online"
+  },
+  "feature_point": {
+    "name": "线上备案申请查询重置",
+    "type": "查询"
+  },
+  "execution_path": "query_reset_online_records",
+  "steps": [
+    {
+      "id": "open_online_page",
+      "kind": "navigation",
+      "action": "navigate_to_url",
+      "args": {
+        "url_ref": "page_entry.url",
+        "wait_ms": 1200
+      }
+    },
+    {
+      "id": "fill_start_date",
+      "kind": "field_input",
+      "action": "fill_field_by_locator",
+      "args": {
+        "locator": "input[placeholder='开始日期']",
+        "data_ref": "query_form.start_date"
+      }
+    },
+    {
+      "id": "fill_end_date",
+      "kind": "field_input",
+      "action": "fill_field_by_locator",
+      "args": {
+        "locator": "input[placeholder='结束日期']",
+        "data_ref": "query_form.end_date"
+      }
+    },
+    {
+      "id": "trigger_search",
+      "kind": "action",
+      "action": "click_by_locator",
+      "args": {
+        "locator": "button:has-text('搜索')",
+        "wait_ms": 1000
+      }
+    },
+    {
+      "id": "trigger_reset",
+      "kind": "action",
+      "action": "click_by_locator",
+      "args": {
+        "locator": "button:has-text('重置')",
+        "wait_ms": 1500
+      }
+    },
+    {
+      "id": "assert_start_date_cleared",
+      "kind": "assertion",
+      "action": "assert_locator_value",
+      "args": {
+        "locator": "input[placeholder='开始日期']",
+        "value": "",
+        "wait_until_match_ms": 2000
+      }
+    },
+    {
+      "id": "assert_end_date_cleared",
+      "kind": "assertion",
+      "action": "assert_locator_value",
+      "args": {
+        "locator": "input[placeholder='结束日期']",
+        "value": "",
+        "wait_until_match_ms": 2000
+      }
+    },
+    {
+      "id": "capture_query_reset_result",
+      "kind": "artifact",
+      "action": "capture_named_screenshot",
+      "args": {
+        "file_name": "query_reset_result.png",
+        "full_page": true
+      }
+    }
+  ],
+  "success_rules": {
+    "notes": [
+      "The start and end date filters should both be cleared after reset."
+    ]
+  },
+  "notes": [
+    "This is the second real-system template sample used to prove that the generic query/filter template family can run on the actual online-record page without submitting data.",
+    "The current production page exposes stable date-range filters, while the free-text variety field is no longer present on the page."
+  ]
+}

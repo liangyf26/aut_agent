@@ -1,0 +1,11 @@
+{
+  "schema_version": "0.2.0-draft",
+  "strategy": "bootstrap_placeholder",
+  "field_rules": {},
+  "notes": [
+    "No data-generation rules are declared in the bootstrap scaffold.",
+    "Add field rules only after the first discovery or recording round confirms which inputs are actually needed.",
+    "bootstrap_scenario=navigation",
+    "created_at=2026-06-23T23:48:40"
+  ]
+}

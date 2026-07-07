@@ -1,0 +1,3046 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('fs/promises');
+const http = require('http');
+const os = require('os');
+const path = require('path');
+
+const {
+  analyzeV3Run,
+  checkBrowserPreflight,
+  checkStage2ModelProfiles,
+  continueNextRound,
+  createV3Run,
+  deleteV3Runs,
+  generateV3Report,
+  getV3Run,
+  listV3Runs,
+  resolveV3RunArtifact,
+  saveHumanTaskResult,
+  setV3RunLifecycleStatus,
+  startV3Run
+} = require('./stage2V3RunCenter');
+
+async function withTempRunsDir(callback) {
+  const runsDir = await fs.mkdtemp(path.join(os.tmpdir(), 'stage2-v3-runs-'));
+  try {
+    return await callback(runsDir);
+  } finally {
+    await fs.rm(runsDir, { recursive: true, force: true });
+  }
+}
+
+async function readJson(filePath) {
+  return JSON.parse(await fs.readFile(filePath, 'utf8'));
+}
+
+async function withFakeCdpServer(callback) {
+  const server = http.createServer((req, res) => {
+    if (req.url === '/json/version') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        Browser: 'Chrome/149.0.7827.156',
+        'Protocol-Version': '1.3',
+        webSocketDebuggerUrl: 'ws://localhost:9222/devtools/browser/fake'
+      }));
+      return;
+    }
+    if (req.url === '/json/list') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify([{ type: 'page', url: 'https://example.com' }]));
+      return;
+    }
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const { port } = server.address();
+    return await callback(`http://127.0.0.1:${port}`);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+async function withFakeOpenAiCompatibleServer(callback) {
+  const requests = [];
+  const server = http.createServer(async (req, res) => {
+    if (req.method === 'POST' && req.url === '/v1/chat/completions') {
+      const chunks = [];
+      for await (const chunk of req) {
+        chunks.push(chunk);
+      }
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+      requests.push(body);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        id: `chatcmpl_${requests.length}`,
+        object: 'chat.completion',
+        choices: [{
+          index: 0,
+          message: body.tools
+            ? { role: 'assistant', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'ping', arguments: '{}' } }] }
+            : { role: 'assistant', content: '{"ok":true}' },
+          finish_reason: body.tools ? 'tool_calls' : 'stop'
+        }]
+      }));
+      return;
+    }
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const { port } = server.address();
+    return await callback(`http://127.0.0.1:${port}/v1`, requests);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+async function withFakeAiReviewServer(reviewPayload, callback) {
+  const requests = [];
+  const server = http.createServer(async (req, res) => {
+    if (req.method === 'POST' && req.url === '/v1/chat/completions') {
+      const chunks = [];
+      for await (const chunk of req) {
+        chunks.push(chunk);
+      }
+      requests.push(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        choices: [{
+          message: {
+            role: 'assistant',
+            content: JSON.stringify(reviewPayload)
+          },
+          finish_reason: 'stop'
+        }]
+      }));
+      return;
+    }
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const { port } = server.address();
+    return await callback(`http://127.0.0.1:${port}/v1`, requests);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+function argValue(args, name) {
+  const index = args.indexOf(name);
+  return index === -1 ? null : args[index + 1];
+}
+
+async function writeFakePythonV3Artifacts(artifactRoot, runId, overrides = {}) {
+  const pythonRunDir = path.join(artifactRoot, runId);
+  await fs.mkdir(pythonRunDir, { recursive: true });
+  await fs.writeFile(path.join(pythonRunDir, 'menu_tree.json'), JSON.stringify({
+    schema_version: 'stage2_menu_tree.v1',
+    status: 'completed',
+    root_count: 3,
+    entry_count: 4,
+    leaf_count: 2,
+    nodes: [{
+      menu_id: 'menu_business',
+      text: '业务办理',
+      level: 1,
+      is_leaf: false,
+      status: 'expanded',
+      children: [{
+        menu_id: 'menu_online_apply',
+        text: '线上备案申请',
+        level: 2,
+        parent_id: 'menu_business',
+        is_leaf: true,
+        status: 'discovered'
+      }]
+    }, {
+      menu_id: 'menu_query',
+      text: '备案查询',
+      level: 1,
+      is_leaf: true,
+      status: 'discovered'
+    }, {
+      menu_id: 'menu_system',
+      text: '系统管理',
+      level: 1,
+      is_leaf: false,
+      status: 'expanded'
+    }]
+  }, null, 2));
+  await fs.writeFile(path.join(pythonRunDir, 'menu_entries.json'), JSON.stringify({
+    schema_version: 'stage2_menu_entries.v1',
+    items: [{
+      menu_id: 'menu_business',
+      text: '业务办理',
+      level: 1,
+      is_leaf: false,
+      status: 'expanded',
+      source: 'playwright.menu_discovery'
+    }, {
+      menu_id: 'menu_online_apply',
+      text: '线上备案申请',
+      level: 2,
+      parent_id: 'menu_business',
+      menu_path: ['业务办理', '线上备案申请'],
+      is_leaf: true,
+      status: 'discovered',
+      source: 'playwright.menu_discovery',
+      screenshot_refs: ['menu_business_after_expand']
+    }, {
+      menu_id: 'menu_query',
+      text: '备案查询',
+      level: 1,
+      menu_path: ['备案查询'],
+      is_leaf: true,
+      status: 'discovered',
+      source: 'playwright.menu_discovery'
+    }, {
+      menu_id: 'menu_system',
+      text: '系统管理',
+      level: 1,
+      menu_path: ['系统管理'],
+      is_leaf: false,
+      status: 'expanded',
+      source: 'playwright.menu_discovery'
+    }]
+  }, null, 2));
+  await fs.writeFile(path.join(pythonRunDir, 'menu_traversal_log.jsonl'), [
+    JSON.stringify({ event: 'expand', menu_id: 'menu_business', status: 'success', screenshot_ref: 'menu_business_after_expand' }),
+    JSON.stringify({ event: 'scan', menu_id: 'menu_query', status: 'leaf_discovered' })
+  ].join('\n'));
+  await fs.writeFile(path.join(pythonRunDir, 'page_exploration_log.jsonl'), [
+    JSON.stringify({ event: 'enter_menu_leaf', menu_id: 'menu_online_apply', status: 'reachable', page_entry_id: 'page_home' }),
+    JSON.stringify({ event: 'enter_menu_leaf', menu_id: 'menu_query', status: 'not_attempted', failure_reason: 'max_pages_reached' })
+  ].join('\n'));
+  await fs.writeFile(path.join(pythonRunDir, 'page_entries.json'), JSON.stringify({
+    schema_version: 'stage2_page_entries.v3',
+    items: overrides.pageItems || [{
+      page_entry_id: 'page_home',
+      name: '首页',
+      url: 'https://example.com/home',
+      menu_path: ['首页'],
+      page_type: 'dashboard',
+      discovery_depth: 0,
+      status: 'reachable',
+      source: 'fake_python',
+      screenshot_refs: []
+    }]
+  }, null, 2));
+  await fs.writeFile(path.join(pythonRunDir, 'feature_points.json'), JSON.stringify({
+    schema_version: 'stage2_feature_points.v3',
+    items: overrides.featureItems || [{
+      feature_point_id: 'feature_nav',
+      page_entry_id: 'page_home',
+      name: '首页可达',
+      feature_type: 'navigation',
+      risk_level: 'low',
+      auto_verifiable: true,
+      verification_strategy: 'navigation_minimal_path',
+      locator_candidates: [],
+      source: 'fake_python',
+      confidence: 0.9,
+      review_status: 'auto_included'
+    }]
+  }, null, 2));
+  await fs.writeFile(path.join(pythonRunDir, 'generated_test_cases.json'), JSON.stringify({
+    schema_version: 'stage2_generated_test_cases.v3',
+    items: [{
+      test_case_id: 'case_nav',
+      feature_point_id: 'feature_nav',
+      title: '首页可达基础验证',
+      type_template: 'navigation',
+      preconditions: [],
+      steps: [{ action: 'goto', target: 'https://example.com/home' }],
+      expected_feedback: ['页面可达'],
+      risk_policy: 'safe_auto',
+      assertions: ['page_loaded'],
+      requires_human_confirmation: false
+    }]
+  }, null, 2));
+  await fs.writeFile(path.join(pythonRunDir, 'execution_results.json'), JSON.stringify({
+    schema_version: 'stage2_execution_results.v3',
+    items: overrides.executionItems || [{
+      test_case_id: 'case_nav',
+      status: 'passed',
+      verdict: '真实浏览器低风险路径可达。',
+      started_at: '2026-06-24T00:00:00.000Z',
+      finished_at: '2026-06-24T00:00:01.000Z',
+      actions: [{ action: 'goto', ok: true }],
+      page_feedback: ['loaded'],
+      screenshot_refs: [],
+      network_refs: [],
+      failure_reason: null,
+      manual_confirmation_required: false,
+      execution_mode: 'real_browser'
+    }]
+  }, null, 2));
+  if (overrides.actionLogLines) {
+    await fs.writeFile(path.join(pythonRunDir, 'action_log.jsonl'), overrides.actionLogLines.join('\n'));
+  }
+  if (overrides.networkEvents) {
+    await fs.writeFile(path.join(pythonRunDir, 'network_events.json'), JSON.stringify(overrides.networkEvents, null, 2));
+  }
+  await fs.writeFile(path.join(pythonRunDir, 'next_round_plan.json'), JSON.stringify({
+    schema_version: 'stage2_next_round_plan.v3',
+    current_round_id: 'round_001',
+    should_continue: false,
+    decision: 'stop_goal_completed',
+    next_round_goal: '本轮已完成。',
+    target_page_entry_ids: [],
+    target_feature_point_ids: [],
+    planned_improvements: [],
+    risk_level: 'low',
+    requires_human_approval: false
+  }, null, 2));
+  await fs.writeFile(path.join(pythonRunDir, 'human_tasks.json'), JSON.stringify({
+    schema_version: 'stage2_human_tasks.v3',
+    items: []
+  }, null, 2));
+  await fs.writeFile(path.join(pythonRunDir, 'source_real_browser.json'), JSON.stringify(
+    overrides.sourceRealBrowser || {
+      schema_version: 'stage2_v3_run.v1',
+      executor_stack: {
+        playwright: {
+          status: 'used',
+          current_page: '首页',
+          current_skill: 'Playwright',
+          current_step: '页面入口探索'
+        },
+        browser_use: {
+          status: 'not_invoked',
+          reason: 'Playwright 已覆盖当前目标。'
+        }
+      }
+    },
+    null,
+    2
+  ));
+  return pythonRunDir;
+}
+
+async function writeFakePythonV1Artifacts(artifactRoot, runId) {
+  const pythonRunDir = path.join(artifactRoot, runId);
+  await fs.mkdir(pythonRunDir, { recursive: true });
+  const page = {
+    page_entry_id: 'page_001',
+    name: '真实首页',
+    url: 'https://example.com/home',
+    menu_path: ['真实首页'],
+    page_type: 'landing',
+    discovery_depth: 0,
+    status: 'reachable',
+    source: 'real_browser_cdp',
+    screenshot_refs: ['screenshots/home_visible.png']
+  };
+  const feature = {
+    feature_point_id: 'feature_001',
+    page_entry_id: 'page_001',
+    name: '页面可见性验证',
+    feature_type: 'view',
+    risk_level: 'low',
+    auto_verifiable: true,
+    verification_strategy: 'page_visible',
+    locator_candidates: [],
+    source: 'real_browser_page_visible',
+    confidence: 0.95,
+    review_status: 'auto_included'
+  };
+  const testCase = {
+    test_case_id: 'case_001',
+    feature_point_id: 'feature_001',
+    title: '首页真实浏览器可见性验证',
+    type_template: 'page_visible',
+    preconditions: [],
+    steps: [{ action: 'goto', target: 'https://example.com/home' }],
+    expected_feedback: ['页面可见'],
+    risk_policy: 'safe_auto',
+    assertions: ['page_visible'],
+    requires_human_confirmation: false
+  };
+  const result = {
+    test_case_id: 'case_001',
+    status: 'real_passed',
+    verdict: '真实浏览器低风险页面可见性验证通过。',
+    started_at: '2026-06-24T00:00:00.000Z',
+    finished_at: '2026-06-24T00:00:01.000Z',
+    actions: [{ action: 'goto', ok: true }],
+    page_feedback: ['页面可见'],
+    screenshot_refs: ['screenshots/home_visible.png'],
+    network_refs: [],
+    failure_reason: null,
+    manual_confirmation_required: false,
+    execution_mode: 'real_browser'
+  };
+
+  await fs.writeFile(path.join(pythonRunDir, 'page_entries.json'), JSON.stringify({
+    schema_version: 'stage2_v3_run.v1',
+    page_entries: [page],
+    items: [page]
+  }, null, 2));
+  await fs.writeFile(path.join(pythonRunDir, 'feature_points.json'), JSON.stringify({
+    schema_version: 'stage2_v3_run.v1',
+    feature_points: [feature],
+    items: [feature]
+  }, null, 2));
+  await fs.writeFile(path.join(pythonRunDir, 'generated_test_cases.json'), JSON.stringify({
+    schema_version: 'stage2_v3_run.v1',
+    test_cases: [testCase],
+    items: [testCase]
+  }, null, 2));
+  await fs.writeFile(path.join(pythonRunDir, 'execution_results.json'), JSON.stringify({
+    schema_version: 'stage2_v3_run.v1',
+    results: [result],
+    items: [result]
+  }, null, 2));
+  await fs.writeFile(path.join(pythonRunDir, 'next_round_plan.json'), JSON.stringify({
+    schema_version: 'stage2_next_round_plan.v3',
+    current_round_id: 'round_001',
+    should_continue: false,
+    decision: 'stop_goal_completed',
+    next_round_goal: '本轮已完成。',
+    target_page_entry_ids: [],
+    target_feature_point_ids: [],
+    planned_improvements: [],
+    risk_level: 'low',
+    requires_human_approval: false
+  }, null, 2));
+  await fs.writeFile(path.join(pythonRunDir, 'human_tasks.json'), JSON.stringify({
+    schema_version: 'stage2_human_tasks.v3',
+    items: []
+  }, null, 2));
+  return pythonRunDir;
+}
+
+test('stage2 v3 browser preflight checks the live CDP endpoint', async () => {
+  await withFakeCdpServer(async (cdpUrl) => {
+    const preflight = await checkBrowserPreflight(cdpUrl);
+
+    assert.equal(preflight.ok, true);
+    assert.equal(preflight.status, 'connected');
+    assert.equal(preflight.browser, 'Chrome/149.0.7827.156');
+    assert.equal(preflight.targetCount, 1);
+    assert.match(preflight.message, /Chrome\/149/);
+  });
+});
+
+test('stage2 v3 browser preflight returns visible unavailable state', async () => {
+  await withFakeCdpServer(async (cdpUrl) => {
+    const preflight = await checkBrowserPreflight(`${cdpUrl}/bad-path`);
+
+    assert.equal(preflight.ok, true);
+    assert.equal(preflight.status, 'connected');
+  });
+  const failed = await checkBrowserPreflight('http://127.0.0.1:1', { timeoutMs: 800 });
+  assert.equal(failed.ok, false);
+  assert.match(failed.message, /CDP/);
+});
+
+test('stage2 v3 run center loads model profiles, preflights them, and persists run selection', async () => {
+  await withFakeOpenAiCompatibleServer(async (baseUrl, requests) => {
+    await withTempRunsDir(async (runsDir) => {
+      const configPath = path.join(runsDir, 'stage2-model-profiles.json');
+      await fs.writeFile(configPath, JSON.stringify({
+        schema_version: 'stage2_model_profiles.v1',
+        profiles: [
+          {
+            id: 'deepseek-v4',
+            label: 'DeepSeek V4',
+            provider: 'openai_compatible',
+            baseUrl,
+            apiKey: 'test-key',
+            model: 'deepseek-v4-flash',
+            browserUseMode: 'chatopenai_structured'
+          },
+          {
+            id: 'offline-model',
+            label: 'Offline Model',
+            provider: 'openai_compatible',
+            baseUrl: 'http://127.0.0.1:1/v1',
+            apiKey: 'test-key',
+            model: 'offline-model'
+          }
+        ]
+      }, null, 2));
+
+      const preflight = await checkStage2ModelProfiles({ configPath, timeoutMs: 800 });
+      assert.equal(preflight.schema_version, 'stage2_model_profile_preflight.v1');
+      assert.equal(preflight.profiles.length, 2);
+      assert.equal(preflight.profiles[0].id, 'deepseek-v4');
+      assert.equal(preflight.profiles[0].status, 'available');
+      assert.equal(preflight.profiles[0].capability_tags.chat_completion, true);
+      assert.equal(preflight.profiles[0].capability_tags.json_object_response_format, true);
+      assert.equal(preflight.profiles[0].capability_tags.json_schema_response_format, true);
+      assert.equal(preflight.profiles[0].capability_tags.tool_calling, true);
+      assert.equal(preflight.profiles[0].capability_tags.browser_use_chatopenai_structured, true);
+      assert.equal(preflight.profiles[1].status, 'unavailable');
+      assert.ok(requests.length >= 4);
+
+      const created = await createV3Run({
+        systemName: '多模型样例系统',
+        entryUrl: 'https://example.com/home',
+        cdpUrl: 'http://localhost:9222',
+        modelProfileIds: ['deepseek-v4', 'offline-model']
+      }, { runsDir, modelProfileConfigPath: configPath });
+
+      assert.deepEqual(created.run.modelProfileIds, ['deepseek-v4', 'offline-model']);
+      assert.equal(created.run.modelProfiles[0].label, 'DeepSeek V4');
+      assert.equal(created.run.modelProfiles[0].apiKeyConfigured, true);
+      assert.equal(created.run.modelProfiles[0].apiKey, undefined);
+
+      const received = [];
+      await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+        runsDir,
+        modelProfileConfigPath: configPath,
+        pythonRunner: async ({ args, artifactRoot }) => {
+          received.push({ args });
+          const runId = argValue(args, '--v3-run-id');
+          const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId);
+          return {
+            stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+            stderr: ''
+          };
+        }
+      });
+
+      assert.deepEqual(
+        received.map((call) => argValue(call.args, '--v3-model-profile')),
+        ['deepseek-v4', 'offline-model']
+      );
+
+      const inputConfig = await readJson(path.join(runsDir, created.run.runId, 'input_config.json'));
+      assert.deepEqual(inputConfig.selected_model_profile_ids, ['deepseek-v4', 'offline-model']);
+      assert.equal(inputConfig.selected_model_profiles[0].id, 'deepseek-v4');
+      assert.equal(inputConfig.selected_model_profiles[0].api_key_configured, true);
+      assert.equal(inputConfig.selected_model_profiles[0].api_key, undefined);
+    });
+  });
+});
+
+test('stage2 v3 run center creates a draft run and starts a stable artifact contract', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      scope: '优先覆盖查询、详情和导出入口'
+    }, { runsDir });
+
+    assert.equal(created.run.status, 'draft');
+    assert.ok(created.run.runId.startsWith('stage2_v3_'));
+    assert.ok(created.run.artifacts.page_entries.href.startsWith('/api/stage2/v3/runs/'));
+
+    const started = await startV3Run(created.run.runId, { executionMode: 'contract_only' }, { runsDir });
+    assert.equal(started.run.status, 'waiting_human');
+    assert.equal(started.run.executionMode, 'contract_only');
+    assert.equal(started.run.summary.pageEntries, 1);
+    assert.equal(started.run.summary.featurePoints, 4);
+    assert.equal(started.run.summary.generatedTestCases, 4);
+    assert.equal(started.run.summary.execution.skipped, 4);
+    assert.equal(started.run.summary.nextDecision, 'wait_human_review');
+
+    const run = await getV3Run(created.run.runId, { runsDir });
+    assert.equal(run.artifacts.page_entries.schema_version, 'stage2_page_entries.v3');
+    assert.equal(run.artifacts.feature_points.schema_version, 'stage2_feature_points.v3');
+    assert.equal(run.artifacts.generated_test_cases.schema_version, 'stage2_generated_test_cases.v3');
+    assert.equal(run.artifacts.execution_results.schema_version, 'stage2_execution_results.v3');
+    assert.ok(run.artifacts.execution_results.items.every((item) => item.status !== 'passed'));
+    assert.ok(run.artifacts.execution_results.items.some((item) => item.failure_reason === 'contract_only_mode'));
+    assert.equal(run.artifacts.next_round_plan.requires_human_approval, true);
+  });
+});
+
+test('stage2 v3 run creation preserves execution mode, model selection, and local timestamp', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const modelProfiles = [{
+      id: 'local_qwen',
+      label: 'local_qwen',
+      provider: 'openai_compatible',
+      model: 'Qwen3.6',
+      apiKeyConfigured: true
+    }];
+
+    const created = await createV3Run({
+      systemName: '追本溯源管理平台',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      executionMode: 'real_browser',
+      modelProfileIds: ['local_qwen']
+    }, { runsDir, modelProfiles });
+
+    assert.equal(created.run.executionMode, 'real_browser');
+    assert.deepEqual(created.run.modelProfileIds, ['local_qwen']);
+    assert.equal(created.run.modelProfiles[0].label, 'local_qwen');
+    assert.match(created.run.createdAt, /\+08:00$/);
+
+    const stamp = created.run.runId.match(/^stage2_v3_(\d{8}_\d{6})_/)[1];
+    const compactCreatedAt = created.run.createdAt
+      .replace(/[-:]/g, '')
+      .replace('T', '_')
+      .slice(0, 15);
+    assert.equal(stamp, compactCreatedAt);
+
+    const manifest = await readJson(path.join(runsDir, created.run.runId, 'run_manifest.json'));
+    const inputConfig = await readJson(path.join(runsDir, created.run.runId, 'input_config.json'));
+    assert.equal(manifest.execution_mode, 'real_browser');
+    assert.equal(inputConfig.execution_mode, 'real_browser');
+    assert.deepEqual(manifest.selected_model_profile_ids, ['local_qwen']);
+
+    const listed = await listV3Runs({ runsDir });
+    assert.equal(listed.runs[0].executionMode, 'real_browser');
+    assert.deepEqual(listed.runs[0].modelProfileIds, ['local_qwen']);
+  });
+});
+
+test('stage2 v3 run center deletes selected runs and their artifact directories', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const first = await createV3Run({
+      systemName: '待删除系统',
+      entryUrl: 'https://example.com/delete-me',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+    const second = await createV3Run({
+      systemName: '保留系统',
+      entryUrl: 'https://example.com/keep-me',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+    const evidenceDir = path.join(runsDir, first.run.runId, 'screenshots');
+    await fs.mkdir(evidenceDir, { recursive: true });
+    await fs.writeFile(path.join(evidenceDir, 'evidence.png'), Buffer.from('fake screenshot evidence'));
+
+    const deleted = await deleteV3Runs({ runIds: [first.run.runId] }, { runsDir });
+
+    assert.equal(deleted.deletedCount, 1);
+    assert.deepEqual(deleted.deletedRunIds, [first.run.runId]);
+    assert.ok(deleted.freedBytes > 0);
+    await assert.rejects(fs.access(path.join(runsDir, first.run.runId)));
+    await assert.doesNotReject(fs.access(path.join(runsDir, second.run.runId)));
+
+    const listed = await listV3Runs({ runsDir });
+    assert.deepEqual(listed.runs.map((run) => run.runId), [second.run.runId]);
+  });
+});
+
+test('stage2 v3 run center deletes all listed runs when requested', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const first = await createV3Run({
+      systemName: '全选删除系统 A',
+      entryUrl: 'https://example.com/a',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+    const second = await createV3Run({
+      systemName: '全选删除系统 B',
+      entryUrl: 'https://example.com/b',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+
+    const deleted = await deleteV3Runs({ all: true }, { runsDir });
+
+    assert.equal(deleted.deletedCount, 2);
+    assert.deepEqual(new Set(deleted.deletedRunIds), new Set([first.run.runId, second.run.runId]));
+    assert.equal((await listV3Runs({ runsDir })).runs.length, 0);
+  });
+});
+
+test('stage2 v3 run center rejects unsafe run ids during deletion', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    await assert.rejects(
+      () => deleteV3Runs({ runIds: ['../outside'] }, { runsDir }),
+      /runId/
+    );
+  });
+});
+
+test('stage2 v3 run center exposes first-round menu discovery separately from browser targets', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      scope: '优先完成“线上备案申请”页面'
+    }, { runsDir });
+
+    const started = await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId);
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    assert.ok(started.run.artifacts.menu_tree.href.includes('/artifacts/menu_tree'));
+    assert.ok(started.run.artifacts.menu_entries.href.includes('/artifacts/menu_entries'));
+    assert.ok(started.run.artifacts.page_exploration_log.href.includes('/artifacts/page_exploration_log'));
+    assert.equal(started.run.summary.menuEntries, 4);
+    assert.equal(started.run.summary.menuLeaves, 2);
+    assert.equal(started.run.summary.candidatePageEntries, 2);
+    assert.equal(started.run.summary.materializedPageEntries, 1);
+    assert.equal(started.run.summary.menuRoots, 3);
+    assert.equal(started.run.summary.browserTargets, 0);
+    assert.equal(started.run.summary.pageEntries, 2);
+
+    const run = await getV3Run(created.run.runId, { runsDir });
+    assert.equal(run.artifacts.menu_tree.root_count, 3);
+    assert.equal(run.artifacts.menu_entries.items[1].text, '线上备案申请');
+    assert.match(run.artifacts.menu_traversal_log, /menu_business_after_expand/);
+    assert.match(run.artifacts.page_exploration_log, /enter_menu_leaf/);
+    assert.match(run.run.summary.countExplanation.menu_leaf_vs_page_entries, /menu leaves attempted/);
+    assert.match(run.run.summary.countExplanation.candidate_page_entries, /candidate page entries/);
+  });
+});
+
+test('stage2 v3 run center explains menu leaf candidates when Python times out before page materialization', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理平台',
+      entryUrl: 'https://www.zbsykj.com:19096/index',
+      cdpUrl: 'http://localhost:9222',
+      executionMode: 'real_browser',
+      prioritizedTargets: ['线上备案申请']
+    }, { runsDir });
+    const runDir = path.join(runsDir, created.run.runId);
+    await fs.writeFile(path.join(runDir, 'menu_entries.json'), JSON.stringify({
+      schema_version: 'stage2_menu_entries.v1',
+      items: [
+        { menu_id: 'menu_home', text: '首页', level: 1, is_leaf: true },
+        { menu_id: 'menu_apply_root', text: '备案管理', level: 1, is_leaf: false },
+        { menu_id: 'menu_apply', text: '线上备案申请', level: 2, parent_id: 'menu_apply_root', is_leaf: true },
+        { menu_id: 'menu_purchase', text: '收购溯源', level: 2, is_leaf: true },
+        { menu_id: 'menu_production', text: '饮片生产', level: 2, is_leaf: true },
+        { menu_id: 'menu_sale', text: '销售溯源', level: 2, is_leaf: true },
+        { menu_id: 'menu_bonsai', text: '盆景溯源', level: 2, is_leaf: true },
+        { menu_id: 'menu_notice', text: '通知列表', level: 2, is_leaf: true },
+        { menu_id: 'menu_notice_root', text: '通知公告管理', level: 1, is_leaf: false },
+        { menu_id: 'menu_trace_root', text: '溯源管理', level: 1, is_leaf: false }
+      ]
+    }, null, 2));
+
+    await startV3Run(created.run.runId, { executionMode: 'real_browser', roundId: 'round_002' }, {
+      runsDir,
+      pythonRunner: async () => {
+        const error = new Error('Command failed because execution timed out.');
+        error.killed = true;
+        error.signal = 'SIGTERM';
+        error.stderr = 'INFO     [Agent] Step 63:\nINFO     [Agent] Next goal: Repair remaining required fields.';
+        throw error;
+      }
+    });
+
+    const publicRun = await getV3Run(created.run.runId, { runsDir });
+    assert.equal(publicRun.run.summary.menuEntries, 10);
+    assert.equal(publicRun.run.summary.menuLeaves, 7);
+    assert.equal(publicRun.run.summary.candidatePageEntries, 7);
+    assert.equal(publicRun.run.summary.materializedPageEntries, 1);
+    assert.equal(publicRun.run.summary.pageEntries, 7);
+    assert.match(publicRun.run.summary.countExplanation.candidate_page_entries, /7 candidate page entries/);
+    assert.match(publicRun.run.summary.countExplanation.page_entries_vs_candidates, /1 materialized page entries/);
+  });
+});
+
+test('stage2 v3 public summary shows menu leaf page candidates during first-round discovery', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理平台',
+      entryUrl: 'https://www.zbsykj.com:19096/index',
+      cdpUrl: 'http://localhost:9222',
+      executionMode: 'real_browser',
+      prioritizedTargets: ['线上备案申请']
+    }, { runsDir });
+    const runDir = path.join(runsDir, created.run.runId);
+    await fs.writeFile(path.join(runDir, 'menu_entries.json'), JSON.stringify({
+      schema_version: 'stage2_menu_entries.v1',
+      leaf_count: 7,
+      items: [
+        { menu_id: 'menu_home', text: '首页', level: 1, is_leaf: true, route_hint: 'https://www.zbsykj.com:19096/index' },
+        { menu_id: 'menu_apply', text: '线上备案申请', level: 2, is_leaf: true, route_hint: 'https://www.zbsykj.com:19096/record/online' },
+        { menu_id: 'menu_purchase', text: '收购溯源', level: 2, is_leaf: true, route_hint: 'https://www.zbsykj.com:19096/traceability/purchase' },
+        { menu_id: 'menu_production', text: '饮片生产', level: 2, is_leaf: true, route_hint: 'https://www.zbsykj.com:19096/traceability/production' },
+        { menu_id: 'menu_sale', text: '销售溯源', level: 2, is_leaf: true, route_hint: 'https://www.zbsykj.com:19096/traceability/sale' },
+        { menu_id: 'menu_bonsai', text: '盆景溯源', level: 2, is_leaf: true, route_hint: 'https://www.zbsykj.com:19096/traceability/bonsai' },
+        { menu_id: 'menu_notice', text: '通知列表', level: 2, is_leaf: true, route_hint: 'https://www.zbsykj.com:19096/zwsy/notice/noticeItem' },
+        { menu_id: 'menu_notice_root', text: '通知公告管理', level: 1, is_leaf: false },
+        { menu_id: 'menu_trace_root', text: '溯源管理', level: 1, is_leaf: false },
+        { menu_id: 'menu_apply_root', text: '备案管理', level: 1, is_leaf: false }
+      ]
+    }, null, 2));
+    await fs.writeFile(path.join(runDir, 'page_entries.json'), JSON.stringify({
+      schema_version: 'stage2_page_entries.v3',
+      items: []
+    }, null, 2));
+
+    const publicRun = await getV3Run(created.run.runId, { runsDir });
+    assert.equal(publicRun.run.summary.menuEntries, 10);
+    assert.equal(publicRun.run.summary.menuLeaves, 7);
+    assert.equal(publicRun.run.summary.candidatePageEntries, 7);
+    assert.equal(publicRun.run.summary.materializedPageEntries, 0);
+    assert.equal(publicRun.run.summary.pageEntries, 7);
+    assert.match(publicRun.run.summary.countExplanation.candidate_page_entries, /7 candidate page entries/);
+  });
+});
+
+test('stage2 v3 run center materializes first-round menu leaf candidates into page entries when source has route hints only', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理平台',
+      entryUrl: 'https://www.zbsykj.com:19096/index',
+      cdpUrl: 'http://localhost:9222',
+      executionMode: 'real_browser',
+      prioritizedTargets: ['线上备案申请']
+    }, { runsDir });
+    const runDir = path.join(runsDir, created.run.runId);
+
+    await fs.writeFile(path.join(runDir, 'source_real_browser.json'), JSON.stringify({
+      schema_version: 'stage2_v3_run.v1',
+      status: 'completed',
+      menu_entries: {
+        schema_version: 'stage2_menu_entries.v1',
+        items: [{
+          menu_id: 'menu_9',
+          text: '线上备案申请',
+          level: 2,
+          parent_id: 'menu_3',
+          menu_path: ['备案管理', '线上备案申请'],
+          is_leaf: true,
+          route_hint: 'https://www.zbsykj.com:19096/record/online',
+          status: 'discovered',
+          source: 'playwright.menu_discovery'
+        }]
+      }
+    }, null, 2));
+
+    await startV3Run(created.run.runId, {
+      executionMode: 'real_browser',
+      roundId: 'round_002'
+    }, {
+      runsDir,
+      pythonRunner: async () => {
+        const error = new Error('Command failed because execution timed out.');
+        error.killed = true;
+        error.signal = 'SIGTERM';
+        error.stderr = 'INFO     [Agent] Step 9:\nINFO     [Agent] Next goal: Call script_prefill_form.';
+        error.stdout = '';
+        throw error;
+      }
+    });
+
+    const pageEntries = await readJson(path.join(runDir, 'page_entries.json'));
+    assert.equal(pageEntries.items.length, 1);
+    assert.equal(pageEntries.items[0].page_entry_id, 'menu_page_009');
+    assert.equal(pageEntries.items[0].name, '线上备案申请');
+    assert.equal(pageEntries.items[0].url, 'https://www.zbsykj.com:19096/record/online');
+    assert.equal(pageEntries.items[0].status, 'discovered_from_menu');
+  });
+});
+
+test('stage2 v3 run center does not count unfinished browser-use form submission as successful side effect execution', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理平台',
+      entryUrl: 'https://www.zbsykj.com:19096/index',
+      cdpUrl: 'http://localhost:9222',
+      executionMode: 'real_browser',
+      prioritizedTargets: ['线上备案申请']
+    }, { runsDir });
+
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          executionItems: [{
+            test_case_id: 'case_online_apply_create',
+            feature_point_id: 'browser_use_target_001_flow',
+            status: 'side_effect_executed',
+            verdict: 'form submitted',
+            started_at: '2026-06-29T00:40:00.000Z',
+            finished_at: '2026-06-29T00:41:00.000Z',
+            actions: [{ action: 'submit', ok: true }],
+            page_feedback: ['开始日期不能为空', '验收监管单位不能为空', '验收日期不能为空', '验收文件不能为空'],
+            screenshot_refs: [],
+            network_refs: [],
+            failure_reason: null,
+            manual_confirmation_required: false,
+            execution_mode: 'real_browser'
+          }],
+          featureItems: [{
+            feature_point_id: 'browser_use_target_001_flow',
+            page_entry_id: 'browser_use_target_001',
+            name: '线上备案申请目标接管流程',
+            feature_type: 'create',
+            risk_level: 'medium',
+            auto_verifiable: true,
+            review_status: 'auto_included'
+          }],
+          sourceRealBrowser: {
+            schema_version: 'stage2_v3_run.v1',
+            executor_stack: {
+              browser_use: {
+                status: 'used',
+                current_page: '线上备案申请',
+                current_skill: 'Browser Use',
+                current_step: '表单提交流程'
+              }
+            }
+          }
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    const publicRun = await getV3Run(created.run.runId, { runsDir });
+    const executionResults = await readJson(path.join(runsDir, created.run.runId, 'execution_results.json'));
+
+    assert.equal(executionResults.items[0].status, 'failed');
+    assert.equal(executionResults.items[0].failure_reason, 'required_fields_unresolved');
+    assert.equal(publicRun.run.summary.execution.passed, 0);
+    assert.equal(publicRun.run.summary.execution.failed, 1);
+  });
+});
+
+test('stage2 v3 run center does not count browser-use judge failure as successful handover', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理平台',
+      entryUrl: 'https://www.zbsykj.com:19096/index',
+      cdpUrl: 'http://localhost:9222',
+      executionMode: 'real_browser',
+      prioritizedTargets: ['线上备案申请']
+    }, { runsDir });
+
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          executionItems: [{
+            test_case_id: 'browser_use_target_001_flow_case',
+            feature_point_id: 'browser_use_target_001_flow',
+            status: 'passed',
+            verdict: 'passed',
+            actions: [{ source: 'browser_use', action: 'agent_run', status: 'completed' }],
+            page_feedback: [
+              'Final Result: 测试未能成功提交备案申请。失败原因：验收监管单位仍为空，育苗地点有红框错误。Judge Verdict: FAIL'
+            ],
+            screenshot_refs: ['browser_use_handover_final'],
+            failure_reason: null,
+            manual_confirmation_required: false,
+            execution_mode: 'browser_use_takeover'
+          }],
+          featureItems: [{
+            feature_point_id: 'browser_use_target_001_flow',
+            page_entry_id: 'browser_use_target_001',
+            name: '线上备案申请目标接管流程',
+            feature_type: 'create',
+            risk_level: 'high',
+            auto_verifiable: true,
+            review_status: 'auto_included'
+          }]
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    const publicRun = await getV3Run(created.run.runId, { runsDir });
+    const executionResults = await readJson(path.join(runsDir, created.run.runId, 'execution_results.json'));
+
+    assert.equal(executionResults.items[0].status, 'failed');
+    assert.equal(executionResults.items[0].failure_reason, 'browser_use_handover_failed');
+    assert.equal(executionResults.items[0].manual_confirmation_required, true);
+    assert.equal(publicRun.run.summary.execution.passed, 0);
+    assert.equal(publicRun.run.summary.execution.failed, 1);
+  });
+});
+
+test('stage2 v3 run center surfaces current page and executor from real browser artifacts', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      executionMode: 'real_browser',
+      scope: '优先完成“线上备案申请”页面'
+    }, { runsDir });
+
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          sourceRealBrowser: {
+            schema_version: 'stage2_v3_run.v1',
+            executor_stack: {
+              playwright: {
+                status: 'used',
+                current_page: '线上备案申请',
+                current_skill: 'Playwright',
+                current_step: '页面入口探索'
+              },
+              browser_use: {
+                status: 'used',
+                selected_model: 'local_qwen',
+                reason: 'Playwright 模板无法完成提交，Browser Use 接管。',
+                current_page: '线上备案申请',
+                current_skill: 'Browser Use',
+                current_step: '目标流程接管'
+              }
+            }
+          }
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    const currentStatus = await readJson(path.join(runsDir, created.run.runId, 'current_status.json'));
+    assert.equal(currentStatus.current_page, '线上备案申请');
+    assert.equal(currentStatus.current_executor, 'Browser Use');
+    assert.equal(currentStatus.current_step, '目标流程接管');
+  });
+});
+
+test('stage2 v3 run center tracks prioritized and waived target pages across Python bridge', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      scope: '第一轮完整遍历菜单入口',
+      prioritizedTargets: ['线上备案申请', '备案进度查询'],
+      waivedTargets: ['旧版备案页面']
+    }, { runsDir });
+    let received = null;
+
+    const started = await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        received = { args };
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId);
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    const inputConfig = await readJson(path.join(runsDir, created.run.runId, 'input_config.json'));
+    assert.deepEqual(inputConfig.prioritized_targets, ['线上备案申请', '备案进度查询']);
+    assert.deepEqual(inputConfig.waived_targets, ['旧版备案页面']);
+    assert.deepEqual(
+      received.args.filter((item, index) => received.args[index - 1] === '--v3-prioritized-target'),
+      ['线上备案申请', '备案进度查询']
+    );
+    assert.deepEqual(
+      received.args.filter((item, index) => received.args[index - 1] === '--v3-waived-target'),
+      ['旧版备案页面']
+    );
+
+    assert.equal(started.run.summary.targetTracking.total, 3);
+    assert.equal(started.run.summary.targetTracking.found, 1);
+    assert.equal(started.run.summary.targetTracking.missed, 1);
+    assert.equal(started.run.summary.targetTracking.waived, 1);
+    assert.equal(started.run.targetTracking.items[0].status, 'found');
+    assert.equal(started.run.targetTracking.items[0].matched_items[0].kind, 'menu_entry');
+    assert.equal(started.run.targetTracking.items[0].matched_items[0].menu_id, 'menu_online_apply');
+    assert.deepEqual(started.run.missedTargets, ['备案进度查询']);
+
+    const runDir = path.join(runsDir, created.run.runId);
+    const analysis = await readJson(path.join(runDir, 'round_analysis.json'));
+    const nextRoundPlan = await readJson(path.join(runDir, 'next_round_plan.json'));
+    assert.deepEqual(analysis.missing_scope_targets, ['备案进度查询']);
+    assert.equal(analysis.target_tracking.find((item) => item.target === '旧版备案页面').status, 'waived');
+    assert.deepEqual(nextRoundPlan.target_search_goals, ['备案进度查询']);
+  });
+});
+
+test('stage2 v3 run center returns visible operation feedback and persisted status context', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '操作反馈样例系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+
+    assert.equal(created.operation.action, 'create_run');
+    assert.equal(created.operation.status, 'succeeded');
+    assert.match(created.operation.message, /已创建|草稿/);
+    assert.equal(created.operation.error, null);
+    assert.equal(created.run.currentStatus.phase, 'draft');
+    assert.match(created.run.currentStatus.message, /等待启动/);
+    assert.ok(created.run.recentEvents.some((event) => event.type === 'run_created'));
+
+    const started = await startV3Run(created.run.runId, { executionMode: 'contract_only' }, { runsDir });
+    assert.equal(started.operation.action, 'start');
+    assert.equal(started.operation.status, 'blocked');
+    assert.match(started.operation.nextAction, /人工确认|审核|继续/);
+    assert.equal(started.run.status, 'waiting_human');
+    assert.equal(started.run.currentStatus.phase, 'round_analysis');
+    assert.ok(started.run.recentEvents.some((event) => event.type === 'status_changed'));
+
+    const paused = await setV3RunLifecycleStatus(created.run.runId, 'pause', {}, { runsDir });
+    assert.equal(paused.operation.action, 'pause');
+    assert.equal(paused.operation.status, 'succeeded');
+    assert.equal(paused.run.status, 'paused');
+    assert.equal(paused.run.currentStatus.phase, 'pause');
+
+    const resumed = await setV3RunLifecycleStatus(created.run.runId, 'resume', {}, { runsDir });
+    assert.equal(resumed.operation.action, 'resume');
+    assert.equal(resumed.operation.status, 'running');
+    assert.equal(resumed.run.status, 'running');
+    assert.equal(resumed.operation.error, null);
+
+    const blocked = await continueNextRound(created.run.runId, {}, { runsDir });
+    assert.equal(blocked.operation.action, 'continue_next_round');
+    assert.equal(blocked.operation.status, 'blocked');
+    assert.match(blocked.operation.message, /人工批准|人工确认/);
+    assert.equal(blocked.run.status, 'waiting_human');
+
+    const listed = await listV3Runs({ runsDir });
+    const listedRun = listed.runs.find((run) => run.runId === created.run.runId);
+    assert.equal(listedRun.currentStatus.phase, 'next_round_blocked');
+    assert.ok(listedRun.recentEvents.length >= 3);
+  });
+});
+
+test('stage2 v3 run center requires explicit confirmation for full access mode', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    await assert.rejects(
+      () => createV3Run({
+        systemName: '全权限未确认系统',
+        entryUrl: 'https://example.com/home',
+        cdpUrl: 'http://localhost:9222',
+        safetyPolicy: 'test_env_full_access',
+        allowedSideEffects: ['submit', 'delete']
+      }, { runsDir }),
+      /测试环境全权限模式必须先/
+    );
+  });
+});
+
+test('stage2 v3 run center starts real_browser mode through Python v3 bridge', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '真实执行样例系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+    let received = null;
+    const started = await startV3Run(created.run.runId, {
+      executionMode: 'real_browser',
+      maxPages: 3,
+      maxFeaturesPerPage: 4
+    }, {
+      runsDir,
+      pythonRunner: async ({ command, args, artifactRoot }) => {
+        received = { command, args, artifactRoot };
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId);
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    assert.equal(started.run.status, 'completed');
+    assert.equal(started.run.executionMode, 'real_browser');
+    assert.equal(received.command, process.env.STAGE2_PYTHON || process.env.PYTHON || 'python');
+    assert.equal(argValue(received.args, '--v3-run-id'), created.run.runId);
+    assert.equal(argValue(received.args, '--v3-artifact-root'), received.artifactRoot);
+    assert.equal(argValue(received.args, '--page-url'), 'https://example.com/home');
+    assert.equal(argValue(received.args, '--cdp-url'), 'http://localhost:9222/');
+    assert.equal(argValue(received.args, '--v3-safety-policy'), 'low_risk_only');
+
+    const runDir = path.join(runsDir, created.run.runId);
+    const executionResults = await readJson(path.join(runDir, 'execution_results.json'));
+    const preflight = await readJson(path.join(runDir, 'preflight_result.json'));
+    assert.equal(executionResults.items[0].status, 'passed');
+    assert.equal(executionResults.items[0].execution_mode, 'real_browser');
+    assert.equal(executionResults.items[0].feature_point_id, 'feature_nav');
+    assert.match(executionResults.items[0].title, /feature_nav/);
+    assert.match(executionResults.items[0].title, /首页可达基础验证/);
+    assert.equal(preflight.checks.python_orchestrator.ok, true);
+  });
+});
+
+test('stage2 v3 run center imports action log and network evidence artifacts from Python bridge', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '证据样例系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+
+    const started = await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          actionLogLines: [
+            JSON.stringify({ action: 'script_restore_target_page', status: 'completed', duration_ms: 120 }),
+            JSON.stringify({ action: 'script_prefill_form', status: 'completed', duration_ms: 350 })
+          ],
+          networkEvents: {
+            schema_version: 'stage2_network_events.v1',
+            capture_status: 'enabled',
+            items: [{ url: 'https://example.com/api/submit', method: 'POST', status: 200 }]
+          }
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    assert.ok(started.run.artifacts.action_log.href.includes('/artifacts/action_log'));
+    assert.ok(started.run.artifacts.network_events.href.includes('/artifacts/network_events'));
+    const actionLogArtifact = await resolveV3RunArtifact(created.run.runId, 'action_log', { runsDir });
+    const networkArtifact = await resolveV3RunArtifact(created.run.runId, 'network_events', { runsDir });
+    assert.match(await fs.readFile(actionLogArtifact.path, 'utf8'), /script_prefill_form/);
+    const networkEvents = await readJson(networkArtifact.path);
+    assert.equal(networkEvents.items[0].status, 200);
+  });
+});
+
+test('stage2 v3 run center preserves Browser Use takeover evidence from Python bridge', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: 'Browser Use 接管样例系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      prioritizedTargets: ['线上备案申请']
+    }, { runsDir });
+
+    const started = await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          pageItems: [{
+            page_entry_id: 'browser_use_target_001',
+            name: '线上备案申请',
+            url: 'https://example.com/record/online',
+            menu_path: ['业务办理', '线上备案申请'],
+            page_type: 'form',
+            discovery_depth: 2,
+            status: 'reachable',
+            source: 'browser_use.semantic_recovery',
+            screenshot_refs: ['browser_use_target_001_final']
+          }],
+          featureItems: [{
+            feature_point_id: 'browser_use_target_001_flow',
+            page_entry_id: 'browser_use_target_001',
+            name: '线上备案申请目标接管流程',
+            feature_type: 'navigation',
+            risk_level: 'low',
+            auto_verifiable: true,
+            verification_strategy: 'browser_use_target_handover',
+            locator_candidates: [],
+            source: 'browser_use.semantic_recovery',
+            confidence: 'agent_observed',
+            review_status: 'auto_included'
+          }],
+          executionItems: [{
+            test_case_id: 'case_browser_use_online_apply',
+            feature_point_id: 'browser_use_target_001_flow',
+            status: 'passed',
+            verdict: 'Browser Use 已进入线上备案申请页面。',
+            started_at: '2026-06-24T00:00:00.000Z',
+            finished_at: '2026-06-24T00:00:01.000Z',
+            actions: [{ source: 'browser_use', action: 'agent_run', status: 'completed' }],
+            page_feedback: ['已进入线上备案申请页面，可见申请表单。'],
+            screenshot_refs: ['browser_use_target_001_initial', 'browser_use_target_001_final'],
+            network_refs: [],
+            failure_reason: null,
+            manual_confirmation_required: false,
+            execution_mode: 'browser_use_takeover'
+          }]
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    const runDir = path.join(runsDir, created.run.runId);
+    const executionResults = await readJson(path.join(runDir, 'execution_results.json'));
+    assert.equal(executionResults.items[0].execution_mode, 'browser_use_takeover');
+    assert.equal(executionResults.items[0].actions[0].source, 'browser_use');
+    assert.deepEqual(executionResults.items[0].page_feedback, ['已进入线上备案申请页面，可见申请表单。']);
+    assert.deepEqual(executionResults.items[0].screenshot_refs, [
+      'browser_use_target_001_initial',
+      'browser_use_target_001_final'
+    ]);
+    assert.equal(started.run.summary.execution.recentEvidence[0].executionMode, 'browser_use_takeover');
+    assert.equal(started.run.summary.execution.recentEvidence[0].actionCount, 1);
+    assert.deepEqual(started.run.summary.execution.recentEvidence[0].screenshotRefs, [
+      'browser_use_target_001_initial',
+      'browser_use_target_001_final'
+    ]);
+  });
+});
+
+test('stage2 v3 run center keeps next round open for discovered but uncovered targets', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '目标未覆盖样例系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      prioritizedTargets: ['线上备案申请']
+    }, { runsDir });
+
+    let calls = 0;
+    const pythonRunner = async ({ args, artifactRoot }) => {
+      calls += 1;
+      const runId = argValue(args, '--v3-run-id');
+      const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+        pageItems: [{
+          page_entry_id: 'page_online_apply',
+          name: '线上备案申请',
+          url: 'https://example.com/record/online',
+          menu_path: ['业务办理', '线上备案申请'],
+          page_type: 'form',
+          discovery_depth: 1,
+          status: 'unreachable',
+          source: 'fake_python',
+          screenshot_refs: [],
+          failure_reason: 'blank_page_after_navigation'
+        }],
+        featureItems: []
+      });
+      return {
+        stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+        stderr: ''
+      };
+    };
+
+    await startV3Run(created.run.runId, {
+      executionMode: 'real_browser'
+    }, { runsDir, pythonRunner });
+
+    const runDir = path.join(runsDir, created.run.runId);
+    const nextRoundPlan = await readJson(path.join(runDir, 'next_round_plan.json'));
+    const roundAnalysis = await readJson(path.join(runDir, 'round_analysis.json'));
+
+    assert.equal(nextRoundPlan.should_continue, true);
+    assert.equal(nextRoundPlan.decision, 'auto_continue');
+    assert.match(nextRoundPlan.next_round_goal, /线上备案申请/);
+    assert.deepEqual(roundAnalysis.uncovered_scope_targets, ['线上备案申请']);
+    assert.ok(
+      roundAnalysis.failure_summary.clusters.some((cluster) => (
+        cluster.reason === 'scope_target_discovered_but_uncovered'
+      ))
+    );
+
+    await fs.writeFile(path.join(runDir, 'next_round_plan.json'), JSON.stringify({
+      schema_version: 'stage2_next_round_plan.v3',
+      current_round_id: 'round_001',
+      should_continue: false,
+      decision: 'stop_goal_completed',
+      next_round_goal: '本轮已完成。',
+      target_page_entry_ids: [],
+      target_feature_point_ids: [],
+      planned_improvements: [],
+      risk_level: 'low',
+      requires_human_approval: false
+    }, null, 2));
+
+    const continued = await continueNextRound(created.run.runId, {}, { runsDir, pythonRunner });
+    assert.equal(calls, 2);
+    assert.equal(continued.run.currentRoundId, 'round_002');
+    assert.equal(continued.operation.status, 'succeeded');
+  });
+});
+
+test('stage2 v3 run center does not treat page-visible placeholder as prioritized target coverage', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '目标仅页面可见样例系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      prioritizedTargets: ['线上备案申请']
+    }, { runsDir });
+
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          pageItems: [{
+            page_entry_id: 'page_online_apply',
+            name: '线上备案申请',
+            url: 'https://example.com/record/online',
+            menu_path: ['备案管理', '线上备案申请'],
+            page_type: 'form',
+            discovery_depth: 1,
+            status: 'reachable',
+            source: 'fake_python',
+            screenshot_refs: ['online_apply_visible']
+          }],
+          featureItems: [{
+            feature_point_id: 'feature_online_apply_visible',
+            page_entry_id: 'page_online_apply',
+            name: '页面可见性验证',
+            feature_type: 'view',
+            risk_level: 'low',
+            auto_verifiable: true,
+            verification_strategy: 'playwright_page_visible',
+            locator_candidates: [],
+            source: 'fake_python',
+            confidence: 0.9,
+            review_status: 'auto_included'
+          }],
+          executionItems: [{
+            test_case_id: 'case_online_apply_visible',
+            feature_point_id: 'feature_online_apply_visible',
+            status: 'real_passed',
+            verdict: '页面可见。',
+            started_at: '2026-06-24T00:00:00.000Z',
+            finished_at: '2026-06-24T00:00:01.000Z',
+            actions: [{ action: 'goto', ok: true }],
+            page_feedback: ['loaded'],
+            screenshot_refs: ['online_apply_visible'],
+            network_refs: [],
+            failure_reason: null,
+            manual_confirmation_required: false,
+            execution_mode: 'real_browser'
+          }]
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    const runDir = path.join(runsDir, created.run.runId);
+    const roundAnalysis = await readJson(path.join(runDir, 'round_analysis.json'));
+    const nextRoundPlan = await readJson(path.join(runDir, 'next_round_plan.json'));
+
+    assert.deepEqual(roundAnalysis.uncovered_scope_targets, ['线上备案申请']);
+    assert.equal(nextRoundPlan.should_continue, true);
+    assert.equal(nextRoundPlan.decision, 'auto_continue');
+    assert.match(nextRoundPlan.next_round_goal, /线上备案申请/);
+    assert.ok(
+      roundAnalysis.failure_summary.clusters.some((cluster) => (
+        cluster.reason === 'scope_target_discovered_but_uncovered'
+      ))
+    );
+  });
+});
+
+test('stage2 v3 run center does not treat visible-only target controls as prioritized flow coverage', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '目标仅控件可见样例系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      prioritizedTargets: ['线上备案申请']
+    }, { runsDir });
+
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          pageItems: [{
+            page_entry_id: 'page_online_apply',
+            name: '线上备案申请',
+            url: 'https://example.com/record/online',
+            menu_path: ['备案管理', '线上备案申请'],
+            page_type: 'form',
+            discovery_depth: 1,
+            status: 'reachable',
+            source: 'fake_python',
+            screenshot_refs: ['online_apply_visible']
+          }],
+          featureItems: [{
+            feature_point_id: 'feature_online_apply_label',
+            page_entry_id: 'page_online_apply',
+            name: '线上备案申请',
+            feature_type: 'navigation',
+            risk_level: 'low',
+            auto_verifiable: true,
+            verification_strategy: 'playwright_visible_control',
+            locator_candidates: [],
+            source: 'fake_python',
+            confidence: 0.9,
+            review_status: 'auto_included'
+          }, {
+            feature_point_id: 'feature_apply_button',
+            page_entry_id: 'page_online_apply',
+            name: '我要申请备案',
+            feature_type: 'view',
+            risk_level: 'low',
+            auto_verifiable: true,
+            verification_strategy: 'playwright_visible_control',
+            locator_candidates: [],
+            source: 'fake_python',
+            confidence: 0.9,
+            review_status: 'auto_included'
+          }],
+          executionItems: [{
+            test_case_id: 'case_online_apply_label',
+            feature_point_id: 'feature_online_apply_label',
+            status: 'real_passed',
+            verdict: 'passed',
+            started_at: '2026-06-24T00:00:00.000Z',
+            finished_at: '2026-06-24T00:00:01.000Z',
+            actions: [{ action: 'observe_feature', target: 'feature_online_apply_label', status: 'passed' }],
+            page_feedback: ['功能点入口可见。'],
+            screenshot_refs: ['online_apply_visible'],
+            network_refs: [],
+            failure_reason: null,
+            manual_confirmation_required: false,
+            execution_mode: 'real_browser'
+          }, {
+            test_case_id: 'case_apply_button',
+            feature_point_id: 'feature_apply_button',
+            status: 'real_passed',
+            verdict: 'passed',
+            started_at: '2026-06-24T00:00:01.000Z',
+            finished_at: '2026-06-24T00:00:02.000Z',
+            actions: [{ action: 'observe_feature', target: 'feature_apply_button', status: 'passed' }],
+            page_feedback: ['功能点入口可见。'],
+            screenshot_refs: ['online_apply_visible'],
+            network_refs: [],
+            failure_reason: null,
+            manual_confirmation_required: false,
+            execution_mode: 'real_browser'
+          }]
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    const runDir = path.join(runsDir, created.run.runId);
+    const roundAnalysis = await readJson(path.join(runDir, 'round_analysis.json'));
+    const nextRoundPlan = await readJson(path.join(runDir, 'next_round_plan.json'));
+
+    assert.deepEqual(roundAnalysis.uncovered_scope_targets, ['线上备案申请']);
+    assert.equal(nextRoundPlan.should_continue, true);
+    assert.equal(nextRoundPlan.decision, 'auto_continue');
+    assert.match(nextRoundPlan.next_round_goal, /线上备案申请/);
+    assert.ok(
+      roundAnalysis.failure_summary.clusters.some((cluster) => (
+        cluster.reason === 'scope_target_discovered_but_uncovered'
+      ))
+    );
+  });
+});
+
+test('stage2 v3 run center exposes execution verdict counts and recent evidence', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '执行证据样例系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+    const started = await startV3Run(created.run.runId, {
+      executionMode: 'real_browser'
+    }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          executionItems: [{
+            test_case_id: 'case_nav',
+            feature_point_id: 'feature_nav',
+            status: 'passed',
+            verdict: 'passed',
+            execution_mode: 'real_browser',
+            actions: [{ action: 'goto', status: 'passed' }],
+            page_feedback: ['首页加载完成'],
+            screenshot_refs: ['screenshots/home_entry.png'],
+            failure_reason: null,
+            manual_confirmation_required: false
+          }, {
+            test_case_id: 'case_query',
+            feature_point_id: 'feature_query',
+            status: 'failed',
+            verdict: 'failed',
+            execution_mode: 'real_browser',
+            actions: [{ action: 'click', target: '查询', status: 'failed' }],
+            page_feedback: ['列表没有刷新'],
+            screenshot_refs: ['screenshots/query_failure.png'],
+            failure_reason: 'assertion_failed',
+            manual_confirmation_required: true
+          }, {
+            test_case_id: 'case_delete',
+            feature_point_id: 'feature_delete',
+            status: 'skipped_by_policy',
+            verdict: 'skipped',
+            execution_mode: 'real_browser',
+            actions: [],
+            page_feedback: [],
+            screenshot_refs: [],
+            failure_reason: 'policy_denied',
+            manual_confirmation_required: true
+          }]
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'waiting_human' }),
+          stderr: ''
+        };
+      }
+    });
+
+    assert.equal(started.run.summary.execution.total, 3);
+    assert.equal(started.run.summary.execution.passed, 1);
+    assert.equal(started.run.summary.execution.failed, 1);
+    assert.equal(started.run.summary.execution.blocked, 1);
+    assert.equal(started.run.summary.execution.skipped, 1);
+    assert.deepEqual(
+      started.run.summary.execution.recentEvidence.map((item) => item.testCaseId),
+      ['case_nav', 'case_query', 'case_delete']
+    );
+    assert.equal(started.run.summary.execution.recentEvidence[0].screenshotRefs[0], 'screenshots/home_entry.png');
+    assert.equal(started.run.summary.execution.recentEvidence[1].failureReason, 'assertion_failed');
+    assert.equal(started.run.summary.execution.recentEvidence[2].failureReason, 'policy_denied');
+  });
+});
+
+test('stage2 v3 run center executes selected model profiles sequentially and writes comparison summary', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const modelProfiles = [{
+      id: 'qwen',
+      label: 'Qwen',
+      provider: 'openai_compatible',
+      model: 'qwen-test',
+      apiKeyConfigured: true
+    }, {
+      id: 'deepseek',
+      label: 'DeepSeek',
+      provider: 'openai_compatible',
+      model: 'deepseek-test',
+      apiKeyConfigured: true
+    }];
+    const created = await createV3Run({
+      systemName: '多模型样例系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      modelProfileIds: ['qwen', 'deepseek']
+    }, { runsDir, modelProfiles });
+    const calls = [];
+
+    const started = await startV3Run(created.run.runId, {
+      executionMode: 'real_browser'
+    }, {
+      runsDir,
+      modelProfiles,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        calls.push({ model: argValue(args, '--v3-model-profile'), args });
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          executionItems: [{
+            test_case_id: `case_${calls.length}`,
+            status: calls.length === 1 ? 'passed' : 'failed',
+            verdict: calls.length === 1 ? 'passed' : 'failed',
+            execution_mode: 'real_browser',
+            actions: [{ action: 'goto', status: 'passed' }],
+            page_feedback: [`model ${calls.length}`],
+            screenshot_refs: [`screenshots/model_${calls.length}.png`],
+            failure_reason: calls.length === 1 ? null : 'assertion_failed',
+            manual_confirmation_required: calls.length !== 1
+          }]
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    assert.deepEqual(calls.map((item) => item.model), ['qwen', 'deepseek']);
+    assert.equal(started.run.summary.modelComparison.total, 2);
+    assert.equal(started.run.summary.modelComparison.completed, 2);
+    assert.equal(started.run.summary.modelComparison.failed, 0);
+
+    const runDir = path.join(runsDir, created.run.runId);
+    const comparison = await readJson(path.join(runDir, 'model_comparison.json'));
+    assert.equal(comparison.items.length, 2);
+    assert.deepEqual(comparison.items.map((item) => item.model_profile_id), ['qwen', 'deepseek']);
+    assert.ok(comparison.items.every((item) => item.shared_config_signature === comparison.shared_config_signature));
+    assert.equal(comparison.items[0].execution.passed, 1);
+    assert.equal(comparison.items[1].execution.failed, 1);
+    assert.ok(comparison.items[0].artifacts.run_dir.includes('model_attempts'));
+  });
+});
+
+test('stage2 v3 multi-model comparison continues after one model failure', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const modelProfiles = [{
+      id: 'broken',
+      label: 'Broken Model',
+      provider: 'openai_compatible',
+      model: 'broken-test',
+      apiKeyConfigured: true
+    }, {
+      id: 'steady',
+      label: 'Steady Model',
+      provider: 'openai_compatible',
+      model: 'steady-test',
+      apiKeyConfigured: true
+    }];
+    const created = await createV3Run({
+      systemName: '多模型失败续跑系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      modelProfileIds: ['broken', 'steady']
+    }, { runsDir, modelProfiles });
+    const calls = [];
+
+    const started = await startV3Run(created.run.runId, {
+      executionMode: 'real_browser'
+    }, {
+      runsDir,
+      modelProfiles,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const model = argValue(args, '--v3-model-profile');
+        calls.push(model);
+        if (model === 'broken') {
+          const error = new Error('model route failed');
+          error.code = 3;
+          error.stderr = 'model unavailable';
+          throw error;
+        }
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId);
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    assert.deepEqual(calls, ['broken', 'steady']);
+    assert.equal(started.run.status, 'completed');
+    assert.equal(started.run.summary.modelComparison.total, 2);
+    assert.equal(started.run.summary.modelComparison.completed, 1);
+    assert.equal(started.run.summary.modelComparison.failed, 1);
+
+    const comparison = await readJson(path.join(runsDir, created.run.runId, 'model_comparison.json'));
+    assert.equal(comparison.items[0].status, 'failed');
+    assert.equal(comparison.items[0].failure_reason, 'python_v3_orchestrator_failed');
+    assert.equal(comparison.items[1].status, 'completed');
+  });
+});
+
+test('stage2 v3 run center keeps next round open when scoped target is not discovered', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '目标页面未命中系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      scope: '优先完成“备案进度查询”页面'
+    }, { runsDir });
+    let received = null;
+    const started = await startV3Run(created.run.runId, {
+      executionMode: 'real_browser'
+    }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        received = { args };
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId);
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    assert.equal(argValue(received.args, '--v3-scope'), '优先完成“备案进度查询”页面');
+    assert.equal(started.run.summary.nextDecision, 'auto_continue');
+
+    const runDir = path.join(runsDir, created.run.runId);
+    const analysis = await readJson(path.join(runDir, 'round_analysis.json'));
+    const nextRoundPlan = await readJson(path.join(runDir, 'next_round_plan.json'));
+    assert.deepEqual(analysis.missing_scope_targets, ['备案进度查询']);
+    assert.equal(analysis.ai_provider_status, 'model_unavailable');
+    assert.equal(nextRoundPlan.decision, 'auto_continue');
+    assert.equal(nextRoundPlan.should_continue, true);
+    assert.match(nextRoundPlan.next_round_goal, /备案进度查询/);
+  });
+});
+
+test('stage2 v3 continue next round starts execution instead of ending in planned state', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '下一轮执行系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      scope: '优先完成“备案进度查询”页面'
+    }, { runsDir });
+    const calls = [];
+    const pythonRunner = async ({ args, artifactRoot }) => {
+      calls.push(args);
+      const runId = argValue(args, '--v3-run-id');
+      const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId);
+      return {
+        stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+        stderr: ''
+      };
+    };
+
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, { runsDir, pythonRunner });
+    const continued = await continueNextRound(created.run.runId, {}, { runsDir, pythonRunner });
+
+    assert.equal(calls.length, 2);
+    assert.notEqual(continued.run.status, 'planned');
+    assert.equal(continued.run.status, 'completed');
+    assert.equal(continued.run.currentRoundId, 'round_002');
+    assert.equal(continued.operation.status, 'succeeded');
+    assert.ok(continued.run.recentEvents.some((event) => event.type === 'next_round_queued'));
+    assert.ok(continued.run.recentEvents.some((event) => event.type === 'status_changed' && event.phase === 'round_analysis'));
+  });
+});
+
+test('stage2 v3 second round completion feedback names the actual round', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '下一轮文案系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      scope: '优先完成“备案进度查询”页面'
+    }, { runsDir });
+    const pythonRunner = async ({ args, artifactRoot }) => {
+      const runId = argValue(args, '--v3-run-id');
+      const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId);
+      return {
+        stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+        stderr: ''
+      };
+    };
+
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, { runsDir, pythonRunner });
+    await continueNextRound(created.run.runId, {}, { runsDir, pythonRunner });
+
+    const events = (await fs.readFile(path.join(runsDir, created.run.runId, 'progress_events.jsonl'), 'utf8'))
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    const secondRoundEvent = events.find((event) => (
+      event.type === 'status_changed'
+      && event.phase === 'round_analysis'
+      && /第 2 轮|第2轮/.test(event.message || '')
+    ));
+
+    assert.ok(secondRoundEvent);
+    assert.doesNotMatch(secondRoundEvent.message, /首轮/);
+  });
+});
+
+test('stage2 v3 continue next round returns precise blockers for unmet prerequisites', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '下一轮阻塞系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+    await startV3Run(created.run.runId, { executionMode: 'contract_only' }, { runsDir });
+    const runDir = path.join(runsDir, created.run.runId);
+
+    const cases = [{
+      name: 'executor',
+      plan: { decision: 'auto_continue', prerequisite_blockers: [{ code: 'executor_unavailable' }] },
+      code: 'executor_unavailable',
+      hint: /执行器|Python/
+    }, {
+      name: 'browser-use',
+      plan: { decision: 'auto_continue', prerequisite_blockers: [{ code: 'browser_use_unavailable' }] },
+      code: 'browser_use_unavailable',
+      hint: /Browser-use/
+    }, {
+      name: 'playwright',
+      plan: { decision: 'auto_continue', prerequisite_blockers: [{ code: 'playwright_disconnected' }] },
+      code: 'playwright_disconnected',
+      hint: /Playwright|CDP/
+    }, {
+      name: 'model',
+      plan: { decision: 'auto_continue', prerequisite_blockers: [{ code: 'model_unavailable' }] },
+      code: 'model_unavailable',
+      hint: /模型/
+    }, {
+      name: 'human',
+      plan: { decision: 'wait_human_review', requires_human_approval: true },
+      code: 'human_approval_required',
+      hint: /人工/
+    }, {
+      name: 'budget',
+      plan: { decision: 'stop_budget_exhausted' },
+      code: 'budget_exhausted',
+      hint: /预算|上限/
+    }, {
+      name: 'no-improvement',
+      plan: { decision: 'stop_no_improvement' },
+      code: 'no_improvement',
+      hint: /改进/
+    }];
+
+    for (const item of cases) {
+      await fs.writeFile(path.join(runDir, 'next_round_plan.json'), JSON.stringify({
+        schema_version: 'stage2_next_round_plan.v3',
+        current_round_id: 'round_001',
+        should_continue: item.plan.decision === 'auto_continue',
+        next_round_goal: '继续下一轮。',
+        target_page_entry_ids: [],
+        target_feature_point_ids: [],
+        planned_improvements: [],
+        risk_level: 'low',
+        requires_human_approval: false,
+        ...item.plan
+      }, null, 2));
+
+      const blocked = await continueNextRound(created.run.runId, {}, { runsDir });
+      assert.equal(blocked.operation.status, 'blocked', item.name);
+      assert.equal(blocked.operation.error.code, item.code, item.name);
+      assert.match(blocked.operation.nextAction, item.hint, item.name);
+      assert.notEqual(blocked.run.status, 'planned', item.name);
+    }
+  });
+});
+
+test('stage2 v3 run center persists and forwards test environment full access policy', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '全权限测试系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      safetyPolicy: 'test_env_full_access',
+      fullAccessConfirmed: true,
+      allowedSideEffects: ['submit', 'delete', 'approve']
+    }, { runsDir });
+    let received = null;
+    await startV3Run(created.run.runId, {
+      executionMode: 'real_browser'
+    }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        received = { args };
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          executionItems: [{
+            test_case_id: 'case_nav',
+            status: 'side_effect_executed',
+            verdict: '已执行提交动作。',
+            started_at: '2026-06-24T00:00:00.000Z',
+            finished_at: '2026-06-24T00:00:01.000Z',
+            action_type: 'submit',
+            control_label: '提交',
+            policy_decision: { decision: 'allowed', reason_code: 'test_env_full_access_allowlisted' },
+            before_screenshot_ref: 'side_effect_001_before',
+            after_screenshot_ref: 'side_effect_001_after',
+            failure_reason: null,
+            execution_mode: 'real_browser'
+          }]
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    const runDir = path.join(runsDir, created.run.runId);
+    const manifest = await readJson(path.join(runDir, 'run_manifest.json'));
+    const inputConfig = await readJson(path.join(runDir, 'input_config.json'));
+    const executionResults = await readJson(path.join(runDir, 'execution_results.json'));
+    const publicRun = await getV3Run(created.run.runId, { runsDir });
+    assert.equal(manifest.safety_policy, 'test_env_full_access');
+    assert.equal(publicRun.run.fullAccessConfirmed, true);
+    assert.equal(inputConfig.full_access_confirmed, true);
+    assert.deepEqual(inputConfig.allowed_side_effect_actions, ['submit', 'delete', 'approve']);
+    assert.equal(argValue(received.args, '--v3-safety-policy'), 'test_env_full_access');
+    assert.deepEqual(
+      received.args.filter((item, index) => received.args[index - 1] === '--v3-allow-side-effect-action'),
+      ['submit', 'delete', 'approve']
+    );
+    assert.equal(executionResults.items[0].status, 'side_effect_executed');
+    assert.deepEqual(executionResults.items[0].screenshot_refs, ['side_effect_001_before', 'side_effect_001_after']);
+  });
+});
+
+test('stage2 v3 run center imports Python v1-shaped real browser artifacts', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '真实执行兼容系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+
+    const started = await startV3Run(created.run.runId, {
+      executionMode: 'real_browser'
+    }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV1Artifacts(artifactRoot, runId);
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    assert.equal(started.run.status, 'completed');
+    assert.equal(started.run.summary.pageEntries, 1);
+    assert.equal(started.run.summary.featurePoints, 1);
+    assert.equal(started.run.summary.generatedTestCases, 1);
+    assert.equal(started.run.summary.execution.passed, 1);
+    assert.equal(started.run.summary.execution.by_status.real_passed, 1);
+    assert.equal(started.run.summary.nextDecision, 'stop_goal_completed');
+
+    const runDir = path.join(runsDir, created.run.runId);
+    const pageEntries = await readJson(path.join(runDir, 'page_entries.json'));
+    const featurePoints = await readJson(path.join(runDir, 'feature_points.json'));
+    const generatedTestCases = await readJson(path.join(runDir, 'generated_test_cases.json'));
+    const roundAnalysis = await readJson(path.join(runDir, 'round_analysis.json'));
+    assert.equal(pageEntries.schema_version, 'stage2_page_entries.v3');
+    assert.equal(pageEntries.items.length, 1);
+    assert.equal(featurePoints.items.length, 1);
+    assert.equal(generatedTestCases.items.length, 1);
+    assert.equal(roundAnalysis.coverage_summary.page_entries, 1);
+    assert.equal(roundAnalysis.failure_summary.total_clusters, 0);
+
+    const continued = await continueNextRound(created.run.runId, {}, { runsDir });
+    assert.equal(continued.run.status, 'completed');
+    assert.equal(continued.run.currentRoundId, 'round_001');
+    assert.equal(continued.run.rounds.length, 1);
+    const currentStatus = await readJson(path.join(runDir, 'current_status.json'));
+    assert.equal(currentStatus.message, '当前目标已完成，无需进入下一轮；可生成报告或创建新的更大范围 run。');
+  });
+});
+
+test('stage2 v3 run center records Python failure as visible run failure artifacts', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '失败样例系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+
+    const started = await startV3Run(created.run.runId, {
+      executionMode: 'real_browser'
+    }, {
+      runsDir,
+      pythonRunner: async () => {
+        const error = new Error('CDP connection refused');
+        error.stderr = 'Cannot connect to http://localhost:9222';
+        error.code = 2;
+        throw error;
+      }
+    });
+
+    assert.equal(started.run.status, 'failed');
+    assert.equal(started.run.executionMode, 'real_browser');
+    assert.equal(started.run.summary.nextDecision, 'wait_human_review');
+    assert.match(started.operation.nextAction, /preflight_result/);
+    assert.deepEqual(
+      started.operation.diagnosticArtifacts.map((item) => item.key),
+      ['preflight_result', 'python_execution', 'execution_results', 'progress_events', 'browser_use_tool_timings']
+    );
+
+    const runDir = path.join(runsDir, created.run.runId);
+    const currentStatus = await readJson(path.join(runDir, 'current_status.json'));
+    const executionResults = await readJson(path.join(runDir, 'execution_results.json'));
+    const humanTasks = await readJson(path.join(runDir, 'human_tasks.json'));
+    assert.equal(currentStatus.phase, 'real_browser_execution_failed');
+    assert.match(currentStatus.message, /CDP connection refused/);
+    assert.equal(currentStatus.failure_reason, 'python_v3_orchestrator_failed');
+    assert.ok(executionResults.items.every((item) => item.failure_reason === 'python_v3_orchestrator_failed'));
+    assert.ok(humanTasks.items.some((item) => item.task_id === 'task_connect_executor_or_confirm_plan'));
+  });
+});
+
+test('stage2 v3 run center classifies Python orchestrator timeout and exposes it in current status', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理平台',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      executionMode: 'real_browser'
+    }, { runsDir });
+
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ timeoutMs }) => {
+        const error = new Error('Command failed because execution timed out.');
+        error.killed = true;
+        error.signal = 'SIGTERM';
+        error.stderr = [
+          'INFO     [Agent] Step 22:',
+          'INFO     [Agent] Next goal: Fill 育苗地点 cascader.',
+          "ERROR    [tools] Action 'script_prefill_form' failed with error: Error executing action script_prefill_form: timeout",
+          'INFO     [Agent] Step 23:',
+          'INFO     [Agent] Next goal: Retry submitting the online filing form.'
+        ].join('\n');
+        error.stdout = '';
+        error.timeoutMs = timeoutMs;
+        throw error;
+      }
+    });
+
+    const pythonExecution = await readJson(path.join(runsDir, created.run.runId, 'python_execution.json'));
+    const currentStatus = await readJson(path.join(runsDir, created.run.runId, 'current_status.json'));
+
+    assert.equal(pythonExecution.failureReason, 'python_v3_orchestrator_timeout');
+    assert.equal(pythonExecution.timeoutMs, 30 * 60 * 1000);
+    assert.equal(pythonExecution.timeoutDiagnostics.last_step, 23);
+    assert.match(pythonExecution.timeoutDiagnostics.last_goal, /Retry submitting/);
+    assert.match(currentStatus.message, /超过 30 分钟/);
+    assert.equal(currentStatus.failure_reason, 'python_v3_orchestrator_timeout');
+    assert.equal(currentStatus.timeout_diagnostics.last_step, 23);
+  });
+});
+
+test('stage2 v3 run center records orchestrator timeout as blocked cases instead of feature failures', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理平台',
+      entryUrl: 'https://www.zbsykj.com:19096/index',
+      cdpUrl: 'http://localhost:9222',
+      executionMode: 'real_browser',
+      prioritizedTargets: ['线上备案申请']
+    }, { runsDir });
+    const runDir = path.join(runsDir, created.run.runId);
+    await fs.writeFile(path.join(runDir, 'feature_points.json'), JSON.stringify({
+      schema_version: 'stage2_feature_points.v3',
+      items: [{
+        feature_point_id: 'feature_online_apply_create',
+        page_entry_id: 'page_online_apply',
+        name: '线上备案申请新增',
+        feature_type: 'create',
+        risk_level: 'medium',
+        auto_verifiable: true,
+        review_status: 'auto_included'
+      }]
+    }, null, 2));
+    await fs.writeFile(path.join(runDir, 'generated_test_cases.json'), JSON.stringify({
+      schema_version: 'stage2_generated_test_cases.v3',
+      items: [{
+        test_case_id: 'case_online_apply_create',
+        feature_point_id: 'feature_online_apply_create',
+        title: '线上备案申请新增 - 最小执行路径',
+        requires_human_confirmation: false
+      }]
+    }, null, 2));
+
+    await startV3Run(created.run.runId, {
+      executionMode: 'real_browser',
+      roundId: 'round_003'
+    }, {
+      runsDir,
+      pythonRunner: async () => {
+        const error = new Error('Command failed because execution timed out.');
+        error.killed = true;
+        error.signal = 'SIGTERM';
+        error.stderr = 'INFO     [Agent] Step 42:\nINFO     [Agent] Next goal: Fill remark field.';
+        error.stdout = '';
+        throw error;
+      }
+    });
+
+    const executionResults = await readJson(path.join(runDir, 'execution_results.json'));
+    const summary = (await getV3Run(created.run.runId, { runsDir })).run.summary.execution;
+    assert.equal(executionResults.items.length, 1);
+    assert.equal(executionResults.items[0].test_case_id, 'case_online_apply_create');
+    assert.equal(executionResults.items[0].feature_point_id, 'feature_online_apply_create');
+    assert.equal(executionResults.items[0].status, 'blocked_by_executor');
+    assert.equal(executionResults.items[0].failure_reason, 'python_v3_orchestrator_timeout');
+    assert.match(executionResults.items[0].verdict, /未形成单功能点结论/);
+    assert.equal(summary.failed, 0);
+    assert.equal(summary.blocked, 1);
+  });
+});
+
+test('stage2 v3 run center preserves prior menu discovery artifacts when Python times out', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理平台',
+      entryUrl: 'https://www.zbsykj.com:19096/index',
+      cdpUrl: 'http://localhost:9222',
+      executionMode: 'real_browser',
+      prioritizedTargets: ['线上备案申请']
+    }, { runsDir });
+    const runDir = path.join(runsDir, created.run.runId);
+    await fs.writeFile(path.join(runDir, 'menu_entries.json'), JSON.stringify({
+      schema_version: 'stage2_menu_entries.v1',
+      items: [{
+        menu_id: 'menu_5',
+        text: '线上备案申请',
+        is_leaf: true,
+        route_hint: 'https://www.zbsykj.com:19096/record/online',
+        menu_path: ['备案管理', '线上备案申请'],
+        status: 'discovered'
+      }],
+      menu_entries: [{
+        menu_id: 'menu_5',
+        text: '线上备案申请',
+        is_leaf: true,
+        route_hint: 'https://www.zbsykj.com:19096/record/online',
+        menu_path: ['备案管理', '线上备案申请'],
+        status: 'discovered'
+      }]
+    }, null, 2));
+
+    await startV3Run(created.run.runId, {
+      executionMode: 'real_browser',
+      roundId: 'round_002'
+    }, {
+      runsDir,
+      pythonRunner: async () => {
+        const error = new Error('Command failed because execution timed out.');
+        error.killed = true;
+        error.signal = 'SIGTERM';
+        error.stderr = 'INFO     [Agent] Step 9:\nINFO     [Agent] Next goal: Call script_prefill_form.';
+        error.stdout = '';
+        throw error;
+      }
+    });
+
+    const menuEntries = await readJson(path.join(runDir, 'menu_entries.json'));
+    const roundAnalysis = await readJson(path.join(runDir, 'round_analysis.json'));
+    assert.equal(menuEntries.items.length, 1);
+    assert.equal(menuEntries.items[0].text, '线上备案申请');
+    assert.notEqual(roundAnalysis.target_tracking[0].missed_reason, 'not_found_in_menu_or_page_artifacts');
+    assert.deepEqual(roundAnalysis.target_tracking[0].matched_menu_entry_ids, ['menu_5']);
+  });
+});
+
+test('stage2 v3 run center keeps first-round real page entries on timeout instead of reverting to page_home seed', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '追本溯源管理平台',
+      entryUrl: 'https://www.zbsykj.com:19096/index',
+      cdpUrl: 'http://localhost:9222',
+      executionMode: 'real_browser',
+      prioritizedTargets: ['线上备案申请']
+    }, { runsDir });
+    const runDir = path.join(runsDir, created.run.runId);
+    await fs.writeFile(path.join(runDir, 'source_real_browser.json'), JSON.stringify({
+      schema_version: 'stage2_v3_run.v1',
+      status: 'completed',
+      page_entries: [{
+        page_entry_id: 'menu_page_002',
+        name: '线上备案申请',
+        url: 'https://www.zbsykj.com:19096/record/online',
+        menu_path: ['备案管理', '线上备案申请'],
+        page_type: 'form',
+        discovery_depth: 1,
+        status: 'reachable',
+        source: 'browser_use'
+      }],
+      menu_entries: {
+        schema_version: 'stage2_menu_entries.v1',
+        items: [{
+          menu_id: 'menu_5',
+          text: '线上备案申请',
+          is_leaf: true,
+          route_hint: 'https://www.zbsykj.com:19096/record/online',
+          menu_path: ['备案管理', '线上备案申请'],
+          status: 'discovered'
+        }]
+      }
+    }, null, 2));
+
+    await startV3Run(created.run.runId, {
+      executionMode: 'real_browser',
+      roundId: 'round_002'
+    }, {
+      runsDir,
+      pythonRunner: async () => {
+        const error = new Error('Command failed because execution timed out.');
+        error.killed = true;
+        error.signal = 'SIGTERM';
+        error.stderr = 'INFO     [Agent] Step 49:\nINFO     [Agent] Next goal: Retry submit.';
+        error.stdout = '';
+        throw error;
+      }
+    });
+
+    const pageEntries = await readJson(path.join(runDir, 'page_entries.json'));
+    assert.equal(pageEntries.items.length, 1);
+    assert.equal(pageEntries.items[0].page_entry_id, 'menu_page_002');
+    assert.equal(pageEntries.items[0].url, 'https://www.zbsykj.com:19096/record/online');
+    assert.equal(pageEntries.items[0].status, 'reachable');
+  });
+});
+
+test('stage2 v3 run center records missing Python executor without silent success', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '缺执行器样例系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+
+    const started = await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async () => {
+        const error = new Error('spawn python ENOENT');
+        error.code = 'ENOENT';
+        throw error;
+      }
+    });
+
+    assert.equal(started.run.status, 'failed');
+    assert.equal(started.operation.status, 'failed');
+    assert.equal(started.operation.error.code, 'real_browser_execution_failed');
+    assert.equal(started.run.operability.kind, 'executor_unavailable');
+    assert.equal(started.run.operability.actionable, false);
+    const runDir = path.join(runsDir, created.run.runId);
+    const preflight = await readJson(path.join(runDir, 'preflight_result.json'));
+    const executionResults = await readJson(path.join(runDir, 'execution_results.json'));
+    assert.equal(preflight.checks.python_orchestrator.failure_reason, 'python_executor_unavailable');
+    assert.ok(executionResults.items.every((item) => item.failure_reason === 'python_executor_unavailable'));
+
+    const list = await listV3Runs({ runsDir });
+    assert.equal(list.runs[0].operability.kind, 'executor_unavailable');
+  });
+});
+
+test('stage2 v3 run center does not treat Python safe placeholder as real browser success', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '占位返回样例系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+
+    const started = await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          executionItems: [{
+            case_id: 'case_nav',
+            feature_id: 'feature_nav',
+            status: 'passed_safe_placeholder',
+            execution_mode: 'safe_placeholder',
+            started_at: '2026-06-24T00:00:00.000Z',
+            finished_at: '2026-06-24T00:00:01.000Z',
+            evidence: [],
+            message: 'safe placeholder only'
+          }]
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'waiting_human' }),
+          stderr: ''
+        };
+      }
+    });
+
+    assert.equal(started.run.status, 'waiting_human');
+    const runDir = path.join(runsDir, created.run.runId);
+    const executionResults = await readJson(path.join(runDir, 'execution_results.json'));
+    const nextRoundPlan = await readJson(path.join(runDir, 'next_round_plan.json'));
+    assert.equal(executionResults.items[0].status, 'skipped');
+    assert.equal(executionResults.items[0].failure_reason, 'python_returned_safe_placeholder');
+    assert.equal(nextRoundPlan.requires_human_approval, true);
+  });
+});
+
+test('stage2 v3 run center performs deterministic analysis and writes report artifacts', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '示例系统',
+      entryUrl: 'https://example.com/',
+      cdpUrl: 'http://127.0.0.1:9222'
+    }, { runsDir });
+    await startV3Run(created.run.runId, { executionMode: 'contract_only' }, { runsDir });
+
+    const analyzed = await analyzeV3Run(created.run.runId, { runsDir });
+    assert.equal(analyzed.roundAnalysis.schema_version, 'stage2_round_analysis.v3');
+    assert.equal(analyzed.nextRoundPlan.schema_version, 'stage2_next_round_plan.v3');
+    assert.equal(analyzed.nextRoundPlan.decision, 'wait_human_review');
+    assert.ok(analyzed.humanTasks.items.some((item) => item.task_type === 'review_next_round_plan'));
+
+    const reported = await generateV3Report(created.run.runId, { runsDir });
+    assert.equal(reported.report.schema_version, 'stage2_run_report.v3');
+
+    const reportArtifact = await resolveV3RunArtifact(created.run.runId, 'run_report_md', { runsDir });
+    assert.ok(reportArtifact);
+    assert.equal(reportArtifact.fileName, 'run_report.md');
+    const reportText = await fs.readFile(reportArtifact.path, 'utf8');
+    assert.match(reportText, /第二阶段 v3 运行报告/);
+
+    const list = await listV3Runs({ runsDir });
+    assert.equal(list.runs.length, 1);
+    assert.equal(list.runs[0].runId, created.run.runId);
+  });
+});
+
+test('stage2 v3 report organizes structured artifacts and skipped areas', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '报告样例系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          actionLogLines: [
+            JSON.stringify({ action: 'goto', status: 'completed', duration_ms: 120 }),
+            JSON.stringify({ action: 'submit', status: 'skipped_by_policy', duration_ms: 10 })
+          ],
+          networkEvents: {
+            schema_version: 'stage2_network_events.v1',
+            capture_status: 'enabled',
+            items: [{ url: 'https://example.com/api/query', method: 'GET', status: 200 }]
+          },
+          executionItems: [{
+            test_case_id: 'case_nav',
+            feature_point_id: 'feature_nav',
+            status: 'passed',
+            verdict: 'passed',
+            execution_mode: 'real_browser',
+            actions: [{ action: 'goto', status: 'passed' }],
+            page_feedback: ['首页加载完成'],
+            screenshot_refs: ['screenshots/home_entry.png'],
+            failure_reason: null,
+            manual_confirmation_required: false
+          }, {
+            test_case_id: 'case_delete',
+            feature_point_id: 'feature_delete',
+            status: 'skipped_by_policy',
+            verdict: 'skipped',
+            execution_mode: 'real_browser',
+            actions: [],
+            page_feedback: [],
+            screenshot_refs: [],
+            failure_reason: 'policy_denied',
+            manual_confirmation_required: true
+          }]
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'waiting_human' }),
+          stderr: ''
+        };
+      }
+    });
+
+    const reported = await generateV3Report(created.run.runId, { runsDir });
+    assert.ok(reported.report.coverage_by_page.length >= 1);
+    assert.equal(reported.report.coverage_by_page[0].page.page_entry_id, 'page_home');
+    assert.ok(reported.report.coverage_by_page[0].features[0].test_cases.length >= 1);
+    assert.ok(reported.report.skipped_areas.some((item) => item.reason === 'policy_denied'));
+    assert.ok(reported.report.sections.some((section) => section.title === '覆盖与结果矩阵'));
+    assert.ok(reported.report.sections.some((section) => section.title === '未执行/阻断/需复核区域'));
+    assert.ok(reported.report.sections.some((section) => section.title === '执行证据索引'));
+    assert.equal(reported.report.evidence_index.action_log_count, 2);
+    assert.equal(reported.report.evidence_index.network_event_count, 1);
+
+    const reportMd = await fs.readFile(path.join(runsDir, created.run.runId, 'reports', 'run_report.md'), 'utf8');
+    assert.match(reportMd, /## 覆盖与结果矩阵/);
+    assert.match(reportMd, /## 执行证据索引/);
+    assert.match(reportMd, /action_log\.jsonl/);
+    assert.match(reportMd, /network_events\.json/);
+    assert.match(reportMd, /policy_denied/);
+    assert.ok(reportMd.includes('screenshots/home_entry.png'));
+  });
+});
+
+test('stage2 v3 report generation preserves waiting-human run status', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '报告状态系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          executionItems: [{
+            test_case_id: 'case_waiting_human',
+            status: 'failed',
+            verdict: 'failed',
+            execution_mode: 'real_browser',
+            actions: [{ action: 'submit', status: 'failed' }],
+            page_feedback: ['验收监管单位仍为空'],
+            screenshot_refs: [],
+            failure_reason: 'required_fields_unresolved',
+            manual_confirmation_required: true
+          }]
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    const beforeReport = await getV3Run(created.run.runId, { runsDir });
+    assert.equal(beforeReport.run.status, 'waiting_human');
+
+    const reported = await generateV3Report(created.run.runId, { runsDir });
+    const manifest = await readJson(path.join(runsDir, created.run.runId, 'run_manifest.json'));
+    const currentStatus = await readJson(path.join(runsDir, created.run.runId, 'current_status.json'));
+
+    assert.equal(reported.run.status, 'waiting_human');
+    assert.equal(manifest.status, 'waiting_human');
+    assert.equal(currentStatus.status, 'waiting_human');
+    assert.equal(currentStatus.phase, 'reporting');
+  });
+});
+
+test('stage2 v3 report includes multi-model effectiveness commentary', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const modelProfiles = [{
+      id: 'model-a',
+      label: 'Model A',
+      provider: 'openai_compatible',
+      model: 'a',
+      apiKeyConfigured: true
+    }, {
+      id: 'model-b',
+      label: 'Model B',
+      provider: 'openai_compatible',
+      model: 'b',
+      apiKeyConfigured: true
+    }];
+    const created = await createV3Run({
+      systemName: '多模型报告系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      modelProfileIds: ['model-a', 'model-b']
+    }, { runsDir, modelProfiles });
+    let callCount = 0;
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      modelProfiles,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        callCount += 1;
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          executionItems: [{
+            test_case_id: `case_${callCount}`,
+            status: callCount === 1 ? 'passed' : 'failed',
+            verdict: callCount === 1 ? 'passed' : 'failed',
+            execution_mode: 'real_browser',
+            actions: [{ action: 'goto', status: 'passed' }],
+            page_feedback: [`model ${callCount}`],
+            screenshot_refs: [`screenshots/model_${callCount}.png`],
+            failure_reason: callCount === 1 ? null : 'assertion_failed',
+            manual_confirmation_required: callCount !== 1
+          }]
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+
+    const reported = await generateV3Report(created.run.runId, { runsDir });
+    assert.equal(reported.report.model_comparison.items.length, 2);
+    assert.ok(reported.report.model_comparison.commentary.some((item) => item.model_profile_id === 'model-a'));
+    assert.ok(reported.report.model_comparison.commentary.some((item) => /失败/.test(item.commentary)));
+
+    const reportMd = await fs.readFile(path.join(runsDir, created.run.runId, 'reports', 'run_report.md'), 'utf8');
+    assert.match(reportMd, /## 模型效果对比/);
+    assert.match(reportMd, /model-a/);
+    assert.match(reportMd, /model-b/);
+  });
+});
+
+test('stage2 v3 report writes project-level promotion candidates with human-gated platform candidates', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '沉淀候选系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async ({ args, artifactRoot }) => {
+        const runId = argValue(args, '--v3-run-id');
+        const pythonRunDir = await writeFakePythonV3Artifacts(artifactRoot, runId, {
+          executionItems: [{
+            test_case_id: 'case_controls',
+            feature_point_id: 'feature_nav',
+            status: 'passed',
+            verdict: 'passed',
+            execution_mode: 'real_browser',
+            actions: [
+              { action: 'select_required_dropdown', field: '验收监管单位', status: 'completed' },
+              { action: 'select_date', field: '验收日期', status: 'completed' },
+              { action: 'upload_file', field: '人员信息表', status: 'completed' }
+            ],
+            page_feedback: ['控件填写成功'],
+            screenshot_refs: [],
+            failure_reason: null,
+            manual_confirmation_required: false
+          }]
+        });
+        return {
+          stdout: JSON.stringify({ run_id: runId, run_dir: pythonRunDir, status: 'completed' }),
+          stderr: ''
+        };
+      }
+    });
+    await generateV3Report(created.run.runId, { runsDir });
+
+    const promotion = await readJson(path.join(runsDir, created.run.runId, 'promotion_candidates.json'));
+    assert.ok(promotion.items.some((item) => item.layer === 'project'));
+    assert.ok(promotion.items.some((item) => item.asset_type === 'stable_locator'));
+    assert.ok(promotion.items.some((item) => item.asset_type === 'test_data_suggestion'));
+    const controlSkill = promotion.items.find((item) => item.asset_type === 'control_skill');
+    assert.ok(controlSkill);
+    assert.ok(['下拉框选择', '日期选择', '文件上传'].includes(controlSkill.friendly_name));
+    assert.ok(controlSkill.plain_description);
+    assert.equal(controlSkill.reuse_level_label, '本项目可直接复用');
+    assert.ok(controlSkill.beginner_next_action);
+    assert.ok(promotion.items
+      .filter((item) => item.layer === 'platform')
+      .every((item) => item.requires_human_approval === true && item.auto_apply === false));
+  });
+});
+
+test('stage2 v3 run center merges evidence-bound AI round review when a model profile is available', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: 'AI 复盘系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      modelProfileIds: ['reviewer'],
+      modelProfiles: [{
+        id: 'reviewer',
+        label: 'Reviewer',
+        provider: 'openai_compatible',
+        model: 'review-model',
+        apiKeyConfigured: true,
+        capabilityTags: { jsonSchema: true }
+      }]
+    }, { runsDir, modelProfiles: [{
+      id: 'reviewer',
+      label: 'Reviewer',
+      provider: 'openai_compatible',
+      model: 'review-model',
+      apiKeyEnv: 'REVIEWER_API_KEY'
+    }] });
+    await startV3Run(created.run.runId, { executionMode: 'contract_only' }, { runsDir });
+
+    const analyzed = await analyzeV3Run(created.run.runId, {
+      runsDir,
+      aiReviewRunner: async ({ evidenceBundle, modelProfile }) => ({
+        analysis_mode: 'ai_assisted_review',
+        model_profile_id: modelProfile.id,
+        confidence: 0.88,
+        coverage_summary: { summary: `reviewed ${evidenceBundle.page_entries.length} pages` },
+        failure_summary: { summary: '需要补齐真实执行证据。' },
+        evidence_quality: { status: 'partial', summary: '有执行结果，无真实截图。' },
+        improvement_candidates: [{
+          candidate_id: 'connect_real_browser',
+          title: '连接真实浏览器后重跑',
+          evidence_refs: ['execution_results']
+        }],
+        learned_rules: ['真实截图缺失时不得声称执行通过'],
+        next_round_recommendations: ['连接 Playwright 后重试']
+      })
+    });
+
+    assert.equal(analyzed.roundAnalysis.analysis_mode, 'ai_assisted_review');
+    assert.equal(analyzed.roundAnalysis.ai_provider_status, 'completed');
+    assert.equal(analyzed.roundAnalysis.model_profile.id, 'reviewer');
+    assert.equal(analyzed.roundAnalysis.improvement_candidates[0].review_status, 'evidence_bound');
+    assert.deepEqual(analyzed.roundAnalysis.learned_rules, ['真实截图缺失时不得声称执行通过']);
+  });
+});
+
+test('stage2 v3 run center uses configured OpenAI-compatible model for AI round review', async () => {
+  await withFakeAiReviewServer({
+    analysis_mode: 'ai_assisted_review',
+    confidence: 0.81,
+    coverage_summary: { summary: '模型已分析覆盖。' },
+    failure_summary: { summary: '需要补齐真实浏览器证据。' },
+    evidence_quality: { status: 'partial' },
+    improvement_candidates: [{
+      candidate_id: 'retry_with_browser',
+      title: '使用真实浏览器重跑',
+      evidence_refs: ['execution_results']
+    }],
+    learned_rules: ['模型复盘必须绑定 execution_results 证据'],
+    next_round_recommendations: ['重跑真实浏览器链路']
+  }, async (baseUrl, requests) => {
+    await withTempRunsDir(async (runsDir) => {
+      const configPath = path.join(runsDir, 'stage2-model-profiles.json');
+      await fs.writeFile(configPath, JSON.stringify({
+        schema_version: 'stage2_model_profiles.v1',
+        profiles: [{
+          id: 'local_qwen',
+          label: 'local_qwen',
+          provider: 'openai_compatible',
+          baseUrl,
+          apiKey: 'test-key',
+          model: 'qwen-review'
+        }]
+      }, null, 2));
+
+      const created = await createV3Run({
+        systemName: 'AI 默认接入系统',
+        entryUrl: 'https://example.com/home',
+        cdpUrl: 'http://localhost:9222',
+        modelProfileIds: ['local_qwen']
+      }, { runsDir, modelProfileConfigPath: configPath });
+      await startV3Run(created.run.runId, { executionMode: 'contract_only' }, { runsDir });
+
+      const analyzed = await analyzeV3Run(created.run.runId, {
+        runsDir,
+        modelProfileConfigPath: configPath
+      });
+
+      assert.equal(analyzed.roundAnalysis.ai_provider_status, 'completed');
+      assert.equal(analyzed.roundAnalysis.model_profile_id, 'local_qwen');
+      assert.equal(analyzed.roundAnalysis.improvement_candidates[0].review_status, 'evidence_bound');
+      assert.equal(requests.length, 1);
+      assert.equal(requests[0].model, 'qwen-review');
+      assert.match(requests[0].messages.at(-1).content, /execution_results/);
+    });
+  });
+});
+
+test('stage2 v3 AI round review sends compact artifact-backed evidence for large runs', async () => {
+  await withFakeAiReviewServer({
+    analysis_mode: 'ai_assisted_review',
+    confidence: 0.84,
+    coverage_summary: { summary: '模型已基于摘要证据完成复盘。' },
+    failure_summary: { summary: '仅少量跳过项需要人工复核。' },
+    evidence_quality: { status: 'partial' },
+    improvement_candidates: [{
+      candidate_id: 'trim_review_payload',
+      title: '复盘请求应使用摘要证据和 artifact 引用',
+      evidence_refs: ['execution_results']
+    }],
+    learned_rules: ['AI 复盘应引用 artifact，而不是接收完整大数组。'],
+    next_round_recommendations: ['继续观察跳过项']
+  }, async (baseUrl, requests) => {
+    await withTempRunsDir(async (runsDir) => {
+      const configPath = path.join(runsDir, 'stage2-model-profiles.json');
+      await fs.writeFile(configPath, JSON.stringify({
+        schema_version: 'stage2_model_profiles.v1',
+        profiles: [{
+          id: 'local_qwen',
+          label: 'local_qwen',
+          provider: 'openai_compatible',
+          baseUrl,
+          apiKey: 'test-key',
+          model: 'qwen-review'
+        }]
+      }, null, 2));
+
+      const created = await createV3Run({
+        systemName: 'AI 大证据复盘系统',
+        entryUrl: 'https://example.com/home',
+        cdpUrl: 'http://localhost:9222',
+        modelProfileIds: ['local_qwen']
+      }, { runsDir, modelProfileConfigPath: configPath });
+      await startV3Run(created.run.runId, { executionMode: 'contract_only' }, { runsDir });
+
+      const runDir = path.join(runsDir, created.run.runId);
+      const pageItems = Array.from({ length: 7 }, (_, index) => ({
+        page_entry_id: `page_${String(index + 1).padStart(3, '0')}`,
+        name: `页面 ${index + 1}`,
+        url: `https://example.com/page/${index + 1}`,
+        menu_path: ['业务菜单', `页面 ${index + 1}`],
+        page_type: 'query_list',
+        status: 'reachable',
+        source: 'playwright.page_exploration',
+        screenshot_refs: [`page_${index + 1}_entry`]
+      }));
+      const featureItems = Array.from({ length: 70 }, (_, index) => {
+        const id = String(index + 1).padStart(3, '0');
+        return {
+          feature_point_id: `feature_${id}`,
+          page_entry_id: pageItems[index % pageItems.length].page_entry_id,
+          name: `功能点 ${id}`,
+          feature_type: index % 10 === 0 ? 'create' : 'navigation',
+          risk_level: index % 10 === 0 ? 'medium' : 'low',
+          auto_verifiable: true,
+          verification_strategy: 'default_visible_or_light_interaction',
+          locator_candidates: [{
+            selector: `[data-test="feature-${id}"]`,
+            raw_dom_debug: `raw_dom_payload_${id}_${'x'.repeat(1200)}`
+          }],
+          source: 'playwright.dom_scan',
+          confidence: 0.8,
+          review_status: 'auto_included'
+        };
+      });
+      const caseItems = featureItems.map((feature, index) => {
+        const id = String(index + 1).padStart(3, '0');
+        return {
+          test_case_id: `case_${id}`,
+          feature_point_id: feature.feature_point_id,
+          title: `验证 ${feature.name}`,
+          type_template: feature.feature_type,
+          preconditions: ['已登录'],
+          steps: [{
+            action: 'click',
+            target: feature.name,
+            raw_instruction_debug: `case_raw_payload_${id}_${'y'.repeat(1000)}`
+          }],
+          expected_feedback: ['入口可见或流程可走通'],
+          risk_policy: 'safe_auto',
+          assertions: ['visible'],
+          requires_human_confirmation: false
+        };
+      });
+      const executionItems = caseItems.map((testCase, index) => {
+        const id = String(index + 1).padStart(3, '0');
+        return {
+          test_case_id: testCase.test_case_id,
+          feature_point_id: testCase.feature_point_id,
+          title: testCase.title,
+          status: index === 18 || index === 49 || index === 65 ? 'skipped_not_observed' : 'real_passed',
+          verdict: '基础路径可走通',
+          actions: [{
+            action: 'click',
+            target: testCase.title,
+            debug_trace: `execution_raw_payload_${id}_${'z'.repeat(1000)}`
+          }],
+          page_feedback: ['功能点入口可见。'],
+          screenshot_refs: ['menu_initial', `case_${id}_after_action`],
+          failure_reason: index === 18 || index === 49 || index === 65 ? 'not_observed' : null,
+          manual_confirmation_required: false,
+          execution_mode: 'real_browser'
+        };
+      });
+
+      await fs.writeFile(path.join(runDir, 'page_entries.json'), JSON.stringify({
+        schema_version: 'stage2_page_entries.v3',
+        items: pageItems
+      }, null, 2));
+      await fs.writeFile(path.join(runDir, 'feature_points.json'), JSON.stringify({
+        schema_version: 'stage2_feature_points.v3',
+        items: featureItems
+      }, null, 2));
+      await fs.writeFile(path.join(runDir, 'generated_test_cases.json'), JSON.stringify({
+        schema_version: 'stage2_generated_test_cases.v3',
+        items: caseItems
+      }, null, 2));
+      await fs.writeFile(path.join(runDir, 'execution_results.json'), JSON.stringify({
+        schema_version: 'stage2_execution_results.v3',
+        items: executionItems
+      }, null, 2));
+      await fs.writeFile(path.join(runDir, 'screenshots_index.json'), JSON.stringify({
+        schema_version: 'stage2_screenshots_index.v3',
+        items: Array.from({ length: 17 }, (_, index) => ({
+          screenshot_id: `shot_${String(index + 1).padStart(3, '0')}`,
+          label: `截图 ${index + 1}`,
+          path: `screenshots/shot_${index + 1}.png`
+        }))
+      }, null, 2));
+
+      await analyzeV3Run(created.run.runId, {
+        runsDir,
+        modelProfileConfigPath: configPath
+      });
+
+      assert.equal(requests.length, 1);
+      const prompt = requests[0].messages.at(-1).content;
+      assert.ok(prompt.length < 60000, `AI review prompt should stay compact, got ${prompt.length} chars`);
+      assert.match(prompt, /evidence_summary/);
+      assert.match(prompt, /artifact_refs/);
+      assert.match(prompt, /execution_results/);
+      assert.doesNotMatch(prompt, /raw_dom_payload_070/);
+      assert.doesNotMatch(prompt, /case_raw_payload_070/);
+      assert.doesNotMatch(prompt, /execution_raw_payload_070/);
+    });
+  });
+});
+
+test('stage2 v3 run center degrades AI review to rule review when model is unavailable or output is invalid', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: 'AI 降级系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222'
+    }, { runsDir });
+    await startV3Run(created.run.runId, { executionMode: 'contract_only' }, { runsDir });
+
+    const unavailable = await analyzeV3Run(created.run.runId, { runsDir });
+    assert.equal(unavailable.roundAnalysis.analysis_mode, 'deterministic_rule_review');
+    assert.equal(unavailable.roundAnalysis.ai_provider_status, 'model_unavailable');
+
+    const createdWithModel = await createV3Run({
+      systemName: 'AI 非法输出系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      modelProfileIds: ['reviewer']
+    }, { runsDir, modelProfiles: [{
+      id: 'reviewer',
+      label: 'Reviewer',
+      provider: 'openai_compatible',
+      model: 'review-model',
+      apiKeyEnv: 'REVIEWER_API_KEY'
+    }] });
+    await startV3Run(createdWithModel.run.runId, { executionMode: 'contract_only' }, { runsDir });
+    const invalid = await analyzeV3Run(createdWithModel.run.runId, {
+      runsDir,
+      aiReviewRunner: async () => ({ invalid: true })
+    });
+    assert.equal(invalid.roundAnalysis.analysis_mode, 'deterministic_rule_review');
+    assert.equal(invalid.roundAnalysis.ai_provider_status, 'invalid_ai_output');
+    assert.ok(invalid.roundAnalysis.review_errors.some((item) => item.code === 'invalid_ai_output'));
+
+    const failed = await analyzeV3Run(createdWithModel.run.runId, {
+      runsDir,
+      aiReviewRunner: async () => {
+        const error = new Error('fetch failed');
+        error.cause = new Error('connect ETIMEDOUT 172.28.29.24:30000');
+        throw error;
+      }
+    });
+    assert.equal(failed.roundAnalysis.ai_provider_status, 'ai_review_failed');
+    assert.match(failed.roundAnalysis.review_errors[0].message, /fetch failed/);
+    assert.match(failed.roundAnalysis.review_errors[0].message, /ETIMEDOUT/);
+  });
+});
+
+test('stage2 v3 run center can AI-review a failed real browser run and persist downgrade reasons', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: 'AI 失败复盘系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      executionMode: 'real_browser',
+      modelProfileIds: ['reviewer']
+    }, { runsDir, modelProfiles: [{
+      id: 'reviewer',
+      label: 'Reviewer',
+      provider: 'openai_compatible',
+      model: 'review-model',
+      apiKeyEnv: 'REVIEWER_API_KEY'
+    }] });
+
+    await startV3Run(created.run.runId, { executionMode: 'real_browser' }, {
+      runsDir,
+      pythonRunner: async () => {
+        const error = new Error('Command failed because execution timed out.');
+        error.killed = true;
+        error.signal = 'SIGTERM';
+        error.stderr = 'INFO     [Agent] Step 42:\nINFO     [Agent] Next goal: Fill remark field.';
+        throw error;
+      }
+    });
+
+    const analyzed = await analyzeV3Run(created.run.runId, {
+      runsDir,
+      aiReviewRunner: async () => {
+        throw new Error('review model unavailable');
+      }
+    });
+    const roundAnalysis = await readJson(path.join(runsDir, created.run.runId, 'round_analysis.json'));
+
+    assert.equal(analyzed.operation.message, '规则复盘产物已生成；AI 复盘不可用或已降级：review model unavailable');
+    assert.equal(roundAnalysis.ai_provider_status, 'ai_review_failed');
+    assert.equal(roundAnalysis.review_errors[0].code, 'ai_review_failed');
+    assert.match(roundAnalysis.review_errors[0].message, /review model unavailable/);
+  });
+});
+
+test('stage2 v3 run center marks AI direction claims without evidence as needs evidence', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: 'AI 证据绑定系统',
+      entryUrl: 'https://example.com/home',
+      cdpUrl: 'http://localhost:9222',
+      modelProfileIds: ['reviewer'],
+      modelProfiles: [{
+        id: 'reviewer',
+        label: 'Reviewer',
+        provider: 'openai_compatible',
+        model: 'review-model',
+        apiKeyConfigured: true,
+        capabilityTags: { jsonSchema: true }
+      }]
+    }, { runsDir, modelProfiles: [{
+      id: 'reviewer',
+      label: 'Reviewer',
+      provider: 'openai_compatible',
+      model: 'review-model',
+      apiKeyEnv: 'REVIEWER_API_KEY'
+    }] });
+    await startV3Run(created.run.runId, { executionMode: 'contract_only' }, { runsDir });
+
+    const analyzed = await analyzeV3Run(created.run.runId, {
+      runsDir,
+      aiReviewRunner: async () => ({
+        analysis_mode: 'ai_assisted_review',
+        confidence: 0.64,
+        improvement_candidates: [{
+          candidate_id: 'unsupported_claim',
+          title: '声称提交链路已稳定',
+          evidence_refs: []
+        }]
+      })
+    });
+
+    assert.equal(analyzed.roundAnalysis.analysis_mode, 'ai_assisted_review');
+    assert.equal(analyzed.roundAnalysis.improvement_candidates[0].review_status, 'needs_evidence');
+    assert.equal(analyzed.roundAnalysis.improvement_candidates[0].blocks_next_round, true);
+  });
+});
+
+test('stage2 v3 run center saves human task results and gates next round approval', async () => {
+  await withTempRunsDir(async (runsDir) => {
+    const created = await createV3Run({
+      systemName: '高风险样例系统',
+      entryUrl: 'https://example.com/',
+      cdpUrl: 'http://localhost:9222',
+      scope: '包含新增、删除和审批动作'
+    }, { runsDir });
+    await startV3Run(created.run.runId, { executionMode: 'contract_only' }, { runsDir });
+
+    const runDir = path.join(runsDir, created.run.runId);
+    const humanTasksBefore = await readJson(path.join(runDir, 'human_tasks.json'));
+    assert.ok(humanTasksBefore.items.some((item) => item.task_id === 'task_review_feature_points'));
+
+    let saved = null;
+    for (const task of humanTasksBefore.items.filter((item) => item.status === 'pending')) {
+      saved = await saveHumanTaskResult(created.run.runId, {
+        taskId: task.task_id,
+        operatorId: 'tester',
+        note: '人工处理完成。',
+        result: { approvedFeaturePointIds: ['feature_001'] }
+      }, { runsDir });
+    }
+    assert.ok(saved);
+    assert.ok(saved.humanTasks.items.every((item) => item.status === 'completed'));
+    assert.ok(saved.humanTasks.items.every((item) => /human_task_results/.test(item.result_artifact)));
+
+    const continued = await continueNextRound(created.run.runId, {}, { runsDir });
+    assert.notEqual(continued.run.status, 'planned');
+    assert.equal(continued.run.status, 'waiting_human');
+    assert.equal(continued.run.currentRoundId, 'round_002');
+  });
+});

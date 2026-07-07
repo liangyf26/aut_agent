@@ -1,0 +1,42 @@
+{
+  "verified_at": "2026-06-18",
+  "reference_success_record_id": "101371731601000105",
+  "auto_created_success_record_id": "101378368363000187",
+  "initial_form": {
+    "plant_name": "墨兰",
+    "register_type_text": "育苗"
+  },
+  "cultivation_template": {
+    "deptId": "100",
+    "cityRegionId": "4501-450103-450103004-450103004014",
+    "cityRegionName": "南宁-青秀-南湖-厢竹社区居委会",
+    "rangeStr": "街心花园",
+    "seedlingSource": 0,
+    "cultivateType": 2,
+    "cultivateDate": "2026-06-01",
+    "cultivateNum": 120,
+    "cultivateArea": 8,
+    "remark": "自动化回填测试",
+    "acceptanceNum": 120,
+    "cultivatePurpose": 2,
+    "acceptanceDeptId": "100",
+    "acceptancePerson": "王五",
+    "acceptanceDate": "2026-06-17",
+    "isHardening": 0
+  },
+  "filing_submit": {
+    "dept_id": "100",
+    "dept_label": "广西壮族自治区林业局"
+  },
+  "success_markers": {
+    "ui_text": "提交完成，待备案登记/监管单位登记备案",
+    "final_api_path": "/prod-api/zwsy/registration/apply/dept",
+    "final_api_response_code": 200
+  },
+  "source_artifacts": {
+    "baseline_doc": "docs/suyuan-online-apply-baseline.md",
+    "baseline_json": "artifacts/suyuan_submit_loop/success_baseline.json",
+    "full_submit_probe": "artifacts/suyuan_submit_loop/online_apply_full_submit_probe.json",
+    "final_submit_probe": "artifacts/suyuan_submit_loop/online_apply_submit_record_probe.json"
+  }
+}

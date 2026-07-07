@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>Stage2 Template Lab</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 24px; }
+      .stack { display: grid; gap: 12px; max-width: 720px; }
+      .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+      label { display: grid; gap: 4px; min-width: 220px; }
+      input, select, button { font-size: 14px; padding: 6px 8px; }
+      #result { min-height: 24px; font-weight: 600; }
+      #querySummary, #createSummary { color: #222; }
+      .pill { display: inline-block; padding: 4px 8px; border: 1px solid #bbb; }
+    </style>
+  </head>
+  <body>
+    <div class="stack">
+      <h1>Stage2 Template Lab</h1>
+      <div id="landingMarker" class="pill">landing-ready</div>
+
+      <section id="queryArea" class="stack">
+        <h2>查询/筛选</h2>
+        <div class="row">
+          <label>
+            关键词
+            <input id="queryInput" name="query" placeholder="请输入关键词" />
+          </label>
+          <label>
+            状态
+            <select id="statusSelect" name="status">
+              <option value="">请选择</option>
+              <option value="pending">待处理</option>
+              <option value="done">已完成</option>
+            </select>
+          </label>
+          <button id="searchButton" type="button">搜索</button>
+        </div>
+        <div id="querySummary">query-idle</div>
+      </section>
+
+      <section id="createArea" class="stack">
+        <h2>新增</h2>
+        <div class="row">
+          <label>
+            名称
+            <input id="createName" name="createName" placeholder="请输入名称" />
+          </label>
+          <label>
+            类型
+            <select id="createType" name="createType">
+              <option value="">请选择</option>
+              <option value="alpha">Alpha</option>
+              <option value="beta">Beta</option>
+            </select>
+          </label>
+          <button id="createButton" type="button">提交新增</button>
+        </div>
+        <div id="createSummary">create-idle</div>
+      </section>
+
+      <div id="result">result-idle</div>
+    </div>
+
+    <script>
+      const queryInput = document.getElementById("queryInput");
+      const statusSelect = document.getElementById("statusSelect");
+      const searchButton = document.getElementById("searchButton");
+      const querySummary = document.getElementById("querySummary");
+      const createName = document.getElementById("createName");
+      const createType = document.getElementById("createType");
+      const createButton = document.getElementById("createButton");
+      const createSummary = document.getElementById("createSummary");
+      const result = document.getElementById("result");
+
+      searchButton.addEventListener("click", () => {
+        const message = `query:${queryInput.value || "-"}|status:${statusSelect.value || "-"}`;
+        querySummary.textContent = message;
+        result.textContent = "query-completed";
+      });
+
+      createButton.addEventListener("click", () => {
+        const message = `create:${createName.value || "-"}|type:${createType.value || "-"}`;
+        createSummary.textContent = message;
+        result.textContent = "create-submitted";
+      });
+    </script>
+  </body>
+</html>
