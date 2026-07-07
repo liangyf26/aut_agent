@@ -110,8 +110,8 @@ PLAYBOOK_TABLE: dict[str, PlaybookSpec] = {
     ),
     fc.PAGE_LOAD_TIMEOUT: _spec(
         fc.PAGE_LOAD_TIMEOUT,
-        ("extend_wait", "reload_page", "degrade_to_semantic_confirmation"),
-        "页面在延长等待后可交互", EXIT_RETRY,
+        ("extend_wait", "reload_page", "raise_human_task"),
+        "页面加载失败，记录证据并转人工确认", EXIT_HUMAN,
     ),
     fc.PERMISSION_BLOCKED: _spec(
         fc.PERMISSION_BLOCKED,
@@ -167,8 +167,8 @@ PLAYBOOK_TABLE: dict[str, PlaybookSpec] = {
     ),
     fc.EVIDENCE_INCOMPLETE: _spec(
         fc.EVIDENCE_INCOMPLETE,
-        ("force_action_log", "force_step_screenshot"),
-        "动作日志与步骤级截图补齐", EXIT_RETRY,
+        ("force_action_log", "force_step_screenshot", "raise_human_review_task"),
+        "证据链缺失，强制补齐并转人工审核", EXIT_HUMAN,
     ),
     fc.NO_PROGRESS_REPEATED: _spec(
         fc.NO_PROGRESS_REPEATED,

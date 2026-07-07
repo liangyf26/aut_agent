@@ -38,6 +38,7 @@ parallel entrypoint.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -49,6 +50,180 @@ if TYPE_CHECKING:
 EXECUTION_MODE_REAL_BROWSER = "real_browser"
 
 
+_STRUCTURAL_TAG_NAMES = frozenset({
+    "A", "BUTTON", "DIV", "INPUT", "SELECT", "SPAN",
+    "LI", "UL", "TD", "TR", "FORM", "LABEL", "NAV",
+    "HEADER", "FOOTER", "MAIN", "SECTION", "ARTICLE",
+})
+
+_TAGS_WITHOUT_TEXT_CONTENT = frozenset({"input", "textarea", "select"})
+
+
+def _build_stable_locator(
+    *,
+    tag: str = "",
+    text: str = "",
+    el_id: str = "",
+    role: str = "",
+    css_path: str = "",
+    classes: list[str] | None = None,
+) -> str:
+    """Build a stable Playwright locator for a DOM element from its collected properties.
+
+    Priority (descending):
+    1. ``#<id>`` — permanently stable, survives any page mutation
+    2. ``<tag>:has-text("<escaped text>")`` — text-based, survives re-render
+    3. ``<tag>[role="<role>"]`` — attribute-based, but ambiguous with multiple buttons
+    4. CSS path — structural, least stable but always available as fallback
+    """
+    classes = classes or []
+
+    # 1. ID selector — gold standard, never degrades
+    if el_id and _is_sane_css_id(el_id):
+        return f"#{el_id}"
+
+    # 2. Text-based Playwright selector — survives page reload; more specific than role
+    if text and tag:
+        if text.upper() == tag.upper() or text.strip().upper() in _STRUCTURAL_TAG_NAMES:
+            pass  # fall through to role / CSS path
+        else:
+            escaped = _escape_playwright_text(text)
+            if escaped and len(escaped) < 60:
+                if tag in _TAGS_WITHOUT_TEXT_CONTENT:
+                    return f'{tag}[placeholder*="{escaped}"], {tag}[aria-label*="{escaped}"]'
+                return f'{tag}:has-text("{escaped}")'
+
+    # 3. Tag + role attribute — stable across DOM re-renders, but ambiguous with multiple same-tag elements
+    if role and tag:
+        return f'{tag}[role="{role}"]'
+
+    # 4. CSS path — available for every element, but fragile against DOM restructuring
+    if css_path:
+        return css_path
+
+    # Last resort: class-based
+    if classes and tag:
+        safe_classes = [c for c in classes if _is_sane_css_class(c)]
+        if safe_classes:
+            return f"{tag}.{'.'.join(safe_classes)}"
+
+    return f'{tag}:has-text("未知控件")'
+
+
+def _build_locator_candidates(
+    *,
+    tag: str = "",
+    text: str = "",
+    el_id: str = "",
+    role: str = "",
+    css_path: str = "",
+    classes: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Build a ranked list of locator candidates for a DOM element.
+
+    Each candidate::
+
+        {"selector": "<playwright locator>", "confidence": float, "strategy": "<id|text|role|css_path|class|fallback>"}
+
+    Candidates are ordered by descending confidence. The confidence values
+    follow the same priority hierarchy as ``_build_stable_locator()``:
+    #id (0.95) > :has-text (0.85) > [role] (0.60) > CSS path (0.40) >
+    class-based (0.30) > fallback (0.10).
+
+    P0-2's locator_trier iterates these candidates and picks the first one
+    that matches the live page at execution time.
+    """
+    classes = list(classes or [])
+    candidates: list[dict[str, Any]] = []
+
+    # 1. ID-based (0.95)
+    if el_id and _is_sane_css_id(el_id):
+        candidates.append({"selector": f"#{el_id}", "confidence": 0.95, "strategy": "id"})
+
+    # 2. Text-based (0.85) — when text is meaningful and distinct from the tag name
+    _text_is_meaningful = bool(
+        text
+        and tag
+        and text.upper() != tag.upper()
+        and text.strip().upper() not in _STRUCTURAL_TAG_NAMES
+    )
+    if _text_is_meaningful:
+        escaped = _escape_playwright_text(text)
+        if escaped and len(escaped) < 60:
+            if tag in _TAGS_WITHOUT_TEXT_CONTENT:
+                selector = f'{tag}[placeholder*="{escaped}"], {tag}[aria-label*="{escaped}"]'
+            else:
+                selector = f'{tag}:has-text("{escaped}")'
+            candidates.append({"selector": selector, "confidence": 0.85, "strategy": "text"})
+
+    # 3. Role-based (0.60)
+    if role and tag:
+        candidates.append({"selector": f'{tag}[role="{role}"]', "confidence": 0.60, "strategy": "role"})
+
+    # 4. CSS path (0.40)
+    if css_path:
+        candidates.append({"selector": css_path, "confidence": 0.40, "strategy": "css_path"})
+
+    # 5. Class-based (0.30)
+    if classes and tag:
+        safe_classes = [c for c in classes if _is_sane_css_class(c)]
+        if safe_classes:
+            candidates.append({"selector": f"{tag}.{'.'.join(safe_classes)}", "confidence": 0.30, "strategy": "class"})
+
+    # 6. Fallback (0.10) — always included as last resort
+    candidates.append({"selector": f'{tag}:has-text("未知控件")', "confidence": 0.10, "strategy": "fallback"})
+
+    return candidates
+
+
+def _escape_playwright_text(raw: str) -> str:
+    """Escape text for a Playwright text selector (``has-text`` / ``text=``).
+
+    Playwright treats single quotes, double quotes, and backslashes as
+    special inside a ``has-text`` argument.  We strip newlines (body text
+    often contains them) and backslash-escape the dangerous characters.
+    """
+    compacted = re.sub(r"\s+", " ", str(raw or "")).strip()[:80]
+    escaped = compacted.replace("\\", "\\\\").replace('"', '\\"').replace("'", "\\'")
+    return escaped
+
+
+def _is_sane_css_id(value: str) -> bool:
+    """True when *value* is safe to use as a bare CSS ``#`` selector.
+
+    Auto-generated ids (``:r1:``, random hex strings, very-long strings)
+    can change across page loads, making them no more stable than a CSS path,
+    so we skip them.
+    """
+    v = str(value).strip()
+    if not v or len(v) < 2 or len(v) > 48:
+        return False
+    # React-style auto-ids start with colon or digit
+    if re.match(r"^[:\d]", v):
+        return False
+    # Pure hex strings (8+ chars) are likely random
+    if re.fullmatch(r"[0-9a-fA-F]{8,}", v):
+        return False
+    # Space, slash, backslash are never safe in bare CSS #id
+    if "/" in v or "\\" in v or " " in v:
+        return False
+    # Otherwise: if it contains only alphanumeric, hyphens, underscores,
+    # and colons (for legacy frameworks), it's safe
+    if re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_:.\-]*", v):
+        return True
+    return False
+
+
+def _is_sane_css_class(value: str) -> bool:
+    """True when *value* is safe to use as a bare CSS ``.class`` selector."""
+    v = str(value).strip()
+    if not v or len(v) > 80:
+        return False
+    if re.search(r"[^a-zA-Z0-9_-]", v):
+        return False
+    return True
+
+
 async def classify_features_with_playwright(
     page: "Page",
     adapter: "FeatureAdapter",
@@ -57,6 +232,9 @@ async def classify_features_with_playwright(
     page_id: str,
     screenshots_dir: Path,
     max_features_per_page: int = 6,
+    safety_policy: str = "low_risk_only",
+    cdp_url: str = "",
+    model_name: str | None = None,
 ) -> tuple[list[str], list[dict[str, Any]]]:
     """Scan the CURRENT real page's DOM and register one feature goal per
     detected control.
@@ -127,11 +305,79 @@ async def classify_features_with_playwright(
 
     feature_goal_ids: list[str] = []
     test_cases: list[dict[str, Any]] = []
+    _browser_use_used = False
     for feature in real_features:
         feature_type = feature.get("feature_type", "view")
         risk_level = feature.get("risk_level", "low")
         element_text = feature.get("name")
-        element_locator = f"[data-real-feature-index='{feature.get('evidence', {}).get('candidate_index')}']"
+        evidence = feature.get("evidence", {})
+        raw_text = str(evidence.get("raw_text") or "")
+        tag = evidence.get("tag") or ""
+        input_type = evidence.get("type") or ""
+
+        # Browser Use reclassification for unrecognized input/select controls
+        if feature_type == "view" and cdp_url and model_name and tag in {"input", "select", "textarea"}:
+            try:
+                from ..execution_goal.browser_use_executor import (
+                    BrowserUseSafety,
+                    execute_with_browser_use,
+                )
+                instruction = (
+                    f"页面上有一个 <{tag}> 控件" +
+                    (f"，type={input_type}" if input_type else "") +
+                    (f"，标签文字是 \"{element_text}\"" if element_text else "") +
+                    "。请判断这个控件的功能类型，从以下选项中选择："
+                    "file_upload(文件上传)、date_picker(日期选择)、text_input(文本输入)、"
+                    "cascader(级联选择下拉)、dropdown(普通下拉)、submit(提交按钮)、other(其他)。"
+                    "只返回 JSON: {\"feature_type\": \"...\", \"risk_level\": \"low|high\"}"
+                )
+                result = await execute_with_browser_use(
+                    page, instruction,
+                    context={"stage": "feature_discovery", "cdp_url": cdp_url},
+                    safety=BrowserUseSafety(write_allowed=False, max_steps=3),
+                    model_name=model_name,
+                )
+                if result.ok:
+                    import json as _json
+                    try:
+                        content = str(result.actions[0].get("content", "")) if result.actions else ""
+                        m = __import__("re").search(r'\{[^{}]*"feature_type"[^{}]*\}', content or str(result.actions))
+                        if m:
+                            data = _json.loads(m.group(0))
+                            new_type = data.get("feature_type")
+                        else:
+                            new_type = None
+                    except Exception:
+                        new_type = None
+                    if new_type and new_type != "other":
+                        feature_type = new_type
+                        risk_level = data.get("risk_level", "high") if new_type in {"file_upload", "submit"} else "low"
+                        _browser_use_used = True
+                        # Register new keywords so future rounds can classify this type directly
+                        from ..v3_real_browser import register_feature_type
+                        register_feature_type(new_type, [raw_text, element_text or "", tag, input_type])
+            except Exception:
+                pass
+            finally:
+                if feature_type == "view":
+                    continue  # still unrecognized — skip this control
+
+        element_locator = _build_stable_locator(
+            tag=evidence.get("tag") or "",
+            text=raw_text,
+            el_id=evidence.get("id") or "",
+            role=evidence.get("role") or "",
+            css_path=evidence.get("css_path") or "",
+            classes=evidence.get("classes") or [],
+        )
+        locator_candidates = _build_locator_candidates(
+            tag=evidence.get("tag") or "",
+            text=raw_text,
+            el_id=evidence.get("id") or "",
+            role=evidence.get("role") or "",
+            css_path=evidence.get("css_path") or "",
+            classes=evidence.get("classes") or [],
+        )
 
         feature_goal_id = adapter.register_feature_goal(
             feature_id=feature["feature_id"],
@@ -141,6 +387,7 @@ async def classify_features_with_playwright(
             parent_goal_id=page_goal_id,
             element_text=element_text,
             element_locator=element_locator,
+            locator_candidates=locator_candidates,
         )
         adapter.engine.goals[feature_goal_id].status = "running"
 
@@ -155,6 +402,7 @@ async def classify_features_with_playwright(
             confidence=confidence,
             element_text=element_text,
             element_locator=element_locator,
+            locator_candidates=locator_candidates,
         )
         adapter.record_feature_identified(
             attempt_id=feature_attempt_id,
@@ -174,7 +422,9 @@ async def classify_features_with_playwright(
                 confidence=confidence,
                 element_text=element_text,
                 element_locator=element_locator,
+                locator_candidates=locator_candidates,
                 page_url=page.url,
+                safety_policy=safety_policy,
             )
         )
 
@@ -189,4 +439,9 @@ async def classify_features_with_playwright(
     return feature_goal_ids, test_cases
 
 
-__all__ = ["EXECUTION_MODE_REAL_BROWSER", "classify_features_with_playwright"]
+__all__ = [
+    "EXECUTION_MODE_REAL_BROWSER",
+    "_build_locator_candidates",
+    "_build_stable_locator",
+    "classify_features_with_playwright",
+]

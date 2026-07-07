@@ -3383,6 +3383,14 @@ def _build_page_features_from_snapshot(
     for offset, control in enumerate(snapshot.get("controls", [])[: max(1, max_features_per_page)], start=0):
         text = _text(control.get("text")) or f"可见控件 {offset + 1}"
         feature_type = _infer_feature_type(text, _text(control.get("tag")), _text(control.get("type")))
+        if feature_type == "view":
+            record_unrecognized_control({
+                "tag": _text(control.get("tag")),
+                "type": _text(control.get("type")),
+                "text": text[:80],
+                "classes": str(control.get("classes", ""))[:120],
+                "page_id": page_id,
+            })
         feature_id = f"feature_{start_index + offset:03d}"
         risk_level = _risk_level(feature_type)
         features.append(
@@ -3404,6 +3412,11 @@ def _build_page_features_from_snapshot(
                     "tag": control.get("tag"),
                     "type": control.get("type"),
                     "candidate_index": control.get("candidate_index"),
+                    "raw_text": _text(control.get("text")),
+                    "css_path": control.get("css_path") or "",
+                    "classes": control.get("classes") or [],
+                    "id": control.get("id") or "",
+                    "role": control.get("role") or "",
                 },
             }
         )
@@ -4223,8 +4236,29 @@ def _dom_collection_expression() -> str:
       };
       const label = (el) => (
         el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') ||
-        el.getAttribute('placeholder') || el.value || el.name || el.id || el.tagName
+        el.getAttribute('placeholder') || el.value || el.name || el.id || ''
       ).trim().replace(/\\s+/g, ' ').slice(0, 80);
+      const cssPath = (el) => {
+        if (!el || !el.tagName) return '';
+        if (el.id) return '#' + CSS.escape(el.id);
+        const parts = [];
+        let current = el;
+        while (current && current.nodeType === 1 && parts.length < 5) {
+          let selector = current.tagName.toLowerCase();
+          const classes = Array.from(current.classList || [])
+            .filter(function (name) { return name && name.length < 40 && name.indexOf('is-') !== 0; })
+            .slice(0, 2);
+          if (classes.length) selector += '.' + classes.map(function (name) { return CSS.escape(name); }).join('.');
+          const parent = current.parentElement;
+          if (parent) {
+            const siblings = Array.from(parent.children).filter(function (node) { return node.tagName === current.tagName; });
+            if (siblings.length > 1) selector += ':nth-of-type(' + (siblings.indexOf(current) + 1) + ')';
+          }
+          parts.unshift(selector);
+          current = parent;
+        }
+        return parts.join(' > ');
+      };
       const bodyText = document.body ? document.body.innerText.toLowerCase() : '';
       const loginWords = ['login', 'sign in', '登录', '登陆', '验证码'];
       const links = Array.from(document.querySelectorAll('a[href]'))
@@ -4243,7 +4277,9 @@ def _dom_collection_expression() -> str:
           type: el.getAttribute('type') || '',
           href: el.href || '',
           name: el.name || '',
-          id: el.id || ''
+          id: el.id || '',
+          classes: Array.from(el.classList).filter(function (c) { return c && c.length < 40; }).slice(0, 4),
+          css_path: cssPath(el)
         }));
       return {
         links,
@@ -4266,7 +4302,7 @@ def _side_effect_click_expression() -> str:
       };
       const label = (el) => (
         el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') ||
-        el.getAttribute('placeholder') || el.value || el.name || el.id || el.tagName
+        el.getAttribute('placeholder') || el.value || el.name || el.id || ''
       ).trim().replace(/\\s+/g, ' ').slice(0, 80);
       window.__stage2DialogLog = Array.isArray(window.__stage2DialogLog) ? window.__stage2DialogLog : [];
       if (!window.__stage2DialogPatched) {
@@ -4401,6 +4437,11 @@ def _build_features(
                     "tag": control.get("tag"),
                     "type": control.get("type"),
                     "candidate_index": control.get("candidate_index"),
+                    "raw_text": str(control.get("text") or ""),
+                    "css_path": control.get("css_path") or "",
+                    "classes": control.get("classes") or [],
+                    "id": control.get("id") or "",
+                    "role": control.get("role") or "",
                 },
             }
         )
@@ -4752,8 +4793,53 @@ def _infer_page_type(name: str, url: str) -> str:
     return "page"
 
 
+_DYNAMIC_TYPE_VOCABULARY: dict[str, list[str]] = {}
+
+
+def register_feature_type(feature_type: str, keywords: list[str]) -> None:
+    """Register a new feature type with keyword triggers for future classification.
+
+    After Browser Use or AI discovers a new control type (e.g. ``file_upload``),
+    call this to add it to the vocabulary.  The next time ``_infer_feature_type``
+    encounters a control whose text/tag matches one of the *keywords*, it will
+    classify it as *feature_type* without needing Browser Use again.
+    """
+    if feature_type not in _DYNAMIC_TYPE_VOCABULARY:
+        _DYNAMIC_TYPE_VOCABULARY[feature_type] = []
+    for kw in keywords:
+        kw_lower = kw.lower().strip()
+        if kw_lower and kw_lower not in _DYNAMIC_TYPE_VOCABULARY[feature_type]:
+            _DYNAMIC_TYPE_VOCABULARY[feature_type].append(kw_lower)
+
+
+def _get_registered_feature_types() -> list[str]:
+    return sorted(_DYNAMIC_TYPE_VOCABULARY.keys())
+
+
+# Seed with input-type-based detection
+register_feature_type("file_upload", ["upload", "上传", "file", "选择文件", "附件", "浏览"])
+register_feature_type("date_picker", ["date", "日期", "picker", "时间", "年月日"])
+register_feature_type("cascader", ["cascader", "级联", "省市区", "地区选择"])
+register_feature_type("number_input", ["number", "数字", "数量", "金额"])
+
+
 def _infer_feature_type(text: str, tag: str, input_type: str) -> str:
     lowered = f"{text} {tag} {input_type}".lower()
+
+    # 1. Check dynamic vocabulary (self-evolving, registered by Browser Use / AI)
+    for feature_type, keywords in sorted(_DYNAMIC_TYPE_VOCABULARY.items()):
+        if any(kw in lowered for kw in keywords):
+            return feature_type
+
+    # 2. Check input_type-based rules (DOM-type awareness, before text matching)
+    if input_type == "file":
+        return "file_upload"
+    if input_type in {"date", "datetime-local", "month", "week", "time"}:
+        return "date_picker"
+    if input_type == "number":
+        return "number_input"
+
+    # 3. Static text-based rules (original vocabulary)
     if any(word in lowered for word in ("delete", "删除", "作废")):
         return "delete"
     if any(word in lowered for word in ("approve", "审批", "审核")):
@@ -4771,6 +4857,20 @@ def _infer_feature_type(text: str, tag: str, input_type: str) -> str:
     if any(word in lowered for word in ("search", "query", "查询", "检索")) or input_type in {"search", "text"}:
         return "query"
     return "view"
+
+_UNRECOGNIZED_CONTROLS: list[dict] = []
+
+
+def record_unrecognized_control(control: dict) -> None:
+    _UNRECOGNIZED_CONTROLS.append(control)
+
+
+def get_unrecognized_controls() -> list[dict]:
+    return list(_UNRECOGNIZED_CONTROLS)
+
+
+def clear_unrecognized_controls() -> None:
+    _UNRECOGNIZED_CONTROLS.clear()
 
 
 def _risk_level(feature_type: str) -> str:

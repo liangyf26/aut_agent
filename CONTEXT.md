@@ -106,6 +106,34 @@ _Avoid_: 默认视觉执行、随意接管、无审核兜底
 第二阶段在验证层中，从复杂真实流程里抽出的可重复注册、可重复组合的一组共享动作实现。复用动作族通过 `TemplateActionRegistry` 组装，位于通用模板动作与项目级胶水之间，用于降低“项目专用大脚本”比例。
 _Avoid_: 项目专用大脚本、整流硬编码
 
+**L2 定位器候选池 (L2 Locator Candidate Pool)**:
+Stage D 不再只产出单一 `element_locator` 字符串，而是产出置信度排序的多策略定位器候选数组（`locator_candidates`），每个候选包含 `selector`、`confidence` 和 `strategy`。Stage E 按置信度降序尝试，首个命中即停（P0-1 + P0-2）。
+_Avoid_: 单一定位器、失败后直接报错、无候选回退
+
+**L2 尝试引擎 (L2 Locator Trier Engine)**:
+Stage E 在执行阶段消费 P0-1 产出的 `locator_candidates`，按置信度降序遍历并调用 `wait_for` 验证元素是否存在于 DOM。首个命中的候选直接用于执行动作（click/fill），全部失败时抛出 `AllCandidatesFailed`（P0-2）。
+_Avoid_: 直接使用单个 target、失败后不做候选回退
+
+**阶段E前置检查 (Stage E Preflight / Capability Preflight Gate)**:
+Stage E 启动时运行的 capability routing 检查，决定 L1（静态快照）、L2（候选池）、L3（ARIA）和 L4（Browser Use）各层在本次执行中是否可用。检查结果写入 `routing_summary.json`（P0-3）。
+_Avoid_: 不做检查直接执行、跳过 L4 能力门禁、无 routing_summary 落盘
+
+**L3 ARIA 语义匹配 (L3 ARIA Semantic Matching)**:
+L2 候选全部失败时，消费 Playwright 原生 `page.getByRole()` / `page.getByText()` / `page.getByLabel()` 做语义级定位。纯 Playwright，不引入 LLM（P0-5）。
+_Avoid_: 候选失败直接报错、跳过 ARIA 直接调 LLM
+
+**Browser Use 统一执行器 (Unified Browser Use Executor)**:
+L4 语义接管层的统一入口 `execute_with_browser_use()`，接受 instruction、`BrowserUseSafety` 约束和 `context`（阶段/目标/已尝试策略），返回 `BrowserUseResult`。`write_allowed=False` 时仅允许导航和观察，禁用点击/填写/提交（P0-4）。
+_Avoid_: 各阶段各自造 Browser Use 封装、无统一安全层、高风险操作绕过门禁
+
+**LLM 归因顾问 (LLM Failure Adviser)**:
+Stage E 执行失败后，通过 `analyze_failure()` 生成选择题型 root cause 分析（`primary_cause`/`confidence`/`suggested_action`），LLM 调用 3s 超时后降级为规则回退。结果写入 `round_analysis.json` 的 `llm_advice` 字段（P1-1）。
+_Avoid_: 开放式长文本总结、不超时的 LLM 调用、无规则回退
+
+**自进化功能分类器 (Self-Evolving Feature Classifier)**:
+Stage D 的 `_infer_feature_type()` 不再是纯静态关键词匹配。三层检测：① 动态词汇表（Browser Use 发现新类型后 `register_feature_type()` 注册）；② DOM `input_type` 原生识别（`type=file`→上传、`type=date`→日期）；③ 静态关键词回退。首轮识别失败自动触发 Browser Use 语义复分类 + 动态词汇表注册，下轮直接命中（最多 2 轮自动循环）。
+_Avoid_: 纯静态关键词、新控件永远无法识别、识别失败不自动回退
+
 **泛化回归测试护栏 (Generalization Regression Guardrail)**:
 在继续抽象模板、动作族或接入新系统前，用于锁定模板动作名、registry contract、共享动作 handler 输入输出、policy bridge 等关键行为的一组回归测试。
 _Avoid_: 先拆再说、无护栏泛化

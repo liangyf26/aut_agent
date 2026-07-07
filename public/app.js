@@ -2,7 +2,16 @@ const STAGE2_ONBOARDING_FORM_KEY = 'stage2_new_system_onboarding_form';
 const STAGE2_ONBOARDING_RESULTS_KEY = 'stage2_new_system_onboarding_results';
 const STAGE2_LOCAL_RUNS_KEY = 'stage2_v3_local_runs';
 const STAGE2_ACTION_LOG_LIMIT = 200;
-const WORKSPACE_VIEW = window.location.pathname.replace(/\/+$/, '') === '/stage2' ? 'stage2' : 'stage1';
+const WORKSPACE_VIEW = (() => {
+  const normalizedPath = window.location.pathname.replace(/\/+$/, '');
+  if (normalizedPath === '/stage2') {
+    return 'stage2';
+  }
+  if (normalizedPath === '/testcenter') {
+    return 'testcenter';
+  }
+  return 'stage1';
+})();
 
 const stage2OnboardingDefaults = {
   systemName: '',
@@ -177,8 +186,10 @@ const state = {
     unitTestResults: {},
     goalChainStageResults: {},
     goalChainStageForms: {},
-    e2eForm: { cdpUrl: 'http://localhost:9222', executionMode: 'fixture_simulated' },
+    e2eForm: { cdpUrl: 'http://localhost:9222', executionMode: 'fixture_simulated', systemName: '', maxPages: '5', maxFeaturesPerPage: '12', safetyPolicy: 'low_risk_only', modelName: '' },
     e2eResult: null,
+    e2eProgress: null,
+    e2ePollTimer: null,
     e2eRunning: false
   }
 };
@@ -1386,6 +1397,19 @@ function renderProjectHeader() {
   const project = state.currentProject;
   const runCenter = getProjectRunCenter(project);
   const eyebrow = document.querySelector('.eyebrow');
+
+  if (WORKSPACE_VIEW === 'testcenter') {
+    if (eyebrow) {
+      eyebrow.textContent = '第二阶段 goal_loop 测试工具';
+    }
+    pageTitle.textContent = '第二阶段测试中心';
+    pageSubtitle.textContent = '阶段A-E的单元测试和端到端全流程测试在这里独立操作，与第二阶段运行中心的 v3 run 无关。';
+    projectStatus.textContent = '就绪';
+    projectStatus.className = 'status-pill success';
+    document.title = '第二阶段测试中心 - aut_agent';
+    return;
+  }
+
   if (WORKSPACE_VIEW === 'stage2') {
     if (eyebrow) {
       eyebrow.textContent = '第二阶段 Python 执行子系统';
@@ -1394,17 +1418,7 @@ function renderProjectHeader() {
     pageSubtitle.textContent = '新系统接入、验证矩阵、人工接管和运行产物在这里独立操作。';
     projectStatus.textContent = state.stage2Overview ? '已接入' : '待读取';
     projectStatus.className = `status-pill ${state.stage2Overview ? 'success' : 'warning'}`;
-  } else if (eyebrow) {
-    eyebrow.textContent = '第一阶段需求驱动评测';
-  }
-
-  if (WORKSPACE_VIEW === 'stage2') {
     document.title = '第二阶段运行中心 - aut_agent';
-  } else {
-    document.title = 'aut_agent 软件自动化评测平台';
-  }
-
-  if (WORKSPACE_VIEW === 'stage2') {
     document.querySelector('#currentPhaseLabel').textContent = runCenter.currentPhaseLabel;
     document.querySelector('#currentStepLabel').textContent = runCenter.currentStepLabel;
     document.querySelector('#currentObjectLabel').textContent = runCenter.currentObjectLabel || '未选择项目';
@@ -1413,6 +1427,11 @@ function renderProjectHeader() {
     document.querySelector('#lastUpdatedLabel').textContent = formatDate(project?.updatedAt || runCenter.latestEventAt, true);
     return;
   }
+
+  if (eyebrow) {
+    eyebrow.textContent = '第一阶段需求驱动评测';
+  }
+  document.title = 'aut_agent 软件自动化评测平台';
 
   pageTitle.textContent = project ? project.name : '自动化测试运行中心';
   pageSubtitle.textContent = project
@@ -2343,6 +2362,7 @@ function renderStage2V3AiTab() {
         <header><strong>改进与沉淀候选</strong><span class="tag">${escapeHtml(String((analysis.improvement_candidates || analysis.improvementCandidates || []).length || 0))}</span></header>
         ${renderStage2CompactList(analysis.improvement_candidates || analysis.improvementCandidates || [], '暂无改进候选。')}
       </article>
+      ${renderDecisionChain({decisionChain: run.decisionChain || run.summary?.decisionChain || []})}
     </section>
   `;
 }
@@ -2596,12 +2616,14 @@ function testCenterVerdictTag(verdict, reason) {
     passed: '通过',
     failed: '失败',
     needs_human: '需人工介入',
+    warning: '注意',
     unknown: '未知'
   };
   const classByVerdict = {
     passed: 'passed',
     failed: 'failed',
     needs_human: 'manual',
+    warning: 'warning',
     unknown: 'warning'
   };
   const label = labelByVerdict[verdict] || verdict || '未知';
@@ -2694,11 +2716,15 @@ function renderTestCenterStageResult(result) {
   if (!result) {
     return '';
   }
+  const discovery = _extractE2eDiscoveryDetail(result);
+  const takeover = result.humanTakeover;
+  const resolved = result.humanTakeoverResolution?.ready_to_resume;
+  const canResolve = takeover && takeover.status === 'waiting_human' && !resolved;
   return `
     <div class="tag-row">
       ${testCenterVerdictTag(result.evaluation?.verdict, result.evaluation?.reason)}
       <span class="tag">退出码 ${escapeHtml(String(result.exitCode ?? '-'))}</span>
-      <span class="tag">耗时 ${escapeHtml(String(result.durationMs ?? '-'))}ms</span>
+      <span class="tag">耗时 ${formatTestCenterDuration(result.durationMs)}</span>
     </div>
     <p class="stage2-help-text">${escapeHtml(result.evaluation?.reason || '')}</p>
     ${result.runSummary ? renderStage2KeyValueList([
@@ -2708,9 +2734,147 @@ function renderTestCenterStageResult(result) {
       ['pending', result.runSummary.pending ?? '-'],
       ['root_conclusion', result.runSummary.root_conclusion || result.runSummary.stop_reason || '-']
     ]) : ''}
-    ${result.humanTakeover ? `<p class="stage2-help-text">人工接管：${escapeHtml(result.humanTakeover.waiting_reason || result.humanTakeover.status || '-')}</p>` : ''}
+    ${discovery ? `<div class="stage2-help-text" style="white-space:pre-wrap;font-family:monospace;font-size:0.85em">${discovery}</div>` : ''}
+    ${takeover ? `
+      <p class="stage2-help-text">
+        人工接管：${escapeHtml(takeover.waiting_reason || takeover.status || '-')}
+        ${resolved ? ' <span class="tag pass">已处理</span>' : ''}
+      </p>
+      ${canResolve ? `
+        <div class="inline-actions" style="margin-top:0.5rem">
+          <button class="ghost-action compact-action" data-test-center-resolve-takeover
+            data-runid="${escapeHtml(result.runId)}"
+            data-outputdir="${escapeHtml(result.outputDir)}"
+            type="button">标记已处理</button>
+        </div>
+      ` : ''}
+    ` : ''}
+    ${renderDecisionChain(result)}
     ${result.stderrPreview ? `<details><summary>stderr</summary><pre>${escapeHtml(result.stderrPreview)}</pre></details>` : ''}
   `;
+}
+
+function renderDecisionChain(result) {
+  if (!result || !result.decisionChain || !result.decisionChain.length) {
+    return '';
+  }
+  const layerLabel = (l) => ({l2:'L2 候选池',l3:'L3 ARIA',l4:'L4 Browser Use',l1:'L1 静态'})[l] || l;
+  const statusIcons = {completed:'&#x2713;',failed:'&#x2717;',skipped:'&#x2014;'};
+  const statusClass = (s) => s === 'completed' ? 'passed' : 'failed';
+
+  let html = '<details class="stage2-work-card decision-chain"><summary>AI 决策链 <span class="tag muted">' + result.decisionChain.length + ' 个目标</span></summary>';
+  for (const chain of result.decisionChain) {
+    html += '<div class="chain-group">';
+    html += '<header><strong>' + escapeHtml(chain.test_case_id) + '</strong>';
+    if (chain.failure_reason) html += ' <span class="tag failed">' + escapeHtml(chain.failure_reason) + '</span>';
+    html += '</header>';
+    for (const feat of chain.features) {
+      const acts = feat.failed_attempts || [];
+      html += '<div class="chain-feature">';
+      html += '<span class="tag ' + statusClass(feat.status) + '">' + statusIcons[feat.status] + ' ' + layerLabel(feat.layer) + '</span>';
+      html += '<span class="chain-strategy">' + escapeHtml(feat.winning_strategy || feat.action) + '</span>';
+      if (feat.cascade_notes.length) {
+        html += '<ul class="chain-notes">' + feat.cascade_notes.map((n) => '<li>' + escapeHtml(n) + '</li>').join('') + '</ul>';
+      }
+      if (acts.length) {
+        html += '<details class="chain-attempts"><summary>' + acts.length + ' 次失败尝试</summary>';
+        html += '<ul class="chain-attempt-list">' + acts.map((a) => '<li><span class="tag muted">' + escapeHtml(a.strategy) + '</span> <code>' + escapeHtml(a.selector) + '</code></li>').join('') + '</ul>';
+        html += '</details>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  html += '</details>';
+  return html;
+}
+
+function _extractE2eDiscoveryDetail(result) {
+  const parsed = result.parsedStdout;
+  const discovered = result.discoveredNames;
+  const stageId = result.stageId;
+  if (stageId === 'menu') {
+    const parts = [];
+    if (parsed && parsed.total_goals != null) parts.push(`发现 ${parsed.succeeded ?? parsed.total_goals} 个菜单入口`);
+    if (parsed && parsed.pending != null && parsed.pending > 0) parts.push(`（${parsed.pending} 个待继续）`);
+    if (discovered && discovered.names && discovered.names.length) {
+      parts.push('\n' + discovered.names.map((n, i) => `${i + 1}. ${n}`).join('\n'));
+    }
+    return parts.join(' ');
+  }
+  if (stageId === 'page') {
+    const parts = [];
+    if (parsed && parsed.reachable_count != null) parts.push(`可达页面 ${parsed.reachable_count} 个`);
+    if (parsed && parsed.blocked_count) parts.push(`，${parsed.blocked_count} 个受限`);
+    if (parsed && parsed.blank_count) parts.push(`，${parsed.blank_count} 个白屏`);
+    if (discovered && discovered.names && discovered.names.length) {
+      parts.push('\n' + discovered.names.map((n, i) => `${i + 1}. ${n}`).join('\n'));
+    }
+    return parts.join('');
+  }
+  if (stageId === 'feature') {
+    const parts = [];
+    if (parsed && parsed.feature_count != null) parts.push(`功能点 ${parsed.feature_count} 个`);
+    if (parsed && parsed.test_cases_generated != null) parts.push(`，生成 ${parsed.test_cases_generated} 条用例`);
+    if (parsed && parsed.feature_types) {
+      const types = Object.entries(parsed.feature_types).map(([k, v]) => `${k}×${v}`).join(' ');
+      if (types) parts.push(`\n类型分布: ${types}`);
+    }
+    if (discovered && discovered.items && discovered.items.length) {
+      parts.push('\n' + discovered.items.map((f, i) => `${i + 1}. ${f.name} [${f.type}] ${f.risk === 'high' ? '⚠高风险' : ''}`).join('\n'));
+    }
+    return parts.join(' ');
+  }
+  if (stageId === 'execution') {
+    const parts = [];
+    if (parsed && parsed.executed_case_count != null) parts.push(`已执行 ${parsed.executed_case_count} 条用例`);
+    if (discovered) {
+      parts.push(`（通过 ${discovered.passed}，失败 ${discovered.failed}）`);
+      if (discovered.reasons && Object.keys(discovered.reasons).length) {
+        parts.push(`\n失败原因: ${Object.entries(discovered.reasons).map(([k, v]) => `${k}×${v}`).join('  ')}`);
+      }
+    }
+    if (parsed && parsed.total_execution_goals != null) parts.push(`共 ${parsed.total_execution_goals} 条用例`);
+    if (parsed && parsed.stopped_reason) parts.push(`\n停止原因: ${_translateStoppedReason(parsed.stopped_reason)}`);
+    // Add actionable guidance for common failures
+    const guidance = _buildFailureGuidance(discovered);
+    if (guidance) parts.push(guidance);
+    return parts.join(' ');
+  }
+  return null;
+}
+
+function _buildFailureGuidance(discovered) {
+  if (!discovered || !discovered.reasons || !discovered.failed) return null;
+  const parts = ['\n\n--- 操作指导 ---'];
+  if (discovered.reasons.locator_unstable) {
+    parts.push(`\n定位器不稳定（${discovered.reasons.locator_unstable} 例）：测试用例生成的 CSS 选择器/文本选择器在该页面上无法匹配到元素。`);
+    parts.push('建议：检查生成用例中 click/fill 步骤的 target 字段是否与页面实际 DOM 结构一致。');
+    parts.push('可在浏览器开发者工具中手动验证选择器，匹配后更新 locate_or_hints.json。');
+  }
+  if (discovered.reasons.page_load_timeout) {
+    parts.push(`\n页面加载超时（${discovered.reasons.page_load_timeout} 例）：导航步骤的目标 URL 无法在 5 秒内加载完成。`);
+    parts.push('建议：检查目标 URL 是否可访问、CDP Chrome 是否仍在运行且已登录。');
+  }
+  if (discovered.reasons.assertion_failed) {
+    parts.push(`\n断言失败（${discovered.reasons.assertion_failed} 例）：页面操作完成但验证步骤未通过。`);
+    parts.push('建议：检查测试用例的 verify 步骤目标是否对应真实 DOM 元素。');
+  }
+  if (discovered.reasons.evidence_incomplete) {
+    parts.push(`\n证据不完整（${discovered.reasons.evidence_incomplete} 例）：无法识别测试用例类型，无法执行。`);
+    parts.push('建议：检查 generated_test_cases.json 中用例的 type 字段是否正确。');
+  }
+  return parts.join('\n');
+}
+
+function formatTestCenterDuration(ms) {
+  if (ms == null) return '-';
+  if (ms < 1000) return `${ms}ms`;
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(1)}s`;
+  const m = Math.floor(s / 60);
+  const ss = (s % 60).toFixed(0);
+  return `${m}m${ss}s`;
 }
 
 function renderTestCenterStageSection() {
@@ -2750,17 +2914,23 @@ function renderTestCenterStageSection() {
 function renderTestCenterE2eSection() {
   const form = state.testCenter.e2eForm;
   const result = state.testCenter.e2eResult;
+  const progress = state.testCenter.e2eProgress;
   const running = state.testCenter.e2eRunning;
   const stageOrderIds = ['menu', 'page', 'feature', 'execution'];
   const stepById = {};
-  (result?.steps || []).forEach((step) => {
+  // Merge completed steps from result OR progress (for real-time updates)
+  const steps = result?.steps || progress?.steps || [];
+  steps.forEach((step) => {
     stepById[step.stageId] = step;
   });
+  const currentStage = progress?.currentStage;
+  const runningStatus = progress?.status === 'running' || running;
 
   return `
-    <section class="stage2-table-card">
+    <section class="stage2-table-card" data-e2e-progress-root>
       <div class="stage2-section-head">
         <h3>端到端全流程测试</h3>
+        <span data-e2e-head-tag>${runningStatus && currentStage ? `<span class="tag pulse">运行中：${stageOrderIds.indexOf(currentStage) + 1}/4</span>` : ''}</span>
       </div>
       <p class="stage2-help-text">依次跑通菜单发现→页面发现→功能点发现→执行，每一步自动把产物路径传给下一步；任意一步失败或需人工介入即停止，不会继续往后跑。</p>
       <div class="stage2-field-grid">
@@ -2770,6 +2940,11 @@ function renderTestCenterE2eSection() {
           <small>已登录目标系统的 Chrome 远程调试地址，四个阶段共用同一个连接。</small>
         </label>
         <label class="stage2-field">
+          <span>Browser Use 模型</span>
+          <input type="text" data-test-center-e2e-field="modelName" value="${escapeHtml(form.modelName || '')}" placeholder="local_ai" />
+          <small>功能发现阶段 Browser Use 复分类用的模型 profile 名（如 local_ai、local_qwen）。留空则跳过 Browser Use 复分类。</small>
+        </label>
+        <label class="stage2-field">
           <span>执行阶段模式</span>
           <select data-test-center-e2e-field="executionMode">
             <option value="fixture_simulated" ${form.executionMode === 'fixture_simulated' ? 'selected' : ''}>fixture_simulated（安全，纯模拟）</option>
@@ -2777,45 +2952,105 @@ function renderTestCenterE2eSection() {
           </select>
           <small>只影响最后的执行阶段；菜单/页面/功能点发现三个阶段恒定驱动真实浏览器。</small>
         </label>
+        <label class="stage2-field">
+          <span>安全策略</span>
+          <select data-test-center-e2e-field="safetyPolicy">
+            <option value="low_risk_only" ${form.safetyPolicy !== 'test_env_full_access' ? 'selected' : ''}>low_risk_only（仅低风险，提交/删除需人工确认）</option>
+            <option value="test_env_full_access" ${form.safetyPolicy === 'test_env_full_access' ? 'selected' : ''}>test_env_full_access（全功能，允许提交/保存/上传，仅测试环境）</option>
+          </select>
+          <small>影响执行阶段的风险控制。选 test_env_full_access 后提交、保存等高危操作将自动执行（需确认在测试环境）。</small>
+        </label>
+        <label class="stage2-field">
+          <span>执行最大轮数</span>
+          <input type="number" data-test-center-e2e-field="maxExecutionRounds" value="${escapeHtml(form.maxExecutionRounds || '1')}" min="1" max="20" />
+          <small>real_browser 模式始终只执行一轮；fixture_simulated 可按此上限自动重试可重试的失败用例。</small>
+        </label>
+        <label class="stage2-field">
+          <span>real_browser 多轮重试</span>
+          <select data-test-center-e2e-field="allowRealBrowserRetry">
+            <option value="" ${!form.allowRealBrowserRetry ? 'selected' : ''}>不允许（默认，单轮后停止）</option>
+            <option value="true" ${form.allowRealBrowserRetry === 'true' ? 'selected' : ''}>允许（测试环境可用，多轮自动重试）</option>
+          </select>
+          <small>仅测试环境可用。默认禁止 real_browser 多轮重试（避免无人看守时对生产系统重复操作）。勾选后才放开 maxRounds 对 real_browser 的限制。</small>
+        </label>
+        <label class="stage2-field">
+          <span>目标系统名称</span>
+          <input type="text" data-test-center-e2e-field="systemName" value="${escapeHtml(form.systemName || '')}" placeholder="如：线上备案申请、用户管理" />
+          <small>可选，仅用于运行记录标记。</small>
+        </label>
+        <label class="stage2-field">
+          <span>目标页面 URL</span>
+          <input type="text" data-test-center-e2e-field="targetUrl" value="${escapeHtml(form.targetUrl || '')}" placeholder="https://example.com/page" />
+          <small>可选。设置后在启动前导航 Chrome 到此页面；留空则从 Chrome 当前页面开始发现。</small>
+        </label>
+        <label class="stage2-field">
+          <span>最大发现页面数</span>
+          <input type="number" data-test-center-e2e-field="maxPages" value="${escapeHtml(form.maxPages || '5')}" min="1" max="100" />
+          <small>菜单发现阶段扫描的菜单/页面数量上限，越大覆盖越全但耗时越长。</small>
+        </label>
+        <label class="stage2-field">
+          <span>每页最大功能点数</span>
+          <input type="number" data-test-center-e2e-field="maxFeaturesPerPage" value="${escapeHtml(form.maxFeaturesPerPage || '12')}" min="1" max="200" />
+          <small>功能点发现阶段每页识别的控件数量，调大可以捕获更多交互控件（上传、级联、日期选择等）。默认 12。</small>
+        </label>
       </div>
       <div class="inline-actions">
-        <button class="primary-action compact-action" data-test-center-run-e2e type="button" ${running || state.pendingAction ? 'disabled' : ''}>${running ? '运行中...' : '开始端到端测试'}</button>
+        <button class="primary-action compact-action" data-test-center-run-e2e type="button" ${running ? 'disabled' : ''}>${running ? '运行中...' : '开始端到端测试'}</button>
       </div>
       <div class="stage2-timeline-line">
         ${stageOrderIds.map((stageId, index) => {
           const step = stepById[stageId];
           const stageLabel = TEST_CENTER_STAGE_ORDER.find((item) => item.id === stageId)?.label || stageId;
-          const notRun = !step;
+          const isCurrent = currentStage === stageId && runningStatus;
+          const notRun = !step && !isCurrent;
+          const dur = step ? ` · ${formatTestCenterDuration(step.durationMs)}` : '';
+          const verdict = step ? testCenterVerdictTag(step.evaluation?.verdict, step.evaluation?.reason) : (isCurrent ? '进行中...' : '未运行');
           return `
-            <article class="stage2-timeline-step ${notRun ? '' : 'current'}">
+            <article class="stage2-timeline-step ${notRun ? '' : 'current'} ${isCurrent ? 'pulse' : ''}" data-e2e-step-index="${index}">
               <span>步骤 ${index + 1}</span>
-              <strong>${escapeHtml(stageLabel)}</strong>
-              ${notRun ? '<small>未运行</small>' : `<small>${testCenterVerdictTag(step.evaluation?.verdict, step.evaluation?.reason)}</small>`}
+              <strong>${escapeHtml(stageLabel)}${dur}</strong>
+              <small>${verdict}</small>
             </article>
           `;
         }).join('')}
       </div>
-      ${result?.stoppedReason ? `<p class="stage2-help-text">停止原因：${escapeHtml(result.stoppedReason)}</p>` : ''}
-      ${(result?.steps || []).map((step) => `
-        <details class="stage2-work-card">
-          <summary>${escapeHtml(TEST_CENTER_STAGE_ORDER.find((item) => item.id === step.stageId)?.label || step.stageId)} 详情</summary>
-          ${renderTestCenterStageResult(step)}
-        </details>
-      `).join('')}
+      <p class="stage2-help-text" data-e2e-stop-reason>${result?.stoppedReason ? `停止原因：${escapeHtml(_translateStoppedReason(result.stoppedReason))}` : ''}</p>
+      <div data-e2e-details>
+        ${(steps || []).map((step) => `
+          <details class="stage2-work-card" data-e2e-stage-id="${escapeHtml(step.stageId)}">
+            <summary>${escapeHtml(TEST_CENTER_STAGE_ORDER.find((item) => item.id === step.stageId)?.label || step.stageId)} 详情</summary>
+            ${renderTestCenterStageResult(step)}
+          </details>
+        `).join('')}
+      </div>
     </section>
   `;
 }
 
 function renderStage2TestCenterTab() {
-  const container = document.querySelector('#stage2TestcenterTab');
+  const container = document.querySelector('#stage2TestcenterPanel');
   if (!container) {
     return;
   }
+
+  // Preserve <details> open state across re-renders
+  const openStates = {};
+  container.querySelectorAll('details').forEach((el) => {
+    const id = el.getAttribute('data-e2e-stage-id') || el.getAttribute('data-test-center-stage');
+    if (id) openStates[id] = el.open;
+  });
+
   container.innerHTML = `
     ${renderTestCenterUnitSection()}
     ${renderTestCenterStageSection()}
     ${renderTestCenterE2eSection()}
   `;
+
+  // Restore open state
+  container.querySelectorAll('details').forEach((el) => {
+    const id = el.getAttribute('data-e2e-stage-id') || el.getAttribute('data-test-center-stage');
+    if (id && openStates[id]) el.open = true;
+  });
 }
 
 async function runTestCenterUnitSuite(kind) {
@@ -2858,21 +3093,166 @@ async function runTestCenterStage(stageId) {
   }
 }
 
-async function runTestCenterE2e() {
-  state.testCenter.e2eRunning = true;
+async function resolveHumanTakeover(runId, outputDir) {
+  state.pendingAction = 'resolve-takeover';
   render();
   try {
-    const payload = await api('/api/stage2/test-center/run-goal-chain-e2e', {
+    await api('/api/stage2/test-center/mark-takeover-resolved', {
+      method: 'POST',
+      body: JSON.stringify({ runId, outputDir })
+    });
+    saveState.textContent = '人工接管已标记为已处理';
+    // Reload the test center state to get updated takeover resolution
+    const state = await api('/api/stage2/test-center/state');
+    if (state) {
+      for (const [key, val] of Object.entries(state)) {
+        if (val != null) state.testCenter[key] = val;
+      }
+    }
+  } catch (error) {
+    saveState.textContent = '标记失败: ' + error.message;
+  } finally {
+    state.pendingAction = null;
+    render();
+  }
+}
+
+async function runTestCenterE2e() {
+  state.testCenter.e2eRunning = true;
+  state.testCenter.e2eProgress = null;
+  state.testCenter.e2ePollTimer = null;
+  render();
+  try {
+    // Start the async E2E run
+    const startPayload = await api('/api/stage2/test-center/start-goal-chain-e2e', {
       method: 'POST',
       body: JSON.stringify({ params: { ...state.testCenter.e2eForm } })
     });
-    state.testCenter.e2eResult = payload.result;
-    saveState.textContent = payload.result.stoppedAt ? `端到端测试在「${payload.result.stoppedAt}」阶段停止` : '端到端测试全部通过';
+    const runId = startPayload.runId;
+
+    // Poll for real-time progress — use incremental DOM update, not full render
+    let pollTimer = null;
+    await new Promise((resolve) => {
+      const poll = async () => {
+        try {
+          const resp = await api(`/api/stage2/test-center/e2e-progress?runId=${encodeURIComponent(runId)}`);
+          state.testCenter.e2eProgress = resp;
+          refreshE2eProgress();
+          if (resp.status === 'completed' || resp.status === 'failed') {
+            if (pollTimer) clearTimeout(pollTimer);
+            state.testCenter.e2eRunning = false;
+            state.testCenter.e2ePollTimer = null;
+            state.testCenter.e2eResult = resp;
+            state.testCenter.e2eProgress = null;
+            saveState.textContent = resp.stoppedAt ? `端到端测试在「${resp.stoppedAt}」阶段停止` : '端到端测试全部通过';
+            refreshE2eProgress();
+            resolve();
+          } else {
+            pollTimer = setTimeout(poll, 1500);
+          }
+        } catch (err) {
+          if (pollTimer) clearTimeout(pollTimer);
+          state.testCenter.e2eRunning = false;
+          state.testCenter.e2eProgress = null;
+          saveState.textContent = '进度查询失败：' + err.message;
+          render();
+          resolve();
+        }
+      };
+      pollTimer = setTimeout(poll, 500);
+      state.testCenter.e2ePollTimer = () => clearTimeout(pollTimer);
+    });
   } catch (error) {
     saveState.textContent = error.message;
-  } finally {
     state.testCenter.e2eRunning = false;
+    state.testCenter.e2eProgress = null;
     render();
+  }
+}
+
+function _translateStoppedReason(reason) {
+  if (!reason) return reason;
+  const m = {
+    'real_browser_round_limit': '真实浏览器执行限制：已执行一轮后自动停止，请人工核实后重新调用以重试可重试的用例',
+    'converged: no retryable failures remain.': '执行收敛：无可重试的失败用例',
+    'converged: no retryable failures after round 1.': '执行收敛：第一轮后无可重试的失败用例',
+    'paused_on_human_takeover': '存在待人工处理的暂停目标，请先执行 --resolve-goal-loop-takeover 再重新调用',
+    'max_rounds_reached': '已达最大轮数限制',
+  };
+  for (const [key, val] of Object.entries(m)) {
+    if (reason.includes(key)) return val;
+  }
+  return reason;
+}
+
+function refreshE2eProgress() {
+  const panel = document.querySelector('#stage2TestcenterPanel');
+  if (!panel) return;
+  const e2eSection = panel.querySelector('[data-e2e-progress-root]');
+  if (!e2eSection) return;
+  const progress = state.testCenter.e2eProgress;
+  const result = state.testCenter.e2eResult;
+  const steps = progress?.steps || result?.steps || [];
+  const currentStage = progress?.currentStage;
+  const running = state.testCenter.e2eRunning;
+  const stageOrderIds = ['menu', 'page', 'feature', 'execution'];
+
+  // Update button state
+  const btn = panel.querySelector('[data-test-center-run-e2e]');
+  if (btn) {
+    btn.disabled = running;
+    btn.textContent = running ? '运行中...' : (result ? '已完成' : '开始端到端测试');
+  }
+
+  // Update heading status tag
+  const headTag = e2eSection.querySelector('[data-e2e-head-tag]');
+  if (headTag) {
+    headTag.innerHTML = running && currentStage ? `<span class="tag pulse">运行中：${stageOrderIds.indexOf(currentStage) + 1}/4</span>` : (result ? '已完成' : '');
+  }
+
+  // Update timeline steps — patch existing DOM, don't rebuild
+  e2eSection.querySelectorAll('.stage2-timeline-step').forEach((el) => {
+    const stepIdx = Number(el.getAttribute('data-e2e-step-index'));
+    const stageId = stageOrderIds[stepIdx];
+    const step = steps.find((s) => s.stageId === stageId);
+    const isCurrent = currentStage === stageId && running;
+    const dur = step ? ` · ${formatTestCenterDuration(step.durationMs)}` : '';
+    const vText = step
+      ? testCenterVerdictTag(step.evaluation?.verdict, step.evaluation?.reason)
+      : (isCurrent ? '进行中...' : '未运行');
+    el.classList.toggle('current', !!step || isCurrent);
+    el.classList.toggle('pulse', !!isCurrent);
+    const strong = el.querySelector('strong');
+    if (strong) strong.textContent = (TEST_CENTER_STAGE_ORDER.find((i) => i.id === stageId)?.label || stageId) + dur;
+    const small = el.querySelector('small');
+    if (small) small.innerHTML = vText;
+  });
+
+  // Append new detail panels — never remove already-open ones
+  const detailsContainer = e2eSection.querySelector('[data-e2e-details]');
+  if (detailsContainer) {
+    const existingIds = new Set();
+    detailsContainer.querySelectorAll('details').forEach((el) => {
+      existingIds.add(el.getAttribute('data-e2e-stage-id'));
+    });
+    steps.forEach((step) => {
+      if (!existingIds.has(step.stageId)) {
+        const detail = document.createElement('details');
+        detail.className = 'stage2-work-card';
+        detail.setAttribute('data-e2e-stage-id', step.stageId);
+        detail.innerHTML = `
+          <summary>${escapeHtml(TEST_CENTER_STAGE_ORDER.find((item) => item.id === step.stageId)?.label || step.stageId)} 详情</summary>
+          ${renderTestCenterStageResult(step)}
+        `;
+        detailsContainer.appendChild(detail);
+      }
+    });
+  }
+
+  // Update stop reason
+  const stopReasonEl = e2eSection.querySelector('[data-e2e-stop-reason]');
+  if (stopReasonEl) {
+    stopReasonEl.textContent = result?.stoppedReason ? `停止原因：${_translateStoppedReason(result.stoppedReason)}` : '';
   }
 }
 
@@ -4451,7 +4831,7 @@ document.querySelector('#stage2Cockpit')?.addEventListener('click', (event) => {
   }
 });
 
-document.querySelector('#stage2TestcenterTab')?.addEventListener('click', (event) => {
+document.querySelector('#stage2TestcenterPanel')?.addEventListener('click', (event) => {
   const unitButton = event.target.closest('[data-test-center-run-unit]');
   if (unitButton) {
     runTestCenterUnitSuite(unitButton.dataset.testCenterRunUnit);
@@ -4467,10 +4847,20 @@ document.querySelector('#stage2TestcenterTab')?.addEventListener('click', (event
   const e2eButton = event.target.closest('[data-test-center-run-e2e]');
   if (e2eButton) {
     runTestCenterE2e();
+    return;
+  }
+
+  const resolveTakeoverButton = event.target.closest('[data-test-center-resolve-takeover]');
+  if (resolveTakeoverButton) {
+    resolveHumanTakeover(
+      resolveTakeoverButton.dataset.runid,
+      resolveTakeoverButton.dataset.outputdir
+    );
+    return;
   }
 });
 
-document.querySelector('#stage2TestcenterTab')?.addEventListener('input', (event) => {
+document.querySelector('#stage2TestcenterPanel')?.addEventListener('input', (event) => {
   const stageField = event.target.closest('[data-test-center-stage-field]');
   if (stageField) {
     const card = stageField.closest('[data-test-center-stage-card]');

@@ -32,6 +32,11 @@
 - `prototype/stage2/app/`: 第二阶段平台原型模块
 - `prototype/stage2/app/goal_loop/`: 目标循环内核（第二阶段 v4，见 `docs/技术方案第二阶段v4.md`/`docs/第二阶段实施计划v4.md`）——`menu_goal`/`page_goal`/`feature_goal`/`execution_goal`/`cross_system_goal` 各自对应阶段A-F 的菜单/页面/功能点/执行/跨系统闭环，与下面的 v3 真实浏览器管线是两条独立代码路径。四阶段（B/C/D/E）均已接入 `main.py` 的 `--run-menu-goal`/`--run-page-goal`/`--run-feature-goal`/`--run-execution-goal`；阶段F（`cross_system_goal`）2026-07-05 接入 `--run-cross-system-goal`，已用两个真实系统（追本溯源 + 订场系统）跑通端到端验证，见「第二阶段入口」的命令示例
 - `prototype/stage2/app/execution_goal/execution_runner.py` vs `real_browser_runner.py`: 阶段E 执行分两种模式——`execution_runner.py` 是默认的 fixture 模拟执行（`execution_mode="fixture_simulated"`，不驱动浏览器）；`real_browser_runner.py` 是 2026-07-04 验证过的真实 Playwright 执行分支（`execution_mode="real_browser"`），已针对真实苏源系统跑通，但还只是可选模块，未合并为默认路径
+- `prototype/stage2/app/execution_goal/locator_trier.py`: P0-2 L2 定位器尝试引擎，按置信度降序遍历 Stage D 产出的 `locator_candidates`，首个命中的候选执行点击/填写动作，全部失败时抛出 `AllCandidatesFailed`
+- `prototype/stage2/app/execution_goal/preflight.py`: P0-3 Stage E 前置检查，启动时运行 capability routing 决定 L1-L4 各层可用性，写入 `routing_summary.json`
+- `prototype/stage2/app/execution_goal/browser_use_executor.py`: P0-4 Browser Use 统一执行器，提供 `execute_with_browser_use()` 入口和 `BrowserUseSafety` 安全约束层，供阶段 B/C/D/E 适配调用
+- `prototype/stage2/app/execution_goal/failure_adviser.py`: P1-1 LLM 归因顾问，提供 `analyze_failure()` 选择题型 prompt 和规则回退，结果写入 `round_analysis.json` 的 `llm_advice` 字段
+- `--goal-chain-safety-policy`: E2E 管线的安全策略开关（`low_risk_only` / `test_env_full_access`），接通 feature + execution 阶段，控制是否允许自动执行提交/上传等高危操作；同时 Stage D 对 `input[type=file]`/`date` 等原生类型做自动识别，并支持 Browser Use 对未知控件做语义复分类 + 动态词汇表注册 + 最多 2 轮自动循环
 - `prototype/stage2/templates/`: 项目级执行模板、基线、schema、locator hints
 - `prototype/stage2/app/verification/suyuan_shared_actions.py`: 溯源样本的 wizard / drawer 共享动作族
 - `prototype/stage2/app/verification/suyuan_submit_dialog_actions.py`: 溯源样本的 upload / submit dialog 共享动作族

@@ -28,7 +28,9 @@ def generate_test_case(
     confidence: str,
     element_text: str | None = None,
     element_locator: str | None = None,
+    locator_candidates: list[dict] | None = None,
     page_url: str | None = None,
+    safety_policy: str = "low_risk_only",
 ) -> dict:
     """
     Generate a test case for a feature point.
@@ -44,6 +46,7 @@ def generate_test_case(
         confidence: Classification confidence
         element_text: Element text
         element_locator: Element locator/selector
+        locator_candidates: Ranked locator candidates (L2 pool, P0-1)
         page_url: Page URL
 
     Returns:
@@ -64,6 +67,7 @@ def generate_test_case(
             "metadata": {
                 "feature_type": feature_type,
                 "confidence": confidence,
+                "locator_candidates": locator_candidates,
             },
         }
 
@@ -78,7 +82,8 @@ def generate_test_case(
     # export job), unlike a read-only query/reset/detail/tab action.
     needs_confirmation = (
         not should_generate_executable_test(risk_level, confidence)
-        or feature_type in _SIDE_EFFECTING_FEATURE_TYPES
+        and safety_policy != "test_env_full_access"
+        or (feature_type in _SIDE_EFFECTING_FEATURE_TYPES and safety_policy != "test_env_full_access")
     )
 
     if needs_confirmation:
@@ -98,6 +103,7 @@ def generate_test_case(
                 "confidence": confidence,
                 "element_text": element_text,
                 "element_locator": element_locator,
+                "locator_candidates": locator_candidates,
             },
         }
 
@@ -106,6 +112,7 @@ def generate_test_case(
         feature_type=feature_type,
         element_text=element_text,
         element_locator=element_locator,
+        locator_candidates=locator_candidates,
         page_url=page_url,
     )
 
@@ -124,6 +131,7 @@ def generate_test_case(
             "confidence": confidence,
             "element_text": element_text,
             "element_locator": element_locator,
+            "locator_candidates": locator_candidates,
         },
     }
 
@@ -132,6 +140,7 @@ def _generate_test_steps(
     feature_type: str,
     element_text: str | None,
     element_locator: str | None,
+    locator_candidates: list[dict] | None,
     page_url: str | None,
 ) -> list[dict]:
     """
@@ -141,6 +150,7 @@ def _generate_test_steps(
         feature_type: Feature type
         element_text: Element text
         element_locator: Element locator
+        locator_candidates: Ranked locator candidates (L2 pool, P0-1)
         page_url: Page URL
 
     Returns:
@@ -159,7 +169,7 @@ def _generate_test_steps(
             {
                 "step": 2,
                 "action": "fill",
-                "target": "input[name='keyword']",
+                "target": "input[type='text']:visible, input:not([type]):visible, textarea:visible",
                 "value": "测试",
                 "description": "填写查询条件",
             },
@@ -167,6 +177,7 @@ def _generate_test_steps(
                 "step": 3,
                 "action": "click",
                 "target": locator,
+                "locator_candidates": locator_candidates,
                 "description": f"点击{element_text or '查询'}按钮",
             },
             {
@@ -188,7 +199,7 @@ def _generate_test_steps(
             {
                 "step": 2,
                 "action": "fill",
-                "target": "input[name='keyword']",
+                "target": "input[type='text']:visible, input:not([type]):visible, textarea:visible",
                 "value": "测试",
                 "description": "填写查询条件",
             },
@@ -196,12 +207,13 @@ def _generate_test_steps(
                 "step": 3,
                 "action": "click",
                 "target": locator,
+                "locator_candidates": locator_candidates,
                 "description": f"点击{element_text or '重置'}按钮",
             },
             {
                 "step": 4,
                 "action": "verify",
-                "target": "input[name='keyword']",
+                "target": "input[type='text']:visible, input:not([type]):visible, textarea:visible",
                 "expected": "",
                 "description": "验证表单已清空",
             },
@@ -219,6 +231,7 @@ def _generate_test_steps(
                 "step": 2,
                 "action": "click",
                 "target": locator,
+                "locator_candidates": locator_candidates,
                 "description": f"点击{element_text or '详情'}按钮",
             },
             {
@@ -241,6 +254,7 @@ def _generate_test_steps(
                 "step": 2,
                 "action": "click",
                 "target": locator,
+                "locator_candidates": locator_candidates,
                 "description": f"点击{element_text or '导出'}按钮",
             },
             {
@@ -263,6 +277,7 @@ def _generate_test_steps(
                 "step": 2,
                 "action": "click",
                 "target": locator,
+                "locator_candidates": locator_candidates,
                 "description": f"点击Tab: {element_text}",
             },
             {
@@ -285,6 +300,7 @@ def _generate_test_steps(
                 "step": 2,
                 "action": "click",
                 "target": locator,
+                "locator_candidates": locator_candidates,
                 "description": f"点击{element_text or '弹窗'}按钮",
             },
             {
@@ -308,6 +324,7 @@ def _generate_test_steps(
                 "step": 2,
                 "action": "click",
                 "target": locator,
+                "locator_candidates": locator_candidates,
                 "description": f"点击{element_text or feature_type}",
             },
             {

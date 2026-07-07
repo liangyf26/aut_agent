@@ -942,7 +942,8 @@ function buildPublicRun(runDir, manifest, artifacts = {}) {
       executionMode,
       safetyPolicy: manifest.safety_policy || artifacts.input_config?.safety_policy || SAFETY_POLICY_LOW_RISK_ONLY,
       countExplanation,
-      modelComparison: summarizeModelComparison(artifacts.model_comparison)
+      modelComparison: summarizeModelComparison(artifacts.model_comparison),
+      decisionChain: extractDecisionChain(artifacts.execution_results),
     },
     modelComparison: artifacts.model_comparison || null,
     targetTracking,
@@ -1479,6 +1480,47 @@ function groupFailures(executionResults) {
     test_case_ids: caseIds,
     count: caseIds.length
   }));
+}
+
+function extractDecisionChain(executionResults) {
+  const items = executionResults?.items || [];
+  const chains = [];
+  for (const result of items) {
+    const actions = result.actions || [];
+    const cascadeActions = actions.filter((a) => {
+      const r = a.result || {};
+      return r.layer || r.cascade_notes || r.tried_candidates;
+    });
+    if (!cascadeActions.length) continue;
+
+    const features = [];
+    for (const act of cascadeActions) {
+      const r = act.result || {};
+      const layer = r.layer || (r.tried_candidates ? 'l2' : 'unknown');
+      const failedAttempts = (r.attempts || [])
+        .concat(r.l2_attempts || [])
+        .concat(r.l3_attempts || []);
+      features.push({
+        action: act.action || 'unknown',
+        status: act.status || 'unknown',
+        layer,
+        winning_strategy: r.winning_strategy || null,
+        winning_selector: r.winning_selector || null,
+        failed_attempts: failedAttempts.map((a) => ({
+          strategy: a.strategy || 'unknown',
+          selector: (a.selector || '').slice(0, 120),
+          error: (a.error || '').slice(0, 200),
+        })),
+        cascade_notes: r.cascade_notes || [],
+      });
+    }
+    chains.push({
+      test_case_id: result.test_case_id,
+      failure_reason: result.failure_reason || null,
+      features,
+    });
+  }
+  return chains;
 }
 
 function extractScopeTargets(inputConfig = {}) {
@@ -4628,6 +4670,7 @@ module.exports = {
   continueNextRound,
   createV3Run,
   deleteV3Runs,
+  extractDecisionChain,
   generateV3Report,
   getV3Run,
   listV3Runs,
