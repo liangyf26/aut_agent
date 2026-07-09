@@ -156,7 +156,7 @@ def _generate_test_steps(
     Returns:
         List of test step dicts
     """
-    locator = element_locator or f"button:has-text('{element_text}')"
+    locator = element_locator or _default_locator(feature_type, element_text)
 
     if feature_type == "query":
         return [
@@ -311,6 +311,24 @@ def _generate_test_steps(
             },
         ]
 
+    elif feature_type in {"form_field", "form_select", "number_input", "date_picker", "cascader"}:
+        placeholder = {"form_field": "测试文本", "form_select": "1", "number_input": "100",
+                       "date_picker": "2026-01-01", "cascader": "1"}.get(feature_type, "测试")
+        return [
+            {"step": 1, "action": "navigate", "target": page_url or "/", "description": "导航到页面"},
+            {"step": 2, "action": "fill", "target": locator, "locator_candidates": locator_candidates,
+             "value": placeholder, "description": f"填写{element_text or feature_type}"},
+        ]
+
+    elif feature_type == "submit":
+        return [
+            {"step": 1, "action": "navigate", "target": page_url or "/", "description": "导航到页面"},
+            {"step": 2, "action": "click", "target": locator, "locator_candidates": locator_candidates,
+             "description": f"点击{element_text or '提交'}按钮"},
+            {"step": 3, "action": "verify", "target": "page_state_changed",
+             "description": "验证提交后页面状态变化"},
+        ]
+
     else:
         # Generic steps for unknown types
         return [
@@ -334,6 +352,20 @@ def _generate_test_steps(
                 "description": "验证页面状态变化",
             },
         ]
+
+
+def _default_locator(feature_type: str, element_text: str | None) -> str:
+    text = element_text or feature_type
+    type_map = {
+        "form_field": f"input[type='text']:visible, input:not([type]):visible, textarea:visible",
+        "form_select": f"select:visible",
+        "number_input": f"input[type='number']:visible",
+        "date_picker": f"input[type='date']:visible, input[type='datetime-local']:visible",
+        "cascader": f"input[placeholder*='{text}']:visible" if text else "input:visible",
+        "file_upload": f"input[type='file']:visible",
+        "submit": f"button:has-text('{text}'), input[type='submit'][value*='{text}']" if text else "button:visible",
+    }
+    return type_map.get(feature_type, f"button:has-text('{text}')") if text else type_map.get(feature_type, "button:visible")
 
 
 def _get_expected_result(feature_type: str, element_text: str | None) -> str:

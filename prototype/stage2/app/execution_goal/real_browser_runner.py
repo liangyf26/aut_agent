@@ -236,6 +236,9 @@ async def _try_l4_browser_use(
     *,
     action: str,
     cascade_context: dict[str, Any],
+    override_instruction: str = "",
+    steps: int = 4,
+    timeout_ms: int = 90_000,
 ) -> dict[str, Any] | None:
     model_name = cascade_context.get("model_name")
     cdp_url = cascade_context.get("cdp_url")
@@ -245,14 +248,21 @@ async def _try_l4_browser_use(
 
     from .browser_use_executor import BrowserUseSafety, execute_with_browser_use
 
-    desc = item.get("description") or f"{action}操作"
-    instruction = (
-        f"在当前页面上{desc}。如果需要点击某个元素，请尝试用附近的文字或 aria-label 来定位。"
+    instruction = override_instruction or (
+        f"在当前页面上{item.get('description') or f'{action}操作'}。如果需要点击某个元素，请尝试用附近的文字或 aria-label 来定位。"
     )
-    safety = BrowserUseSafety(write_allowed=action != "fill", max_steps=4)
+    safety = BrowserUseSafety(write_allowed=True, max_steps=steps, timeout_ms=timeout_ms)
+
+    # Release Playwright's CDP grip so Browser Use can take over
+    ctx = page.context
+    browser = ctx.browser
+    await browser.close()
+    import asyncio
+    await asyncio.sleep(0.3)
+
     try:
         br_result = await execute_with_browser_use(
-            page=page,
+            page=None,
             instruction=instruction,
             context={
                 "stage": "execution_verification",
@@ -264,9 +274,21 @@ async def _try_l4_browser_use(
             screenshots_dir=screenshots_dir,
         )
     except Exception:
-        return None
+        br_result = None
 
-    if not br_result.ok:
+    # Reconnect Playwright
+    try:
+        from playwright.async_api import async_playwright
+        _pw = await async_playwright().start()
+        _b = await _pw.chromium.connect_over_cdp(cdp_url)
+        _pages = []
+        for _c in _b.contexts:
+            _pages.extend(_c.pages)
+        new_page = _pages[0] if _pages else None
+    except Exception:
+        new_page = None
+
+    if not br_result or not br_result.ok:
         return None
 
     return {
@@ -340,6 +362,19 @@ async def _run_executable_steps(
                     duration_ms = int((time.perf_counter() - started) * 1000)
                     actions.append(_action(idx, action_name, "failed", duration_ms=duration_ms, result=result))
                     return actions, "assertion_failed"
+            elif action_name == "browser_use":
+                instruction = str(item.get("instruction") or item.get("description") or "在当前页面上执行操作")
+                l4_result = await _try_l4_browser_use(
+                    page, item, action="browser_use", cascade_context=cascade_context,
+                    override_instruction=instruction, steps=10, timeout_ms=180_000,
+                )
+                if l4_result:
+                    result = l4_result
+                else:
+                    duration_ms = int((time.perf_counter() - started) * 1000)
+                    actions.append(_action(idx, action_name, "failed", duration_ms=duration_ms,
+                        result={"ok": False, "reason": "browser_use_failed"}))
+                    return actions, "locator_unstable"
             else:
                 duration_ms = int((time.perf_counter() - started) * 1000)
                 actions.append(

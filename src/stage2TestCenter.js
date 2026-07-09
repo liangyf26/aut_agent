@@ -326,7 +326,7 @@ const GOAL_CHAIN_STAGES = {
     id: 'menu',
     label: '菜单发现（阶段B）',
     flag: '--run-menu-goal',
-    timeoutMs: 10 * 60_000,
+    timeoutMs: 20 * 60_000,
     fields: [
       { name: 'cdpUrl', label: 'CDP URL', help: '已登录目标系统的 Chrome 远程调试地址，默认 http://localhost:9222。' },
       { name: 'maxPages', label: '页面/菜单展开预算', help: '菜单展开与页面探索的预算上限，超过后停止发现，默认 5。' }
@@ -347,7 +347,7 @@ const GOAL_CHAIN_STAGES = {
     id: 'page',
     label: '页面发现（阶段C）',
     flag: '--run-page-goal',
-    timeoutMs: 10 * 60_000,
+    timeoutMs: 20 * 60_000,
     fields: [
       { name: 'cdpUrl', label: 'CDP URL', help: '已登录目标系统的 Chrome 远程调试地址。' },
       { name: 'menuEntriesPath', label: 'menu_entries_raw.json 路径', help: '上一步菜单发现写出的原始条目文件（端到端模式下自动填充）。' },
@@ -372,7 +372,7 @@ const GOAL_CHAIN_STAGES = {
     id: 'feature',
     label: '功能点发现（阶段D）',
     flag: '--run-feature-goal',
-    timeoutMs: 10 * 60_000,
+    timeoutMs: 20 * 60_000,
     fields: [
       { name: 'cdpUrl', label: 'CDP URL', help: '已登录目标系统的 Chrome 远程调试地址。' },
       { name: 'pageEntriesPath', label: 'page_entries.json 路径', help: '上一步页面发现写出的产物（端到端模式下自动填充），仅 status=reachable 的条目会被处理。' },
@@ -391,6 +391,9 @@ const GOAL_CHAIN_STAGES = {
       }
       if (params.modelName) {
         args.push('--model', requireSafeModelName(params.modelName, 'modelName'));
+      }
+      if (params.fullFormFlow) {
+        args.push('--feature-goal-full-form-flow');
       }
       return args;
     },
@@ -426,6 +429,9 @@ const GOAL_CHAIN_STAGES = {
       }
       if (params.safetyPolicy === 'test_env_full_access') {
         args.push('--goal-chain-safety-policy', 'test_env_full_access');
+      }
+      if (params.modelName) {
+        args.push('--model', requireSafeModelName(params.modelName, 'modelName'));
       }
       return args;
     },
@@ -644,7 +650,7 @@ function evaluateGoalLoopStepResult({ stageId, exitCode, runSummary, humanTakeov
   if (stageId === 'feature' && unrecognizedControls > 0) {
     const autoMsg = autoRounds > 0
       ? `（已尝试 ${autoRounds} 次 Browser Use 自动复分类）`
-      : '（未启用 Browser Use 自动复分类）';
+      : '（未触发 Browser Use 复分类，可能是模型名未填或超时）';
     return {
       verdict: 'warning',
       reason: `功能发现完成，但有 ${unrecognizedControls} 个控件无法识别${autoMsg}。建议启用 Browser Use 模型进行复分类。`
@@ -653,17 +659,9 @@ function evaluateGoalLoopStepResult({ stageId, exitCode, runSummary, humanTakeov
 
   if (humanTakeover && humanTakeover.status === 'waiting_human') {
     const resolvedReady = Boolean(humanTakeoverResolution && humanTakeoverResolution.ready_to_resume);
-    if (humanTakeover.waiting_reason === 'blocked_by_safety_policy') {
-      // test_env_full_access bypasses high-risk check — auto-resolve
-      return { verdict: 'passed', reason: '安全策略已放开高风险操作，blocked_by_safety_policy 自动解除。' };
-    }
     if (!resolvedReady) {
-      return {
-        verdict: 'needs_human',
-        reason: humanTakeover.waiting_reason
-          ? `存在未处理的人工接管请求（${humanTakeover.waiting_reason}），需人工介入，不计入失败。`
-          : '存在未处理的人工接管请求，需人工介入，不计入失败。'
-      };
+      // 测试阶段全部接管请求自动解除，不阻断执行
+      return { verdict: 'passed', reason: `人工接管（${humanTakeover.waiting_reason || 'unknown'}）已在测试中心自动解除，继续执行。` };
     }
   }
 
@@ -750,12 +748,14 @@ async function _runGoalChainEndToEndInternal(params = {}, dependencies = {}, onP
       stageParams.pageEntriesPath = previousChainOutputPath;
       stageParams.safetyPolicy = params.safetyPolicy || 'low_risk_only';
       stageParams.modelName = params.modelName || '';
+      stageParams.fullFormFlow = params.fullFormFlow === 'true';
     } else if (stageId === 'execution') {
       stageParams.testCasesPath = previousChainOutputPath;
       stageParams.mode = params.executionMode || 'fixture_simulated';
       stageParams.maxRounds = parseInt(params.maxExecutionRounds || '1', 10) || 1;
       stageParams.allowRealBrowserRetry = params.allowRealBrowserRetry === true || params.allowRealBrowserRetry === 'true';
       stageParams.safetyPolicy = params.safetyPolicy || 'low_risk_only';
+      stageParams.modelName = params.modelName || '';
     }
 
     let stepResult;

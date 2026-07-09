@@ -186,7 +186,7 @@ const state = {
     unitTestResults: {},
     goalChainStageResults: {},
     goalChainStageForms: {},
-    e2eForm: { cdpUrl: 'http://localhost:9222', executionMode: 'fixture_simulated', systemName: '', maxPages: '5', maxFeaturesPerPage: '12', safetyPolicy: 'low_risk_only', modelName: '' },
+    e2eForm: { cdpUrl: 'http://localhost:9222', executionMode: 'fixture_simulated', systemName: '', maxPages: '5', maxFeaturesPerPage: '12', safetyPolicy: 'low_risk_only', modelName: '', fullFormFlow: '' },
     e2eResult: null,
     e2eProgress: null,
     e2ePollTimer: null,
@@ -197,6 +197,22 @@ const state = {
 const AUTO_REFRESH_MS = 15000;
 let stage2BrowserPreflightTimer = null;
 const STAGE2_FULL_ACCESS_ALLOWLIST = ['create', 'edit', 'submit', 'delete', 'approve', 'save', 'remove'];
+
+function quickPresetE2EForm() {
+  const f = state.testCenter.e2eForm;
+  f.executionMode = 'real_browser';
+  f.safetyPolicy = 'test_env_full_access';
+  f.maxPages = '1';
+  f.maxFeaturesPerPage = '80';
+  f.fullFormFlow = 'true';
+  f.allowRealBrowserRetry = 'true';
+  f.maxExecutionRounds = '5';
+  f.modelName = f.modelName || 'local_ai';
+  f.systemName = '线上备案申请';
+  f.targetUrl = 'https://www.zbsykj.com:19096/record/online';
+  renderStage2TestCenterTab();
+}
+
 const fields = ['name', 'client', 'vendor', 'sutName', 'sutBaseUrl', 'accountNotes', 'scope', 'documentText'];
 
 const projectForm = document.querySelector('#projectForm');
@@ -2933,6 +2949,10 @@ function renderTestCenterE2eSection() {
         <span data-e2e-head-tag>${runningStatus && currentStage ? `<span class="tag pulse">运行中：${stageOrderIds.indexOf(currentStage) + 1}/4</span>` : ''}</span>
       </div>
       <p class="stage2-help-text">依次跑通菜单发现→页面发现→功能点发现→执行，每一步自动把产物路径传给下一步；任意一步失败或需人工介入即停止，不会继续往后跑。</p>
+      <div class="inline-actions" style="margin-bottom:8px">
+        <button class="primary-action compact-action" onclick="quickPresetE2EForm()" type="button">⚡ 一键录入页全流程</button>
+        <small style="margin-left:8px;color:var(--muted)">自动设 real_browser + test_env_full_access + 每页 20 功能点 + 全流程录入</small>
+      </div>
       <div class="stage2-field-grid">
         <label class="stage2-field">
           <span>CDP URL</span>
@@ -2959,6 +2979,14 @@ function renderTestCenterE2eSection() {
             <option value="test_env_full_access" ${form.safetyPolicy === 'test_env_full_access' ? 'selected' : ''}>test_env_full_access（全功能，允许提交/保存/上传，仅测试环境）</option>
           </select>
           <small>影响执行阶段的风险控制。选 test_env_full_access 后提交、保存等高危操作将自动执行（需确认在测试环境）。</small>
+        </label>
+        <label class="stage2-field">
+          <span>录入页面全流程</span>
+          <select data-test-center-e2e-field="fullFormFlow">
+            <option value="" ${!form.fullFormFlow ? 'selected' : ''}>否（各控件独立测试）</option>
+            <option value="true" ${form.fullFormFlow === 'true' ? 'selected' : ''}>是（先填表单再提交，单条全流程用例）</option>
+          </select>
+          <small>勾选后，提交按钮将附带"填写所有可见表单域"步骤，模拟真实录入流程。</small>
         </label>
         <label class="stage2-field">
           <span>执行最大轮数</span>
@@ -5089,4 +5117,6 @@ loadDashboardData().then(() => {
   saveState.textContent = error.message;
 });
 
-window.setInterval(autoRefreshDashboard, AUTO_REFRESH_MS);
+const _dashboardRefreshInterval = WORKSPACE_VIEW === 'testcenter'
+  ? null
+  : window.setInterval(autoRefreshDashboard, AUTO_REFRESH_MS);

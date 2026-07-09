@@ -25,6 +25,7 @@ returns a degraded ``BrowserUseResult(ok=False, failure_reason="browser_use_unav
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -241,7 +242,7 @@ async def _run_agent(
     api_key = profile.get("apiKey") or profile.get("api_key") or "EMPTY"
     base_url = profile.get("baseUrl") or profile.get("base_url")
 
-    llm = ChatOpenAICls(model=model, api_key=api_key, base_url=base_url)
+    llm = ChatOpenAICls(model=model, api_key=api_key, base_url=base_url, request_timeout=60)
 
     cdp_url = str(context.get("cdp_url") or "")
     browser = BrowserCls(cdp_url=cdp_url) if cdp_url else BrowserCls()
@@ -254,7 +255,19 @@ async def _run_agent(
         max_actions_per_step=1,
     )
 
-    history = await agent.run(max_steps=safety.max_steps)
+    agent_timeout = max(safety.timeout_ms / 1000.0, 5.0)
+    try:
+        history = await asyncio.wait_for(agent.run(max_steps=safety.max_steps), timeout=agent_timeout)
+    except asyncio.TimeoutError:
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        return BrowserUseResult(
+            ok=False,
+            model=model,
+            instruction=instruction,
+            failure_reason="browser_use_timeout",
+            notes=[f"Agent timed out after {agent_timeout}s"],
+            duration_ms=duration_ms,
+        )
 
     if screenshots_dir and page is not None:
         await _capture(page, screenshots_dir, "browser_use_after")
@@ -293,7 +306,7 @@ def _resolve_profile(model_name: str | None) -> dict[str, Any] | None:
     import os
     from contextlib import suppress
 
-    default_path = Path(__file__).resolve().parents[3] / "config" / "stage2-model-profiles.json"
+    default_path = Path(__file__).resolve().parents[4] / "config" / "stage2-model-profiles.json"
     path = Path(os.environ.get("STAGE2_MODEL_PROFILES_PATH", str(default_path)))
     if not path.exists():
         return None
@@ -336,10 +349,82 @@ async def _capture(page: "Page", screenshots_dir: Path, name: str) -> dict[str, 
     return {"path": str(path), "kind": "screenshot", "name": name}
 
 
+async def classify_with_vision(
+    page: "Page",
+    instruction: str,
+    *,
+    model_name: str,
+) -> dict[str, Any] | None:
+    """Use a screenshot + LLM to classify page content.  No Browser(), no CDP
+    — the Playwright *page* that the caller already owns is the only browser
+    connection.  Works for Stage D feature re-classification where Browser Use
+    would conflict with an existing Playwright CDP session.
+    """
+    import base64
+    import sys
+
+    profile = _resolve_profile(model_name)
+    if not profile:
+        print(f"[vision] profile not found: {model_name}", file=sys.stderr)
+        return None
+    try:
+        data = await page.screenshot(type="png", full_page=False)
+        b64 = base64.b64encode(data).decode()
+    except Exception as exc:
+        print(f"[vision] screenshot failed: {exc}", file=sys.stderr)
+        return None
+
+    model = profile.get("model") or "unknown"
+    api_key = profile.get("apiKey") or profile.get("api_key") or "EMPTY"
+    base_url = profile.get("baseUrl") or profile.get("base_url")
+
+    prompt = instruction + "\n只返回 JSON，不要其他文字。"
+
+    try:
+        import openai
+        client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+            ]}],
+            max_tokens=1024,
+        )
+        text = resp.choices[0].message.content or ""
+    except ImportError:
+        try:
+            from browser_use import ChatOpenAI as _ChatOpenAI
+            llm = _ChatOpenAI(model=model, api_key=api_key, base_url=base_url)
+            resp = await llm.ainvoke(prompt)
+            text = str(resp.content if hasattr(resp, "content") else resp)
+        except Exception as exc:
+            print(f"[vision] LLM call failed: {exc}", file=sys.stderr)
+            return None
+    except Exception as exc:
+        print(f"[vision] LLM call failed: {exc}", file=sys.stderr)
+        return None
+
+    print(f"[vision] LLM response ({len(text)} chars): {text[:200]}", file=sys.stderr)
+    import json, re
+    m = re.search(r'\{[^{}]*"feature_type"[^{}]*|[^{}]*"controls"[^{}]*\}', text, re.DOTALL)
+    if not m:
+        m = re.search(r'\{.*\}', text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError as exc:
+            print(f"[vision] JSON parse failed: {exc}", file=sys.stderr)
+            return None
+    print(f"[vision] no JSON found in response", file=sys.stderr)
+    return None
+
+
 __all__ = [
     "BROWSER_USE_FALLBACK_MODE",
     "BrowserUseResult",
     "BrowserUseSafety",
+    "classify_with_vision",
     "execute_with_browser_use",
     "safety_for_stage",
 ]

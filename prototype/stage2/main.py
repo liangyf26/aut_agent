@@ -789,7 +789,7 @@ async def run_execution_goal_entrypoint(
                     raise RuntimeError("未发现可用页面，无法执行 execution_goal real_browser 模式")
                 page = pages[0]
                 screenshots_dir = output_dir / "screenshots"
-                rounds = await _run_and_export(page=page, screenshots_dir=screenshots_dir, safety_policy=safety_policy)
+                rounds = await _run_and_export(page=page, screenshots_dir=screenshots_dir, safety_policy=safety_policy, cascade_model_name=model_name, cascade_cdp_url=cdp_url)
             finally:
                 await browser.close()
 
@@ -1029,6 +1029,7 @@ async def run_feature_goal_entrypoint(
     max_features_per_page: int = 6,
     safety_policy: str = "low_risk_only",
     model_name: str | None = None,
+    full_form_flow: bool = False,
 ) -> dict[str, Any]:
     """Run Stage D's feature_goal real-browser classification and write
     feature_points.json / generated_test_cases.json.
@@ -1100,59 +1101,31 @@ async def run_feature_goal_entrypoint(
                         await page.wait_for_timeout(1500)
 
                     if auto_round > 0 and model_name:
-                        print(f"[auto-round {auto_round}] 启动 Browser Use 复分类: {entry.get('page_title') or page_id}", file=sys.stderr)
-                        from prototype.stage2.app.execution_goal.browser_use_executor import (
-                            BrowserUseSafety, execute_with_browser_use,
-                        )
-                        page_title = await page.title()
+                        print(f"[auto-round {auto_round}] 启动 Vision 复分类: {entry.get('page_title') or page_id}", file=sys.stderr)
+                        from prototype.stage2.app.execution_goal.browser_use_executor import classify_with_vision
+
                         instruction = (
-                            f"当前页面标题：{page_title}。\n"
-                            "请浏览页面，找到所有可见的输入控件（input、select、textarea），"
-                            "对每个控件判断其功能：file_upload(文件上传)、date_picker(日期选择)、"
-                            "text_input(文本输入)、cascader(级联选择下拉)、dropdown(普通下拉)、"
-                            "submit(提交按钮)、number_input(数字输入)。\n"
-                            "只返回 JSON: {\"controls\": [{\"tag\": \"input\", \"type\": \"text\","
-                            "\"text\": \"控件描述\", \"feature_type\": \"text_input\"}]}"
+                            "请观察截图中的所有可见控件（input、select、textarea、button），"
+                            "逐一判断每个控件的功能类型，返回 JSON："
+                            '{"controls":[{"tag":"input","type":"text","text":"描述","feature_type":"text_input"}]}'
+                            "\n可选类型: text_input, date_picker, number_input, file_upload, cascader, dropdown, submit"
                         )
                         try:
-                            result = await execute_with_browser_use(
-                                page, instruction,
-                                context={"stage": "feature_discovery", "cdp_url": cdp_url},
-                                safety=BrowserUseSafety(write_allowed=False, max_steps=5),
-                                model_name=model_name,
-                            )
-                            if result.ok:
-                                print(f"  [auto-round {auto_round}] Browser Use OK, actions={len(result.actions)}", file=sys.stderr)
-                                import json as _json, re as _re
-                                # Try to find JSON in any action content
-                                all_text = ""
-                                for act in result.actions:
-                                    if isinstance(act, dict):
-                                        all_text += str(act.get("content", "")) + " " + str(act.get("entry", "")) + " "
-                                    else:
-                                        all_text += str(act) + " "
-                                m = _re.search(r'\{"controls"\s*:\s*\[.*?\]\}', all_text, _re.DOTALL)
-                                if not m:
-                                    m = _re.search(r'\{[^{}]*"controls"\s*:\s*\[[^\]]*\][^{}]*\}', all_text)
-                                if m:
-                                    try:
-                                        data = _json.loads(m.group(0))
-                                        for ctrl in data.get("controls", []):
-                                            ft = ctrl.get("feature_type")
-                                            if ft and ft != "other":
-                                                from prototype.stage2.app.v3_real_browser import register_feature_type
-                                                keywords = [ctrl.get("text", ""), ctrl.get("tag", ""), ctrl.get("type", "")]
-                                                register_feature_type(ft, [k for k in keywords if k])
-                                                print(f"  [auto-round {auto_round}] 注册新类型: {ft} ← {keywords}", file=sys.stderr)
-                                    except _json.JSONDecodeError as je:
-                                        print(f"  [auto-round {auto_round}] JSON 解析失败: {je} [{m.group(0)[:120]}]", file=sys.stderr)
-                                else:
-                                    print(f"  [auto-round {auto_round}] 未找到 JSON controls [{all_text[:200]}]", file=sys.stderr)
+                            data = await classify_with_vision(page, instruction, model_name=model_name)
+                            if data:
+                                print(f"  [auto-round {auto_round}] Vision OK", file=sys.stderr)
+                                for ctrl in data.get("controls", []):
+                                    ft = ctrl.get("feature_type")
+                                    if ft and ft != "other":
+                                        from prototype.stage2.app.v3_real_browser import register_feature_type
+                                        keywords = [ctrl.get("text", ""), ctrl.get("tag", ""), ctrl.get("type", "")]
+                                        register_feature_type(ft, [k for k in keywords if k])
+                                        print(f"  [auto-round {auto_round}] 注册新类型: {ft} ← {keywords}", file=sys.stderr)
                             else:
-                                print(f"  [auto-round {auto_round}] Browser Use 失败: ok=False, reason={result.failure_reason}", file=sys.stderr)
+                                print(f"  [auto-round {auto_round}] Vision 返回空", file=sys.stderr)
                         except Exception as exc:
-                            print(f"  [auto-round {auto_round}] Browser Use 异常: {type(exc).__name__}: {exc}", file=sys.stderr)
-                        await page.wait_for_timeout(500)
+                            print(f"  [auto-round {auto_round}] Vision 异常: {type(exc).__name__}: {exc}", file=sys.stderr)
+                        await page.wait_for_timeout(200)
 
                     page_goal = engine.register_goal(
                         goal_type="feature",
@@ -1208,6 +1181,18 @@ async def run_feature_goal_entrypoint(
     # — classify_features_with_playwright returns cases directly rather than
     # appending to it (that append only happens in the fixture-driven
     # scan_page_features path), so backfill it here before summarizing.
+
+    # Full form flow: generate a combined test case that fills all form fields
+    # before submitting, simulating a real data-entry workflow
+    if full_form_flow and safety_policy == "test_env_full_access":
+        print(f"[tc_form_flow] full_form_flow={full_form_flow} safety_policy={safety_policy} cases={len(all_test_cases)}", file=sys.stderr)
+        form_case = _build_form_flow_test_case(all_test_cases, page_url=reachable_entries[0].get("page_url") if reachable_entries else None)
+        if form_case:
+            all_test_cases.insert(0, form_case)  # first priority
+            print(f"[tc_form_flow] generated, total cases now {len(all_test_cases)}", file=sys.stderr)
+        else:
+            print(f"[tc_form_flow] NOT generated — no eligible trigger found (need risk=high, type=executable)", file=sys.stderr)
+
     orchestrator._test_cases = all_test_cases
     run_summary_path = orchestrator.export_goal_summary()
 
@@ -1237,6 +1222,49 @@ async def run_feature_goal_entrypoint(
         "auto_rounds": auto_round,
         "auto_rounds_completed": f"经过 {auto_round + 1} 轮分类（含 {auto_round} 次 Browser Use 复分类），"
                                 f"还有 {len(unrecognized)} 个控件无法识别。" if unrecognized else None,
+    }
+
+
+def _build_form_flow_test_case(all_cases: list[dict], *, page_url: str | None = None) -> dict | None:
+    """Build a single Browser Use-driven test case for the full form flow.
+
+    Instead of generating individual fill steps (which all fail on SPA
+    composite controls), this produces one ``browser_use`` step that
+    delegates the entire form-filling-and-submit workflow to Browser Use.
+    """
+    trigger = next((c for c in all_cases
+        if c.get("type") == "executable" and c.get("risk_level") == "high"
+    ), None)
+    if not trigger:
+        return None
+
+    return {
+        "test_case_id": "tc_form_flow",
+        "feature_id": "form_flow",
+        "page_id": trigger.get("page_id", ""),
+        "type": "executable",
+        "risk_level": "high",
+        "requires_approval": False,
+        "steps": [
+            {"step": 1, "action": "navigate", "target": page_url or "/", "description": "导航到表单页面"},
+            {"step": 2, "action": "browser_use",
+             "description": "在表单页面上，对所有可见的输入框、下拉框、日期选择器、文件上传控件填写测试数据，然后点击提交按钮。先点'我要申请备案'进入表单页再操作。",
+             "instruction": (
+                 "请在这个页面上找到一个能进入表单录入的按钮（如'我要申请备案'或'我要申报'），"
+                 "点击进入表单。然后在弹出的表单中，对所有可见的输入框、下拉选择器、日期选择器、"
+                 "文件上传控件逐一填写测试数据（文本填'测试数据'，下拉选第一个选项，"
+                 "日期选当天），全部填完后点击提交按钮。"
+             )},
+            {"step": 3, "action": "verify", "target": "page_state_changed", "description": "验证提交反馈"},
+        ],
+        "expected_result": "表单填写并提交成功",
+        "description": "全流程录入测试：Browser Use 填写表单并提交",
+        "metadata": {
+            "feature_type": "submit", "confidence": "high",
+            "element_text": "提交",
+            "element_locator": trigger.get("metadata", {}).get("element_locator"),
+            "locator_candidates": trigger.get("metadata", {}).get("locator_candidates"),
+        },
     }
 
 
@@ -2236,6 +2264,12 @@ def main() -> None:
         help="Safety policy for the goal-chain pipeline (feature + execution stages).",
     )
     parser.add_argument(
+        "--feature-goal-full-form-flow",
+        action="store_true",
+        default=False,
+        help="Generate a single full-form-flow test case that fills all visible form fields before submitting.",
+    )
+    parser.add_argument(
         "--run-cross-system-goal",
         action="store_true",
         help="Run Stage F's real-browser cross-system validation over N systems "
@@ -2539,6 +2573,7 @@ def main() -> None:
                         max_rounds=args.execution_goal_max_rounds,
                         allow_real_browser_retry=args.execution_goal_allow_real_browser_retry,
                         safety_policy=args.goal_chain_safety_policy,
+                        model_name=args.model or None,
                     )
                 ),
                 ensure_ascii=False,
@@ -2596,6 +2631,7 @@ def main() -> None:
                         max_features_per_page=args.goal_chain_max_features_per_page,
                         safety_policy=args.goal_chain_safety_policy,
                         model_name=args.model or None,
+                        full_form_flow=args.feature_goal_full_form_flow,
                     )
                 ),
                 ensure_ascii=False,

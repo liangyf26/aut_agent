@@ -192,6 +192,7 @@ class ExecutionGoalOrchestrator:
         runner: RealBrowserRunner,
         runner_kwargs: dict[str, Any] | None = None,
         injected_failures: dict[str, str] | None = None,
+        halt_on_pause: bool = True,
     ) -> list[ExecutionOutcome]:
         """Real-browser counterpart to :meth:`execute_all`.
 
@@ -248,6 +249,15 @@ class ExecutionGoalOrchestrator:
 
             stop_eval = self.engine.evaluate_stop(goal.goal_id)
             if stop_eval.target_status in PAUSED_STATUSES:
+                if not halt_on_pause:
+                    # Auto-resolve: set the paused goal to terminal, then
+                    # supersede with the next available frontier goal
+                    next_id = next((gid for gid in self.engine.frontier if gid != goal.goal_id), None)
+                    if next_id:
+                        self.engine.supersede_active(next_goal_id=next_id)
+                    else:
+                        self.engine.supersede_active(next_goal_id=goal.goal_id)
+                    continue
                 self.halted_early = True
                 break
 
@@ -294,23 +304,14 @@ class ExecutionGoalOrchestrator:
         screenshots_dir: Path | None = None,
         injected_failures: dict[str, str] | None = None,
         safety_policy: str = "low_risk_only",
+        cascade_model_name: str | None = None,
+        cascade_cdp_url: str | None = None,
     ) -> list[ExecutionOutcome]:
         """Run every queued execution goal via either execution mode.
 
-        This is a convenience dispatcher over :meth:`execute_all` (default,
-        fixture-simulated, unchanged) and :meth:`execute_all_async` (real
-        browser) so a caller (CLI entrypoint, verification script) can pick
-        the mode via one string argument instead of knowing which of the two
-        underlying methods to call and how to build the runner closure
-        itself. Neither underlying method is modified by this wrapper.
-
-        Args:
-            mode: ``"fixture_simulated"`` (default) or ``"real_browser"``.
-            page: a live Playwright ``Page``, required when
-                ``mode == "real_browser"``.
-            screenshots_dir: directory real screenshots are written under,
-                required when ``mode == "real_browser"``.
-            injected_failures: forwarded to whichever underlying method runs.
+        When *safety_policy* is ``"test_env_full_access"``, paused goals
+        (e.g. assertion_failed, locator_unstable) are auto-resolved and
+        the batch continues rather than halting.
 
         Raises:
             ValueError: for an unrecognized ``mode``, or a missing
@@ -328,16 +329,23 @@ class ExecutionGoalOrchestrator:
             from .real_browser_runner import execute_test_case_with_playwright
 
             async def runner(test_case: dict, *, goal_id: str | None, injected_failure: str | None):
+                cctx: dict[str, Any] = {"safety_policy": safety_policy}
+                if cascade_model_name:
+                    cctx["model_name"] = cascade_model_name
+                if cascade_cdp_url:
+                    cctx["cdp_url"] = cascade_cdp_url
+                cascade = cctx if safety_policy != "low_risk_only" or cascade_model_name else None
                 return await execute_test_case_with_playwright(
                     page,
                     test_case,
                     goal_id=goal_id,
                     screenshots_dir=screenshots_dir,
                     injected_failure=injected_failure,
-                    cascade_context={"safety_policy": safety_policy} if safety_policy != "low_risk_only" else None,
+                    cascade_context=cascade,
                 )
 
-            return await self.execute_all_async(runner=runner, injected_failures=injected_failures)
+            return await self.execute_all_async(runner=runner, injected_failures=injected_failures,
+                halt_on_pause=safety_policy != "test_env_full_access")
 
         raise ValueError(f"unrecognized execution mode: {mode!r}; expected 'fixture_simulated' or 'real_browser'")
 
@@ -352,6 +360,8 @@ class ExecutionGoalOrchestrator:
         injected_failures: dict[str, str] | None = None,
         allow_real_browser_retry: bool = False,
         safety_policy: str = "low_risk_only",
+        cascade_model_name: str | None = None,
+        cascade_cdp_url: str | None = None,
     ) -> list[dict[str, Any]]:
         """Run round 1, then keep auto-advancing through retryable failures
         (方案 §13 exit=retry) within THIS process, up to ``max_rounds``.
@@ -410,6 +420,8 @@ class ExecutionGoalOrchestrator:
                 screenshots_dir=screenshots_dir,
                 injected_failures=round_injected_failures,
                 safety_policy=safety_policy,
+                cascade_model_name=cascade_model_name,
+                cascade_cdp_url=cascade_cdp_url,
             )
             # Scoped to THIS round's goal_ids only: the engine never deletes
             # a prior round's terminal goal, it accumulates a new one

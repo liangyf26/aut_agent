@@ -4821,6 +4821,8 @@ register_feature_type("file_upload", ["upload", "上传", "file", "选择文件"
 register_feature_type("date_picker", ["date", "日期", "picker", "时间", "年月日"])
 register_feature_type("cascader", ["cascader", "级联", "省市区", "地区选择"])
 register_feature_type("number_input", ["number", "数字", "数量", "金额"])
+register_feature_type("form_field", ["text", "input", "输入", "文本框", "姓名", "电话", "手机", "邮箱", "地址", "备注"])
+register_feature_type("form_select", ["select", "下拉", "选择", "请选择"])
 
 
 def _infer_feature_type(text: str, tag: str, input_type: str) -> str:
@@ -4838,6 +4840,12 @@ def _infer_feature_type(text: str, tag: str, input_type: str) -> str:
         return "date_picker"
     if input_type == "number":
         return "number_input"
+    if tag == "input" and input_type in {"text", "email", "tel", "url", "password", ""}:
+        return "form_field"
+    if tag == "textarea":
+        return "form_field"
+    if tag == "select":
+        return "form_select"
 
     # 3. Static text-based rules (original vocabulary)
     if any(word in lowered for word in ("delete", "删除", "作废")):
