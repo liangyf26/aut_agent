@@ -241,8 +241,16 @@ async def _run_agent(
 ) -> BrowserUseResult:
     api_key = profile.get("apiKey") or profile.get("api_key") or "EMPTY"
     base_url = profile.get("baseUrl") or profile.get("base_url")
+    browser_use_mode = str(profile.get("browserUseMode") or "chatopenai")
+    use_structured = browser_use_mode == "chatopenai_structured"
 
-    llm = ChatOpenAICls(model=model, api_key=api_key, base_url=base_url, request_timeout=60)
+    llm = ChatOpenAICls(
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        add_schema_to_system_prompt=use_structured,
+        dont_force_structured_output=use_structured,
+    )
 
     cdp_url = str(context.get("cdp_url") or "")
     browser = BrowserCls(cdp_url=cdp_url) if cdp_url else BrowserCls()

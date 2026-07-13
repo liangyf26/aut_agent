@@ -24,7 +24,7 @@
       "label": "opencode_qwen",
       "provider": "anthropic",
       "baseUrl": "https://opencode.ai/zen/go/v1",
-      "apiKey": "sk-rJPtsrHQ1xfijrcmcYI9eyZBSA7HJZ9Na9MgnqrORrVYpIVxiAOd0GQrUqtn1MPY",
+      "apiKey": "OPENCODE_API_KEY",
       "model": "qwen3.7-plus",
       "browserUseMode": "chatopenai"
     },
@@ -33,16 +33,16 @@
       "label": "opencode_deepseek",
       "provider": "openai_compatible",
       "baseUrl": "https://opencode.ai/zen/go/v1",
-      "apiKey": "sk-rJPtsrHQ1xfijrcmcYI9eyZBSA7HJZ9Na9MgnqrORrVYpIVxiAOd0GQrUqtn1MPY",
+      "apiKey": "OPENCODE_API_KEY",
       "model": "deepseek-v4-flash",
-      "browserUseMode": "chatopenai"
+      "browserUseMode": "chatopenai_structured"
     },
     {
       "id": "opencode_kimi",
       "label": "opencode_kimi",
       "provider": "openai_compatible",
       "baseUrl": "https://opencode.ai/zen/go/v1",
-      "apiKey": "sk-rJPtsrHQ1xfijrcmcYI9eyZBSA7HJZ9Na9MgnqrORrVYpIVxiAOd0GQrUqtn1MPY",
+      "apiKey": "OPENCODE_API_KEY",
       "model": "kimi-k2.6",
       "browserUseMode": "chatopenai"
     },
@@ -51,9 +51,36 @@
       "label": "minimax-cn",
       "provider": "openai_compatible",
       "baseUrl": "https://api.minimaxi.com/v1",
-      "apiKey": "sk-cp-dR7aqskegn1H_bjVjIoCs5Qbseqcdc4R0l3BGl29mY4KvnqgOQwp7KJdBXfL5SQ0PHHWAmo4E6MUYrBoyj_jg7I3B2LVBpkWCjSNL9ykvqfOL7Y0O2Bf5tQ",
+      "apiKey": "MINIMAX_API_KEY",
       "model": "MiniMax-M3",
       "browserUseMode": "chatopenai_structured"
+    },
+	{
+      "id": "volcengine_kimi",
+      "label": "volcengine_kimi",
+      "provider": "anthropic",
+      "baseUrl": "https://ark.cn-beijing.volces.com/api/coding",
+      "apiKey": "ARK_API_KEY",
+      "model": "kimi-k2.6",
+      "browserUseMode": "chatopenai"
+    },
+    {
+      "id": "volcengine_deepseek",
+      "label": "volcenginee_deepseek",
+      "provider": "openai_compatible",
+      "baseUrl": "https://ark.cn-beijing.volces.com/api/coding/v3",
+      "apiKey": "ARK_API_KEY",
+      "model": "deepseek-v4-flash",
+      "browserUseMode": "chatopenai_structured"
+    },
+    {
+      "id": "volcengine_doubao",
+      "label": "volcengine_doubao",
+      "provider": "openai_compatible",
+      "baseUrl": "https://ark.cn-beijing.volces.com/api/coding/v3",
+      "apiKey": "ARK_API_KEY",
+      "model": "doubao-seed-2.0-pro",
+      "browserUseMode": "chatopenai"
     }
   ]
 }

@@ -3052,10 +3052,14 @@ async def _run_browser_use_target_handover(
                 _LLMCls = _MiniMaxChatOpenAI
             else:
                 _LLMCls = ChatOpenAI
+            _browser_use_mode = str(profile.get("browserUseMode") or "chatopenai")
+            _use_structured = _browser_use_mode == "chatopenai_structured"
             _llm_kwargs = dict(
                 model=profile["model"],
                 api_key=profile.get("apiKey") or profile.get("api_key") or "EMPTY",
                 base_url=profile.get("baseUrl") or profile.get("base_url"),
+                add_schema_to_system_prompt=_use_structured,
+                dont_force_structured_output=_use_structured,
             )
 
         llm = _LLMCls(**_llm_kwargs)
