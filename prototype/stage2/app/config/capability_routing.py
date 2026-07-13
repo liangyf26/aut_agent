@@ -30,6 +30,7 @@ def _required_tags_for_stage_mode(mode: str) -> list[str]:
         "template_init",
         "browser_use_chatopenai_structured",
         "browser_use_chatdeepseek_structured",
+        "browser_use_anthropic",
     }
     if mode in predefined_modes:
         return required_capability_tags_for_mode(mode)
@@ -226,8 +227,24 @@ def _build_preflight_blocked_routing(
 def _build_discovery_route(capability_tags: dict[str, bool]) -> CapabilityStageRoute:
     chat_completion_ready = capability_tags.get("chat_completion") is True
     json_schema_ready = capability_tags.get("json_schema_response_format") is True
+    tool_calling_ready = capability_tags.get("tool_calling") is True
     openai_structured_ready = capability_tags.get("browser_use_chatopenai_structured") is True
     deepseek_structured_ready = capability_tags.get("browser_use_chatdeepseek_structured") is True
+    anthropic_ready = capability_tags.get("browser_use_compatible") is True
+
+    if anthropic_ready and chat_completion_ready and tool_calling_ready:
+        mode = "browser_use_anthropic"
+        return CapabilityStageRoute(
+            stage="discovery",
+            allowed=True,
+            recommended_mode=mode,
+            reason_code="browser_use_anthropic_ready",
+            reason="This Anthropic model passed chat + tool-use checks and can join live discovery.",
+            required_tags=_required_tags_for_stage_mode(mode),
+            routing_tags=["discovery_enabled", "browser_use_compatible", "anthropic_wrapper"],
+            capability_tags=dict(capability_tags),
+            notes=["Use the Anthropic ChatAnthropic wrapper for browser_use exploration."],
+        )
 
     if openai_structured_ready and chat_completion_ready and json_schema_ready:
         mode = "browser_use_chatopenai_structured"

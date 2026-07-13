@@ -5,19 +5,55 @@
       "id": "local_ai",
       "label": "local_ai",
       "provider": "openai_compatible",
-      "baseUrl": "http://172.28.50.9:30000/v1",
+      "baseUrl": "http://172.28.50.9:30030/v1",
       "apiKey": "123456",
-      "model": "AI-tester",
+      "model": "Qwen3.6-27B",
       "browserUseMode": "chatopenai"
     },
     {
       "id": "local_qwen",
       "label": "local_qwen",
       "provider": "openai_compatible",
-      "baseUrl": "http://172.28.29.24:30000/v1/",
-      "apiKey": "123456",
-      "model": "Qwen3.6-35B-A3B-UD-Q5_K_M-MTP",
+      "baseUrl": "http://172.28.29.24:8000/v1/",
+      "apiKey": "",
+      "model": "Qwen27b",
       "browserUseMode": "chatopenai"
+    },
+    {
+      "id": "opencode_qwen",
+      "label": "opencode_qwen",
+      "provider": "anthropic",
+      "baseUrl": "https://opencode.ai/zen/go/v1",
+      "apiKey": "sk-rJPtsrHQ1xfijrcmcYI9eyZBSA7HJZ9Na9MgnqrORrVYpIVxiAOd0GQrUqtn1MPY",
+      "model": "qwen3.7-plus",
+      "browserUseMode": "chatopenai"
+    },
+    {
+      "id": "opencode_deepseek",
+      "label": "opencode_deepseek",
+      "provider": "openai_compatible",
+      "baseUrl": "https://opencode.ai/zen/go/v1",
+      "apiKey": "sk-rJPtsrHQ1xfijrcmcYI9eyZBSA7HJZ9Na9MgnqrORrVYpIVxiAOd0GQrUqtn1MPY",
+      "model": "deepseek-v4-flash",
+      "browserUseMode": "chatopenai"
+    },
+    {
+      "id": "opencode_kimi",
+      "label": "opencode_kimi",
+      "provider": "openai_compatible",
+      "baseUrl": "https://opencode.ai/zen/go/v1",
+      "apiKey": "sk-rJPtsrHQ1xfijrcmcYI9eyZBSA7HJZ9Na9MgnqrORrVYpIVxiAOd0GQrUqtn1MPY",
+      "model": "kimi-k2.6",
+      "browserUseMode": "chatopenai"
+    },
+    {
+      "id": "minimax-cn",
+      "label": "minimax-cn",
+      "provider": "openai_compatible",
+      "baseUrl": "https://api.minimaxi.com/v1",
+      "apiKey": "sk-cp-dR7aqskegn1H_bjVjIoCs5Qbseqcdc4R0l3BGl29mY4KvnqgOQwp7KJdBXfL5SQ0PHHWAmo4E6MUYrBoyj_jg7I3B2LVBpkWCjSNL9ykvqfOL7Y0O2Bf5tQ",
+      "model": "MiniMax-M3",
+      "browserUseMode": "chatopenai_structured"
     }
   ]
 }

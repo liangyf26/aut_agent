@@ -583,8 +583,97 @@ async function postModelProbe(profile, body, options = {}) {
   }
 }
 
+async function postAnthropicProbe(profile, extraBody, options = {}) {
+  const timeoutMs = normalizeInteger(options.timeoutMs || options.timeout_ms, 3000, 500, 30000);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const endpoint = new URL('messages', `${profile.baseUrl.replace(/\/$/, '')}/`).toString();
+    const headers = {
+      'Content-Type': 'application/json',
+      'x-api-key': profile.apiKey || '',
+      'anthropic-version': '2023-06-01'
+    };
+    const body = {
+      model: profile.model,
+      max_tokens: 32,
+      messages: [{ role: 'user', content: 'Say "ok".' }],
+      ...extraBody
+    };
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      signal: controller.signal,
+      headers,
+      body: JSON.stringify(body)
+    });
+    if (!response.ok) {
+      let reason = `HTTP ${response.status}`;
+      try {
+        const err = await response.json().catch(() => null);
+        if (err?.error?.message) reason = err.error.message;
+      } catch (_) { /* ignore */ }
+      return { ok: false, reason };
+    }
+    const payload = await response.json().catch(() => ({}));
+    return { ok: true, payload };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: error.name === 'AbortError' ? 'timeout' : error.message
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function preflightAnthropicProfile(profile, checkedAt, options = {}) {
+  // Anthropic Messages API can be slow to respond; use a longer default timeout.
+  const probeOpts = { ...options, timeoutMs: options.timeoutMs || options.timeout_ms || 15000 };
+  const plain = await postAnthropicProbe(profile, {}, probeOpts);
+  // Anthropic tool-use probe.
+  const tools = plain.ok ? await postAnthropicProbe(profile, {
+    tools: [{
+      name: 'ping',
+      description: 'Capability probe ping.',
+      input_schema: {
+        type: 'object',
+        properties: {},
+        additionalProperties: false
+      }
+    }]
+  }, probeOpts) : { ok: false, reason: plain.reason };
+  // Anthropic models don't have OpenAI-style json_schema response_format;
+  // browser_use compatibility is gated on tool calling.
+  const capabilityTags = {
+    chat_completion: plain.ok,
+    tool_calling: tools.ok,
+    browser_use_compatible: plain.ok && tools.ok
+  };
+  return {
+    id: profile.id,
+    label: profile.label,
+    provider: profile.provider,
+    model: profile.model,
+    status: plain.ok ? 'available' : 'unavailable',
+    checked_at: checkedAt,
+    capability_tags: capabilityTags,
+    checks: {
+      chat_completion: { ok: plain.ok, reason: plain.reason || null },
+      tool_calling: { ok: tools.ok, reason: tools.reason || null },
+      browser_use: {
+        ok: capabilityTags.browser_use_compatible,
+        mode: 'anthropic'
+      }
+    },
+    profile: redactModelProfile(profile)
+  };
+}
+
 async function preflightModelProfile(profile, options = {}) {
   const checkedAt = nowIso();
+  if (profile.provider === 'anthropic') {
+    return await preflightAnthropicProfile(profile, checkedAt, options);
+  }
   if (profile.provider !== 'openai_compatible') {
     return {
       id: profile.id,
@@ -594,7 +683,7 @@ async function preflightModelProfile(profile, options = {}) {
       status: 'unsupported',
       checked_at: checkedAt,
       capability_tags: {},
-      checks: { provider: { ok: false, reason: '当前仅支持 OpenAI-compatible 模型预检。' } },
+      checks: { provider: { ok: false, reason: '当前仅支持 OpenAI-compatible / Anthropic 模型预检。' } },
       profile: redactModelProfile(profile)
     };
   }

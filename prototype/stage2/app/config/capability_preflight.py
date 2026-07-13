@@ -27,6 +27,11 @@ _DEFAULT_REQUIRED_TAGS_BY_MODE: dict[str, tuple[str, ...]] = {
         "chat_completion",
         "browser_use_chatdeepseek_structured",
     ),
+    "browser_use_anthropic": (
+        "chat_completion",
+        "tool_calling",
+        "browser_use_compatible",
+    ),
 }
 
 

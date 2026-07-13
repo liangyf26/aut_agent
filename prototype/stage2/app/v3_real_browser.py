@@ -1234,6 +1234,7 @@ async def _run_browser_use_target_handover(
         )
     try:
         from browser_use import Agent, Browser, ChatOpenAI, Tools  # type: ignore
+        from browser_use import ChatAnthropic  # type: ignore
     except Exception as exc:
         return _browser_use_handover_failure(
             targets,
@@ -3019,11 +3020,45 @@ async def _run_browser_use_target_handover(
 
             return await timed_tool("script_submit_form", run)
 
-        llm = ChatOpenAI(
-            model=profile["model"],
-            api_key=profile.get("apiKey") or profile.get("api_key") or "EMPTY",
-            base_url=profile.get("baseUrl") or profile.get("base_url"),
-        )
+        # Select LLM class based on provider: anthropic vs openai_compatible.
+        provider = (profile.get("provider") or "").lower()
+        if provider == "anthropic":
+            _LLMCls = ChatAnthropic
+            _llm_kwargs: dict[str, Any] = dict(
+                model=profile["model"],
+                api_key=profile.get("apiKey") or profile.get("api_key") or "EMPTY",
+                base_url=profile.get("baseUrl") or profile.get("base_url"),
+            )
+        else:
+            # OpenAI-compatible. MiniMax-M3 wraps responses in <think>
+            # tags that break browser_use's JSON parser. Disable thinking
+            # via the official API parameter on every call.
+            if "minimax" in (profile.get("model") or "").lower():
+                _base_cls = ChatOpenAI
+                class _MiniMaxChatOpenAI(_base_cls):
+                    def get_client(self):
+                        client = super().get_client()
+                        original = client.chat.completions.create
+                        async def _patched(**kw: Any) -> Any:
+                            kw.setdefault("extra_body", {})
+                            if isinstance(kw["extra_body"], dict):
+                                kw["extra_body"]["thinking"] = {"type": "disabled"}
+                            # MiniMax API rejects image_detail:auto in
+                            # vision requests. Strip it from all messages.
+                            kw["messages"] = _strip_image_detail(kw.get("messages"))
+                            return await original(**kw)
+                        client.chat.completions.create = _patched
+                        return client
+                _LLMCls = _MiniMaxChatOpenAI
+            else:
+                _LLMCls = ChatOpenAI
+            _llm_kwargs = dict(
+                model=profile["model"],
+                api_key=profile.get("apiKey") or profile.get("api_key") or "EMPTY",
+                base_url=profile.get("baseUrl") or profile.get("base_url"),
+            )
+
+        llm = _LLMCls(**_llm_kwargs)
         agent = Agent(
             task=_browser_use_handover_task(config, targets, handover_reasons),
             llm=llm,
@@ -3243,6 +3278,37 @@ def _browser_use_handover_task(
 11. get_page_feedback 只在失败、最终确认或本轮结束时调用，避免每个确定性工具后都等待页面摘要。
 12. 最后用可读文本总结：是否进入目标页面、是否点击“我要申请备案”、填写字段数量、上传文件数量、提交次数、最终页面反馈和失败原因。
 """
+
+
+def _strip_image_detail(messages: Any) -> list[dict[str, Any]]:
+    """Return a copy of *messages* with image_detail/detail stripped.
+
+    MiniMax-M3 API rejects ``image detail`` (error 2013).  This handles both
+    plain dicts and Pydantic model instances returned by browser_use's
+    ``OpenAIMessageSerializer``.
+    """
+    import copy
+    if not isinstance(messages, list):
+        return messages
+    result: list[dict[str, Any]] = []
+    for msg in messages:
+        msg_dict: dict[str, Any]
+        if isinstance(msg, dict):
+            msg_dict = copy.deepcopy(msg)
+        elif hasattr(msg, 'model_dump'):
+            msg_dict = msg.model_dump()
+        else:
+            result.append(msg)
+            continue
+        content = msg_dict.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    image_url = part.get("image_url")
+                    if isinstance(image_url, dict):
+                        image_url.pop("detail", None)
+        result.append(msg_dict)
+    return result
 
 
 def _load_browser_use_model_profile(model_name: str | None) -> dict[str, Any] | None:
